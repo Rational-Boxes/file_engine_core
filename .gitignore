@@ -1,3 +1,7 @@
 .idea/
 .txt
 .bac
+.env
+build/
+build_*/
+*_build/
