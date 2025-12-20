@@ -115,6 +115,7 @@ add_executable(fileengine_server
 
 target_link_libraries(fileengine_server
     fileengine_core
+    proto_lib
     ${GRPCPP_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${UUID_LIBRARIES}  # Add uuid library

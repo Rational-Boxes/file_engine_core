@@ -130,27 +130,13 @@ Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
 
 TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id) {
     try {
-        // Create database instance for the tenant
-        auto db = std::make_unique<Database>(
-            config_.db_host,
-            config_.db_port, 
-            config_.db_name,
-            config_.db_user,
-            config_.db_password
-        );
-        
-        // Initialize the database connection
-        if (!db->connect()) {
-            return nullptr;
-        }
-        
         // Create storage instance for the tenant
         auto storage = std::make_unique<Storage>(
             config_.storage_base_path,
             config_.encrypt_data,
             config_.compress_data
         );
-        
+
         // Create S3 storage instance
         auto object_store = std::make_unique<S3Storage>(
             config_.s3_endpoint,
@@ -160,25 +146,26 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
             config_.s3_secret_key,
             config_.s3_path_style
         );
-        
+
         // Initialize the S3 storage
         auto init_result = object_store->initialize();
         if (!init_result.success) {
             return nullptr;
         }
-        
+
         // Create the tenant context
+        // The database connection is handled by the shared database instance
+        // Tenant contexts manage storage and object store contexts only
         auto context = std::make_unique<TenantContext>();
-        context->db = std::move(db);
         context->storage = std::move(storage);
         context->object_store = std::move(object_store);
-        
+
         // Return a pointer to the context (it will be managed by the unique_ptr in the map)
         // We need to release the unique_ptr to return a raw pointer, but we need to be careful about ownership
         // The proper approach is to return a raw pointer but store the unique_ptr in the map
         TenantContext* raw_context = context.get();
         tenant_contexts_[tenant_id] = std::move(context);
-        
+
         return raw_context;
     } catch (const std::exception& ex) {
         return nullptr;

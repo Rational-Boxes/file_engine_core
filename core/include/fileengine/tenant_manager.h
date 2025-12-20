@@ -12,11 +12,6 @@
 namespace fileengine {
 
 struct TenantConfig {
-    std::string db_host;
-    int db_port;
-    std::string db_name;
-    std::string db_user;
-    std::string db_password;
     std::string storage_base_path;
     std::string s3_endpoint;
     std::string s3_region;
@@ -38,7 +33,7 @@ class TenantManager {
 public:
     TenantManager(const TenantConfig& config);
     ~TenantManager();
-    
+
     TenantContext* get_tenant_context(const std::string& tenant_id);
     bool initialize_tenant(const std::string& tenant_id);
     bool tenant_exists(const std::string& tenant_id) const;

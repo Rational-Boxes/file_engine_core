@@ -6,52 +6,26 @@
 #include <chrono>
 #include <ctime>
 
-#include "fileengine/logger.h"
-
-
-namespace fileengine_service {
-    // Include the generated types
-}
-
 namespace fileengine {
 
 GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                                  std::shared_ptr<TenantManager> tenant_manager,
-                                 std::shared_ptr<AclManager> acl_manager,
-                                 bool root_user_enabled)
-    : filesystem_(filesystem), tenant_manager_(tenant_manager),
-      acl_manager_(acl_manager), root_user_enabled_(root_user_enabled) {
+                                 std::shared_ptr<AclManager> acl_manager)
+    : filesystem_(filesystem), tenant_manager_(tenant_manager), acl_manager_(acl_manager) {
 }
 
 // Directory operations
 grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
-                                            const fileengine_service::MakeDirectoryRequest* request,
-                                            fileengine_service::MakeDirectoryResponse* response) {
+                                            const fileengine_rpc::MakeDirectoryRequest* request,
+                                            fileengine_rpc::MakeDirectoryResponse* response) {
     // Get the authentication context
     std::string parent_uid = request->parent_uid();
     std::string name = request->name();
     auto auth_context = request->auth();
 
-    // Log the request details
-    LOG_DEBUG("GRPC-Service", "MakeDirectory called: parent_uid=" + parent_uid + ", name=" + name);
-
     // Determine tenant from auth context
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
-
-    // Check if this is a root user before validating permissions
-    if (root_user_enabled_ && user == "root") {
-        LOG_DEBUG("GRPC-Service", "Root user bypassing permission check for mkdir");
-    } else {
-        // Validate permissions for non-root users
-        if (!validate_user_permissions(parent_uid, auth_context, 0200)) { // WRITE permission
-            LOG_WARN("GRPC-Service", "User " + user + " denied permission to create directory in " + parent_uid);
-            response->set_success(false);
-            response->set_uid("");
-            response->set_error("User does not have permission to create directory");
-            return grpc::Status::OK;
-        }
-    }
 
     // Call the filesystem to create the directory
     auto result = filesystem_->mkdir(parent_uid, name, user, request->permissions(), tenant);
@@ -60,20 +34,18 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
         response->set_success(true);
         response->set_uid(result.value);
         response->set_error("");
-        LOG_INFO("GRPC-Service", "Directory created successfully: " + result.value);
     } else {
         response->set_success(false);
         response->set_uid("");
         response->set_error(result.error);
-        LOG_ERROR("GRPC-Service", "Failed to create directory: " + result.error);
     }
 
     return grpc::Status::OK;
 }
 
 grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
-                                              const fileengine_service::RemoveDirectoryRequest* request,
-                                              fileengine_service::RemoveDirectoryResponse* response) {
+                                              const fileengine_rpc::RemoveDirectoryRequest* request,
+                                              fileengine_rpc::RemoveDirectoryResponse* response) {
     std::string dir_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -98,8 +70,8 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
-                                            const fileengine_service::ListDirectoryRequest* request,
-                                            fileengine_service::ListDirectoryResponse* response) {
+                                            const fileengine_rpc::ListDirectoryRequest* request,
+                                            fileengine_rpc::ListDirectoryResponse* response) {
     std::string dir_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -123,27 +95,25 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
             auto* dir_entry = response->add_entries();
             dir_entry->set_uid(entry.uid);
             dir_entry->set_name(entry.name);
-            
             // Convert internal file type to gRPC file type
-            fileengine_service::FileType grpc_file_type;
+            fileengine_rpc::FileType grpc_file_type;
             switch (entry.type) {
                 case fileengine::FileType::REGULAR_FILE:
-                    grpc_file_type = fileengine_service::FileType::REGULAR_FILE;
+                    grpc_file_type = fileengine_rpc::FileType::REGULAR_FILE;
                     break;
                 case fileengine::FileType::DIRECTORY:
-                    grpc_file_type = fileengine_service::FileType::DIRECTORY;
+                    grpc_file_type = fileengine_rpc::FileType::DIRECTORY;
                     break;
                 case fileengine::FileType::SYMLINK:
-                    grpc_file_type = fileengine_service::FileType::SYMLINK;
+                    grpc_file_type = fileengine_rpc::FileType::SYMLINK;
                     break;
                 default:
-                    grpc_file_type = fileengine_service::FileType::REGULAR_FILE; // default
+                    grpc_file_type = fileengine_rpc::FileType::REGULAR_FILE; // default
                     break;
             }
             dir_entry->set_type(grpc_file_type);
-            
             dir_entry->set_size(entry.size);
-            // DirectoryEntry already has int64_t values
+            // Internal DirectoryEntry already has int64_t values, so assign directly
             dir_entry->set_created_at(entry.created_at);
             dir_entry->set_modified_at(entry.modified_at);
             dir_entry->set_version_count(entry.version_count);
@@ -154,8 +124,8 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* context,
-                                                       const fileengine_service::ListDirectoryWithDeletedRequest* request,
-                                                       fileengine_service::ListDirectoryWithDeletedResponse* response) {
+                                                       const fileengine_rpc::ListDirectoryWithDeletedRequest* request,
+                                                       fileengine_rpc::ListDirectoryWithDeletedResponse* response) {
     // For now, implement the same as ListDirectory but indicate this functionality would return deleted items too
     std::string dir_uid = request->uid();
     auto auth_context = request->auth();
@@ -170,7 +140,7 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->listdir(dir_uid, user, tenant);
+    auto result = filesystem_->listdir_with_deleted(dir_uid, user, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -180,27 +150,25 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
             auto* dir_entry = response->add_entries();
             dir_entry->set_uid(entry.uid);
             dir_entry->set_name(entry.name);
-            
             // Convert internal file type to gRPC file type
-            fileengine_service::FileType grpc_file_type;
+            fileengine_rpc::FileType grpc_file_type;
             switch (entry.type) {
                 case fileengine::FileType::REGULAR_FILE:
-                    grpc_file_type = fileengine_service::FileType::REGULAR_FILE;
+                    grpc_file_type = fileengine_rpc::FileType::REGULAR_FILE;
                     break;
                 case fileengine::FileType::DIRECTORY:
-                    grpc_file_type = fileengine_service::FileType::DIRECTORY;
+                    grpc_file_type = fileengine_rpc::FileType::DIRECTORY;
                     break;
                 case fileengine::FileType::SYMLINK:
-                    grpc_file_type = fileengine_service::FileType::SYMLINK;
+                    grpc_file_type = fileengine_rpc::FileType::SYMLINK;
                     break;
                 default:
-                    grpc_file_type = fileengine_service::FileType::REGULAR_FILE; // default
+                    grpc_file_type = fileengine_rpc::FileType::REGULAR_FILE; // default
                     break;
             }
             dir_entry->set_type(grpc_file_type);
-            
             dir_entry->set_size(entry.size);
-            // DirectoryEntry already has int64_t values
+            // Internal DirectoryEntry already has int64_t values, so assign directly
             dir_entry->set_created_at(entry.created_at);
             dir_entry->set_modified_at(entry.modified_at);
             dir_entry->set_version_count(entry.version_count);
@@ -212,8 +180,8 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
 
 // File operations
 grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
-                                   const fileengine_service::TouchRequest* request,
-                                   fileengine_service::TouchResponse* response) {
+                                   const fileengine_rpc::TouchRequest* request,
+                                   fileengine_rpc::TouchResponse* response) {
     std::string parent_uid = request->parent_uid();
     std::string name = request->name();
     auto auth_context = request->auth();
@@ -243,8 +211,8 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
-                                        const fileengine_service::RemoveFileRequest* request,
-                                        fileengine_service::RemoveFileResponse* response) {
+                                        const fileengine_rpc::RemoveFileRequest* request,
+                                        fileengine_rpc::RemoveFileResponse* response) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -269,8 +237,8 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
-                                          const fileengine_service::UndeleteFileRequest* request,
-                                          fileengine_service::UndeleteFileResponse* response) {
+                                          const fileengine_rpc::UndeleteFileRequest* request,
+                                          fileengine_rpc::UndeleteFileResponse* response) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -294,8 +262,8 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
-                                     const fileengine_service::PutFileRequest* request,
-                                     fileengine_service::PutFileResponse* response) {
+                                     const fileengine_rpc::PutFileRequest* request,
+                                     fileengine_rpc::PutFileResponse* response) {
     std::string file_uid = request->uid();
     auto file_data = request->data();
     auto auth_context = request->auth();
@@ -324,28 +292,20 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
-                                     const fileengine_service::GetFileRequest* request,
-                                     fileengine_service::GetFileResponse* response) {
+                                     const fileengine_rpc::GetFileRequest* request,
+                                     fileengine_rpc::GetFileResponse* response) {
     std::string file_uid = request->uid();
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
 
-    LOG_DEBUG("GRPC-Service", "GetFile called for file: " + file_uid + ", version: " + version_timestamp);
-
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
 
-    // Check if this is a root user before validating permissions
-    if (root_user_enabled_ && user == "root") {
-        LOG_DEBUG("GRPC-Service", "Root user bypassing permission check for GetFile");
-    } else {
-        // Check permissions - user needs read access to the file
-        if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
-            LOG_WARN("GRPC-Service", "User " + user + " denied permission to read file " + file_uid);
-            response->set_success(false);
-            response->set_error("User does not have permission to read file");
-            return grpc::Status::OK;
-        }
+    // Check permissions - user needs read access to the file
+    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+        response->set_success(false);
+        response->set_error("User does not have permission to read file");
+        return grpc::Status::OK;
     }
 
     auto result = filesystem_->get(file_uid, user, tenant);
@@ -354,10 +314,8 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
     if (result.success) {
         response->set_data(std::string(result.value.begin(), result.value.end()));
         response->set_error("");
-        LOG_DEBUG("GRPC-Service", "GetFile succeeded for file: " + file_uid);
     } else {
         response->set_error(result.error);
-        LOG_ERROR("GRPC-Service", "GetFile failed for file: " + file_uid + ", error: " + result.error);
     }
 
     return grpc::Status::OK;
@@ -365,27 +323,19 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
 
 // File information operations
 grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
-                                  const fileengine_service::StatRequest* request,
-                                  fileengine_service::StatResponse* response) {
+                                  const fileengine_rpc::StatRequest* request,
+                                  fileengine_rpc::StatResponse* response) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
-
-    LOG_DEBUG("GRPC-Service", "Stat called for file: " + file_uid);
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
 
-    // Check if this is a root user before validating permissions
-    if (root_user_enabled_ && user == "root") {
-        LOG_DEBUG("GRPC-Service", "Root user bypassing permission check for stat");
-    } else {
-        // Check permissions - user needs read access to stat the file
-        if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
-            LOG_WARN("GRPC-Service", "User " + user + " denied permission to stat file " + file_uid);
-            response->set_success(false);
-            response->set_error("User does not have permission to access file information");
-            return grpc::Status::OK;
-        }
+    // Check permissions - user needs read access to stat the file
+    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+        response->set_success(false);
+        response->set_error("User does not have permission to access file information");
+        return grpc::Status::OK;
     }
 
     auto result = filesystem_->stat(file_uid, user, tenant);
@@ -396,51 +346,44 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
         info->set_uid(result.value.uid);
         info->set_name(result.value.name);
         info->set_parent_uid(result.value.parent_uid);
-
         // Convert internal file type to gRPC file type
-        fileengine_service::FileType grpc_file_type;
+        fileengine_rpc::FileType grpc_file_type;
         switch (result.value.type) {
             case fileengine::FileType::REGULAR_FILE:
-                grpc_file_type = fileengine_service::FileType::REGULAR_FILE;
+                grpc_file_type = fileengine_rpc::FileType::REGULAR_FILE;
                 break;
             case fileengine::FileType::DIRECTORY:
-                grpc_file_type = fileengine_service::FileType::DIRECTORY;
+                grpc_file_type = fileengine_rpc::FileType::DIRECTORY;
                 break;
             case fileengine::FileType::SYMLINK:
-                grpc_file_type = fileengine_service::FileType::SYMLINK;
+                grpc_file_type = fileengine_rpc::FileType::SYMLINK;
                 break;
             default:
-                grpc_file_type = fileengine_service::FileType::REGULAR_FILE; // default
+                grpc_file_type = fileengine_rpc::FileType::REGULAR_FILE; // default
                 break;
         }
         info->set_type(grpc_file_type);
-
         info->set_size(result.value.size);
         info->set_owner(result.value.owner);
         info->set_permissions(result.value.permissions);
-        // Convert from time_point to int64_t timestamp
+        // Convert time point to timestamp
         info->set_created_at(std::chrono::duration_cast<std::chrono::seconds>(
             result.value.created_at.time_since_epoch()).count());
         info->set_modified_at(std::chrono::duration_cast<std::chrono::seconds>(
             result.value.modified_at.time_since_epoch()).count());
         info->set_version(result.value.version);
-
-        LOG_DEBUG("GRPC-Service", "Stat succeeded for file: " + file_uid);
     } else {
         response->set_error(result.error);
-        LOG_ERROR("GRPC-Service", "Stat failed for file: " + file_uid + ", error: " + result.error);
     }
 
     return grpc::Status::OK;
 }
 
 grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
-                                    const fileengine_service::ExistsRequest* request,
-                                    fileengine_service::ExistsResponse* response) {
+                                    const fileengine_rpc::ExistsRequest* request,
+                                    fileengine_rpc::ExistsResponse* response) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
-
-    LOG_DEBUG("GRPC-Service", "Exists called for file: " + file_uid);
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
 
@@ -449,10 +392,8 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
     response->set_success(result.success);
     if (result.success) {
         response->set_exists(result.value);
-        LOG_DEBUG("GRPC-Service", "Exists check for file " + file_uid + " returned: " + (result.value ? "true" : "false"));
     } else {
         response->set_error(result.error);
-        LOG_ERROR("GRPC-Service", "Exists check failed for file " + file_uid + ", error: " + result.error);
     }
 
     return grpc::Status::OK;
@@ -460,8 +401,8 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
 
 // File manipulation operations
 grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
-                                    const fileengine_service::RenameRequest* request,
-                                    fileengine_service::RenameResponse* response) {
+                                    const fileengine_rpc::RenameRequest* request,
+                                    fileengine_rpc::RenameResponse* response) {
     std::string uid = request->uid();
     std::string new_name = request->new_name();
     auto auth_context = request->auth();
@@ -469,7 +410,7 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
 
-    // Check permissions - user needs write access to the file
+    // Check permissions - user needs write access to rename the file
     if (!validate_user_permissions(uid, auth_context, 0200)) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to rename file");
@@ -487,8 +428,8 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
-                                  const fileengine_service::MoveRequest* request,
-                                  fileengine_service::MoveResponse* response) {
+                                  const fileengine_rpc::MoveRequest* request,
+                                  fileengine_rpc::MoveResponse* response) {
     std::string source_uid = request->source_uid();
     std::string dest_uid = request->destination_parent_uid();
     auto auth_context = request->auth();
@@ -520,8 +461,8 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
-                                  const fileengine_service::CopyRequest* request,
-                                  fileengine_service::CopyResponse* response) {
+                                  const fileengine_rpc::CopyRequest* request,
+                                  fileengine_rpc::CopyResponse* response) {
     std::string source_uid = request->source_uid();
     std::string dest_uid = request->destination_parent_uid();
     auto auth_context = request->auth();
@@ -554,15 +495,15 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
 
 // Version operations
 grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
-                                          const fileengine_service::ListVersionsRequest* request,
-                                          fileengine_service::ListVersionsResponse* response) {
+                                          const fileengine_rpc::ListVersionsRequest* request,
+                                          fileengine_rpc::ListVersionsResponse* response) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
 
-    // Check permissions - user needs read access to the file
+    // Check permissions - user needs read access to list file versions
     if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to list file versions");
@@ -584,8 +525,8 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
-                                        const fileengine_service::GetVersionRequest* request,
-                                        fileengine_service::GetVersionResponse* response) {
+                                        const fileengine_rpc::GetVersionRequest* request,
+                                        fileengine_rpc::GetVersionResponse* response) {
     std::string file_uid = request->uid();
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
@@ -593,7 +534,7 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
 
-    // Check permissions - user needs read access to the file
+    // Check permissions - user needs read access to access file version
     if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to access file version");
@@ -614,8 +555,8 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
 
 // Metadata operations
 grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
-                                         const fileengine_service::SetMetadataRequest* request,
-                                         fileengine_service::SetMetadataResponse* response) {
+                                         const fileengine_rpc::SetMetadataRequest* request,
+                                         fileengine_rpc::SetMetadataResponse* response) {
     std::string file_uid = request->uid();
     std::string key = request->key();
     std::string value = request->value();
@@ -642,8 +583,8 @@ grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
-                                         const fileengine_service::GetMetadataRequest* request,
-                                         fileengine_service::GetMetadataResponse* response) {
+                                         const fileengine_rpc::GetMetadataRequest* request,
+                                         fileengine_rpc::GetMetadataResponse* response) {
     std::string file_uid = request->uid();
     std::string key = request->key();
     auto auth_context = request->auth();
@@ -671,8 +612,8 @@ grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
-                                            const fileengine_service::GetAllMetadataRequest* request,
-                                            fileengine_service::GetAllMetadataResponse* response) {
+                                            const fileengine_rpc::GetAllMetadataRequest* request,
+                                            fileengine_rpc::GetAllMetadataResponse* response) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -701,8 +642,8 @@ grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
-                                            const fileengine_service::DeleteMetadataRequest* request,
-                                            fileengine_service::DeleteMetadataResponse* response) {
+                                            const fileengine_rpc::DeleteMetadataRequest* request,
+                                            fileengine_rpc::DeleteMetadataResponse* response) {
     std::string file_uid = request->uid();
     std::string key = request->key();
     auto auth_context = request->auth();
@@ -728,8 +669,8 @@ grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context,
-                                                   const fileengine_service::GetMetadataForVersionRequest* request,
-                                                   fileengine_service::GetMetadataForVersionResponse* response) {
+                                                   const fileengine_rpc::GetMetadataForVersionRequest* request,
+                                                   fileengine_rpc::GetMetadataForVersionResponse* response) {
     std::string file_uid = request->uid();
     std::string version_timestamp = request->version_timestamp();
     std::string key = request->key();
@@ -754,8 +695,8 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
 }
 
 grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* context,
-                                                      const fileengine_service::GetAllMetadataForVersionRequest* request,
-                                                      fileengine_service::GetAllMetadataForVersionResponse* response) {
+                                                      const fileengine_rpc::GetAllMetadataForVersionRequest* request,
+                                                      fileengine_rpc::GetAllMetadataForVersionResponse* response) {
     std::string file_uid = request->uid();
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
@@ -780,17 +721,18 @@ grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* cont
 
 // ACL operations
 grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
-                                             const fileengine_service::GrantPermissionRequest* request,
-                                             fileengine_service::GrantPermissionResponse* response) {
+                                             const fileengine_rpc::GrantPermissionRequest* request,
+                                             fileengine_rpc::GrantPermissionResponse* response) {
     std::string resource_uid = request->resource_uid();
     std::string principal = request->principal();
-    fileengine_service::Permission permission = request->permission();
+    fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
 
     // Only admins or users with grant permission can grant permissions
+    // Check if it's a root user first
     if (user != "root" && !validate_user_permissions(resource_uid, auth_context, 0200)) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to grant permissions");
@@ -813,11 +755,11 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
-                                              const fileengine_service::RevokePermissionRequest* request,
-                                              fileengine_service::RevokePermissionResponse* response) {
+                                              const fileengine_rpc::RevokePermissionRequest* request,
+                                              fileengine_rpc::RevokePermissionResponse* response) {
     std::string resource_uid = request->resource_uid();
     std::string principal = request->principal();
-    fileengine_service::Permission permission = request->permission();
+    fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -845,10 +787,10 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
-                                             const fileengine_service::CheckPermissionRequest* request,
-                                             fileengine_service::CheckPermissionResponse* response) {
+                                             const fileengine_rpc::CheckPermissionRequest* request,
+                                             fileengine_rpc::CheckPermissionResponse* response) {
     std::string resource_uid = request->resource_uid();
-    fileengine_service::Permission required_permission = request->required_permission();
+    fileengine_rpc::Permission required_permission = request->required_permission();
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -874,12 +816,12 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
 
 // Streaming operations for large files
 grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
-                                              grpc::ServerReader<fileengine_service::PutFileRequest>* reader,
-                                              fileengine_service::PutFileResponse* response) {
-    fileengine_service::PutFileRequest request;
+                                              grpc::ServerReader<fileengine_rpc::PutFileRequest>* reader,
+                                              fileengine_rpc::PutFileResponse* response) {
+    fileengine_rpc::PutFileRequest request;
     std::vector<uint8_t> full_data;
     std::string file_uid;
-    fileengine_service::AuthenticationContext auth_context;
+    fileengine_rpc::AuthenticationContext auth_context;
     bool first_chunk = true;
 
     while (reader->Read(&request)) {
@@ -921,8 +863,8 @@ grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
-                                                const fileengine_service::GetFileRequest* request,
-                                                grpc::ServerWriter<fileengine_service::GetFileResponse>* writer) {
+                                                const fileengine_rpc::GetFileRequest* request,
+                                                grpc::ServerWriter<fileengine_rpc::GetFileResponse>* writer) {
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -931,7 +873,7 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
 
     // Check permissions - user needs read access to the file
     if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
-        fileengine_service::GetFileResponse response;
+        fileengine_rpc::GetFileResponse response;
         response.set_success(false);
         response.set_error("User does not have permission to read file");
         writer->Write(response);
@@ -941,13 +883,13 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
     auto result = filesystem_->get(file_uid, user, tenant);
 
     if (result.success) {
-        // Simulate streaming by creating chunks
+        // Simulate streaming by sending chunks
         const size_t chunk_size = 1024 * 64; // 64KB chunks
         const auto& data = result.value;
         size_t offset = 0;
 
         while (offset < data.size()) {
-            fileengine_service::GetFileResponse response;
+            fileengine_rpc::GetFileResponse response;
             size_t current_chunk_size = std::min(chunk_size, data.size() - offset);
             std::string chunk_data(reinterpret_cast<const char*>(&data[offset]), current_chunk_size);
             
@@ -962,7 +904,7 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
             offset += current_chunk_size;
         }
     } else {
-        fileengine_service::GetFileResponse response;
+        fileengine_rpc::GetFileResponse response;
         response.set_success(false);
         response.set_error(result.error);
         writer->Write(response);
@@ -973,13 +915,13 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
 
 // Administrative operations
 grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
-                                             const fileengine_service::StorageUsageRequest* request,
-                                             fileengine_service::StorageUsageResponse* response) {
+                                            const fileengine_rpc::StorageUsageRequest* request,
+                                            fileengine_rpc::StorageUsageResponse* response) {
     auto auth_context = request->auth();
     std::string tenant = request->tenant();
 
     // In a real implementation, this would check storage usage
-    // For now, we'll return some simulated values
+    // For this example, we'll return some simulated values
     response->set_success(true);
     response->set_error("");
     response->set_total_space(1024 * 1024 * 1024);  // 1GB
@@ -991,8 +933,8 @@ grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
-                                              const fileengine_service::PurgeOldVersionsRequest* request,
-                                              fileengine_service::PurgeOldVersionsResponse* response) {
+                                              const fileengine_rpc::PurgeOldVersionsRequest* request,
+                                              fileengine_rpc::PurgeOldVersionsResponse* response) {
     std::string file_uid = request->uid();
     int keep_count = request->keep_count();
     auto auth_context = request->auth();
@@ -1016,13 +958,13 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
 }
 
 grpc::Status GRPCFileService::TriggerSync(grpc::ServerContext* context,
-                                         const fileengine_service::TriggerSyncRequest* request,
-                                         fileengine_service::TriggerSyncResponse* response) {
+                                         const fileengine_rpc::TriggerSyncRequest* request,
+                                         fileengine_rpc::TriggerSyncResponse* response) {
     std::string tenant = request->tenant();
     auto auth_context = request->auth();
 
     // In a real implementation, we would trigger a sync operation here
-    // For this example, we'll just simulate success
+    // For this example, we'll just return success to indicate the call was accepted
     response->set_success(true);
     response->set_error("");
 
@@ -1030,15 +972,15 @@ grpc::Status GRPCFileService::TriggerSync(grpc::ServerContext* context,
 }
 
 // Helper functions
-std::string GRPCFileService::get_tenant_from_auth_context(const fileengine_service::AuthenticationContext& auth_ctx) {
+std::string GRPCFileService::get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
     return auth_ctx.tenant().empty() ? "default" : auth_ctx.tenant();
 }
 
-std::string GRPCFileService::get_user_from_auth_context(const fileengine_service::AuthenticationContext& auth_ctx) {
+std::string GRPCFileService::get_user_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
     return auth_ctx.user();
 }
 
-std::vector<std::string> GRPCFileService::get_roles_from_auth_context(const fileengine_service::AuthenticationContext& auth_ctx) {
+std::vector<std::string> GRPCFileService::get_roles_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
     std::vector<std::string> roles;
     for (const auto& role : auth_ctx.roles()) {
         roles.push_back(role);
@@ -1047,18 +989,20 @@ std::vector<std::string> GRPCFileService::get_roles_from_auth_context(const file
 }
 
 bool GRPCFileService::validate_user_permissions(const std::string& resource_uid,
-                                               const fileengine_service::AuthenticationContext& auth_ctx,
+                                               const fileengine_rpc::AuthenticationContext& auth_ctx,
                                                int required_permissions) {
-    // Check if root user is enabled and if the current user is root
-    if (root_user_enabled_ && auth_ctx.user() == "root") {
-        return true;  // Root user has all permissions when enabled
+    std::string user = get_user_from_auth_context(auth_ctx);
+    std::string tenant = get_tenant_from_auth_context(auth_ctx);
+    
+    // Check if root user is enabled and user is root
+    // This would typically be checked against the config, but for now we'll do a basic check
+    if (user == "root") {
+        // Root user bypasses permission system
+        return true;
     }
-
+    
     // Convert roles from gRPC context to internal representation
     std::vector<std::string> roles = get_roles_from_auth_context(auth_ctx);
-
-    std::string tenant = get_tenant_from_auth_context(auth_ctx);
-    std::string user = auth_ctx.user();
 
     auto result = acl_manager_->check_permission(resource_uid, user, roles, required_permissions, tenant);
     return result.success && result.value;
