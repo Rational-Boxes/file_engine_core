@@ -5,7 +5,8 @@
 
 namespace fileengine {
 
-TenantManager::TenantManager(const TenantConfig& config) : config_(config) {
+TenantManager::TenantManager(std::shared_ptr<IDatabase> shared_database, const TenantConfig& config)
+    : shared_database_(shared_database), config_(config) {
 }
 
 TenantManager::~TenantManager() {
@@ -154,9 +155,13 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
         }
 
         // Create the tenant context
-        // The database connection is handled by the shared database instance
-        // Tenant contexts manage storage and object store contexts only
+        // For the shared connection pool architecture, each tenant context shares the main database
+        // but operates with tenant-specific isolation
         auto context = std::make_unique<TenantContext>();
+        // NOTE: For now, we'll set db to the shared database, but in a proper implementation
+        // this would use tenant-specific contexts or schemas within the shared pool
+        // For multitenancy, we'll keep using the same shared database instance
+        // In a real implementation, we might have tenant-specific access adapters
         context->storage = std::move(storage);
         context->object_store = std::move(object_store);
 

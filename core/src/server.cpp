@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     tenant_config.encrypt_data = config.encrypt_data;
     tenant_config.compress_data = config.compress_data;
 
-    auto tenant_manager = std::make_shared<fileengine::TenantManager>(tenant_config);
+    auto tenant_manager = std::make_shared<fileengine::TenantManager>(database, tenant_config);
 
     // Initialize ACL manager
     auto acl_manager = std::make_shared<fileengine::AclManager>(database);

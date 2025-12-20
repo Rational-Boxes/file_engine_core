@@ -31,7 +31,8 @@ struct TenantContext {
 
 class TenantManager {
 public:
-    TenantManager(const TenantConfig& config);
+    // Accept the shared database instance instead of creating separate ones
+    TenantManager(std::shared_ptr<IDatabase> shared_database, const TenantConfig& config);
     ~TenantManager();
 
     TenantContext* get_tenant_context(const std::string& tenant_id);
@@ -39,9 +40,13 @@ public:
     bool tenant_exists(const std::string& tenant_id) const;
     Result<void> remove_tenant(const std::string& tenant_id);
 
+    // Method to get the shared database for use by other components
+    std::shared_ptr<IDatabase> get_shared_database() const { return shared_database_; }
+
 private:
     TenantContext* create_tenant_context(const std::string& tenant_id);
 
+    std::shared_ptr<IDatabase> shared_database_;  // Single shared database instance
     TenantConfig config_;
     std::map<std::string, std::unique_ptr<TenantContext>> tenant_contexts_;
     mutable std::mutex mutex_;
