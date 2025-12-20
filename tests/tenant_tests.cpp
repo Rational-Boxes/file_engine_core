@@ -14,11 +14,11 @@ void test_tenant_config_creation() {
     std::cout << "Testing TenantConfig creation..." << std::endl;
     
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "test_db";
-    config.db_user = "test_user";
-    config.db_password = "test_pass";
+    
+    
+    
+    
+    
     config.storage_base_path = "/tmp/test_storage";
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -29,11 +29,6 @@ void test_tenant_config_creation() {
     config.encrypt_data = false;
     config.compress_data = false;
     
-    assert(config.db_host == "localhost");
-    assert(config.db_port == 5432);
-    assert(config.db_name == "test_db");
-    assert(config.db_user == "test_user");
-    assert(config.db_password == "test_pass");
     assert(config.storage_base_path == "/tmp/test_storage");
     assert(config.s3_endpoint == "http://localhost:9000");
     assert(config.s3_region == "us-east-1");
@@ -49,13 +44,11 @@ void test_tenant_config_creation() {
 
 void test_tenant_manager_creation() {
     std::cout << "Testing TenantManager creation..." << std::endl;
-    
+
+    // Create a shared database instance to pass to the TenantManager
+    auto shared_db = std::make_shared<fileengine::Database>("localhost", 5432, "test_db", "test_user", "test_pass", 5);
+
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "test_db";
-    config.db_user = "test_user";
-    config.db_password = "test_pass";
     config.storage_base_path = "/tmp/test_storage";
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -65,11 +58,11 @@ void test_tenant_manager_creation() {
     config.s3_path_style = true;
     config.encrypt_data = false;
     config.compress_data = false;
-    
-    auto tenant_manager = std::make_unique<fileengine::TenantManager>(config);
-    
+
+    auto tenant_manager = std::make_unique<fileengine::TenantManager>(shared_db, config);
+
     assert(tenant_manager != nullptr);
-    
+
     std::cout << "TenantManager creation test passed!" << std::endl;
 }
 
@@ -91,11 +84,11 @@ void test_tenant_lifecycle_operations() {
     std::cout << "Testing TenantManager lifecycle operations..." << std::endl;
     
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "test_db";
-    config.db_user = "test_user";
-    config.db_password = "test_pass";
+    
+    
+    
+    
+    
     config.storage_base_path = "/tmp/test_storage_" + fileengine::Utils::generate_uuid();
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -106,7 +99,7 @@ void test_tenant_lifecycle_operations() {
     config.encrypt_data = false;
     config.compress_data = false;
     
-    auto tenant_manager = std::make_unique<fileengine::TenantManager>(config);
+    auto tenant_manager = std::make_unique<fileengine::TenantManager>(shared_db, config);
     
     std::string tenant_id = "test_tenant_" + fileengine::Utils::generate_uuid();
     
@@ -137,11 +130,11 @@ void test_tenant_directory_operations() {
     std::cout << "Testing TenantManager basic directory operations..." << std::endl;
 
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "test_db";
-    config.db_user = "test_user";
-    config.db_password = "test_pass";
+    
+    
+    
+    
+    
     config.storage_base_path = "/tmp/test_storage_" + fileengine::Utils::generate_uuid();
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -152,7 +145,7 @@ void test_tenant_directory_operations() {
     config.encrypt_data = false;
     config.compress_data = false;
 
-    auto tenant_manager = std::make_unique<fileengine::TenantManager>(config);
+    auto tenant_manager = std::make_unique<fileengine::TenantManager>(shared_db, config);
 
     std::string tenant_name = "dir_test_tenant";
 
@@ -171,11 +164,11 @@ void test_tenant_initialization() {
     std::cout << "Testing TenantManager initialization process..." << std::endl;
     
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "test_db";
-    config.db_user = "test_user";
-    config.db_password = "test_pass";
+    
+    
+    
+    
+    
     config.storage_base_path = "/tmp/test_storage_" + fileengine::Utils::generate_uuid();
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -186,7 +179,7 @@ void test_tenant_initialization() {
     config.encrypt_data = false;
     config.compress_data = false;
     
-    auto tenant_manager = std::make_unique<fileengine::TenantManager>(config);
+    auto tenant_manager = std::make_unique<fileengine::TenantManager>(shared_db, config);
     
     std::string tenant_id = "init_test_tenant_" + fileengine::Utils::generate_uuid();
     
@@ -204,11 +197,11 @@ void test_multiple_tenants() {
     std::cout << "Testing multiple tenant management..." << std::endl;
     
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "test_db";
-    config.db_user = "test_user";
-    config.db_password = "test_pass";
+    
+    
+    
+    
+    
     config.storage_base_path = "/tmp/test_storage_" + fileengine::Utils::generate_uuid();
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -219,7 +212,7 @@ void test_multiple_tenants() {
     config.encrypt_data = false;
     config.compress_data = false;
     
-    auto tenant_manager = std::make_unique<fileengine::TenantManager>(config);
+    auto tenant_manager = std::make_unique<fileengine::TenantManager>(shared_db, config);
     
     // Create multiple tenants
     std::string tenant1 = "tenant_1_" + fileengine::Utils::generate_uuid();

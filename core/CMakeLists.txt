@@ -101,6 +101,7 @@ target_link_libraries(fileengine_core
     ${GRPCPP_LIBRARIES}
     proto_lib
     ${UUID_LIBRARIES}  # Add uuid library
+    ${CMAKE_THREAD_LIBS_INIT}  # Properly link thread libraries
 )
 
 # Compiler definitions
