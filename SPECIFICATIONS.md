@@ -50,7 +50,7 @@ and administrative functions. Implement in C++.
 
 ### Filesystem operations
 
-- list, option to show versions
+- list, option to show deleted
 - mkdir
 - touch
 - put
