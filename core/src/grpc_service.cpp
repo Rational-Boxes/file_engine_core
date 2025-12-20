@@ -740,7 +740,39 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     }
 
     // Convert gRPC Permission to our internal representation
-    int converted_permissions = static_cast<int>(permission);
+    int converted_permissions;
+    switch(permission) {
+        case fileengine_rpc::Permission::READ:
+            converted_permissions = static_cast<int>(fileengine::Permission::READ);
+            break;
+        case fileengine_rpc::Permission::WRITE:
+            converted_permissions = static_cast<int>(fileengine::Permission::WRITE);
+            break;
+        case fileengine_rpc::Permission::DELETE:
+            converted_permissions = static_cast<int>(fileengine::Permission::DELETE);
+            break;
+        case fileengine_rpc::Permission::LIST_DELETED:
+            converted_permissions = static_cast<int>(fileengine::Permission::LIST_DELETED);
+            break;
+        case fileengine_rpc::Permission::UNDELETE:
+            converted_permissions = static_cast<int>(fileengine::Permission::UNDELETE);
+            break;
+        case fileengine_rpc::Permission::VIEW_VERSIONS:
+            converted_permissions = static_cast<int>(fileengine::Permission::VIEW_VERSIONS);
+            break;
+        case fileengine_rpc::Permission::RETRIEVE_BACK_VERSION:
+            converted_permissions = static_cast<int>(fileengine::Permission::RETRIEVE_BACK_VERSION);
+            break;
+        case fileengine_rpc::Permission::RESTORE_TO_VERSION:
+            converted_permissions = static_cast<int>(fileengine::Permission::RESTORE_TO_VERSION);
+            break;
+        case fileengine_rpc::Permission::EXECUTE:
+            converted_permissions = static_cast<int>(fileengine::Permission::EXECUTE);
+            break;
+        default:
+            converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
+            break;
+    }
 
     auto result = acl_manager_->grant_permission(resource_uid, principal,
                                                  PrincipalType::USER,  // Simplified for this example
@@ -772,7 +804,39 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    int converted_permissions = static_cast<int>(permission);
+    int converted_permissions;
+    switch(permission) {
+        case fileengine_rpc::Permission::READ:
+            converted_permissions = static_cast<int>(fileengine::Permission::READ);
+            break;
+        case fileengine_rpc::Permission::WRITE:
+            converted_permissions = static_cast<int>(fileengine::Permission::WRITE);
+            break;
+        case fileengine_rpc::Permission::DELETE:
+            converted_permissions = static_cast<int>(fileengine::Permission::DELETE);
+            break;
+        case fileengine_rpc::Permission::LIST_DELETED:
+            converted_permissions = static_cast<int>(fileengine::Permission::LIST_DELETED);
+            break;
+        case fileengine_rpc::Permission::UNDELETE:
+            converted_permissions = static_cast<int>(fileengine::Permission::UNDELETE);
+            break;
+        case fileengine_rpc::Permission::VIEW_VERSIONS:
+            converted_permissions = static_cast<int>(fileengine::Permission::VIEW_VERSIONS);
+            break;
+        case fileengine_rpc::Permission::RETRIEVE_BACK_VERSION:
+            converted_permissions = static_cast<int>(fileengine::Permission::RETRIEVE_BACK_VERSION);
+            break;
+        case fileengine_rpc::Permission::RESTORE_TO_VERSION:
+            converted_permissions = static_cast<int>(fileengine::Permission::RESTORE_TO_VERSION);
+            break;
+        case fileengine_rpc::Permission::EXECUTE:
+            converted_permissions = static_cast<int>(fileengine::Permission::EXECUTE);
+            break;
+        default:
+            converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
+            break;
+    }
 
     auto result = acl_manager_->revoke_permission(resource_uid, principal,
                                                   PrincipalType::USER,  // Simplified for this example
@@ -799,7 +863,39 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
     // Convert roles from gRPC context to internal representation
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
-    int required_permissions_int = static_cast<int>(required_permission);
+    int required_permissions_int;
+    switch(required_permission) {
+        case fileengine_rpc::Permission::READ:
+            required_permissions_int = static_cast<int>(fileengine::Permission::READ);
+            break;
+        case fileengine_rpc::Permission::WRITE:
+            required_permissions_int = static_cast<int>(fileengine::Permission::WRITE);
+            break;
+        case fileengine_rpc::Permission::DELETE:
+            required_permissions_int = static_cast<int>(fileengine::Permission::DELETE);
+            break;
+        case fileengine_rpc::Permission::LIST_DELETED:
+            required_permissions_int = static_cast<int>(fileengine::Permission::LIST_DELETED);
+            break;
+        case fileengine_rpc::Permission::UNDELETE:
+            required_permissions_int = static_cast<int>(fileengine::Permission::UNDELETE);
+            break;
+        case fileengine_rpc::Permission::VIEW_VERSIONS:
+            required_permissions_int = static_cast<int>(fileengine::Permission::VIEW_VERSIONS);
+            break;
+        case fileengine_rpc::Permission::RETRIEVE_BACK_VERSION:
+            required_permissions_int = static_cast<int>(fileengine::Permission::RETRIEVE_BACK_VERSION);
+            break;
+        case fileengine_rpc::Permission::RESTORE_TO_VERSION:
+            required_permissions_int = static_cast<int>(fileengine::Permission::RESTORE_TO_VERSION);
+            break;
+        case fileengine_rpc::Permission::EXECUTE:
+            required_permissions_int = static_cast<int>(fileengine::Permission::EXECUTE);
+            break;
+        default:
+            required_permissions_int = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
+            break;
+    }
 
     auto result = acl_manager_->check_permission(resource_uid, user, roles,
                                                  required_permissions_int, tenant);

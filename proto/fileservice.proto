@@ -81,9 +81,15 @@ enum FileType {
 }
 
 enum Permission {
-    READ = 0;
-    WRITE = 1;
-    EXECUTE = 2;
+    READ = 0;              // Read permission
+    WRITE = 1;             // Write permission
+    DELETE = 2;            // Delete permission
+    LIST_DELETED = 3;      // List deleted items permission
+    UNDELETE = 4;          // Undelete permission
+    VIEW_VERSIONS = 5;     // View versions permission
+    RETRIEVE_BACK_VERSION = 6;  // Retrieve back version permission
+    RESTORE_TO_VERSION = 7;     // Restore to version permission
+    EXECUTE = 8;            // Execute permission
 }
 
 // Directory operations

@@ -9,9 +9,15 @@
 namespace fileengine {
 
 enum class Permission {
-    READ = 0x4,     // 4 in octal
-    WRITE = 0x2,    // 2 in octal
-    EXECUTE = 0x1   // 1 in octal
+    READ = 0x400,     // Read permission
+    WRITE = 0x200,    // Write permission
+    DELETE = 0x100,   // Delete permission
+    LIST_DELETED = 0x080, // List deleted items permission
+    UNDELETE = 0x040, // Undelete permission
+    VIEW_VERSIONS = 0x020, // View versions permission
+    RETRIEVE_BACK_VERSION = 0x010, // Retrieve back version permission
+    RESTORE_TO_VERSION = 0x008, // Restore to version permission
+    EXECUTE = 0x001   // Execute permission (kept for compatibility)
 };
 
 // Define operators for Permission enum to enable bitwise operations
