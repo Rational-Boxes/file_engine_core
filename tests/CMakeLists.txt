@@ -64,76 +64,176 @@ add_executable(object_store_sync_tests
 )
 
 # Link libraries for all tests
+# Set the library path to find the core library built in the core directory
+set(FILEENGINE_CORE_LIBRARY_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../core/build)
+
 target_link_libraries(basic_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
+    ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    gpr
+    grpc++_reflection
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    pthread
+    dl
 )
 
 target_link_libraries(database_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(storage_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(s3_storage_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(tenant_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(acl_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(cache_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(filesystem_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(query_builder_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(storage_tracker_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(file_culler_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 target_link_libraries(object_store_sync_tests
-    fileengine_core
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     Threads::Threads
     ${CMAKE_DL_LIBS}
+    ${LIBPQ_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    ${GRPCPP_LIBRARIES}
+    ${UUID_LIBRARIES}
+    gpr
+    grpc++_reflection
+    pthread
 )
 
 # Compiler definitions

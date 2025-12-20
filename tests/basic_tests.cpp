@@ -36,15 +36,14 @@ void test_timestamp_generation() {
 
 void test_filesystem_basics() {
     std::cout << "Testing filesystem basic operations..." << std::endl;
-    
+
     // This is a basic test to ensure the filesystem classes can be instantiated
     // A full test would require a running database and storage backend
+    // First create a database instance to share with tenant manager
+    auto database = std::make_shared<fileengine::Database>("localhost", 5432, "fileengine_test",
+                                                          "testuser", "testpass", 5);
+
     fileengine::TenantConfig config;
-    config.db_host = "localhost";
-    config.db_port = 5432;
-    config.db_name = "fileengine_test";
-    config.db_user = "testuser";
-    config.db_password = "testpass";
     config.storage_base_path = "/tmp/fileengine_test";
     config.s3_endpoint = "http://localhost:9000";
     config.s3_region = "us-east-1";
@@ -54,14 +53,14 @@ void test_filesystem_basics() {
     config.s3_path_style = true;
     config.encrypt_data = false;
     config.compress_data = false;
-    
-    auto tenant_manager = std::make_shared<fileengine::TenantManager>(config);
+
+    auto tenant_manager = std::make_shared<fileengine::TenantManager>(database, config);  // Pass shared database
     auto filesystem = std::make_shared<fileengine::FileSystem>(tenant_manager);
-    
+
     // Just ensure they can be created without crashing
     assert(tenant_manager != nullptr);
     assert(filesystem != nullptr);
-    
+
     std::cout << "Filesystem basic operations test passed!" << std::endl;
 }
 
