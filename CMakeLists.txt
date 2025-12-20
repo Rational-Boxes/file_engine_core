@@ -29,8 +29,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cli/include)
 # Add core library
 add_subdirectory(core)
 
-# Add CLI executable
-add_subdirectory(cli)
+# Add CLI as an optional component
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cli/CMakeLists.txt")
+    add_subdirectory(cli)
+endif()
 
 # Add tests
 add_subdirectory(tests)
