@@ -26,12 +26,37 @@ POSIX ACLs to control filesystem entity visibility and permissions.
 - Detailed per-host tracking of local filesystem usage and intelligent culling of files
 - If a file does not exist in local storage, fetch the payload from the S3 service
 - All filesystem operations and ACL permission management behind Protocol Buffers interface
+- Prevent duplicate file object names, except deleted items
+
+### Default permissions for ACL system
+
+- read
+- write
+- delete
+- list deleted
+- undelete
+- view versions
+- retrieve back version
+- restore to version
 
 ## Command-line interface
 
 Commandline tool to connect to the Protocol Buffers interface locally for filesystem
 and administrative functions. Implement in C++.
 
-- All filesystem operations: list, list with deleted, mkdir, touch, put, upload, download file
+- All filesystem operations
 - ACL and permission control operations
 - Diagnostic checks for filesystem usage, S3 synchronization status, logged errors
+
+### Filesystem operations
+
+- list, option to show versions
+- mkdir
+- touch
+- put
+- upload, combines touch and put
+- download, optional select version
+- view versions
+- restore to version
+- delete
+- undelete
