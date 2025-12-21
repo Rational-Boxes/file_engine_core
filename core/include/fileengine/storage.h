@@ -42,6 +42,9 @@ public:
     void set_object_store(IObjectStore* object_store) override;
     IObjectStore* get_object_store() const override;
 
+    // Storage clearing operation
+    Result<void> clear_storage(const std::string& tenant = "") override;
+
 private:
     std::string base_path_;
     bool encrypt_data_;

@@ -35,9 +35,6 @@ public:
     bool initialize();
     void shutdown();
 
-    // Connection information access
-    std::string get_connection_info() const { return connection_info_; }
-
 private:
     std::string connection_info_;
     int pool_size_;

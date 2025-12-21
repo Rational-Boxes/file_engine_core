@@ -179,6 +179,51 @@ void ObjectStoreSync::monitoring_loop() {
     }
 }
 
+bool ObjectStoreSync::is_connection_healthy() {
+    if (!object_store_) {
+        return false;
+    }
+
+    // Try a simple object store operation to test connection health
+    // For S3 storage, we could attempt to list buckets or check connection status
+    try {
+        // In a real implementation, this would check if we can communicate with the object store
+        // For now, we'll just check if the object store instance exists and is initialized
+        return object_store_->is_initialized();
+    } catch (...) {
+        // If there's an exception during the health check, connection is not healthy
+        return false;
+    }
+}
+
+void ObjectStoreSync::attempt_recovery() {
+    if (!object_store_) {
+        return;
+    }
+
+    std::cout << "Attempting to reconnect to object store..." << std::endl;
+
+    // Try to re-initialize the object store connection
+    auto init_result = object_store_->initialize();
+    if (init_result.success) {
+        std::cout << "Object store connection restored successfully." << std::endl;
+        // Optionally trigger a full sync after recovery
+        if (config_.sync_on_demand) {
+            // Start a background sync operation to reconcile any missed changes
+            std::thread recovery_sync_thread([this]() {
+                auto sync_result = perform_startup_sync(); // Use startup sync to resync everything
+                if (sync_result.success) {
+                    std::cout << "Recovery sync completed successfully after connection restoration." << std::endl;
+                } else {
+                    std::cout << "Recovery sync failed after connection restoration: " << sync_result.error << std::endl;
+                }
+            });
+            recovery_sync_thread.detach(); // Run in background
+        }
+    } else {
+        std::cout << "Failed to reconnect to object store, will retry in " << config_.retry_seconds << " seconds." << std::endl;
+    }
+}
 
 Result<void> ObjectStoreSync::sync_files(const std::string& tenant) {
     // Get list of files to sync

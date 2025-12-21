@@ -80,160 +80,195 @@ target_link_libraries(basic_tests
     ${CMAKE_DL_LIBS}
     pthread
     dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(database_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(storage_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(s3_storage_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(tenant_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(acl_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(cache_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(filesystem_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(query_builder_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(storage_tracker_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(file_culler_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 target_link_libraries(object_store_sync_tests
     ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
     ${LIBPQ_LIBRARIES}
+    ${UUID_LIBRARIES}
     ${PROTOBUF_LIBRARIES}
     ${GRPCPP_LIBRARIES}
-    ${UUID_LIBRARIES}
     gpr
     grpc++_reflection
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     pthread
+    dl
+    pq    # Explicitly link to postgresql client library
+    uuid  # Explicitly link to uuid library
 )
 
 # Compiler definitions

@@ -111,11 +111,11 @@ Result<void> S3Storage::create_tenant_bucket(const std::string& tenant) {
     if (tenant.empty()) {
         return Result<void>::err("Tenant name cannot be empty");
     }
-
+    
     if (!initialized_) {
         return Result<void>::err("S3 storage not initialized");
     }
-
+    
     // In a real implementation, this would create a tenant-specific bucket
     // For now, we'll just return success
     return Result<void>::ok();
@@ -125,11 +125,11 @@ Result<bool> S3Storage::tenant_bucket_exists(const std::string& tenant) {
     if (tenant.empty()) {
         return Result<bool>::ok(false);
     }
-
+    
     if (!initialized_) {
         return Result<bool>::err("S3 storage not initialized");
     }
-
+    
     // In a real implementation, this would check if the tenant bucket exists
     // For this simplified version, we'll return true for existing tenants
     return Result<bool>::ok(true);
@@ -139,26 +139,12 @@ Result<void> S3Storage::cleanup_tenant_bucket(const std::string& tenant) {
     if (tenant.empty()) {
         return Result<void>::err("Tenant name cannot be empty");
     }
-
+    
     if (!initialized_) {
         return Result<void>::err("S3 storage not initialized");
     }
-
+    
     // In a real implementation, this would delete the tenant-specific bucket
-    return Result<void>::ok();
-}
-
-Result<void> S3Storage::clear_storage(const std::string& tenant) {
-    if (tenant.empty()) {
-        return Result<void>::err("Tenant cannot be empty for clear_storage operation");
-    }
-
-    if (!initialized_) {
-        return Result<void>::err("S3 storage not initialized");
-    }
-
-    // In a real implementation, this would delete all objects in the tenant's bucket
-    // For now, we'll just return success
     return Result<void>::ok();
 }
 

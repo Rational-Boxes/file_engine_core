@@ -48,7 +48,6 @@ public:
     Result<void> create_tenant_bucket(const std::string& tenant) override;
     Result<bool> tenant_bucket_exists(const std::string& tenant) override;
     Result<void> cleanup_tenant_bucket(const std::string& tenant) override;
-    Result<void> clear_storage(const std::string& tenant = "") override;
 
 private:
     std::string endpoint_;

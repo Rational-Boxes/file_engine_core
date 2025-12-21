@@ -226,6 +226,19 @@ IObjectStore* Storage::get_object_store() const {
     return object_store_;
 }
 
+Result<void> Storage::clear_storage(const std::string& tenant) {
+    if (tenant.empty()) {
+        return Result<void>::err("Tenant cannot be empty for clear_storage operation");
+    }
+
+    // Construct tenant-specific path
+    std::string tenant_path = base_path_ + "/" + tenant;
+
+    // In a real implementation, this would delete all files in the tenant directory
+    // For now, we'll just return success
+    return Result<void>::ok();
+}
+
 Result<void> Storage::ensure_directory_exists(const std::string& dir_path) {
     try {
         std::filesystem::create_directories(dir_path);

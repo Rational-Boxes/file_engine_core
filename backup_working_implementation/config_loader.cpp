@@ -4,7 +4,7 @@
 #include <sstream>
 #include <map>
 #include <memory>
-#include <cstdlib>
+#include <getenv.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cctype>

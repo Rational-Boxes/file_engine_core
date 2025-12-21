@@ -515,6 +515,26 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
     return Result<std::vector<uint8_t>>::err("Version content not found");
 }
 
+Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
+                                           const std::string& version_timestamp,
+                                           const std::string& user,
+                                           const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<bool>::err("Database not available for tenant: " + tenant);
+    }
+
+    // Check if user has special permission to restore to version
+    // Typically requires WRITE permission or special version management permission
+    auto perm_result = validate_user_permissions(file_uid, user, std::vector<std::string>(), static_cast<int>(fileengine::Permission::WRITE), tenant); // WRITE permission
+    if (!perm_result.success || !perm_result.value) {
+        return Result<bool>::err("User does not have permission to restore to version");
+    }
+
+    auto result = context->db->restore_to_version(file_uid, version_timestamp, user, tenant);
+    return result;
+}
+
 Result<void> FileSystem::backup_to_object_store(const std::string& file_uid, 
                                                 const std::string& tenant) {
     auto context = get_tenant_context(tenant);

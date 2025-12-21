@@ -11,6 +11,9 @@ class IObjectStore {
 public:
     virtual ~IObjectStore() = default;
 
+    // Check if the object store is initialized
+    virtual bool is_initialized() const = 0;
+
     // Initialize the object store
     virtual Result<void> initialize() = 0;
 
@@ -35,6 +38,7 @@ public:
     virtual Result<void> create_tenant_bucket(const std::string& tenant) = 0;
     virtual Result<bool> tenant_bucket_exists(const std::string& tenant) = 0;
     virtual Result<void> cleanup_tenant_bucket(const std::string& tenant) = 0;
+    virtual Result<void> clear_storage(const std::string& tenant = "") = 0;
 };
 
 } // namespace fileengine

@@ -35,6 +35,9 @@ public:
     virtual Result<void> sync_to_object_store(std::function<void(const std::string&, const std::string&, int)> progress_callback = nullptr) = 0;
     virtual Result<std::vector<std::string>> get_local_file_paths(const std::string& tenant = "") const = 0;
 
+    // Storage clearing operation
+    virtual Result<void> clear_storage(const std::string& tenant = "") = 0;
+
     // Object store access for caching functionality
     virtual void set_object_store(IObjectStore* object_store) = 0;
     virtual IObjectStore* get_object_store() const = 0;

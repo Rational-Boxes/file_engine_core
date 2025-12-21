@@ -63,10 +63,15 @@ public:
     virtual Result<std::vector<std::string>> list_versions(const std::string& file_uid, 
                                                            const std::string& user, 
                                                            const std::string& tenant = "");
-    virtual Result<std::vector<uint8_t>> get_version(const std::string& file_uid, 
-                                                     const std::string& version_timestamp, 
-                                                     const std::string& user, 
+    virtual Result<std::vector<uint8_t>> get_version(const std::string& file_uid,
+                                                     const std::string& version_timestamp,
+                                                     const std::string& user,
                                                      const std::string& tenant = "");
+
+    virtual Result<bool> restore_to_version(const std::string& file_uid,
+                                           const std::string& version_timestamp,
+                                           const std::string& user,
+                                           const std::string& tenant = "");
 
     // S3 archival operations
     virtual Result<void> backup_to_object_store(const std::string& file_uid, 
