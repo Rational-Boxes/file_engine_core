@@ -7,7 +7,7 @@
 #include <grpcpp/grpcpp.h>
 
 // Include generated gRPC files
-#include "fileengine/fileservice.grpc.pb.h"
+#include "../../build/core/generated/fileengine/fileservice.grpc.pb.h"
 
 using fileengine_service::FileService;
 using fileengine_service::MakeDirectoryRequest;

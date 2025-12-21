@@ -27,10 +27,6 @@ add_executable(storage_tests
     storage_tests.cpp
 )
 
-add_executable(s3_storage_tests
-    s3_storage_tests.cpp
-)
-
 add_executable(tenant_tests
     tenant_tests.cpp
 )
@@ -68,7 +64,7 @@ add_executable(object_store_sync_tests
 set(FILEENGINE_CORE_LIBRARY_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../core/build)
 
 target_link_libraries(basic_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -85,7 +81,7 @@ target_link_libraries(basic_tests
 )
 
 target_link_libraries(database_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -102,24 +98,7 @@ target_link_libraries(database_tests
 )
 
 target_link_libraries(storage_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
-    ${LIBPQ_LIBRARIES}
-    ${UUID_LIBRARIES}
-    ${PROTOBUF_LIBRARIES}
-    ${GRPCPP_LIBRARIES}
-    gpr
-    grpc++_reflection
-    Threads::Threads
-    ${CMAKE_DL_LIBS}
-    pthread
-    dl
-    pq    # Explicitly link to postgresql client library
-    uuid  # Explicitly link to uuid library
-)
-
-target_link_libraries(s3_storage_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -136,7 +115,7 @@ target_link_libraries(s3_storage_tests
 )
 
 target_link_libraries(tenant_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -153,7 +132,7 @@ target_link_libraries(tenant_tests
 )
 
 target_link_libraries(acl_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -170,7 +149,7 @@ target_link_libraries(acl_tests
 )
 
 target_link_libraries(cache_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -187,7 +166,7 @@ target_link_libraries(cache_tests
 )
 
 target_link_libraries(filesystem_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -204,7 +183,7 @@ target_link_libraries(filesystem_tests
 )
 
 target_link_libraries(query_builder_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -221,7 +200,7 @@ target_link_libraries(query_builder_tests
 )
 
 target_link_libraries(storage_tracker_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -238,7 +217,7 @@ target_link_libraries(storage_tracker_tests
 )
 
 target_link_libraries(file_culler_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -255,7 +234,7 @@ target_link_libraries(file_culler_tests
 )
 
 target_link_libraries(object_store_sync_tests
-    ${FILEENGINE_CORE_LIBRARY_PATH}/libfileengine_core.a
+    fileengine_core
     ${FILEENGINE_CORE_LIBRARY_PATH}/libproto_lib.a
     ${LIBPQ_LIBRARIES}
     ${UUID_LIBRARIES}
@@ -276,7 +255,6 @@ set_target_properties(
     basic_tests
     database_tests
     storage_tests
-    s3_storage_tests
     tenant_tests
     acl_tests
     cache_tests

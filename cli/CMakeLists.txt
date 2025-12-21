@@ -35,7 +35,7 @@ add_executable(fileengine_cli
 target_include_directories(fileengine_cli PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/include/fileengine
-    ${CMAKE_CURRENT_BINARY_DIR}/../core/build/generated  # Include generated proto files from core build
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/build/generated/fileengine  # Include generated proto files from core build
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
 )

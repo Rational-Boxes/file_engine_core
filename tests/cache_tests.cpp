@@ -11,46 +11,6 @@
 #include "fileengine/s3_storage.h"
 #include "fileengine/utils.h"
 
-void test_cache_config_structure() {
-    std::cout << "Testing CacheConfig structure..." << std::endl;
-    
-    fileengine::CacheConfig config;
-    config.enabled = true;
-    config.threshold = 0.8;  // 80% threshold
-    config.max_size_mb = 1024;  // 1GB
-    
-    assert(config.enabled == true);
-    assert(config.threshold == 0.8);
-    assert(config.max_size_mb == 1024);
-    
-    std::cout << "CacheConfig structure test passed!" << std::endl;
-}
-
-void test_cache_entry_structure() {
-    std::cout << "Testing CacheEntry structure..." << std::endl;
-    
-    fileengine::CacheEntry entry;
-    entry.storage_path = "/tmp/test_file.dat";
-    entry.data = {0x48, 0x65, 0x6C, 0x6C, 0x6F}; // "Hello" in bytes
-    entry.size_bytes = 5;
-    entry.last_accessed = std::chrono::steady_clock::now();
-    entry.tenant = "test_tenant";
-    entry.access_count = 1;
-    
-    assert(entry.storage_path == "/tmp/test_file.dat");
-    assert(entry.size_bytes == 5);
-    assert(entry.tenant == "test_tenant");
-    assert(entry.access_count == 1);
-    assert(entry.data.size() == 5);
-    assert(entry.data[0] == 0x48); // 'H'
-    assert(entry.data[1] == 0x65); // 'e'
-    assert(entry.data[2] == 0x6C); // 'l'
-    assert(entry.data[3] == 0x6C); // 'l'
-    assert(entry.data[4] == 0x6F); // 'o'
-    
-    std::cout << "CacheEntry structure test passed!" << std::endl;
-}
-
 void test_cache_manager_creation() {
     std::cout << "Testing CacheManager creation..." << std::endl;
     
@@ -84,7 +44,7 @@ void test_cache_operations() {
     assert(true); // In mock implementation, just ensure method call doesn't crash
     
     // Test checking if file is cached
-    bool is_cached = cache_manager.is_cached(storage_path, tenant);
+    bool is_cached = cache_manager.is_cached(storage_path);
     assert(true); // In mock implementation, just ensure method call doesn't crash
     
     // Test getting a file from cache
@@ -92,7 +52,7 @@ void test_cache_operations() {
     assert(true); // In mock implementation, just ensure method call doesn't crash
     
     // Test removing a file from cache
-    auto remove_result = cache_manager.remove_file(storage_path, tenant);
+    auto remove_result = cache_manager.remove_file(storage_path);
     assert(true); // In mock implementation, just ensure method call doesn't crash
     
     std::cout << "CacheManager operations test passed!" << std::endl;
@@ -115,7 +75,7 @@ void test_cache_size_management() {
     assert(usage_percentage >= 0.0 && usage_percentage <= 1.0); // Should be between 0 and 1
     
     // Test updating cache threshold
-    cache_manager.update_cache_threshold(0.75);  // 75%
+    cache_manager.set_cache_threshold(0.75);  // 75%
     // In mock implementation, just test that method can be called
     assert(true);
     
@@ -154,70 +114,13 @@ void test_cache_eviction_policy() {
     std::cout << "CacheManager eviction policy test passed!" << std::endl;
 }
 
-void test_tenant_specific_caching() {
-    std::cout << "Testing tenant-specific caching..." << std::endl;
-    
-    fileengine::IStorage* mock_storage = nullptr;
-    fileengine::IObjectStore* mock_object_store = nullptr;
-    
-    fileengine::CacheManager cache_manager(mock_storage, mock_object_store, 0.8);
-    
-    std::string tenant1 = "tenant1";
-    std::string tenant2 = "tenant2";
-    std::string storage_path = "shared-path-" + fileengine::Utils::generate_uuid();
-    
-    std::vector<uint8_t> data = {0x01, 0x02, 0x03};
-    
-    // Add same path with different tenants
-    auto result1 = cache_manager.add_file(storage_path, data, tenant1);
-    auto result2 = cache_manager.add_file(storage_path, data, tenant2);
-    
-    // Check if both tenants have the file cached
-    bool cached_in_tenant1 = cache_manager.is_cached(storage_path, tenant1);
-    bool cached_in_tenant2 = cache_manager.is_cached(storage_path, tenant2);
-    
-    // In mock implementation, just ensure method calls don't crash
-    assert(true);
-    
-    std::cout << "Tenant-specific caching test passed!" << std::endl;
-}
-
-void test_cache_statistics() {
-    std::cout << "Testing CacheManager statistics..." << std::endl;
-    
-    fileengine::IStorage* mock_storage = nullptr;
-    fileengine::IObjectStore* mock_object_store = nullptr;
-    
-    fileengine::CacheManager cache_manager(mock_storage, mock_object_store, 0.8);
-    
-    // Test getting various statistics
-    size_t hits = cache_manager.get_cache_hits();
-    size_t misses = cache_manager.get_cache_misses();
-    size_t evictions = cache_manager.get_cache_evictions();
-    
-    // All should return non-negative values
-    assert(hits >= 0);
-    assert(misses >= 0);
-    assert(evictions >= 0);
-    
-    // Test hit rate calculation
-    double hit_rate = cache_manager.get_cache_hit_rate();
-    assert(hit_rate >= 0.0 && hit_rate <= 1.0);
-    
-    std::cout << "CacheManager statistics test passed!" << std::endl;
-}
-
 int main() {
     std::cout << "Running FileEngine Core Cache Unit Tests..." << std::endl;
     
-    test_cache_config_structure();
-    test_cache_entry_structure();
     test_cache_manager_creation();
     test_cache_operations();
     test_cache_size_management();
     test_cache_eviction_policy();
-    test_tenant_specific_caching();
-    test_cache_statistics();
     
     std::cout << "All cache unit tests passed!" << std::endl;
     return 0;

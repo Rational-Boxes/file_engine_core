@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(file_engine_core_core VERSION 1.0.0)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Find packages
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -31,26 +33,26 @@ set(PROTO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # Generate gRPC code from proto
 add_custom_command(
-    OUTPUT ${PROTO_OUTPUT_DIR}/fileservice.pb.cc ${PROTO_OUTPUT_DIR}/fileservice.pb.h
-           ${PROTO_OUTPUT_DIR}/fileservice.grpc.pb.cc ${PROTO_OUTPUT_DIR}/fileservice.grpc.pb.h
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_OUTPUT_DIR}
-    COMMAND protoc --proto_path=${PROTO_DIR} --cpp_out=${PROTO_OUTPUT_DIR} ${PROTO_FILE}
-    COMMAND protoc --proto_path=${PROTO_DIR} --grpc_out=${PROTO_OUTPUT_DIR} --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` ${PROTO_FILE}
+    OUTPUT ${PROTO_OUTPUT_DIR}/fileengine/fileservice.pb.cc ${PROTO_OUTPUT_DIR}/fileengine/fileservice.pb.h
+           ${PROTO_OUTPUT_DIR}/fileengine/fileservice.grpc.pb.cc ${PROTO_OUTPUT_DIR}/fileengine/fileservice.grpc.pb.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_OUTPUT_DIR}/fileengine
+    COMMAND protoc --proto_path=${PROTO_DIR} --cpp_out=${PROTO_OUTPUT_DIR}/fileengine ${PROTO_FILE}
+    COMMAND protoc --proto_path=${PROTO_DIR} --grpc_out=${PROTO_OUTPUT_DIR}/fileengine --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` ${PROTO_FILE}
     DEPENDS ${PROTO_FILE}
     COMMENT "Generating gRPC code from proto"
 )
 
 # Create a custom target for generated files
 add_custom_target(generated_files DEPENDS
-    ${PROTO_OUTPUT_DIR}/fileservice.pb.cc
-    ${PROTO_OUTPUT_DIR}/fileservice.pb.h
-    ${PROTO_OUTPUT_DIR}/fileservice.grpc.pb.cc
-    ${PROTO_OUTPUT_DIR}/fileservice.grpc.pb.h)
+    ${PROTO_OUTPUT_DIR}/fileengine/fileservice.pb.cc
+    ${PROTO_OUTPUT_DIR}/fileengine/fileservice.pb.h
+    ${PROTO_OUTPUT_DIR}/fileengine/fileservice.grpc.pb.cc
+    ${PROTO_OUTPUT_DIR}/fileengine/fileservice.grpc.pb.h)
 
 # Add proto library
 add_library(proto_lib
-    ${PROTO_OUTPUT_DIR}/fileservice.pb.cc
-    ${PROTO_OUTPUT_DIR}/fileservice.grpc.pb.cc
+    ${PROTO_OUTPUT_DIR}/fileengine/fileservice.pb.cc
+    ${PROTO_OUTPUT_DIR}/fileengine/fileservice.grpc.pb.cc
 )
 
 target_include_directories(proto_lib PUBLIC
@@ -65,7 +67,7 @@ target_link_libraries(proto_lib
 )
 
 # Add core library
-add_library(fileengine_core
+add_library(fileengine_core SHARED
     src/database.cpp
     src/connection_pool.cpp
     src/storage.cpp
@@ -81,6 +83,7 @@ add_library(fileengine_core
     src/storage_tracker.cpp    # Add missing source file
     src/file_culler.cpp        # Add missing file culler source file
     src/logger.cpp             # Add logger source file
+    src/query_builder.cpp      # Add query builder source file
 )
 
 # Include directories
@@ -88,7 +91,7 @@ target_include_directories(fileengine_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/fileengine
     ${LIBPQ_INCLUDE_DIRS}
-    ${PROTO_OUTPUT_DIR}  # Include generated proto files
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/fileengine # Include the generated fileengine directory
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
 )

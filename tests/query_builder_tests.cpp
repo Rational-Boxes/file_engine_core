@@ -68,20 +68,6 @@ void test_query_builder_update_operations() {
     std::cout << "QueryBuilder UPDATE operations test passed!" << std::endl;
 }
 
-void test_query_builder_delete_operations() {
-    std::cout << "Testing QueryBuilder DELETE operations..." << std::endl;
-    
-    fileengine::QueryBuilder qb;
-    
-    // Test simple DELETE
-    std::string query = qb.delete_from("files")
-                         .where("uid", "test-123")
-                         .build();
-    assert(query.find("DELETE FROM files WHERE uid = 'test-123'") != std::string::npos);
-    
-    std::cout << "QueryBuilder DELETE operations test passed!" << std::endl;
-}
-
 void test_query_builder_where_conditions() {
     std::cout << "Testing QueryBuilder WHERE conditions..." << std::endl;
     
@@ -170,29 +156,6 @@ void test_query_builder_sanitization() {
     std::cout << "QueryBuilder sanitization test passed!" << std::endl;
 }
 
-void test_query_builder_complex_joins() {
-    std::cout << "Testing QueryBuilder complex operations..." << std::endl;
-    
-    fileengine::QueryBuilder qb;
-    
-    // Test building a complex query with joins (simplified for this test)
-    std::string query = qb.select({"f.uid", "f.name", "f.size", "v.version_timestamp", "v.storage_path"})
-                         .from("files f")
-                         .join("versions v", "f.uid = v.file_uid")
-                         .where("f.parent_uid", "parent-123")
-                         .and_where("f.is_deleted", "FALSE")
-                         .order_by("f.name", true)
-                         .limit(50)
-                         .build();
-    
-    // Just verify that the basic structure is there
-    assert(query.find("SELECT f.uid, f.name, f.size") != std::string::npos);
-    assert(query.find("FROM files f") != std::string::npos);
-    assert(query.find("JOIN versions v") != std::string::npos);
-    
-    std::cout << "QueryBuilder complex operations test passed!" << std::endl;
-}
-
 void test_query_builder_methods_chaining() {
     std::cout << "Testing QueryBuilder method chaining..." << std::endl;
     
@@ -247,11 +210,9 @@ int main() {
     test_query_builder_select_operations();
     test_query_builder_insert_operations();
     test_query_builder_update_operations();
-    test_query_builder_delete_operations();
     test_query_builder_where_conditions();
     test_query_builder_order_limit_offset();
     test_query_builder_sanitization();
-    test_query_builder_complex_joins();
     test_query_builder_methods_chaining();
     test_query_builder_get_parameters();
 

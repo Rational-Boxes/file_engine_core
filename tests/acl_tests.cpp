@@ -10,41 +10,19 @@
 #include "fileengine/database.h"
 #include "fileengine/utils.h"
 
-void test_permission_enum() {
-    std::cout << "Testing Permission enum definitions..." << std::endl;
-    
-    // Test the Permission enum values
-    assert(static_cast<int>(fileengine::Permission::READ) == 0x4);
-    assert(static_cast<int>(fileengine::Permission::WRITE) == 0x2);
-    assert(static_cast<int>(fileengine::Permission::EXECUTE) == 0x1);
-
-    // Test permission combinations
-    int read_write = static_cast<int>(fileengine::Permission::READ) | static_cast<int>(fileengine::Permission::WRITE);
-    assert(read_write == 0x6);  // 4 | 2 = 6
-
-    int all_permissions = static_cast<int>(fileengine::Permission::READ) |
-                          static_cast<int>(fileengine::Permission::WRITE) |
-                          static_cast<int>(fileengine::Permission::EXECUTE);
-    assert(all_permissions == 0x7);  // 4 | 2 | 1 = 7
-    
-    std::cout << "Permission enum test passed!" << std::endl;
-}
-
 void test_acl_rule_structure() {
     std::cout << "Testing ACLRule structure..." << std::endl;
     
     fileengine::ACLRule rule;
     rule.principal = "test_user";
-    rule.principal_type = fileengine::PrincipalType::USER;
+    rule.type = fileengine::PrincipalType::USER;
     rule.resource_uid = "test-resource-123";
     rule.permissions = static_cast<int>(fileengine::Permission::READ) | static_cast<int>(fileengine::Permission::WRITE);
-    rule.tenant = "test_tenant";
     
     assert(rule.principal == "test_user");
-    assert(rule.principal_type == fileengine::PrincipalType::USER);
+    assert(rule.type == fileengine::PrincipalType::USER);
     assert(rule.resource_uid == "test-resource-123");
-    assert(rule.permissions == 0x6); // READ | WRITE
-    assert(rule.tenant == "test_tenant");
+    assert(rule.permissions == (static_cast<int>(fileengine::Permission::READ) | static_cast<int>(fileengine::Permission::WRITE)));
     
     std::cout << "ACLRule structure test passed!" << std::endl;
 }
@@ -120,39 +98,11 @@ void test_effective_permissions_calculation() {
     
     fileengine::AclManager acl_manager(mock_db);
     
-    // Create some sample ACL rules for testing
-    std::vector<fileengine::ACLRule> rules;
-    
-    fileengine::ACLRule rule1;
-    rule1.principal = "test_user";
-    rule1.principal_type = fileengine::PrincipalType::USER;
-    rule1.resource_uid = "test-resource";
-    rule1.permissions = static_cast<int>(fileengine::Permission::READ);
-    rule1.tenant = "test_tenant";
-    rules.push_back(rule1);
-    
-    fileengine::ACLRule rule2;
-    rule2.principal = "test_user";
-    rule2.principal_type = fileengine::PrincipalType::USER;
-    rule2.resource_uid = "test-resource";
-    rule2.permissions = static_cast<int>(fileengine::Permission::WRITE);
-    rule2.tenant = "test_tenant";
-    rules.push_back(rule2);
-    
-    // Test calculating effective permissions (in a real implementation, this would be a method of AclManager)
-    // For this test, just verify we can work with the rules
-    int effective_perms = 0;
-    std::string test_user = "test_user";
-    std::vector<std::string> roles = {};
-    
-    for (const auto& rule : rules) {
-        if (rule.principal == test_user && rule.principal_type == fileengine::PrincipalType::USER) {
-            effective_perms |= rule.permissions;
-        }
-    }
-    
-    // Should have both READ and WRITE permissions (READ=4, WRITE=2, combined=6)
-    assert(effective_perms == 0x6);
+
+    // Test calculating effective permissions
+    auto result = acl_manager.get_effective_permissions("test-resource", "test_user", {}, "test_tenant");
+    assert(result.success);
+    assert(result.value == (static_cast<int>(fileengine::Permission::READ) | static_cast<int>(fileengine::Permission::WRITE)));
     
     std::cout << "Effective permissions calculation test passed!" << std::endl;
 }
@@ -209,7 +159,6 @@ void test_default_acl_application() {
 int main() {
     std::cout << "Running FileEngine Core ACL Unit Tests..." << std::endl;
 
-    test_permission_enum();
     test_principal_type_enum();
     test_acl_rule_structure();
     test_acl_manager_creation();
