@@ -854,35 +854,35 @@ int main(int argc, char** argv) {
         std::cout << "Already connected to: " << server_address << std::endl;
     }
     else if (command == "mkdir" && argc == 4) {
-        client.make_directory(argv[2], argv[3], "cli_user");
+        client.make_directory(argv[2], argv[3], user);
     }
     else if (command == "ls" && argc == 3) {
-        client.list_directory(argv[2], "cli_user", false);
+        client.list_directory(argv[2], user, false);
     }
     else if (command == "ls" && argc == 4) {
         bool show_deleted = (std::string(argv[3]) == "true" || std::string(argv[3]) == "1");
-        client.list_directory(argv[2], "cli_user", show_deleted);
+        client.list_directory(argv[2], user, show_deleted);
     }
     else if (command == "lsd" && argc == 3) {  // List with deleted files
-        client.list_directory(argv[2], "cli_user", true);
+        client.list_directory(argv[2], user, true);
     }
     else if (command == "touch" && argc == 4) {
-        client.touch(argv[2], argv[3], "cli_user");
+        client.touch(argv[2], argv[3], user);
     }
     else if (command == "rm" && argc == 3) {
-        client.remove_file(argv[2], "cli_user");
+        client.remove_file(argv[2], user);
     }
     else if (command == "del" && argc == 3) {
-        client.delete_file(argv[2], "cli_user");
+        client.delete_file(argv[2], user);
     }
     else if (command == "undelete" && argc == 3) {
-        client.undelete_file(argv[2], "cli_user");
+        client.undelete_file(argv[2], user);
     }
     else if (command == "stat" && argc == 3) {
-        client.stat(argv[2], "cli_user");
+        client.stat(argv[2], user);
     }
     else if (command == "exists" && argc == 3) {
-        client.exists(argv[2], "cli_user");
+        client.exists(argv[2], user);
     }
     else if (command == "put" && argc == 4) {
         // Read file from disk
@@ -890,13 +890,13 @@ int main(int argc, char** argv) {
         if (file.is_open()) {
             std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
                                       std::istreambuf_iterator<char>());
-            client.put_file(argv[2], data, "cli_user");
+            client.put_file(argv[2], data, user);
         } else {
             std::cout << "✗ Could not open file: " << argv[3] << std::endl;
         }
     }
     else if (command == "get" && argc == 4) {
-        auto data = client.get_file(argv[2], "cli_user");
+        auto data = client.get_file(argv[2], user);
         if (!data.empty()) {
             std::ofstream file(argv[3], std::ios::binary);
             if (file.is_open()) {
@@ -908,36 +908,36 @@ int main(int argc, char** argv) {
         }
     }
     else if (command == "upload" && argc == 5) {
-        client.upload(argv[2], argv[3], argv[4], "cli_user");
+        client.upload(argv[2], argv[3], argv[4], user);
     }
     else if (command == "download" && argc == 4) {
-        client.download(argv[2], argv[3], "cli_user");
+        client.download(argv[2], argv[3], user);
     }
     else if (command == "download" && argc == 5) {
         try {
             int version = std::stoi(argv[4]);
-            client.download(argv[2], argv[3], "cli_user", version);
+            client.download(argv[2], argv[3], user, version);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid version number: " << argv[4] << std::endl;
             return 1;
         }
     }
     else if (command == "rename" && argc == 4) {
-        client.rename(argv[2], argv[3], "cli_user");
+        client.rename(argv[2], argv[3], user);
     }
     else if (command == "move" && argc == 4) {
-        client.move(argv[2], argv[3], "cli_user");
+        client.move(argv[2], argv[3], user);
     }
     else if (command == "copy" && argc == 4) {
-        client.copy(argv[2], argv[3], "cli_user");
+        client.copy(argv[2], argv[3], user);
     }
     else if (command == "versions" && argc == 3) {
-        client.list_versions(argv[2], "cli_user");
+        client.list_versions(argv[2], user);
     }
     else if (command == "getversion" && argc == 4) {
         try {
             int version = std::stoi(argv[3]);
-            client.get_version(argv[2], version, "cli_user");
+            client.get_version(argv[2], version, user);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid version number: " << argv[3] << std::endl;
             return 1;
@@ -946,23 +946,23 @@ int main(int argc, char** argv) {
     else if (command == "restore" && argc == 4) {
         try {
             int version = std::stoi(argv[3]);
-            client.restore_to_version(argv[2], version, "cli_user");
+            client.restore_to_version(argv[2], version, user);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid version number: " << argv[3] << std::endl;
             return 1;
         }
     }
     else if (command == "setmeta" && argc == 5) {
-        client.set_metadata(argv[2], argv[3], argv[4], "cli_user");
+        client.set_metadata(argv[2], argv[3], argv[4], user);
     }
     else if (command == "getmeta" && argc == 4) {
-        client.get_metadata(argv[2], argv[3], "cli_user");
+        client.get_metadata(argv[2], argv[3], user);
     }
     else if (command == "allmeta" && argc == 3) {
-        client.get_all_metadata(argv[2], "cli_user");
+        client.get_all_metadata(argv[2], user);
     }
     else if (command == "delmeta" && argc == 4) {
-        client.delete_metadata(argv[2], argv[3], "cli_user");
+        client.delete_metadata(argv[2], argv[3], user);
     }
     else if (command == "grant" && argc == 5) {
         fileengine_rpc::Permission perm;
@@ -978,7 +978,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.grant_permission(argv[2], argv[3], perm, "cli_user");
+        client.grant_permission(argv[2], argv[3], perm, user);
     }
     else if (command == "revoke" && argc == 5) {
         fileengine_rpc::Permission perm;
@@ -994,7 +994,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.revoke_permission(argv[2], argv[3], perm, "cli_user");
+        client.revoke_permission(argv[2], argv[3], perm, user);
     }
     else if (command == "check" && argc == 5) {
         fileengine_rpc::Permission perm;
@@ -1010,18 +1010,18 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.check_permission(argv[2], argv[3], perm);
+        client.check_permission(argv[2], user, perm);
     }
     else if (command == "usage" && argc == 2) {
-        client.storage_usage("cli_user");
+        client.storage_usage(user);
     }
     else if (command == "sync" && argc == 2) {
-        client.trigger_sync("cli_user");
+        client.trigger_sync(user);
     }
     else if (command == "purge" && argc == 4) {
         try {
             int days = std::stoi(argv[3]);
-            client.purge_old_versions(argv[2], days, "cli_user");
+            client.purge_old_versions(argv[2], days, user);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid days value: " << argv[3] << std::endl;
             return 1;
