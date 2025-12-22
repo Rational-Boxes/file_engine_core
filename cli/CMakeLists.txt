@@ -28,7 +28,7 @@ set(PROTO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/../core/build/generated)
 
 # Add the CLI executable
 add_executable(fileengine_cli
-    src/client_main.cpp
+        src/fileengine_cli.cpp
 )
 
 # Include directories
