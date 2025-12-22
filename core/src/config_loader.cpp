@@ -118,11 +118,11 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     it = env_vars.find("FILEENGINE_MULTI_TENANT_ENABLED");
     if (it != env_vars.end()) config.multi_tenant_enabled = (it->second == "true" || it->second == "1");
 
-    // Server configuration
-    it = env_vars.find("FILEENGINE_HTTP_LISTEN_ADDR");
+    // Server configuration - Changed to match .env file
+    it = env_vars.find("FILEENGINE_GRPC_HOST");
     if (it != env_vars.end()) config.server_address = it->second;
-    
-    it = env_vars.find("FILEENGINE_HTTP_LISTEN_PORT");
+
+    it = env_vars.find("FILEENGINE_GRPC_PORT");
     if (it != env_vars.end()) config.server_port = std::stoi(it->second);
     
     it = env_vars.find("FILEENGINE_HTTP_THREAD_POOL");
@@ -153,145 +153,238 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
 Config ConfigLoader::load_from_env() {
     Config config;
 
-    // Load from environment variables, with defaults
-    config.db_host = get_env_var("FILEENGINE_DB_HOST", config.db_host);
-    config.db_port = std::stoi(get_env_var("FILEENGINE_DB_PORT", std::to_string(config.db_port)));
-    config.db_name = get_env_var("FILEENGINE_DB_NAME", config.db_name);
-    config.db_user = get_env_var("FILEENGINE_DB_USER", config.db_user);
-    config.db_password = get_env_var("FILEENGINE_DB_PASSWORD", config.db_password);
-    
-    config.storage_base_path = get_env_var("FILEENGINE_STORAGE_BASE_PATH", config.storage_base_path);
-    config.encrypt_data = (get_env_var("FILEENGINE_ENCRYPT_DATA", config.encrypt_data ? "true" : "false") == "true");
-    config.compress_data = (get_env_var("FILEENGINE_COMPRESS_DATA", config.compress_data ? "true" : "false") == "true");
-    
-    config.s3_endpoint = get_env_var("FILEENGINE_S3_ENDPOINT", config.s3_endpoint);
-    config.s3_region = get_env_var("FILEENGINE_S3_REGION", config.s3_region);
-    config.s3_bucket = get_env_var("FILEENGINE_S3_BUCKET", config.s3_bucket);
-    config.s3_access_key = get_env_var("FILEENGINE_S3_ACCESS_KEY", config.s3_access_key);
-    config.s3_secret_key = get_env_var("FILEENGINE_S3_SECRET_KEY", config.s3_secret_key);
-    config.s3_path_style = (get_env_var("FILEENGINE_S3_PATH_STYLE", config.s3_path_style ? "true" : "false") == "true");
-    
-    config.cache_threshold = std::stod(get_env_var("FILEENGINE_CACHE_THRESHOLD", std::to_string(config.cache_threshold)));
-    config.max_cache_size_mb = std::stoul(get_env_var("FILEENGINE_MAX_CACHE_SIZE_MB", std::to_string(config.max_cache_size_mb)));
-    config.multi_tenant_enabled = (get_env_var("FILEENGINE_MULTI_TENANT_ENABLED", config.multi_tenant_enabled ? "true" : "false") == "true");
-    
-    // Server configuration
-    config.server_address = get_env_var("FILEENGINE_SERVER_ADDRESS", config.server_address);
-    config.server_port = std::stoi(get_env_var("FILEENGINE_SERVER_PORT", std::to_string(config.server_port)));
-    config.thread_pool_size = std::stoi(get_env_var("FILEENGINE_HTTP_THREAD_POOL", std::to_string(config.thread_pool_size)));
-    
+    // Load from environment variables - use special indicator for unset values
+    std::string env_value;
+
+    env_value = get_env_var("FILEENGINE_PG_HOST", ""); // Empty string means not set
+    if (!env_value.empty()) config.db_host = env_value;
+
+    env_value = get_env_var("FILEENGINE_PG_PORT", "");
+    if (!env_value.empty()) config.db_port = std::stoi(env_value);
+
+    env_value = get_env_var("FILEENGINE_PG_DATABASE", "");
+    if (!env_value.empty()) config.db_name = env_value;
+
+    env_value = get_env_var("FILEENGINE_PG_USER", "");
+    if (!env_value.empty()) config.db_user = env_value;
+
+    env_value = get_env_var("FILEENGINE_PG_PASSWORD", "");
+    if (!env_value.empty()) config.db_password = env_value;
+
+    env_value = get_env_var("FILEENGINE_STORAGE_BASE", "");
+    if (!env_value.empty()) config.storage_base_path = env_value;
+
+    env_value = get_env_var("FILEENGINE_ENCRYPT_DATA", "");
+    if (!env_value.empty()) config.encrypt_data = (env_value == "true" || env_value == "TRUE" || env_value == "1");
+
+    env_value = get_env_var("FILEENGINE_COMPRESS_DATA", "");
+    if (!env_value.empty()) config.compress_data = (env_value == "true" || env_value == "TRUE" || env_value == "1");
+
+    env_value = get_env_var("FILEENGINE_S3_ENDPOINT", "");
+    if (!env_value.empty()) config.s3_endpoint = env_value;
+
+    env_value = get_env_var("FILEENGINE_S3_REGION", "");
+    if (!env_value.empty()) config.s3_region = env_value;
+
+    env_value = get_env_var("FILEENGINE_S3_BUCKET", "");
+    if (!env_value.empty()) config.s3_bucket = env_value;
+
+    env_value = get_env_var("FILEENGINE_S3_ACCESS_KEY", "");
+    if (!env_value.empty()) config.s3_access_key = env_value;
+
+    env_value = get_env_var("FILEENGINE_S3_SECRET_KEY", "");
+    if (!env_value.empty()) config.s3_secret_key = env_value;
+
+    env_value = get_env_var("FILEENGINE_S3_PATH_STYLE", "");
+    if (!env_value.empty()) config.s3_path_style = (env_value == "true" || env_value == "TRUE" || env_value == "1");
+
+    env_value = get_env_var("FILEENGINE_CACHE_THRESHOLD", "");
+    if (!env_value.empty()) config.cache_threshold = std::stod(env_value);
+
+    env_value = get_env_var("FILEENGINE_MAX_CACHE_SIZE_MB", "");
+    if (!env_value.empty()) config.max_cache_size_mb = std::stoul(env_value);
+
+    env_value = get_env_var("FILEENGINE_MULTI_TENANT_ENABLED", "");
+    if (!env_value.empty()) config.multi_tenant_enabled = (env_value == "true" || env_value == "1");
+
+    // Server configuration - Changed to match .env file
+    env_value = get_env_var("FILEENGINE_GRPC_HOST", "");
+    if (!env_value.empty()) config.server_address = env_value;
+
+    env_value = get_env_var("FILEENGINE_GRPC_PORT", "");
+    if (!env_value.empty()) config.server_port = std::stoi(env_value);
+
+    env_value = get_env_var("FILEENGINE_HTTP_THREAD_POOL", "");
+    if (!env_value.empty()) config.thread_pool_size = std::stoi(env_value);
+
     // Security configuration
-    config.root_user_enabled = (get_env_var("FILEENGINE_ROOT_USER", config.root_user_enabled ? "true" : "false") == "true");
-    
+    env_value = get_env_var("FILEENGINE_ROOT_USER", "");
+    if (!env_value.empty()) config.root_user_enabled = (env_value == "true" || env_value == "1");
+
     // Sync configuration
-    config.sync_enabled = (get_env_var("FILEENGINE_S3_SYNC_SUPPORT", "true") == "true");
-    config.sync_retry_seconds = std::stoi(get_env_var("FILEENGINE_S3_RETRY_SECONDS", std::to_string(config.sync_retry_seconds)));
-    config.sync_on_startup = (get_env_var("FILEENGINE_S3_SYNC_ON_STARTUP", config.sync_on_startup ? "true" : "false") == "true");
-    config.sync_on_demand = (get_env_var("FILEENGINE_S3_SYNC_ON_DEMAND", config.sync_on_demand ? "true" : "false") == "true");
-    config.sync_pattern = get_env_var("FILEENGINE_S3_SYNC_PATTERN", config.sync_pattern);
-    config.sync_bidirectional = (get_env_var("FILEENGINE_S3_SYNC_BIDIRECTIONAL", config.sync_bidirectional ? "true" : "false") == "true");
+    env_value = get_env_var("FILEENGINE_S3_SYNC_SUPPORT", "");
+    if (!env_value.empty()) config.sync_enabled = (env_value == "true" || env_value == "minio" || env_value == "s3");
+
+    env_value = get_env_var("FILEENGINE_S3_RETRY_SECONDS", "");
+    if (!env_value.empty()) config.sync_retry_seconds = std::stoi(env_value);
+
+    env_value = get_env_var("FILEENGINE_S3_SYNC_ON_STARTUP", "");
+    if (!env_value.empty()) config.sync_on_startup = (env_value == "true");
+
+    env_value = get_env_var("FILEENGINE_S3_SYNC_ON_DEMAND", "");
+    if (!env_value.empty()) config.sync_on_demand = (env_value == "true");
+
+    env_value = get_env_var("FILEENGINE_S3_SYNC_PATTERN", "");
+    if (!env_value.empty()) config.sync_pattern = env_value;
+
+    env_value = get_env_var("FILEENGINE_S3_SYNC_BIDIRECTIONAL", "");
+    if (!env_value.empty()) config.sync_bidirectional = (env_value == "true");
 
     // Logging configuration
-    config.log_level = get_env_var("FILEENGINE_LOG_LEVEL", config.log_level);
-    config.log_file_path = get_env_var("FILEENGINE_LOG_FILE_PATH", config.log_file_path);
-    config.log_to_console = (get_env_var("FILEENGINE_LOG_TO_CONSOLE", config.log_to_console ? "true" : "false") == "true");
-    config.log_to_file = (get_env_var("FILEENGINE_LOG_TO_FILE", config.log_to_file ? "true" : "false") == "true");
-    config.log_rotation_size_mb = std::stoul(get_env_var("FILEENGINE_LOG_ROTATION_SIZE_MB", std::to_string(config.log_rotation_size_mb)));
-    config.log_retention_days = std::stoi(get_env_var("FILEENGINE_LOG_RETENTION_DAYS", std::to_string(config.log_retention_days)));
+    env_value = get_env_var("FILEENGINE_LOG_LEVEL", "");
+    if (!env_value.empty()) config.log_level = env_value;
+
+    env_value = get_env_var("FILEENGINE_LOG_FILE_PATH", "");
+    if (!env_value.empty()) config.log_file_path = env_value;
+
+    env_value = get_env_var("FILEENGINE_LOG_TO_CONSOLE", "");
+    if (!env_value.empty()) config.log_to_console = (env_value == "true");
+
+    env_value = get_env_var("FILEENGINE_LOG_TO_FILE", "");
+    if (!env_value.empty()) config.log_to_file = (env_value == "true");
+
+    env_value = get_env_var("FILEENGINE_LOG_ROTATION_SIZE_MB", "");
+    if (!env_value.empty()) config.log_rotation_size_mb = std::stoul(env_value);
+
+    env_value = get_env_var("FILEENGINE_LOG_RETENTION_DAYS", "");
+    if (!env_value.empty()) config.log_retention_days = std::stoi(env_value);
 
     return config;
 }
 
 Config ConfigLoader::load_from_cmd_args(int argc, char* argv[]) {
     Config config;
-    
-    // For now, we're not parsing command-line arguments
-    // This would be implemented based on specific requirements
-    // Example parsing could be added here
-    
+
+    // Set all values to designated "unset" state initially
+    config.db_host.clear();
+    config.db_port = -1;  // Use -1 as indicator for unset integer values
+    config.db_name.clear();
+    config.db_user.clear();
+    config.db_password.clear();
+    config.storage_base_path.clear();
+    config.s3_endpoint.clear();
+    config.s3_region.clear();
+    config.s3_bucket.clear();
+    config.s3_access_key.clear();
+    config.s3_secret_key.clear();
+    config.server_address.clear();
+    config.server_port = -1;
+    config.thread_pool_size = -1;
+
+    // Parse command-line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            // Config file is handled separately in load_config
+            ++i;
+        } else if (arg == "--db-host" && i + 1 < argc) {
+            config.db_host = argv[++i];
+        } else if (arg == "--db-port" && i + 1 < argc) {
+            config.db_port = std::stoi(argv[++i]);
+        } else if (arg == "--db-name" && i + 1 < argc) {
+            config.db_name = argv[++i];
+        } else if (arg == "--db-user" && i + 1 < argc) {
+            config.db_user = argv[++i];
+        } else if (arg == "--db-password" && i + 1 < argc) {
+            config.db_password = argv[++i];
+        } else if (arg == "--storage-path" && i + 1 < argc) {
+            config.storage_base_path = argv[++i];
+        } else if (arg == "--s3-endpoint" && i + 1 < argc) {
+            config.s3_endpoint = argv[++i];
+        } else if (arg == "--s3-region" && i + 1 < argc) {
+            config.s3_region = argv[++i];
+        } else if (arg == "--s3-bucket" && i + 1 < argc) {
+            config.s3_bucket = argv[++i];
+        } else if (arg == "--s3-access-key" && i + 1 < argc) {
+            config.s3_access_key = argv[++i];
+        } else if (arg == "--s3-secret-key" && i + 1 < argc) {
+            config.s3_secret_key = argv[++i];
+        } else if (arg == "--listen-addr" && i + 1 < argc) {
+            config.server_address = argv[++i];
+        } else if (arg == "--listen-port" && i + 1 < argc) {
+            config.server_port = std::stoi(argv[++i]);
+        } else if (arg == "--thread-pool-size" && i + 1 < argc) {
+            config.thread_pool_size = std::stoi(argv[++i]);
+        }
+    }
+
     return config;
 }
 
 Config ConfigLoader::load_config(int argc, char* argv[]) {
+    // First, check for custom config file in command-line arguments
+    std::string config_file = ".env";
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            config_file = argv[++i];
+        }
+    }
+
     Config config;
 
-    // 1. Load from .env file if it exists
-    Config file_config = load_from_file(".env");
-    config = file_config;  // Assign file config as base
+    // 1. Load from file (lowest priority)
+    Config file_config = load_from_file(config_file.c_str());
+    // Only use values from file if they were set (not default)
+    if (!file_config.db_host.empty()) config.db_host = file_config.db_host;
+    if (file_config.db_port != 0 && file_config.db_port != 5432) config.db_port = file_config.db_port; // Default is 5432
+    if (!file_config.db_name.empty()) config.db_name = file_config.db_name;
+    if (!file_config.db_user.empty()) config.db_user = file_config.db_user;
+    if (!file_config.db_password.empty()) config.db_password = file_config.db_password;
+    if (!file_config.storage_base_path.empty()) config.storage_base_path = file_config.storage_base_path;
+    if (!file_config.s3_endpoint.empty()) config.s3_endpoint = file_config.s3_endpoint;
+    if (!file_config.s3_region.empty()) config.s3_region = file_config.s3_region;
+    if (!file_config.s3_bucket.empty()) config.s3_bucket = file_config.s3_bucket;
+    if (!file_config.s3_access_key.empty()) config.s3_access_key = file_config.s3_access_key;
+    if (!file_config.s3_secret_key.empty()) config.s3_secret_key = file_config.s3_secret_key;
+    if (!file_config.server_address.empty()) config.server_address = file_config.server_address;
+    if (file_config.server_port != 0 && file_config.server_port != 50051) config.server_port = file_config.server_port; // Default is 50051
+    if (file_config.thread_pool_size != 0 && file_config.thread_pool_size != 10) config.thread_pool_size = file_config.thread_pool_size; // Default is 10
 
-    // 2. Load from environment variables (override file config)
+    // 2. Load from environment (medium priority)
     Config env_config = load_from_env();
-    
-    // Database config overrides
-    if (getenv("FILEENGINE_DB_HOST")) config.db_host = env_config.db_host;
-    if (getenv("FILEENGINE_DB_PORT")) config.db_port = std::stoi(get_env_var("FILEENGINE_DB_PORT", std::to_string(config.db_port)));
-    if (getenv("FILEENGINE_DB_NAME")) config.db_name = env_config.db_name;
-    if (getenv("FILEENGINE_DB_USER")) config.db_user = env_config.db_user;
-    if (getenv("FILEENGINE_DB_PASSWORD")) config.db_password = env_config.db_password;
+    if (!env_config.db_host.empty()) config.db_host = env_config.db_host;
+    if (env_config.db_port != 0 && env_config.db_port != 5432) config.db_port = env_config.db_port;
+    if (!env_config.db_name.empty()) config.db_name = env_config.db_name;
+    if (!env_config.db_user.empty()) config.db_user = env_config.db_user;
+    if (!env_config.db_password.empty()) config.db_password = env_config.db_password;
+    if (!env_config.storage_base_path.empty()) config.storage_base_path = env_config.storage_base_path;
+    if (!env_config.s3_endpoint.empty()) config.s3_endpoint = env_config.s3_endpoint;
+    if (!env_config.s3_region.empty()) config.s3_region = env_config.s3_region;
+    if (!env_config.s3_bucket.empty()) config.s3_bucket = env_config.s3_bucket;
+    if (!env_config.s3_access_key.empty()) config.s3_access_key = env_config.s3_access_key;
+    if (!env_config.s3_secret_key.empty()) config.s3_secret_key = env_config.s3_secret_key;
+    if (!env_config.server_address.empty()) config.server_address = env_config.server_address;
+    if (env_config.server_port != 0 && env_config.server_port != 50051) config.server_port = env_config.server_port;
+    if (env_config.thread_pool_size != 0 && env_config.thread_pool_size != 10) config.thread_pool_size = env_config.thread_pool_size;
 
-    // Storage config overrides
-    if (getenv("FILEENGINE_STORAGE_BASE_PATH")) config.storage_base_path = env_config.storage_base_path;
-    if (getenv("FILEENGINE_ENCRYPT_DATA")) config.encrypt_data = (get_env_var("FILEENGINE_ENCRYPT_DATA", "false") == "true");
-    if (getenv("FILEENGINE_COMPRESS_DATA")) config.compress_data = (get_env_var("FILEENGINE_COMPRESS_DATA", "false") == "true");
-
-    // S3 config overrides
-    if (getenv("FILEENGINE_S3_ENDPOINT")) config.s3_endpoint = env_config.s3_endpoint;
-    if (getenv("FILEENGINE_S3_REGION")) config.s3_region = env_config.s3_region;
-    if (getenv("FILEENGINE_S3_BUCKET")) config.s3_bucket = env_config.s3_bucket;
-    if (getenv("FILEENGINE_S3_ACCESS_KEY")) config.s3_access_key = env_config.s3_access_key;
-    if (getenv("FILEENGINE_S3_SECRET_KEY")) config.s3_secret_key = env_config.s3_secret_key;
-    if (getenv("FILEENGINE_S3_PATH_STYLE")) config.s3_path_style = (get_env_var("FILEENGINE_S3_PATH_STYLE", "false") == "true");
-
-    // Cache config overrides
-    if (getenv("FILEENGINE_CACHE_THRESHOLD")) config.cache_threshold = std::stod(get_env_var("FILEENGINE_CACHE_THRESHOLD", std::to_string(config.cache_threshold)));
-    if (getenv("FILEENGINE_MAX_CACHE_SIZE_MB")) config.max_cache_size_mb = std::stoul(get_env_var("FILEENGINE_MAX_CACHE_SIZE_MB", std::to_string(config.max_cache_size_mb)));
-
-    // Tenant config overrides
-    if (getenv("FILEENGINE_MULTI_TENANT_ENABLED")) config.multi_tenant_enabled = (get_env_var("FILEENGINE_MULTI_TENANT_ENABLED", "true") == "true");
-
-    // Server config overrides - these are the important ones for thread pool
-    if (getenv("FILEENGINE_SERVER_ADDRESS")) config.server_address = env_config.server_address;
-    if (getenv("FILEENGINE_SERVER_PORT")) config.server_port = std::stoi(get_env_var("FILEENGINE_SERVER_PORT", std::to_string(config.server_port)));
-    if (getenv("FILEENGINE_HTTP_THREAD_POOL")) config.thread_pool_size = std::stoi(get_env_var("FILEENGINE_HTTP_THREAD_POOL", std::to_string(config.thread_pool_size)));
-
-    // Security config overrides
-    if (getenv("FILEENGINE_ROOT_USER")) config.root_user_enabled = (get_env_var("FILEENGINE_ROOT_USER", config.root_user_enabled ? "true" : "false") == "true");
-
-    // Sync config overrides
-    if (getenv("FILEENGINE_S3_SYNC_ENABLED")) config.sync_enabled = (get_env_var("FILEENGINE_S3_SYNC_ENABLED", "true") == "true");
-    if (getenv("FILEENGINE_S3_RETRY_SECONDS")) config.sync_retry_seconds = std::stoi(get_env_var("FILEENGINE_S3_RETRY_SECONDS", std::to_string(config.sync_retry_seconds)));
-    if (getenv("FILEENGINE_S3_SYNC_ON_STARTUP")) config.sync_on_startup = (get_env_var("FILEENGINE_S3_SYNC_ON_STARTUP", "true") == "true");
-    if (getenv("FILEENGINE_S3_SYNC_ON_DEMAND")) config.sync_on_demand = (get_env_var("FILEENGINE_S3_SYNC_ON_DEMAND", "true") == "true");
-    if (getenv("FILEENGINE_S3_SYNC_PATTERN")) config.sync_pattern = get_env_var("FILEENGINE_S3_SYNC_PATTERN", config.sync_pattern);
-    if (getenv("FILEENGINE_S3_SYNC_BIDIRECTIONAL")) config.sync_bidirectional = (get_env_var("FILEENGINE_S3_SYNC_BIDIRECTIONAL", "true") == "true");
-
-    // Logging config overrides
-    if (getenv("FILEENGINE_LOG_LEVEL")) config.log_level = get_env_var("FILEENGINE_LOG_LEVEL", config.log_level);
-    if (getenv("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = get_env_var("FILEENGINE_LOG_FILE_PATH", config.log_file_path);
-    if (getenv("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (get_env_var("FILEENGINE_LOG_TO_CONSOLE", config.log_to_console ? "true" : "false") == "true");
-    if (getenv("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (get_env_var("FILEENGINE_LOG_TO_FILE", config.log_to_file ? "true" : "false") == "true");
-    if (getenv("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(get_env_var("FILEENGINE_LOG_ROTATION_SIZE_MB", std::to_string(config.log_rotation_size_mb)));
-    if (getenv("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(get_env_var("FILEENGINE_LOG_RETENTION_DAYS", std::to_string(config.log_retention_days)));
-
-    // 3. Load from command-line arguments (override env and file configs)
+    // 3. Load from command-line arguments (highest priority)
     Config cmd_config = load_from_cmd_args(argc, argv);
-    // For command-line args, we only override if they're legitimately different from defaults
-    if (cmd_config.db_host != config.db_host) config.db_host = cmd_config.db_host;
-    if (cmd_config.db_port != config.db_port) config.db_port = cmd_config.db_port;
-    if (cmd_config.db_name != config.db_name) config.db_name = cmd_config.db_name;
-    if (cmd_config.db_user != config.db_user) config.db_user = cmd_config.db_user;
-    if (cmd_config.db_password != config.db_password) config.db_password = cmd_config.db_password;
-    if (cmd_config.storage_base_path != config.storage_base_path) config.storage_base_path = cmd_config.storage_base_path;
-    if (cmd_config.s3_endpoint != config.s3_endpoint) config.s3_endpoint = cmd_config.s3_endpoint;
-    if (cmd_config.s3_region != config.s3_region) config.s3_region = cmd_config.s3_region;
-    if (cmd_config.s3_bucket != config.s3_bucket) config.s3_bucket = cmd_config.s3_bucket;
-    if (cmd_config.s3_access_key != config.s3_access_key) config.s3_access_key = cmd_config.s3_access_key;
-    if (cmd_config.s3_secret_key != config.s3_secret_key) config.s3_secret_key = cmd_config.s3_secret_key;
-    if (cmd_config.server_address != config.server_address) config.server_address = cmd_config.server_address;
-    if (cmd_config.server_port != config.server_port) config.server_port = cmd_config.server_port;
-    if (cmd_config.thread_pool_size != config.thread_pool_size) config.thread_pool_size = cmd_config.thread_pool_size;
-    if (cmd_config.root_user_enabled != config.root_user_enabled) config.root_user_enabled = cmd_config.root_user_enabled;
-    
+    if (!cmd_config.db_host.empty()) config.db_host = cmd_config.db_host;
+    if (cmd_config.db_port != -1) config.db_port = cmd_config.db_port;  // -1 is unset indicator
+    if (!cmd_config.db_name.empty()) config.db_name = cmd_config.db_name;
+    if (!cmd_config.db_user.empty()) config.db_user = cmd_config.db_user;
+    if (!cmd_config.db_password.empty()) config.db_password = cmd_config.db_password;
+    if (!cmd_config.storage_base_path.empty()) config.storage_base_path = cmd_config.storage_base_path;
+    if (!cmd_config.s3_endpoint.empty()) config.s3_endpoint = cmd_config.s3_endpoint;
+    if (!cmd_config.s3_region.empty()) config.s3_region = cmd_config.s3_region;
+    if (!cmd_config.s3_bucket.empty()) config.s3_bucket = cmd_config.s3_bucket;
+    if (!cmd_config.s3_access_key.empty()) config.s3_access_key = cmd_config.s3_access_key;
+    if (!cmd_config.s3_secret_key.empty()) config.s3_secret_key = cmd_config.s3_secret_key;
+    if (!cmd_config.server_address.empty()) config.server_address = cmd_config.server_address;
+    if (cmd_config.server_port != -1) config.server_port = cmd_config.server_port;
+    if (cmd_config.thread_pool_size != -1) config.thread_pool_size = cmd_config.thread_pool_size;
+
     return config;
 }
 
