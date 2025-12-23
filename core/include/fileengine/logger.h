@@ -36,6 +36,9 @@ public:
     void error(const std::string& component, const std::string& message);
     void fatal(const std::string& component, const std::string& message);
 
+    // Helper method for detailed logging prefixes
+    std::string detailed_log_prefix();
+
 private:
     Logger() = default;
     ~Logger();

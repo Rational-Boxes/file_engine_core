@@ -23,12 +23,17 @@ public:
     // Shutdown the connection pool
     Result<void> shutdown_pool();
 
+    // Server state tracking methods
+    void set_server_in_readonly_mode(bool readonly) { server_in_readonly_mode_ = readonly; }
+    bool is_server_in_readonly_mode() const { return server_in_readonly_mode_; }
+
 private:
     ConnectionPoolManager() = default;
     ~ConnectionPoolManager() = default;
 
     std::shared_ptr<ConnectionPool> pool_;
     bool initialized_{false};
+    bool server_in_readonly_mode_{false};  // Track if server is in disconnected read-only mode
 };
 
 } // namespace fileengine

@@ -88,6 +88,17 @@ public:
     // Tenant management operations
     Result<void> cleanup_tenant_data(const std::string& tenant) override;
 
+    // ACL operations
+    Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
+                         int type, int permissions, const std::string& tenant = "") override;
+    Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
+                            int type, const std::string& tenant = "") override;
+    Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
+                                                        const std::string& tenant = "") override;
+    Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
+                                                const std::string& principal,
+                                                const std::string& tenant = "") override;
+
     // Connection info access for administrative operations
     std::string get_connection_info() const;
 

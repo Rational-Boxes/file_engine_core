@@ -1,8 +1,8 @@
 #include "fileengine/cache_manager.h"
+#include "fileengine/logger.h"
 #include <sys/statvfs.h>
 #include <algorithm>
-
-// TODO: Look out for race conditions in this operation, implement a semephore because culling down to the storage limit nees to be a critical section of code
+#include <mutex>
 
 namespace fileengine {
 
@@ -20,64 +20,106 @@ CacheManager::~CacheManager() {
 }
 
 Result<std::vector<uint8_t>> CacheManager::get_file(const std::string& storage_path, const std::string& tenant) {
+    LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+              "Getting file from cache - storage_path: " + storage_path +
+              ", tenant: " + tenant +
+              " [CONCURRENCY CRITICAL: Cache access with potential race conditions]");
+
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    
+
     auto it = cache_map_.find(storage_path);
     if (it != cache_map_.end()) {
+        LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                  "File found in cache: " + storage_path +
+                  ", updating LRU position [CONCURRENCY CRITICAL: LRU update within lock]");
         // Update LRU position
         lru_list_.erase(it->second.lru_iter);
         lru_list_.push_front(storage_path);
         it->second.lru_iter = lru_list_.begin();
-        
+
         // Update access time
         it->second.file.last_accessed = std::chrono::steady_clock::now();
-        
+
+        LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                  "Successfully retrieved file from cache: " + storage_path);
         return Result<std::vector<uint8_t>>::ok(it->second.file.data);
     }
-    
+
+    LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+              "File not in cache, attempting to load from storage: " + storage_path);
+
     // File not in cache, try to load from storage
     if (storage_) {
         auto storage_result = storage_->read_file(storage_path, tenant);
         if (storage_result.success) {
+            LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                      "File loaded from storage successfully, adding to cache: " + storage_path +
+                      " [CONCURRENCY WARNING: add_file may trigger eviction]");
             // Add to cache
             add_file(storage_path, storage_result.value, tenant);
+            LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                      "File successfully retrieved from storage and added to cache: " + storage_path);
             return storage_result;
+        } else {
+            LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                      "File not found in storage: " + storage_path +
+                      ", error: " + storage_result.error);
         }
+    } else {
+        LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                  "No storage available, skipping storage lookup for: " + storage_path);
     }
-    
+
     // If not in storage, try object store
     if (object_store_) {
+        LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                  "File not in storage, attempting to load from object store: " + storage_path);
         auto object_store_result = object_store_->read_file(storage_path, tenant);
         if (object_store_result.success) {
-            // Add to cache
+            LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                      "File loaded from object store successfully, adding to cache: " + storage_path +
+                      " [CONCURRENCY WARNING: add_file may trigger eviction]");
+            // Add to local storage and cache
             add_file(storage_path, object_store_result.value, tenant);
+            LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                      "File successfully retrieved from object store and added to cache: " + storage_path);
             return object_store_result;
+        } else {
+            LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                      "File not found in object store: " + storage_path +
+                      ", error: " + object_store_result.error);
         }
+    } else {
+        LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+                  "No object store available, skipping object store lookup for: " + storage_path);
     }
-    
+
+    LOG_DEBUG("CacheManager::get_file", Logger::getInstance().detailed_log_prefix() +
+              "File not found in cache, storage, or object store: " + storage_path);
     return Result<std::vector<uint8_t>>::err("File not found in cache, storage, or object store: " + storage_path);
 }
 
 Result<void> CacheManager::add_file(const std::string& storage_path, const std::vector<uint8_t>& data, const std::string& tenant) {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    
     size_t data_size = data.size();
-    
-    // Check if we need to evict items to make space
-    while (current_cache_size_ + data_size > max_cache_size_bytes_ * threshold_ && !lru_list_.empty()) {
-        // Remove least recently used item
-        std::string lru_path = lru_list_.back();
-        lru_list_.pop_back();
-        
-        auto lru_it = cache_map_.find(lru_path);
-        if (lru_it != cache_map_.end()) {
-            current_cache_size_ -= lru_it->second.file.size;
-            cache_map_.erase(lru_it);
-        }
-    }
-    
+
+    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+              "Adding file to cache - storage_path: " + storage_path +
+              ", data_size: " + std::to_string(data_size) +
+              ", tenant: " + tenant +
+              " [CONCURRENCY CRITICAL: Cache operations with potential race conditions]");
+
+    // Use a unique_lock to allow for temporary unlocking during potentially long operations
+    std::unique_lock<std::mutex> lock(cache_mutex_);
+
+    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+              "Acquired cache mutex, current cache size: " + std::to_string(current_cache_size_) +
+              ", max cache size: " + std::to_string(max_cache_size_bytes_) +
+              ", threshold: " + std::to_string(threshold_));
+
     // Check if we still have space
     if (current_cache_size_ + data_size <= max_cache_size_bytes_) {
+        LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                  "Sufficient space available, adding file directly to cache: " + storage_path);
         // Add new item
         auto& entry = cache_map_[storage_path];
         entry.file.path = storage_path;
@@ -85,35 +127,95 @@ Result<void> CacheManager::add_file(const std::string& storage_path, const std::
         entry.file.size = data_size;
         entry.file.tenant = tenant;
         entry.file.last_accessed = std::chrono::steady_clock::now();
-        
+
         lru_list_.push_front(storage_path);
         entry.lru_iter = lru_list_.begin();
-        
+
         current_cache_size_ += data_size;
-        
+
+        LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                  "Successfully added file to cache: " + storage_path +
+                  ", new cache size: " + std::to_string(current_cache_size_));
         return Result<void>::ok();
     }
-    
-    // If still no space, evict more items (this can happen in race conditions)
-    evict_lru_items();
-    
+
+    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+              "Insufficient space, need to evict items - required: " + std::to_string(data_size) +
+              ", available: " + std::to_string(max_cache_size_bytes_ - current_cache_size_) +
+              " [CONCURRENCY WARNING: About to release lock and perform eviction]");
+
+    // If not enough space, we need to evict some items
+    // First, temporarily release the lock to avoid holding it during potential long operations
+    lock.unlock();
+
+    // Evict items to make space - this is the critical section that needs to be atomic
+    {
+        LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                  "Starting critical eviction section [CONCURRENCY CRITICAL: Eviction may conflict with other operations]");
+        std::lock_guard<std::mutex> eviction_lock(cache_mutex_);
+        // Check again in case another thread freed space
+        if (current_cache_size_ + data_size > max_cache_size_bytes_) {
+            LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                      "Performing cache eviction to make space for: " + storage_path +
+                      ", need to free: " + std::to_string((current_cache_size_ + data_size) - max_cache_size_bytes_) +
+                      " bytes");
+            // Evict enough items to make space
+            while (current_cache_size_ + data_size > max_cache_size_bytes_ && !lru_list_.empty()) {
+                // Remove least recently used item
+                std::string lru_path = lru_list_.back();
+                lru_list_.pop_back();
+
+                auto lru_it = cache_map_.find(lru_path);
+                if (lru_it != cache_map_.end()) {
+                    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                              "Evicting LRU item: " + lru_path +
+                              ", size: " + std::to_string(lru_it->second.file.size) +
+                              " [CONCURRENCY CRITICAL: Removing item from cache_map]");
+                    current_cache_size_ -= lru_it->second.file.size;
+                    cache_map_.erase(lru_it);
+                    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                              "Successfully evicted item: " + lru_path +
+                              ", new cache size: " + std::to_string(current_cache_size_));
+                }
+            }
+        } else {
+            LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                      "Another thread freed enough space, skipping eviction");
+        }
+    }
+
+    // Re-acquire the lock to add the new file
+    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+              "Re-acquiring lock to add new file [CONCURRENCY CRITICAL: State may have changed]");
+    lock.lock();
+
+    // Try to add the file again after making space
     if (current_cache_size_ + data_size <= max_cache_size_bytes_) {
-        // Try to add again
+        LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                  "Sufficient space found after eviction, adding file: " + storage_path);
+        // Add new item
         auto& entry = cache_map_[storage_path];
         entry.file.path = storage_path;
         entry.file.data = data;
         entry.file.size = data_size;
         entry.file.tenant = tenant;
         entry.file.last_accessed = std::chrono::steady_clock::now();
-        
+
         lru_list_.push_front(storage_path);
         entry.lru_iter = lru_list_.begin();
-        
+
         current_cache_size_ += data_size;
-        
+
+        LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+                  "Successfully added file to cache after eviction: " + storage_path +
+                  ", final cache size: " + std::to_string(current_cache_size_));
         return Result<void>::ok();
     }
-    
+
+    LOG_DEBUG("CacheManager::add_file", Logger::getInstance().detailed_log_prefix() +
+              "Still insufficient space after eviction for: " + storage_path +
+              ", cache size: " + std::to_string(current_cache_size_) +
+              ", required: " + std::to_string(data_size));
     return Result<void>::err("Not enough space in cache even after eviction");
 }
 
@@ -243,12 +345,12 @@ size_t CacheManager::get_available_system_storage() const {
 
 void CacheManager::evict_lru_items() {
     // Evict items until we're below the threshold
-    while (!lru_list_.empty() && 
+    while (!lru_list_.empty() &&
            current_cache_size_ > max_cache_size_bytes_ * threshold_) {
-        
+
         std::string lru_path = lru_list_.back();
         lru_list_.pop_back();
-        
+
         auto lru_it = cache_map_.find(lru_path);
         if (lru_it != cache_map_.end()) {
             current_cache_size_ -= lru_it->second.file.size;

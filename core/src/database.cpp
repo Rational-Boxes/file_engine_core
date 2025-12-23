@@ -1,5 +1,6 @@
 #include "fileengine/database.h"
 #include "fileengine/utils.h"
+#include "fileengine/logger.h"
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -96,74 +97,47 @@ Result<void> Database::create_schema() {
 }
 
 Result<void> Database::drop_schema() {
-// TODO: Remove this, resets are manual and the data storage is immutable
-    auto conn = connection_pool_->acquire();
-    if (!conn || !conn->is_valid()) {
-        return Result<void>::err("Failed to acquire database connection");
-    }
-
-    PGconn* pg_conn = conn->get_connection();
-
-    // Drop tables in reverse dependency order
-    const char* drop_acl_sql = "DROP TABLE IF EXISTS acl;";
-    const char* drop_metadata_sql = "DROP TABLE IF EXISTS metadata;";
-    const char* drop_versions_sql = "DROP TABLE IF EXISTS versions;";
-    const char* drop_files_sql = "DROP TABLE IF EXISTS files;";
-
-    Result<void> result = Result<void>::ok();
-
-    // Execute drops in order
-    PGresult* res1 = PQexec(pg_conn, drop_acl_sql);
-    if (PQresultStatus(res1) != PGRES_COMMAND_OK && PQresultStatus(res1) != PGRES_BAD_RESPONSE) {
-        result = Result<void>::err("Error dropping ACL table: " + std::string(PQerrorMessage(pg_conn)));
-    }
-    PQclear(res1);
-
-    if (result.success) {
-        PGresult* res2 = PQexec(pg_conn, drop_metadata_sql);
-        if (PQresultStatus(res2) != PGRES_COMMAND_OK && PQresultStatus(res2) != PGRES_BAD_RESPONSE) {
-            result = Result<void>::err("Error dropping metadata table: " + std::string(PQerrorMessage(pg_conn)));
-        }
-        PQclear(res2);
-    }
-
-    if (result.success) {
-        PGresult* res3 = PQexec(pg_conn, drop_versions_sql);
-        if (PQresultStatus(res3) != PGRES_COMMAND_OK && PQresultStatus(res3) != PGRES_BAD_RESPONSE) {
-            result = Result<void>::err("Error dropping versions table: " + std::string(PQerrorMessage(pg_conn)));
-        }
-        PQclear(res3);
-    }
-
-    if (result.success) {
-        PGresult* res4 = PQexec(pg_conn, drop_files_sql);
-        if (PQresultStatus(res4) != PGRES_COMMAND_OK && PQresultStatus(res4) != PGRES_BAD_RESPONSE) {
-            result = Result<void>::err("Error dropping files table: " + std::string(PQerrorMessage(pg_conn)));
-        }
-        PQclear(res4);
-    }
-
-    connection_pool_->release(conn);
-    return result;
+    // This method is no longer used as data storage is immutable
+    // Resets are performed manually by administrators as needed
+    return Result<void>::err("drop_schema not supported - data storage is immutable");
 }
 
 Result<std::string> Database::insert_file(const std::string& uid, const std::string& name,
                                           const std::string& path, const std::string& parent_uid,
                                           FileType type, const std::string& owner,
                                           int permissions, const std::string& tenant) {
+    LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+              "Entering insert_file operation - uid: " + uid +
+              ", name: " + name + ", path: " + path +
+              ", parent_uid: " + parent_uid + ", type: " + std::to_string(static_cast<int>(type)) +
+              ", owner: " + owner + ", permissions: " + std::to_string(permissions) +
+              ", tenant: " + tenant);
+
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
+        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                  "Failed to acquire database connection for UID: " + uid);
         return Result<std::string>::err("Failed to acquire database connection");
     }
 
     PGconn* pg_conn = conn->get_connection();
+    LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+              "Acquired database connection for UID: " + uid);
 
     // Prepare SQL with INSERT/ON CONFLICT handling to avoid duplicates
-// TODO: THis atble has ben simplified, fit this query
     const char* insert_sql = R"SQL(
         INSERT INTO files (uid, name, path, parent_uid, type, size, owner, permissions, current_version, created_at, modified_at, is_deleted)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, FALSE)
-        ON CONFLICT (uid) DO NOTHING
+        ON CONFLICT (uid) DO UPDATE SET
+            name = EXCLUDED.name,
+            path = EXCLUDED.path,
+            parent_uid = EXCLUDED.parent_uid,
+            type = EXCLUDED.type,
+            size = EXCLUDED.size,
+            owner = EXCLUDED.owner,
+            permissions = EXCLUDED.permissions,
+            current_version = EXCLUDED.current_version,
+            modified_at = CURRENT_TIMESTAMP
         RETURNING uid;
     )SQL";
 
@@ -184,6 +158,9 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
         version_timestamp.c_str()            // $9
     };
 
+    LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+              "Executing SQL INSERT with parameters for UID: " + uid);
+
     PGresult* res = PQexecParams(pg_conn, insert_sql, 9, nullptr, param_values, nullptr, nullptr, 0);
 
     std::string result_uid;
@@ -192,16 +169,22 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
             result_uid = PQgetvalue(res, 0, 0);
         }
         if (result_uid.empty()) {
+            LOG_WARN("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                     "File/directory with UID already exists: " + uid);
             // The insert was ignored due to conflict - return error for duplicate prevention
             PQclear(res);
             connection_pool_->release(conn);
             return Result<std::string>::err("File/directory with this UID already exists");
         }
+        LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                  "Successfully inserted file with UID: " + result_uid);
         PQclear(res);
         connection_pool_->release(conn);
         return Result<std::string>::ok(result_uid);
     } else {
         std::string error = PQerrorMessage(pg_conn);
+        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                  "Failed to insert file with UID: " + uid + ", error: " + error);
         PQclear(res);
         connection_pool_->release(conn);
         return Result<std::string>::err("Failed to insert file: " + error);
@@ -1629,6 +1612,177 @@ std::string Database::get_schema_prefix(const std::string& tenant) const {
         return "public";
     }
     return validate_schema_name("tenant_" + tenant);
+}
+
+// ACL operations implementations
+Result<void> Database::add_acl(const std::string& resource_uid, const std::string& principal,
+                               int type, int permissions, const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    // Create ACL table if it doesn't exist
+    const char* create_acl_table_sql = R"SQL(
+        CREATE TABLE IF NOT EXISTS acls (
+            id BIGSERIAL PRIMARY KEY,
+            resource_uid VARCHAR(64) NOT NULL,
+            principal VARCHAR(255) NOT NULL,
+            principal_type INTEGER NOT NULL,
+            permissions INTEGER NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(resource_uid, principal, principal_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_acls_resource_uid ON acls(resource_uid);
+        CREATE INDEX IF NOT EXISTS idx_acls_principal ON acls(principal);
+    )SQL";
+
+    PGresult* create_res = PQexec(pg_conn, create_acl_table_sql);
+    if (PQresultStatus(create_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to create ACL table: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(create_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(create_res);
+
+    const char* insert_sql = R"SQL(
+        INSERT INTO acls (resource_uid, principal, principal_type, permissions)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (resource_uid, principal, principal_type)
+        DO UPDATE SET permissions = $4, updated_at = CURRENT_TIMESTAMP;
+    )SQL";
+
+    const char* param_values[4] = {
+        resource_uid.c_str(),
+        principal.c_str(),
+        std::to_string(type).c_str(),
+        std::to_string(permissions).c_str()
+    };
+
+    PGresult* res = PQexecParams(pg_conn, insert_sql, 4, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to add ACL: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<void>::ok();
+}
+
+Result<void> Database::remove_acl(const std::string& resource_uid, const std::string& principal,
+                                  int type, const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    const char* delete_sql = "DELETE FROM acls WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
+    const char* param_values[3] = {
+        resource_uid.c_str(),
+        principal.c_str(),
+        std::to_string(type).c_str()
+    };
+
+    PGresult* res = PQexecParams(pg_conn, delete_sql, 3, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to remove ACL: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<void>::ok();
+}
+
+Result<std::vector<IDatabase::AclEntry>> Database::get_acls_for_resource(const std::string& resource_uid,
+                                                                         const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<IDatabase::AclEntry>>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    const char* query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM acls WHERE resource_uid = $1;";
+    const char* param_values[1] = {resource_uid.c_str()};
+
+    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to get ACLs for resource: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<IDatabase::AclEntry>>::err(error);
+    }
+
+    std::vector<IDatabase::AclEntry> acls;
+    int nrows = PQntuples(res);
+    for (int i = 0; i < nrows; ++i) {
+        IDatabase::AclEntry entry;
+        entry.resource_uid = PQgetvalue(res, i, 0);
+        entry.principal = PQgetvalue(res, i, 1);
+        entry.type = std::stoi(PQgetvalue(res, i, 2));
+        entry.permissions = std::stoi(PQgetvalue(res, i, 3));
+
+        acls.push_back(entry);
+    }
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<IDatabase::AclEntry>>::ok(acls);
+}
+
+Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::string& resource_uid,
+                                                                 const std::string& principal,
+                                                                 const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<IDatabase::AclEntry>>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    const char* query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM acls WHERE resource_uid = $1 AND principal = $2;";
+    const char* param_values[2] = {resource_uid.c_str(), principal.c_str()};
+
+    PGresult* res = PQexecParams(pg_conn, query_sql, 2, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to get user ACLs: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<IDatabase::AclEntry>>::err(error);
+    }
+
+    std::vector<IDatabase::AclEntry> acls;
+    int nrows = PQntuples(res);
+    for (int i = 0; i < nrows; ++i) {
+        IDatabase::AclEntry entry;
+        entry.resource_uid = PQgetvalue(res, i, 0);
+        entry.principal = PQgetvalue(res, i, 1);
+        entry.type = std::stoi(PQgetvalue(res, i, 2));
+        entry.permissions = std::stoi(PQgetvalue(res, i, 3));
+
+        acls.push_back(entry);
+    }
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<IDatabase::AclEntry>>::ok(acls);
 }
 
 } // namespace fileengine

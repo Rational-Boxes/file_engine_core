@@ -5,8 +5,7 @@
 #include <google/protobuf/empty.pb.h>
 #include <chrono>
 #include <ctime>
-
-// TODO: When the server is in disconncted mode the write operations need to return an appropriate error
+#include "fileengine/connection_pool_manager.h"
 
 namespace fileengine {
 
@@ -20,6 +19,13 @@ GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
 grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
                                             const fileengine_rpc::MakeDirectoryRequest* request,
                                             fileengine_rpc::MakeDirectoryResponse* response) {
+    // Check if server is in read-only mode
+    if (is_server_in_readonly_mode()) {
+        response->set_success(false);
+        response->set_error("Server is in read-only mode due to database disconnection");
+        return grpc::Status::OK;
+    }
+
     // Get the authentication context
     std::string parent_uid = request->parent_uid();
     std::string name = request->name();
@@ -184,6 +190,13 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
 grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
                                    const fileengine_rpc::TouchRequest* request,
                                    fileengine_rpc::TouchResponse* response) {
+    // Check if server is in read-only mode
+    if (is_server_in_readonly_mode()) {
+        response->set_success(false);
+        response->set_error("Server is in read-only mode due to database disconnection");
+        return grpc::Status::OK;
+    }
+
     std::string parent_uid = request->parent_uid();
     std::string name = request->name();
     auto auth_context = request->auth();
@@ -215,6 +228,13 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
 grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
                                         const fileengine_rpc::RemoveFileRequest* request,
                                         fileengine_rpc::RemoveFileResponse* response) {
+    // Check if server is in read-only mode
+    if (is_server_in_readonly_mode()) {
+        response->set_success(false);
+        response->set_error("Server is in read-only mode due to database disconnection");
+        return grpc::Status::OK;
+    }
+
     std::string file_uid = request->uid();
     auto auth_context = request->auth();
 
@@ -266,6 +286,13 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
 grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
                                      const fileengine_rpc::PutFileRequest* request,
                                      fileengine_rpc::PutFileResponse* response) {
+    // Check if server is in read-only mode
+    if (is_server_in_readonly_mode()) {
+        response->set_success(false);
+        response->set_error("Server is in read-only mode due to database disconnection");
+        return grpc::Status::OK;
+    }
+
     std::string file_uid = request->uid();
     auto file_data = request->data();
     auto auth_context = request->auth();
@@ -405,6 +432,13 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
                                     const fileengine_rpc::RenameRequest* request,
                                     fileengine_rpc::RenameResponse* response) {
+    // Check if server is in read-only mode
+    if (is_server_in_readonly_mode()) {
+        response->set_success(false);
+        response->set_error("Server is in read-only mode due to database disconnection");
+        return grpc::Status::OK;
+    }
+
     std::string uid = request->uid();
     std::string new_name = request->new_name();
     auto auth_context = request->auth();
@@ -947,6 +981,13 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
 grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
                                               grpc::ServerReader<fileengine_rpc::PutFileRequest>* reader,
                                               fileengine_rpc::PutFileResponse* response) {
+    // Check if server is in read-only mode
+    if (is_server_in_readonly_mode()) {
+        response->set_success(false);
+        response->set_error("Server is in read-only mode due to database disconnection");
+        return grpc::Status::OK;
+    }
+
     fileengine_rpc::PutFileRequest request;
     std::vector<uint8_t> full_data;
     std::string file_uid;
@@ -1101,6 +1142,11 @@ grpc::Status GRPCFileService::TriggerSync(grpc::ServerContext* context,
 }
 
 // Helper functions
+bool GRPCFileService::is_server_in_readonly_mode() const {
+    // Check if the server is in disconnected read-only mode using ConnectionPoolManager
+    return ConnectionPoolManager::get_instance().is_server_in_readonly_mode();
+}
+
 std::string GRPCFileService::get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
     return auth_ctx.tenant().empty() ? "default" : auth_ctx.tenant();
 }

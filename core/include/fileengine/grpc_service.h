@@ -173,6 +173,9 @@ private:
     bool validate_user_permissions(const std::string& resource_uid,
                                   const fileengine_rpc::AuthenticationContext& auth_ctx,
                                   int required_permissions);
+
+    // Helper function to check if server is in read-only mode
+    bool is_server_in_readonly_mode() const;
 };
 
 } // namespace fileengine

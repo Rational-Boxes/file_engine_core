@@ -79,6 +79,24 @@ public:
     virtual Result<void> create_tenant_schema(const std::string& tenant) = 0;
     virtual Result<bool> tenant_schema_exists(const std::string& tenant) = 0;
     virtual Result<void> cleanup_tenant_data(const std::string& tenant) = 0;
+
+    // ACL operations
+    struct AclEntry {
+        std::string resource_uid;
+        std::string principal;
+        int type;
+        int permissions;
+    };
+
+    virtual Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
+                                 int type, int permissions, const std::string& tenant = "") = 0;
+    virtual Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
+                                    int type, const std::string& tenant = "") = 0;
+    virtual Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
+                                                                 const std::string& tenant = "") = 0;
+    virtual Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
+                                                        const std::string& principal,
+                                                        const std::string& tenant = "") = 0;
 };
 
 } // namespace fileengine

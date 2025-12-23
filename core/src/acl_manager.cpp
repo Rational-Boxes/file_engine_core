@@ -1,46 +1,35 @@
 #include "fileengine/acl_manager.h"
 #include "fileengine/IDatabase.h"
+#include <sstream>
 
-// TODO: Architecture error: THe ACLs need to be managed in storage other than teh metadata tables since regular users need access to metadata but not bypass access control
+// ACLs are stored separately from file metadata to maintain security boundaries
+// Regular users can access file metadata but not bypass access control
 
 namespace fileengine {
 
 AclManager::AclManager(std::shared_ptr<IDatabase> db) : db_(db) {
 }
 
-Result<void> AclManager::grant_permission(const std::string& resource_uid, 
-                                          const std::string& principal, 
-                                          PrincipalType type, 
-                                          int permissions, 
+Result<void> AclManager::grant_permission(const std::string& resource_uid,
+                                          const std::string& principal,
+                                          PrincipalType type,
+                                          int permissions,
                                           const std::string& tenant) {
-    // In a real implementation, this would store the permission in the database
-    // For this implementation, we'll use the generic metadata system in the database
-    // to store ACL information
-    
-    // Create a key for the ACL entry
-    std::string key = "acl_" + principal + "_" + std::to_string(static_cast<int>(type));
-    std::string value = std::to_string(permissions);
-    
-    // Use the database's metadata system to store the ACL
-    // This is a simplified implementation - in a real system, you'd have dedicated ACL tables
-    auto version_timestamp = "current"; // Would use actual version system in practice
-    auto result = db_->set_metadata(resource_uid, version_timestamp, key, value, tenant);
-    
+    // Use the database's dedicated ACL methods
+    // This ensures ACLs are stored separately from file metadata
+    auto result = db_->add_acl(resource_uid, principal, static_cast<int>(type), permissions, tenant);
+
     return result;
 }
 
-Result<void> AclManager::revoke_permission(const std::string& resource_uid, 
-                                           const std::string& principal, 
-                                           PrincipalType type, 
-                                           int permissions, 
+Result<void> AclManager::revoke_permission(const std::string& resource_uid,
+                                           const std::string& principal,
+                                           PrincipalType type,
+                                           int permissions,
                                            const std::string& tenant) {
-    // Create a key for the ACL entry
-    std::string key = "acl_" + principal + "_" + std::to_string(static_cast<int>(type));
-    
-    // Remove the ACL entry
-    auto version_timestamp = "current"; // Would use actual version system in practice
-    auto result = db_->delete_metadata(resource_uid, version_timestamp, key, tenant);
-    
+    // Remove the ACL entry using dedicated ACL methods
+    auto result = db_->remove_acl(resource_uid, principal, static_cast<int>(type), tenant);
+
     return result;
 }
 
@@ -64,38 +53,27 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
     return Result<bool>::ok(has_permission);
 }
 
-Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string& resource_uid, 
+Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string& resource_uid,
                                                                const std::string& tenant) {
     std::vector<ACLRule> acls;
-    
-    // In a real implementation, this would query a dedicated ACL table
-    // For this implementation, we'll retrieve ACLs stored as metadata
-    auto version_timestamp = "current"; // Would use actual version system in practice
-    auto metadata_result = db_->get_all_metadata(resource_uid, version_timestamp, tenant);
-    if (!metadata_result.success) {
-        return Result<std::vector<ACLRule>>::err(metadata_result.error);
+
+    // Query dedicated ACL tables
+    auto acl_result = db_->get_acls_for_resource(resource_uid, tenant);
+    if (!acl_result.success) {
+        return Result<std::vector<ACLRule>>::err(acl_result.error);
     }
-    
-    // Parse the metadata to extract ACL rules
-    for (const auto& [key, value] : metadata_result.value) {
-        if (key.substr(0, 4) == "acl_") {
-            // Parse the key to extract principal and type
-            size_t underscore_pos = key.find('_', 4); // Find the second underscore
-            if (underscore_pos != std::string::npos) {
-                std::string principal = key.substr(4, underscore_pos - 4);
-                std::string type_str = key.substr(underscore_pos + 1);
-                
-                ACLRule rule;
-                rule.resource_uid = resource_uid;
-                rule.principal = principal;
-                rule.type = static_cast<PrincipalType>(std::stoi(type_str));
-                rule.permissions = std::stoi(value);
-                
-                acls.push_back(rule);
-            }
-        }
+
+    // Transform the database format to internal ACLRule format
+    for (const auto& db_acl : acl_result.value) {
+        ACLRule rule;
+        rule.resource_uid = resource_uid;
+        rule.principal = db_acl.principal;
+        rule.type = static_cast<PrincipalType>(db_acl.type);
+        rule.permissions = db_acl.permissions;
+
+        acls.push_back(rule);
     }
-    
+
     return Result<std::vector<ACLRule>>::ok(acls);
 }
 
@@ -154,25 +132,28 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
     return Result<void>::ok();
 }
 
-Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resource_uid, 
-                                                       const std::string& user, 
+Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resource_uid,
+                                                       const std::string& user,
                                                        const std::string& tenant) {
-    // Get all ACLs for the resource
-    auto all_acls_result = get_acls_for_resource(resource_uid, tenant);
-    if (!all_acls_result.success) {
-        return Result<std::vector<ACLRule>>::err(all_acls_result.error);
+    // Query dedicated ACL tables directly for user-specific ACLs
+    auto user_acl_result = db_->get_user_acls(resource_uid, user, tenant);
+    if (!user_acl_result.success) {
+        return Result<std::vector<ACLRule>>::err(user_acl_result.error);
     }
-    
+
     std::vector<ACLRule> user_acls;
-    
-    // Filter ACLs that apply to the user or their roles
-    for (const auto& rule : all_acls_result.value) {
-        if (rule.principal == user || rule.principal == "other") {
-            user_acls.push_back(rule);
-        }
-        // In a real implementation, we'd also check for group memberships
+
+    // Transform the database format to internal ACLRule format
+    for (const auto& db_acl : user_acl_result.value) {
+        ACLRule rule;
+        rule.resource_uid = resource_uid;
+        rule.principal = db_acl.principal;
+        rule.type = static_cast<PrincipalType>(db_acl.type);
+        rule.permissions = db_acl.permissions;
+
+        user_acls.push_back(rule);
     }
-    
+
     return Result<std::vector<ACLRule>>::ok(user_acls);
 }
 

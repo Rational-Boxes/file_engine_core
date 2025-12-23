@@ -10,6 +10,11 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <shared_mutex>
 
 namespace fileengine {
@@ -138,11 +143,33 @@ private:
     TenantContext* get_tenant_context(const std::string& tenant);
     
     // Helper to validate permissions
-    Result<bool> validate_user_permissions(const std::string& resource_uid, 
+    Result<bool> validate_user_permissions(const std::string& resource_uid,
                                           const std::string& user,
                                           const std::vector<std::string>& roles,
                                           int required_permissions,
                                           const std::string& tenant);
+
+private:
+    // Async object store backup functionality
+    struct BackupTask {
+        std::string file_uid;
+        std::string tenant;
+    };
+
+    std::queue<BackupTask> backup_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread backup_worker_thread_;
+    std::atomic<bool> backup_worker_running_{false};
+
+    // Method to start the async backup worker
+    void start_async_backup_worker();
+
+    // Method to stop the async backup worker
+    void stop_async_backup_worker();
+
+    // Method run by the backup worker thread
+    void backup_worker_loop();
 };
 
 } // namespace fileengine

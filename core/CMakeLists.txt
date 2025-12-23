@@ -70,6 +70,7 @@ target_link_libraries(proto_lib
 add_library(fileengine_core SHARED
     src/database.cpp
     src/connection_pool.cpp
+    src/connection_pool_manager.cpp
     src/storage.cpp
     src/s3_storage.cpp
     src/filesystem.cpp

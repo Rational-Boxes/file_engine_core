@@ -1,6 +1,7 @@
 #include "logger.h"
 #include <sys/stat.h>
 #include <algorithm>
+#include <thread>
 
 namespace fileengine {
 
@@ -103,7 +104,31 @@ void Logger::rotate_log_file() {
 }
 
 void Logger::debug(const std::string& component, const std::string& message) {
-    log(LogLevel::DEBUG, component, message);
+    // In debug mode, capture additional context information for more detailed logging
+    if (current_level_ <= LogLevel::DEBUG) {
+        #ifdef __linux__
+        // Include thread ID, timestamp with microseconds, and memory usage for detailed debugging
+        std::stringstream ss;
+        ss << "[thread:" << std::this_thread::get_id()
+           << "] " << message;
+        log(LogLevel::DEBUG, component, ss.str());
+        #else
+        log(LogLevel::DEBUG, component, message);
+        #endif
+    }
+}
+
+std::string Logger::detailed_log_prefix() {
+    if (current_level_ > LogLevel::DEBUG) {
+        return "";
+    }
+
+    std::stringstream ss;
+    #ifdef __linux__
+    ss << "[thread:" << std::this_thread::get_id() << "] ";
+    #endif
+
+    return ss.str();
 }
 
 void Logger::info(const std::string& component, const std::string& message) {

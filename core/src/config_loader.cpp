@@ -11,6 +11,8 @@
 
 namespace fileengine {
 
+// Loads FILEENGINE_LOG_LEVEL and validates conventional log-levels for the logging subsystem
+
 std::string ConfigLoader::get_env_var(const std::string& var, const std::string& default_val) {
     const char* env_val = std::getenv(var.c_str());
     return env_val ? std::string(env_val) : default_val;
