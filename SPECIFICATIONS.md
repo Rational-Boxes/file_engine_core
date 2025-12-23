@@ -60,3 +60,53 @@ and administrative functions. Implement in C++.
 - restore to version
 - delete
 - undelete
+
+## Database structure
+
+The Postgres database must implement a management
+module that manages a global connection pool manager.
+
+The default schema is used for tables that are not unique
+to a tenant, specifically the tables needed for tracking
+file usage per host for local space management.
+
+Multi-tenancy is implemented in schemas, when no schema
+specified the fallback is `default`.
+
+When a tenant is accessed for the first time the required
+are created and in the `files` table the root record is
+created, the root node is identified by a blank UUID string.
+
+The `files` table needs to track:
+
+- UUID
+- Name
+- parent UUID
+- size in bytes, for files
+- owner user
+- permission bit map
+- is a container, folder flag
+- deleted flag
+
+`versions` table:
+
+- file_uuid
+- timestamp
+- size
+- user who saved this version
+
+`metadata`
+
+- file_uuid
+- timestamp
+- key name
+- value
+- metadata creation date
+- user identity
+
+### Usage tracking
+
+Global table to track file access and usage. Used to identify
+files to cull from the local storage when free space is running
+out. Uses last access and access frequency to determine what
+files to delete to recover space in the local cache.
