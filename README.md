@@ -24,6 +24,25 @@ The system consists of these main components:
 - **Synchronization**: Automatic sync between local and remote (S3/MinIO) storage
 - **Multitenancy**: Complete tenant isolation with separate schemas and storage
 
+## Performance Enhancements
+
+### Asynchronous Object Store Backup
+The system now implements a background worker thread for object store backups, providing significant performance improvements:
+
+- PUT operations return immediately after local storage completion
+- Object store backup happens asynchronously in the background
+- Reduces response times for file upload operations
+- Maintains thread safety with mutex-protected queues
+- Preserves original functionality while improving performance
+
+### Enhanced Concurrency Logging
+For troubleshooting potential race conditions and concurrent operations:
+
+- Detailed logging for critical sections and concurrent operations
+- Performance enhancement tags for async operations
+- Thread-safe operation tracking with mutex protections
+- Debug logging for potential race conditions
+
 ## Features
 
 - **UUID-based file identification** for better distributed handling
@@ -34,6 +53,9 @@ The system consists of these main components:
 - **Protocol Buffers interface** for all filesystem operations
 - **S3/MinIO synchronization** with automatic recovery
 - **Detailed storage tracking** per host and per tenant
+- **Asynchronous object store backup** - Performance enhancement: Put operations return immediately after local storage completion while object store backup happens in background
+- **Enhanced concurrency logging** - Detailed debugging information for troubleshooting potential race conditions and concurrent operations
+- **Thread-safe operation queues** - Safe handling of concurrent file operations with mutex-protected shared resources
 
 ## Installation
 

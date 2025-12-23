@@ -50,6 +50,9 @@ FileEngine Core is a simplified, focused implementation of a distributed virtual
 - **Protocol Buffers interface** for all operations
 - **S3/MinIO synchronization** with automatic recovery
 - **Detailed storage tracking** per host and tenant
+- **Asynchronous object store backup** - Performance enhancement: Put operations return immediately after local storage completion while object store backup happens in background
+- **Enhanced concurrency logging** - Detailed debugging information for troubleshooting potential race conditions and concurrent operations
+- **Thread-safe operation queues** - Safe handling of concurrent file operations with mutex-protected shared resources
 
 ## Technical Requirements
 - C++17 compatible compiler
@@ -105,3 +108,24 @@ The system is configured through environment variables or configuration files fo
 - In-memory caching for frequently accessed files
 - Chunked streaming for large file operations
 - Readers-writer locks for maximum read concurrency
+- Asynchronous object store backup for improved PUT operation response times
+- Thread-safe background worker for offloading compute-intensive operations
+- Detailed performance logging for troubleshooting concurrency issues
+
+## Architecture Additions and Improvements
+
+### Asynchronous Object Store Backup
+The system now implements a background worker thread for object store backups:
+
+- PUT operations return immediately after local storage completion
+- Object store backup happens asynchronously in the background
+- Improved response times for file upload operations
+- Thread-safe queue management with mutex protection
+- Proper lifecycle management with startup and shutdown methods
+
+### Enhanced Concurrency Handling
+- Detailed logging for identifying potential race conditions
+- Thread-safe operation queues with mutex protection
+- Conditional variables for proper thread synchronization
+- Comprehensive debug logging for troubleshooting concurrent operations
+- Proper cleanup of worker threads during shutdown
