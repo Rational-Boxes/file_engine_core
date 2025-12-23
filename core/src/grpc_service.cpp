@@ -6,6 +6,8 @@
 #include <chrono>
 #include <ctime>
 
+// TODO: When the server is in disconncted mode the write operations need to return an appropriate error
+
 namespace fileengine {
 
 GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,

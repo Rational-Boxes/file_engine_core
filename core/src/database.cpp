@@ -96,6 +96,7 @@ Result<void> Database::create_schema() {
 }
 
 Result<void> Database::drop_schema() {
+// TODO: Remove this, resets are manual and the data storage is immutable
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
@@ -158,6 +159,7 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
     PGconn* pg_conn = conn->get_connection();
 
     // Prepare SQL with INSERT/ON CONFLICT handling to avoid duplicates
+// TODO: THis atble has ben simplified, fit this query
     const char* insert_sql = R"SQL(
         INSERT INTO files (uid, name, path, parent_uid, type, size, owner, permissions, current_version, created_at, modified_at, is_deleted)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, FALSE)
@@ -207,6 +209,7 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
 }
 
 Result<void> Database::update_file_modified(const std::string& uid, const std::string& tenant) {
+// This is redundant, all versions are stored and tracked by time stamp. The first and last vrtdion time dytsmps are ctime and mtime
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
@@ -232,6 +235,7 @@ Result<void> Database::update_file_modified(const std::string& uid, const std::s
 }
 
 Result<void> Database::update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) {
+// This is redundant, all versions are stored and tracked by time stamp. The first and last vrtdion time dytsmps are ctime and mtime
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");

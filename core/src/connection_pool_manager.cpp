@@ -2,6 +2,8 @@
 #include "fileengine/connection_pool.h"
 #include <mutex>
 
+// TODO: For database connection recovery when configured with a local slave database a global state needs to be tracked for te server being in disconnected read-only mode
+
 namespace fileengine {
 
 ConnectionPoolManager& ConnectionPoolManager::get_instance() {

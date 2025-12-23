@@ -140,6 +140,7 @@ int main(int argc, char** argv) {
     auto storage_tracker = std::make_unique<fileengine::StorageTracker>(config.storage_base_path);
 
     // Initialize cache manager
+    // TODO: The threshold needs to be an optional configuration variable, defaulting to an 80% threshold
     auto cache_manager = std::make_unique<fileengine::CacheManager>(storage.get(), s3_storage.get(), 0.8);
 
     // Initialize filesystem

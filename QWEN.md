@@ -58,6 +58,12 @@ FileEngine Core is a simplified, focused implementation of a distributed virtual
 - libpq development headers
 - AWS SDK for C++ (for S3 support)
 
+## Critical environment and configuration background
+
+- All connections for database and object-store are in the .env file
+- Never edit the .env file
+- The .env needs to be symlinked into the build directory so the binaries can find it
+
 ## Current Implementation State
 The project has a backup working implementation in the `backup_working_implementation/` directory with functional components including:
 - Database connection pooling

@@ -1,6 +1,8 @@
 #include "fileengine/acl_manager.h"
 #include "fileengine/IDatabase.h"
 
+// TODO: Architecture error: THe ACLs need to be managed in storage other than teh metadata tables since regular users need access to metadata but not bypass access control
+
 namespace fileengine {
 
 AclManager::AclManager(std::shared_ptr<IDatabase> db) : db_(db) {

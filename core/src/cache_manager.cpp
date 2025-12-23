@@ -2,6 +2,8 @@
 #include <sys/statvfs.h>
 #include <algorithm>
 
+// TODO: Look out for race conditions in this operation, implement a semephore because culling down to the storage limit nees to be a critical section of code
+
 namespace fileengine {
 
 CacheManager::CacheManager(IStorage* storage, IObjectStore* object_store, double threshold)
