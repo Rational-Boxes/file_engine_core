@@ -109,4 +109,5 @@ The `files` table needs to track:
 Global table to track file access and usage. Used to identify
 files to cull from the local storage when free space is running
 out. Uses last access and access frequency to determine what
-files to delete to recover space in the local cache.
+files to delete to recover space in the local cache. Only
+can be active when data is backed up to an object store.

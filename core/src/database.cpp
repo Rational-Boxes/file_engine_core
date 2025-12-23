@@ -52,105 +52,42 @@ Result<void> Database::create_schema() {
 
     PGconn* pg_conn = conn->get_connection();
 
-    // SQL for creating the files table
-    const char* files_sql = R"SQL(
-        CREATE TABLE IF NOT EXISTS files (
-            uid VARCHAR(64) PRIMARY KEY,
-            name TEXT NOT NULL,
-            path TEXT,                           -- Path for backward compatibility or path-based operations
-            parent_uid VARCHAR(64),              -- Parent UUID to support directory structure
-            type INTEGER NOT NULL,
-            size BIGINT NOT NULL DEFAULT 0,
-            owner TEXT NOT NULL,
-            permissions INTEGER NOT NULL DEFAULT 755,
-            current_version TEXT,                -- Current version as timestamp string
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            modified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            is_deleted BOOLEAN NOT NULL DEFAULT FALSE  -- Flag indicating if file is deleted (soft delete)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_files_parent_uid ON files(parent_uid);
-        CREATE INDEX IF NOT EXISTS idx_files_uid ON files(uid);
-        CREATE INDEX IF NOT EXISTS idx_files_is_deleted ON files(is_deleted);
-    )SQL";
-
-    // SQL for creating the versions table
-    const char* versions_sql = R"SQL(
-        CREATE TABLE IF NOT EXISTS versions (
+    // Create global tables for file access stats and tenant registry as per specification
+    const char* global_tables_sql = R"SQL(
+        CREATE TABLE IF NOT EXISTS file_access_stats (
+            id BIGSERIAL PRIMARY KEY,
             file_uid VARCHAR(64) NOT NULL,
-            version_timestamp VARCHAR(30) NOT NULL,
-            size BIGINT NOT NULL,
-            storage_path TEXT NOT NULL,
+            hostname VARCHAR(255) NOT NULL,
+            last_accessed TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            access_count INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (file_uid, version_timestamp)
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(file_uid, hostname)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_versions_file_uid ON versions(file_uid);
-        CREATE INDEX IF NOT EXISTS idx_versions_timestamp ON versions(version_timestamp);
-    )SQL";
+        CREATE INDEX IF NOT EXISTS idx_file_access_stats_file_uid ON file_access_stats(file_uid);
+        CREATE INDEX IF NOT EXISTS idx_file_access_stats_hostname ON file_access_stats(hostname);
+        CREATE INDEX IF NOT EXISTS idx_file_access_stats_last_accessed ON file_access_stats(last_accessed);
+        CREATE INDEX IF NOT EXISTS idx_file_access_stats_access_count ON file_access_stats(access_count);
 
-    // SQL for creating the ACL table
-    const char* acl_sql = R"SQL(
-        CREATE TABLE IF NOT EXISTS acl (
-            resource_uid VARCHAR(64) NOT NULL,
-            principal TEXT NOT NULL,
-            principal_type INTEGER NOT NULL,  -- 0=user, 1=group, 2=other
-            permissions INTEGER NOT NULL,   -- bit mask of permissions
-            tenant TEXT DEFAULT 'default',
+        -- Global tenants registry table
+        CREATE TABLE IF NOT EXISTS tenants (
+            id BIGSERIAL PRIMARY KEY,
+            tenant_id VARCHAR(255) UNIQUE NOT NULL,
+            schema_name VARCHAR(255) NOT NULL,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (resource_uid, principal, principal_type, tenant)
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-
-        CREATE INDEX IF NOT EXISTS idx_acl_resource_uid ON acl(resource_uid);
-        CREATE INDEX IF NOT EXISTS idx_acl_tenant ON acl(tenant);
     )SQL";
 
-    // SQL for creating the metadata table
-    const char* metadata_sql = R"SQL(
-        CREATE TABLE IF NOT EXISTS metadata (
-            file_uid VARCHAR(64) NOT NULL,
-            version_timestamp VARCHAR(30) NOT NULL,
-            key_name TEXT NOT NULL,
-            value TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (file_uid, version_timestamp, key_name)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_metadata_file_uid ON metadata(file_uid);
-    )SQL";
-
-    // Execute all SQL statements
+    // Execute global schema SQL statements
     Result<void> result = Result<void>::ok();
 
-    PGresult* res1 = PQexec(pg_conn, files_sql);
+    PGresult* res1 = PQexec(pg_conn, global_tables_sql);
     if (PQresultStatus(res1) != PGRES_COMMAND_OK) {
-        result = Result<void>::err("Failed to create files table: " + std::string(PQerrorMessage(pg_conn)));
+        result = Result<void>::err("Failed to create global tables: " + std::string(PQerrorMessage(pg_conn)));
     }
     PQclear(res1);
-
-    if (result.success) {
-        PGresult* res2 = PQexec(pg_conn, versions_sql);
-        if (PQresultStatus(res2) != PGRES_COMMAND_OK) {
-            result = Result<void>::err("Failed to create versions table: " + std::string(PQerrorMessage(pg_conn)));
-        }
-        PQclear(res2);
-    }
-
-    if (result.success) {
-        PGresult* res3 = PQexec(pg_conn, acl_sql);
-        if (PQresultStatus(res3) != PGRES_COMMAND_OK) {
-            result = Result<void>::err("Failed to create ACL table: " + std::string(PQerrorMessage(pg_conn)));
-        }
-        PQclear(res3);
-    }
-
-    if (result.success) {
-        PGresult* res4 = PQexec(pg_conn, metadata_sql);
-        if (PQresultStatus(res4) != PGRES_COMMAND_OK) {
-            result = Result<void>::err("Failed to create metadata table: " + std::string(PQerrorMessage(pg_conn)));
-        }
-        PQclear(res4);
-    }
 
     // Release the connection back to the pool
     connection_pool_->release(conn);
@@ -1393,8 +1330,176 @@ Result<int64_t> Database::get_storage_capacity(const std::string& tenant) {
 }
 
 Result<void> Database::create_tenant_schema(const std::string& tenant) {
-    // In a real implementation, this would create tenant-specific schemas
-    // For now, just return success
+    if (tenant.empty()) {
+        return Result<void>::err("Cannot create schema for empty tenant name");
+    }
+
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection for tenant schema creation");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    // Create tenant schema if it doesn't exist - according to specifications
+    std::string schema_name = tenant; // No "tenant_" prefix as per spec
+
+    // Escape the schema name to prevent SQL injection
+    std::string escaped_schema = schema_name;
+    // Replace any special characters that might be problematic
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '-', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '.', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), ' ', '_');
+
+    // Create schema if it doesn't exist
+    std::string create_schema_sql = "CREATE SCHEMA IF NOT EXISTS \"" + escaped_schema + "\";";
+    PGresult* schema_res = PQexec(pg_conn, create_schema_sql.c_str());
+
+    if (PQresultStatus(schema_res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(schema_res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant schema: " + error);
+    }
+
+    PQclear(schema_res);
+
+    // Create the files table with structure specified in documentation
+    std::string create_files_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".files ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "uid VARCHAR(64) UNIQUE NOT NULL, "
+        "name TEXT NOT NULL, "
+        "parent_uid VARCHAR(64), "
+        "size BIGINT, -- size in bytes, for files "
+        "owner TEXT NOT NULL, "
+        "permission_map INTEGER NOT NULL, -- permission bit map"
+        "is_container BOOLEAN NOT NULL, -- folder flag"
+        "deleted BOOLEAN NOT NULL DEFAULT FALSE"
+        ");";
+
+    std::string create_idx_uid = "CREATE INDEX IF NOT EXISTS idx_files_uid_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".files(uid);";
+    std::string create_idx_parent_uid = "CREATE INDEX IF NOT EXISTS idx_files_parent_uid_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".files(parent_uid);";
+
+    std::string create_versions_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".versions ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "file_uuid VARCHAR(64) NOT NULL, -- file_uuid (as per spec) "
+        "timestamp BIGINT NOT NULL, -- timestamp (as per spec) "
+        "size BIGINT NOT NULL, -- size (as per spec) "
+        "user_who_saved TEXT NOT NULL -- user who saved this version (as per spec) "
+        ");";
+
+    std::string create_idx_versions = "CREATE INDEX IF NOT EXISTS idx_versions_file_uuid_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".versions(file_uuid);";
+
+    std::string create_metadata_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".metadata ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "file_uuid VARCHAR(64) NOT NULL, -- file_uuid (as per spec) "
+        "timestamp BIGINT NOT NULL, -- timestamp (as per spec) "
+        "key_name TEXT NOT NULL, -- key name (as per spec) "
+        "value TEXT NOT NULL, -- value (as per spec) "
+        "metadata_creation_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, -- metadata creation date (as per spec) "
+        "user_identity TEXT NOT NULL -- user identity (as per spec) "
+        ");";
+
+    std::string create_idx_metadata = "CREATE INDEX IF NOT EXISTS idx_metadata_file_uuid_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".metadata(file_uuid);";
+    std::string create_idx_metadata_key = "CREATE INDEX IF NOT EXISTS idx_metadata_key_name_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".metadata(key_name);";
+
+    // Execute all the statements
+    PGresult* res = PQexec(pg_conn, create_files_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant files table: " + error);
+    }
+    PQclear(res);
+
+    res = PQexec(pg_conn, create_idx_uid.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
+
+    res = PQexec(pg_conn, create_idx_parent_uid.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
+
+    res = PQexec(pg_conn, create_versions_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant versions table: " + error);
+    }
+    PQclear(res);
+
+    res = PQexec(pg_conn, create_idx_versions.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
+
+    res = PQexec(pg_conn, create_metadata_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant metadata table: " + error);
+    }
+    PQclear(res);
+
+    res = PQexec(pg_conn, create_idx_metadata.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
+
+    res = PQexec(pg_conn, create_idx_metadata_key.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
+
+    // Create the filesystem root directory record with default permissions
+    // The root directory is identified by blank UUID string (empty string) as per specification
+    std::string root_uid = "";  // Root directory UID is blank (empty string) as per spec
+    std::string root_name = "root";  // Name for the root directory as per spec
+    std::string root_parent_uid = "";  // Root's parent is also empty string (self-referencing concept)
+    size_t root_size = 0;  // Size is 0 for root directory
+    std::string root_owner = "system";  // Owned by system as per spec
+    int root_permission_map = 755;  // permission bit map as per spec
+    bool root_is_container = true;  // folder flag as per spec
+    bool root_deleted = false;  // as per spec
+
+    // First, check if the root directory already exists
+    std::string check_root_sql = "SELECT COUNT(*) FROM \"" + escaped_schema + "\".files WHERE uid = ''";
+    res = PQexec(pg_conn, check_root_sql.c_str());
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to check for existing root directory: " + error);
+    }
+
+    int root_exists = atoi(PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+    if (root_exists == 0) {
+        // Root doesn't exist, so create it as per specification
+        std::string insert_root_sql = "INSERT INTO \"" + escaped_schema + "\".files "
+            "(uid, name, parent_uid, size, owner, permission_map, is_container, deleted) VALUES ("
+            + escape_string(root_uid, pg_conn) + ", "
+            + escape_string(root_name, pg_conn) + ", "
+            + escape_string(root_parent_uid, pg_conn) + ", "
+            + std::to_string(root_size) + ", "
+            + escape_string(root_owner, pg_conn) + ", "
+            + std::to_string(root_permission_map) + ", "
+            + (root_is_container ? "TRUE" : "FALSE") + ", "
+            + (root_deleted ? "TRUE" : "FALSE") + ")";
+
+        res = PQexec(pg_conn, insert_root_sql.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = PQerrorMessage(pg_conn);
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<void>::err("Failed to create root directory: " + error);
+        }
+        PQclear(res);
+    }
+
+    connection_pool_->release(conn);
+
     return Result<void>::ok();
 }
 
