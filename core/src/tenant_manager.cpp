@@ -42,24 +42,22 @@ bool TenantManager::initialize_tenant(const std::string& tenant_id) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Simply create a database instance to create the schema
+    auto db = std::make_unique<Database>(
+        config_.db_host,
+        config_.db_port,
+        config_.db_name,
+        config_.db_user,
+        config_.db_password
+    );
 
-    // Get or create the tenant context
-    TenantContext* context = get_tenant_context(tenant_id);
-    if (!context) {
+    if (!db->connect()) {
         return false;
     }
 
-    // In a real implementation, we would initialize the tenant schema and set up any required resources
-    // For this implementation, we'll just check if the context can be created successfully
-
-    // If needed, create tenant-specific schema
-    if (context->db) {
-        auto result = context->db->create_tenant_schema(tenant_id);
-        return result.success;
-    }
-
-    return true;
+    // Create tenant-specific schema
+    auto result = db->create_tenant_schema(tenant_id);
+    return result.success;
 }
 
 bool TenantManager::tenant_exists(const std::string& tenant_id) const {

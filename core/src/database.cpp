@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -24,7 +25,18 @@ Database::~Database() {
 }
 
 bool Database::connect() {
-    return connection_pool_ && connection_pool_->initialize();
+    LOG_DEBUG("Database", "Attempting to connect to database using connection pool.");
+    if (!connection_pool_) {
+        LOG_ERROR("Database", "Connection pool not initialized during connect attempt.");
+        return false;
+    }
+    bool connected = connection_pool_->initialize();
+    if (connected) {
+        LOG_INFO("Database", "Successfully initialized database connection pool.");
+    } else {
+        LOG_ERROR("Database", "Failed to initialize database connection pool.");
+    }
+    return connected;
 }
 
 void Database::disconnect() {
@@ -46,8 +58,10 @@ bool Database::is_connected() const {
 }
 
 Result<void> Database::create_schema() {
+    LOG_DEBUG("Database", "Attempting to create global schema.");
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
+        LOG_ERROR("Database", "Failed to acquire database connection for schema creation.");
         return Result<void>::err("Failed to acquire database connection for schema creation");
     }
 
@@ -82,18 +96,23 @@ Result<void> Database::create_schema() {
     )SQL";
 
     // Execute global schema SQL statements
-    Result<void> result = Result<void>::ok();
-
+    LOG_DEBUG("Database", "Executing SQL to create global tables.");
     PGresult* res1 = PQexec(pg_conn, global_tables_sql);
     if (PQresultStatus(res1) != PGRES_COMMAND_OK) {
-        result = Result<void>::err("Failed to create global tables: " + std::string(PQerrorMessage(pg_conn)));
+        std::string error_msg = "Failed to create global tables: " + std::string(PQerrorMessage(pg_conn));
+        LOG_ERROR("Database", error_msg);
+        Result<void> result_err = Result<void>::err(error_msg);
+        PQclear(res1);
+        connection_pool_->release(conn);
+        return result_err;
     }
+    LOG_INFO("Database", "Successfully created or verified global tables.");
     PQclear(res1);
 
     // Release the connection back to the pool
     connection_pool_->release(conn);
 
-    return result;
+    return Result<void>::ok();
 }
 
 Result<void> Database::drop_schema() {
@@ -1491,9 +1510,45 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
 }
 
 Result<bool> Database::tenant_schema_exists(const std::string& tenant) {
-    // In a real implementation, this would check if the tenant-specific schema exists
-    // For now, return true to indicate that it exists
-    return Result<bool>::ok(true);
+    if (tenant.empty()) {
+        return Result<bool>::err("Cannot check existence for empty tenant name");
+    }
+
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<bool>::err("Failed to acquire database connection for tenant schema check");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    // Escape the schema name to prevent SQL injection
+    std::string escaped_schema = tenant;
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '-', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '.', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), ' ', '_');
+
+    // Check if the schema exists
+    std::string schema_check_sql = "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = '" + escaped_schema + "');";
+    PGresult* check_res = PQexec(pg_conn, schema_check_sql.c_str());
+
+    if (PQresultStatus(check_res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(check_res);
+        connection_pool_->release(conn);
+        return Result<bool>::err("Failed to check tenant schema existence: " + error);
+    }
+
+    bool schema_exists = false;
+    if (PQntuples(check_res) > 0 && PQnfields(check_res) > 0) {
+        const char* result = PQgetvalue(check_res, 0, 0);
+        std::string result_str(result ? result : "");
+        schema_exists = (result_str == "t" || result_str == "1" || result_str == "true");
+    }
+
+    PQclear(check_res);
+    connection_pool_->release(conn);
+
+    return Result<bool>::ok(schema_exists);
 }
 
 Result<void> Database::cleanup_tenant_data(const std::string& tenant) {

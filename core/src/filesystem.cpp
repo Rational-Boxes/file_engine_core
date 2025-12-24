@@ -907,10 +907,37 @@ Result<std::vector<uint8_t>> FileSystem::fetch_from_object_store_if_missing(cons
 }
 
 TenantContext* FileSystem::get_tenant_context(const std::string& tenant) {
+    LOG_DEBUG("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+              "Called for tenant: " + tenant);
     if (!tenant_manager_) {
+        LOG_WARN("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+                 "Tenant manager not available.");
         return nullptr;
     }
-    return tenant_manager_->get_tenant_context(tenant);
+
+    // Get the tenant context
+    TenantContext* context = tenant_manager_->get_tenant_context(tenant);
+
+    // If context doesn't exist, try to initialize the tenant first
+    if (!context) {
+        LOG_INFO("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+                 "Tenant context not found for " + tenant + ", attempting initialization.");
+        // Try to initialize the tenant (this should create the schema)
+        if (tenant_manager_->initialize_tenant(tenant)) {
+            LOG_INFO("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+                     "Tenant " + tenant + " initialized successfully, re-getting context.");
+            // Try getting the context again after initialization
+            context = tenant_manager_->get_tenant_context(tenant);
+        } else {
+            LOG_ERROR("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+                      "Failed to initialize tenant: " + tenant);
+        }
+    } else {
+        LOG_DEBUG("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+                  "Tenant context found for: " + tenant);
+    }
+
+    return context;
 }
 
 Result<bool> FileSystem::validate_user_permissions(const std::string& resource_uid, 
@@ -970,13 +997,19 @@ void FileSystem::backup_worker_loop() {
         BackupTask task;
         bool has_task = false;
 
-        // Wait for a backup task with timeout
         std::unique_lock<std::mutex> lock(queue_mutex_);
+        LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                  "[CONCURRENCY] Backup worker entering wait state.");
         queue_cv_.wait(lock, [this] {
             return !backup_queue_.empty() || !backup_worker_running_.load();
         });
+        LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                  "[CONCURRENCY] Backup worker woke up. Queue empty: " + (backup_queue_.empty() ? "true" : "false") +
+                  ", Running: " + (backup_worker_running_.load() ? "true" : "false"));
 
         if (!backup_worker_running_.load() && backup_queue_.empty()) {
+            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                      "[CONCURRENCY] Backup worker shutting down (no more tasks and not running).");
             break; // Shutting down and no more tasks
         }
 
@@ -985,9 +1018,14 @@ void FileSystem::backup_worker_loop() {
             task = backup_queue_.front();
             backup_queue_.pop();
             has_task = true;
+            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                      "[CONCURRENCY] Backup worker retrieved task from queue.");
+        } else {
+            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                      "[CONCURRENCY] Backup worker woke up but no task available (likely shutdown signal).");
         }
 
-        lock.unlock();
+        lock.unlock(); // Release lock before processing task to allow other threads to push tasks
 
         if (has_task) {
             LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +

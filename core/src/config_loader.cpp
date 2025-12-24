@@ -324,7 +324,7 @@ Config ConfigLoader::load_from_cmd_args(int argc, char* argv[]) {
 }
 
 Config ConfigLoader::load_config(int argc, char* argv[]) {
-    // First, check for custom config file in command-line arguments
+    // 1. Load from file (lowest priority)
     std::string config_file = ".env";
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -332,48 +332,53 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
             config_file = argv[++i];
         }
     }
-
-    Config config;
-
-    // 1. Load from file (lowest priority)
-    Config file_config = load_from_file(config_file.c_str());
-    // Only use values from file if they were set (not default)
-    if (!file_config.db_host.empty()) config.db_host = file_config.db_host;
-    if (file_config.db_port != 0 && file_config.db_port != 5432) config.db_port = file_config.db_port; // Default is 5432
-    if (!file_config.db_name.empty()) config.db_name = file_config.db_name;
-    if (!file_config.db_user.empty()) config.db_user = file_config.db_user;
-    if (!file_config.db_password.empty()) config.db_password = file_config.db_password;
-    if (!file_config.storage_base_path.empty()) config.storage_base_path = file_config.storage_base_path;
-    if (!file_config.s3_endpoint.empty()) config.s3_endpoint = file_config.s3_endpoint;
-    if (!file_config.s3_region.empty()) config.s3_region = file_config.s3_region;
-    if (!file_config.s3_bucket.empty()) config.s3_bucket = file_config.s3_bucket;
-    if (!file_config.s3_access_key.empty()) config.s3_access_key = file_config.s3_access_key;
-    if (!file_config.s3_secret_key.empty()) config.s3_secret_key = file_config.s3_secret_key;
-    if (!file_config.server_address.empty()) config.server_address = file_config.server_address;
-    if (file_config.server_port != 0 && file_config.server_port != 50051) config.server_port = file_config.server_port; // Default is 50051
-    if (file_config.thread_pool_size != 0 && file_config.thread_pool_size != 10) config.thread_pool_size = file_config.thread_pool_size; // Default is 10
+    Config config = load_from_file(config_file.c_str());
 
     // 2. Load from environment (medium priority)
     Config env_config = load_from_env();
-    if (!env_config.db_host.empty()) config.db_host = env_config.db_host;
-    if (env_config.db_port != 0 && env_config.db_port != 5432) config.db_port = env_config.db_port;
-    if (!env_config.db_name.empty()) config.db_name = env_config.db_name;
-    if (!env_config.db_user.empty()) config.db_user = env_config.db_user;
-    if (!env_config.db_password.empty()) config.db_password = env_config.db_password;
-    if (!env_config.storage_base_path.empty()) config.storage_base_path = env_config.storage_base_path;
-    if (!env_config.s3_endpoint.empty()) config.s3_endpoint = env_config.s3_endpoint;
-    if (!env_config.s3_region.empty()) config.s3_region = env_config.s3_region;
-    if (!env_config.s3_bucket.empty()) config.s3_bucket = env_config.s3_bucket;
-    if (!env_config.s3_access_key.empty()) config.s3_access_key = env_config.s3_access_key;
-    if (!env_config.s3_secret_key.empty()) config.s3_secret_key = env_config.s3_secret_key;
-    if (!env_config.server_address.empty()) config.server_address = env_config.server_address;
-    if (env_config.server_port != 0 && env_config.server_port != 50051) config.server_port = env_config.server_port;
-    if (env_config.thread_pool_size != 0 && env_config.thread_pool_size != 10) config.thread_pool_size = env_config.thread_pool_size;
+    if (!env_config.db_host.empty() && env_config.db_host != "localhost") config.db_host = env_config.db_host;
+    if (env_config.db_port != 5432) config.db_port = env_config.db_port;
+    if (!env_config.db_name.empty() && env_config.db_name != "fileengine") config.db_name = env_config.db_name;
+    if (!env_config.db_user.empty() && env_config.db_user != "fileengine_user") config.db_user = env_config.db_user;
+    if (!env_config.db_password.empty() && env_config.db_password != "fileengine_password") config.db_password = env_config.db_password;
+    if (!env_config.storage_base_path.empty() && env_config.storage_base_path != "/tmp/fileengine_storage") config.storage_base_path = env_config.storage_base_path;
+    if (env_config.encrypt_data) config.encrypt_data = env_config.encrypt_data;
+    if (env_config.compress_data) config.compress_data = env_config.compress_data;
+    if (!env_config.s3_endpoint.empty() && env_config.s3_endpoint != "http://localhost:9000") config.s3_endpoint = env_config.s3_endpoint;
+    if (!env_config.s3_region.empty() && env_config.s3_region != "us-east-1") config.s3_region = env_config.s3_region;
+    if (!env_config.s3_bucket.empty() && env_config.s3_bucket != "fileengine") config.s3_bucket = env_config.s3_bucket;
+    if (!env_config.s3_access_key.empty() && env_config.s3_access_key != "minioadmin") config.s3_access_key = env_config.s3_access_key;
+    if (!env_config.s3_secret_key.empty() && env_config.s3_secret_key != "minioadmin") config.s3_secret_key = env_config.s3_secret_key;
+    if (!env_config.s3_path_style) config.s3_path_style = env_config.s3_path_style;
+    if (env_config.cache_threshold != 0.8) config.cache_threshold = env_config.cache_threshold;
+    if (env_config.max_cache_size_mb != 1024) config.max_cache_size_mb = env_config.max_cache_size_mb;
+    if (!env_config.multi_tenant_enabled) config.multi_tenant_enabled = env_config.multi_tenant_enabled;
+    if (!env_config.server_address.empty() && env_config.server_address != "0.0.0.0") config.server_address = env_config.server_address;
+    if (env_config.server_port != 50051) config.server_port = env_config.server_port;
+    if (env_config.thread_pool_size != 10) config.thread_pool_size = env_config.thread_pool_size;
+    if (env_config.root_user_enabled) config.root_user_enabled = env_config.root_user_enabled;
+    if (!env_config.sync_enabled) config.sync_enabled = env_config.sync_enabled;
+    if (env_config.sync_retry_seconds != 60) config.sync_retry_seconds = env_config.sync_retry_seconds;
+    if (!env_config.sync_on_startup) config.sync_on_startup = env_config.sync_on_startup;
+    if (!env_config.sync_on_demand) config.sync_on_demand = env_config.sync_on_demand;
+    if (!env_config.sync_pattern.empty() && env_config.sync_pattern != "all") config.sync_pattern = env_config.sync_pattern;
+    if (!env_config.sync_bidirectional) config.sync_bidirectional = env_config.sync_bidirectional;
+    if (!env_config.secondary_db_host.empty()) config.secondary_db_host = env_config.secondary_db_host;
+    if (env_config.secondary_db_port != 5432) config.secondary_db_port = env_config.secondary_db_port;
+    if (!env_config.secondary_db_name.empty() && env_config.secondary_db_name != "fileengine_local") config.secondary_db_name = env_config.secondary_db_name;
+    if (!env_config.secondary_db_user.empty() && env_config.secondary_db_user != "fileengine_user") config.secondary_db_user = env_config.secondary_db_user;
+    if (!env_config.secondary_db_password.empty() && env_config.secondary_db_password != "fileengine_password") config.secondary_db_password = env_config.secondary_db_password;
+    if (env_config.log_level != "INFO") config.log_level = env_config.log_level;
+    if (env_config.log_file_path != "/tmp/fileengine.log") config.log_file_path = env_config.log_file_path;
+    if (!env_config.log_to_console) config.log_to_console = env_config.log_to_console;
+    if (env_config.log_to_file) config.log_to_file = env_config.log_to_file;
+    if (env_config.log_rotation_size_mb != 10) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
+    if (env_config.log_retention_days != 7) config.log_retention_days = env_config.log_retention_days;
 
     // 3. Load from command-line arguments (highest priority)
     Config cmd_config = load_from_cmd_args(argc, argv);
     if (!cmd_config.db_host.empty()) config.db_host = cmd_config.db_host;
-    if (cmd_config.db_port != -1) config.db_port = cmd_config.db_port;  // -1 is unset indicator
+    if (cmd_config.db_port != -1) config.db_port = cmd_config.db_port;
     if (!cmd_config.db_name.empty()) config.db_name = cmd_config.db_name;
     if (!cmd_config.db_user.empty()) config.db_user = cmd_config.db_user;
     if (!cmd_config.db_password.empty()) config.db_password = cmd_config.db_password;

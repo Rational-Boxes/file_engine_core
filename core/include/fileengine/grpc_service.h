@@ -12,6 +12,7 @@
 #include "fileengine/filesystem.h"
 #include "fileengine/tenant_manager.h"
 #include "fileengine/acl_manager.h"
+#include "fileengine/connection_pool_manager.h"
 
 namespace fileengine {
 
@@ -161,21 +162,50 @@ private:
     std::shared_ptr<AclManager> acl_manager_;
 
     // Helper function to extract tenant from auth context
-    std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx);
+    inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
+        return auth_ctx.tenant().empty() ? "default" : auth_ctx.tenant();
+    }
 
     // Helper function to extract user from auth context
-    std::string get_user_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx);
+    inline std::string get_user_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
+        return auth_ctx.user();
+    }
 
     // Helper function to get roles from auth context
-    std::vector<std::string> get_roles_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx);
+    inline std::vector<std::string> get_roles_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
+        std::vector<std::string> roles;
+        for (const auto& role : auth_ctx.roles()) {
+            roles.push_back(role);
+        }
+        return roles;
+    }
 
     // Helper function to validate permissions
-    bool validate_user_permissions(const std::string& resource_uid,
-                                  const fileengine_rpc::AuthenticationContext& auth_ctx,
-                                  int required_permissions);
+    inline bool validate_user_permissions(const std::string& resource_uid,
+                                      const fileengine_rpc::AuthenticationContext& auth_ctx,
+                                      int required_permissions) {
+        std::string user = get_user_from_auth_context(auth_ctx);
+        std::string tenant = get_tenant_from_auth_context(auth_ctx);
+        
+        // Check if root user is enabled and user is root
+        // This would typically be checked against the config, but for now we'll do a basic check
+        if (user == "root") {
+            // Root user bypasses permission system
+            return true;
+        }
+        
+        // Convert roles from gRPC context to internal representation
+        std::vector<std::string> roles = get_roles_from_auth_context(auth_ctx);
+
+        auto result = acl_manager_->check_permission(resource_uid, user, roles, required_permissions, tenant);
+        return result.success && result.value;
+    }
 
     // Helper function to check if server is in read-only mode
-    bool is_server_in_readonly_mode() const;
+    inline bool is_server_in_readonly_mode() const {
+        // Check if the server is in disconnected read-only mode using ConnectionPoolManager
+        return ConnectionPoolManager::get_instance().is_server_in_readonly_mode();
+    }
 };
 
 } // namespace fileengine

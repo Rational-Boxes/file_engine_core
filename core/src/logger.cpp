@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <thread>
+#include <filesystem>
 
 namespace fileengine {
 
@@ -41,11 +42,25 @@ void Logger::initialize(const std::string& log_level, const std::string& log_fil
 
     // Open log file if logging to file
     if (log_to_file_) {
+        // Create directory if it doesn't exist
+        std::string dir_path = log_file_path_;
+        size_t last_slash = dir_path.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            dir_path = dir_path.substr(0, last_slash);
+            if (!dir_path.empty()) {
+                std::filesystem::create_directories(dir_path);
+            }
+        }
+
         log_file_.open(log_file_path_, std::ios::app);
         if (log_file_.is_open()) {
             // Get current file size
             log_file_.seekp(0, std::ios::end);
             current_size_ = static_cast<size_t>(log_file_.tellp());
+        } else {
+            // If we can't open the log file, disable file logging but continue
+            log_to_file_ = false;
+            std::cout << "Warning: Could not open log file " << log_file_path_ << ". File logging disabled." << std::endl;
         }
     }
 

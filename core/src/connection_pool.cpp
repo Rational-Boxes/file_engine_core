@@ -1,5 +1,5 @@
 #include "fileengine/connection_pool.h"
-
+#include "fileengine/logger.h"
 #include <sstream>
 
 namespace fileengine {
@@ -32,14 +32,22 @@ ConnectionPool::~ConnectionPool() {
 }
 
 bool ConnectionPool::initialize() {
+    LOG_DEBUG("ConnectionPool", "Initializing connection pool with size: " + std::to_string(pool_size_));
     for (int i = 0; i < pool_size_; ++i) {
         try {
             auto conn = std::make_shared<DatabaseConnection>(connection_info_);
             available_connections_.push(conn);
+            LOG_INFO("ConnectionPool", "Successfully initialized connection #" + std::to_string(i + 1) + " for pool.");
         } catch (const std::exception& e) {
+            LOG_ERROR("ConnectionPool", "Failed to initialize database connection #" + std::to_string(i + 1) + ": " + std::string(e.what()));
+            // Clear any connections that might have been successfully created before the failure
+            while (!available_connections_.empty()) {
+                available_connections_.pop();
+            }
             return false;
         }
     }
+    LOG_INFO("ConnectionPool", "Successfully initialized all " + std::to_string(pool_size_) + " connections in the pool.");
     return true;
 }
 

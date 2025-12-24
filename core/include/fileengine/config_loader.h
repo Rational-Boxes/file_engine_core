@@ -59,7 +59,7 @@ struct Config {
 
     // Logging configuration
     std::string log_level = "INFO";
-    std::string log_file_path = "/var/log/fileengine.log";
+    std::string log_file_path = "/tmp/fileengine.log";
     bool log_to_console = true;
     bool log_to_file = false;
     size_t log_rotation_size_mb = 10;

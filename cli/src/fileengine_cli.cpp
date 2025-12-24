@@ -102,7 +102,11 @@ public:
             std::cout << "✓ Created directory '" << name << "' with UID: " << response.uid() << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to create directory '" << name << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to create directory '" << name << "': " << response.error();
+            if (!status.ok()) {
+                std::cout << " (gRPC Status: " << status.error_code() << " - " << status.error_message() << ")";
+            }
+            std::cout << std::endl;
             return false;
         }
     }
@@ -853,120 +857,120 @@ int main(int argc, char** argv) {
     if (command == "connect" && argc > 2) {
         std::cout << "Already connected to: " << server_address << std::endl;
     }
-    else if (command == "mkdir" && argc == 4) {
-        client.make_directory(argv[2], argv[3], user);
+    else if (command == "mkdir" && argc - arg_offset == 3) {  // command + 2 args
+        client.make_directory(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "ls" && argc == 3) {
-        client.list_directory(argv[2], user, false);
+    else if (command == "ls" && argc - arg_offset == 2) {  // command + 1 arg
+        client.list_directory(argv[arg_offset + 1], user, false);
     }
-    else if (command == "ls" && argc == 4) {
-        bool show_deleted = (std::string(argv[3]) == "true" || std::string(argv[3]) == "1");
-        client.list_directory(argv[2], user, show_deleted);
+    else if (command == "ls" && argc - arg_offset == 3) {  // command + 2 args
+        bool show_deleted = (std::string(argv[arg_offset + 2]) == "true" || std::string(argv[arg_offset + 2]) == "1");
+        client.list_directory(argv[arg_offset + 1], user, show_deleted);
     }
-    else if (command == "lsd" && argc == 3) {  // List with deleted files
-        client.list_directory(argv[2], user, true);
+    else if (command == "lsd" && argc - arg_offset == 2) {  // command + 1 arg
+        client.list_directory(argv[arg_offset + 1], user, true);
     }
-    else if (command == "touch" && argc == 4) {
-        client.touch(argv[2], argv[3], user);
+    else if (command == "touch" && argc - arg_offset == 3) {  // command + 2 args
+        client.touch(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "rm" && argc == 3) {
-        client.remove_file(argv[2], user);
+    else if (command == "rm" && argc - arg_offset == 2) {  // command + 1 arg
+        client.remove_file(argv[arg_offset + 1], user);
     }
-    else if (command == "del" && argc == 3) {
-        client.delete_file(argv[2], user);
+    else if (command == "del" && argc - arg_offset == 2) {  // command + 1 arg
+        client.delete_file(argv[arg_offset + 1], user);
     }
-    else if (command == "undelete" && argc == 3) {
-        client.undelete_file(argv[2], user);
+    else if (command == "undelete" && argc - arg_offset == 2) {  // command + 1 arg
+        client.undelete_file(argv[arg_offset + 1], user);
     }
-    else if (command == "stat" && argc == 3) {
-        client.stat(argv[2], user);
+    else if (command == "stat" && argc - arg_offset == 2) {  // command + 1 arg
+        client.stat(argv[arg_offset + 1], user);
     }
-    else if (command == "exists" && argc == 3) {
-        client.exists(argv[2], user);
+    else if (command == "exists" && argc - arg_offset == 2) {  // command + 1 arg
+        client.exists(argv[arg_offset + 1], user);
     }
-    else if (command == "put" && argc == 4) {
+    else if (command == "put" && argc - arg_offset == 3) {  // command + 2 args
         // Read file from disk
-        std::ifstream file(argv[3], std::ios::binary);
+        std::ifstream file(argv[arg_offset + 2], std::ios::binary);
         if (file.is_open()) {
             std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
                                       std::istreambuf_iterator<char>());
-            client.put_file(argv[2], data, user);
+            client.put_file(argv[arg_offset + 1], data, user);
         } else {
-            std::cout << "✗ Could not open file: " << argv[3] << std::endl;
+            std::cout << "✗ Could not open file: " << argv[arg_offset + 2] << std::endl;
         }
     }
-    else if (command == "get" && argc == 4) {
-        auto data = client.get_file(argv[2], user);
+    else if (command == "get" && argc - arg_offset == 3) {  // command + 2 args
+        auto data = client.get_file(argv[arg_offset + 1], user);
         if (!data.empty()) {
-            std::ofstream file(argv[3], std::ios::binary);
+            std::ofstream file(argv[arg_offset + 2], std::ios::binary);
             if (file.is_open()) {
                 file.write(reinterpret_cast<const char*>(data.data()), data.size());
-                std::cout << "✓ Saved file to: " << argv[3] << std::endl;
+                std::cout << "✓ Saved file to: " << argv[arg_offset + 2] << std::endl;
             } else {
-                std::cout << "✗ Could not save to file: " << argv[3] << std::endl;
+                std::cout << "✗ Could not save to file: " << argv[arg_offset + 2] << std::endl;
             }
         }
     }
-    else if (command == "upload" && argc == 5) {
-        client.upload(argv[2], argv[3], argv[4], user);
+    else if (command == "upload" && argc - arg_offset == 4) {  // command + 3 args
+        client.upload(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user);
     }
-    else if (command == "download" && argc == 4) {
-        client.download(argv[2], argv[3], user);
+    else if (command == "download" && argc - arg_offset == 3) {  // command + 2 args
+        client.download(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "download" && argc == 5) {
+    else if (command == "download" && argc - arg_offset == 4) {  // command + 3 args
         try {
-            int version = std::stoi(argv[4]);
-            client.download(argv[2], argv[3], user, version);
+            int version = std::stoi(argv[arg_offset + 3]);
+            client.download(argv[arg_offset + 1], argv[arg_offset + 2], user, version);
         } catch (const std::exception& e) {
-            std::cout << "✗ Invalid version number: " << argv[4] << std::endl;
+            std::cout << "✗ Invalid version number: " << argv[arg_offset + 3] << std::endl;
             return 1;
         }
     }
-    else if (command == "rename" && argc == 4) {
-        client.rename(argv[2], argv[3], user);
+    else if (command == "rename" && argc - arg_offset == 3) {  // command + 2 args
+        client.rename(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "move" && argc == 4) {
-        client.move(argv[2], argv[3], user);
+    else if (command == "move" && argc - arg_offset == 3) {  // command + 2 args
+        client.move(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "copy" && argc == 4) {
-        client.copy(argv[2], argv[3], user);
+    else if (command == "copy" && argc - arg_offset == 3) {  // command + 2 args
+        client.copy(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "versions" && argc == 3) {
-        client.list_versions(argv[2], user);
+    else if (command == "versions" && argc - arg_offset == 2) {  // command + 1 arg
+        client.list_versions(argv[arg_offset + 1], user);
     }
-    else if (command == "getversion" && argc == 4) {
+    else if (command == "getversion" && argc - arg_offset == 3) {  // command + 2 args
         try {
-            int version = std::stoi(argv[3]);
-            client.get_version(argv[2], version, user);
+            int version = std::stoi(argv[arg_offset + 2]);
+            client.get_version(argv[arg_offset + 1], version, user);
         } catch (const std::exception& e) {
-            std::cout << "✗ Invalid version number: " << argv[3] << std::endl;
+            std::cout << "✗ Invalid version number: " << argv[arg_offset + 2] << std::endl;
             return 1;
         }
     }
-    else if (command == "restore" && argc == 4) {
+    else if (command == "restore" && argc - arg_offset == 3) {  // command + 2 args
         try {
-            int version = std::stoi(argv[3]);
-            client.restore_to_version(argv[2], version, user);
+            int version = std::stoi(argv[arg_offset + 2]);
+            client.restore_to_version(argv[arg_offset + 1], version, user);
         } catch (const std::exception& e) {
-            std::cout << "✗ Invalid version number: " << argv[3] << std::endl;
+            std::cout << "✗ Invalid version number: " << argv[arg_offset + 2] << std::endl;
             return 1;
         }
     }
-    else if (command == "setmeta" && argc == 5) {
-        client.set_metadata(argv[2], argv[3], argv[4], user);
+    else if (command == "setmeta" && argc - arg_offset == 4) {  // command + 3 args
+        client.set_metadata(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user);
     }
-    else if (command == "getmeta" && argc == 4) {
-        client.get_metadata(argv[2], argv[3], user);
+    else if (command == "getmeta" && argc - arg_offset == 3) {  // command + 2 args
+        client.get_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "allmeta" && argc == 3) {
-        client.get_all_metadata(argv[2], user);
+    else if (command == "allmeta" && argc - arg_offset == 2) {  // command + 1 arg
+        client.get_all_metadata(argv[arg_offset + 1], user);
     }
-    else if (command == "delmeta" && argc == 4) {
-        client.delete_metadata(argv[2], argv[3], user);
+    else if (command == "delmeta" && argc - arg_offset == 3) {  // command + 2 args
+        client.delete_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user);
     }
-    else if (command == "grant" && argc == 5) {
+    else if (command == "grant" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
-        std::string perm_arg = argv[4];
+        std::string perm_arg = argv[arg_offset + 3];
         if (perm_arg == "r") {
             perm = fileengine_rpc::Permission::READ;
         } else if (perm_arg == "w") {
@@ -978,11 +982,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.grant_permission(argv[2], argv[3], perm, user);
+        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user);
     }
-    else if (command == "revoke" && argc == 5) {
+    else if (command == "revoke" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
-        std::string perm_arg = argv[4];
+        std::string perm_arg = argv[arg_offset + 3];
         if (perm_arg == "r") {
             perm = fileengine_rpc::Permission::READ;
         } else if (perm_arg == "w") {
@@ -994,11 +998,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.revoke_permission(argv[2], argv[3], perm, user);
+        client.revoke_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user);
     }
-    else if (command == "check" && argc == 5) {
+    else if (command == "check" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
-        std::string perm_arg = argv[4];
+        std::string perm_arg = argv[arg_offset + 3];
         if (perm_arg == "r") {
             perm = fileengine_rpc::Permission::READ;
         } else if (perm_arg == "w") {
@@ -1010,20 +1014,20 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.check_permission(argv[2], user, perm);
+        client.check_permission(argv[arg_offset + 1], user, perm);
     }
-    else if (command == "usage" && argc == 2) {
+    else if (command == "usage" && argc - arg_offset == 1) {  // command only
         client.storage_usage(user);
     }
-    else if (command == "sync" && argc == 2) {
+    else if (command == "sync" && argc - arg_offset == 1) {  // command only
         client.trigger_sync(user);
     }
-    else if (command == "purge" && argc == 4) {
+    else if (command == "purge" && argc - arg_offset == 3) {  // command + 2 args
         try {
-            int days = std::stoi(argv[3]);
-            client.purge_old_versions(argv[2], days, user);
+            int days = std::stoi(argv[arg_offset + 2]);
+            client.purge_old_versions(argv[arg_offset + 1], days, user);
         } catch (const std::exception& e) {
-            std::cout << "✗ Invalid days value: " << argv[3] << std::endl;
+            std::cout << "✗ Invalid days value: " << argv[arg_offset + 2] << std::endl;
             return 1;
         }
     }

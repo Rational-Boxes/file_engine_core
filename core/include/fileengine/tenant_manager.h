@@ -43,6 +43,7 @@ public:
     bool initialize_tenant(const std::string& tenant_id);
     bool tenant_exists(const std::string& tenant_id) const;
     Result<void> remove_tenant(const std::string& tenant_id);
+    const TenantConfig& get_config() const { return config_; }
 
 private:
     TenantContext* create_tenant_context(const std::string& tenant_id);
