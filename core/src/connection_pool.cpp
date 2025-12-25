@@ -5,10 +5,14 @@
 namespace fileengine {
 
 DatabaseConnection::DatabaseConnection(const std::string& conninfo) {
+    LOG_DEBUG("DatabaseConnection", "Attempting to connect to database using conninfo: " + conninfo);
     conn_ = PQconnectdb(conninfo.c_str());
     if (!is_valid()) {
-        throw std::runtime_error("Failed to connect to database: " + std::string(PQerrorMessage(conn_)));
+        std::string error_message = "Failed to connect to database: " + std::string(PQerrorMessage(conn_));
+        LOG_ERROR("DatabaseConnection", error_message);
+        throw std::runtime_error(error_message);
     }
+    LOG_INFO("DatabaseConnection", "Successfully connected to database.");
 }
 
 DatabaseConnection::~DatabaseConnection() {
@@ -21,9 +25,10 @@ ConnectionPool::ConnectionPool(const std::string& host, int port, const std::str
                                const std::string& user, const std::string& password, int pool_size)
     : pool_size_(pool_size), shutdown_flag_(false) {
     std::ostringstream conn_stream;
-    conn_stream << "host=" << host << " port=" << port 
-                << " dbname=" << dbname << " user=" << user 
-                << " password=" << password;
+    conn_stream << "host=" << host << " port=" << port
+                << " dbname=" << dbname << " user=" << user
+                << " password=" << password
+                << " connect_timeout=5";
     connection_info_ = conn_stream.str();
 }
 

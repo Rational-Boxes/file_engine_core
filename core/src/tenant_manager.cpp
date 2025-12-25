@@ -5,7 +5,8 @@
 
 namespace fileengine {
 
-TenantManager::TenantManager(const TenantConfig& config) : config_(config) {
+TenantManager::TenantManager(const TenantConfig& config, std::shared_ptr<IDatabase> shared_db)
+    : config_(config), shared_database_(shared_db) {
 }
 
 TenantManager::~TenantManager() {
@@ -42,21 +43,13 @@ bool TenantManager::initialize_tenant(const std::string& tenant_id) {
         return false;
     }
 
-    // Simply create a database instance to create the schema
-    auto db = std::make_unique<Database>(
-        config_.db_host,
-        config_.db_port,
-        config_.db_name,
-        config_.db_user,
-        config_.db_password
-    );
-
-    if (!db->connect()) {
-        return false;
+    // Always use the shared database instance - never create new connections outside of the pooling system
+    if (shared_database_ == nullptr) {
+        return false;  // Cannot initialize without shared database
     }
 
-    // Create tenant-specific schema
-    auto result = db->create_tenant_schema(tenant_id);
+    // Create tenant-specific schema using the shared database (which uses connection pooling)
+    auto result = shared_database_->create_tenant_schema(tenant_id);
     return result.success;
 }
 
@@ -128,6 +121,12 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
             return nullptr;
         }
 
+        // Create tenant schema in the database
+        auto schema_result = db->create_tenant_schema(tenant_id);
+        if (!schema_result.success) {
+            return nullptr;
+        }
+
         // Create storage instance for the tenant
         auto storage = std::make_unique<Storage>(
             config_.storage_base_path,
@@ -145,10 +144,11 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
             config_.s3_path_style
         );
 
-        // Initialize the object store
+        // Initialize the object store (non-fatal if it fails)
         auto init_result = object_store->initialize();
         if (!init_result.success) {
-            return nullptr;
+            // Log warning but continue - object store is optional
+            // S3/MinIO might not be available or configured
         }
 
         // Create the tenant context

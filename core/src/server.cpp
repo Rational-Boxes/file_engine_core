@@ -121,6 +121,11 @@ int main(int argc, char** argv) {
     // Initialize tenant manager
     std::cout << "Initializing tenant manager..." << std::endl;
     fileengine::TenantConfig tenant_config;
+    tenant_config.db_host = config.db_host;
+    tenant_config.db_port = config.db_port;
+    tenant_config.db_name = config.db_name;
+    tenant_config.db_user = config.db_user;
+    tenant_config.db_password = config.db_password;
     tenant_config.storage_base_path = config.storage_base_path;
     tenant_config.s3_endpoint = config.s3_endpoint;
     tenant_config.s3_region = config.s3_region;
@@ -131,7 +136,7 @@ int main(int argc, char** argv) {
     tenant_config.encrypt_data = config.encrypt_data;
     tenant_config.compress_data = config.compress_data;
 
-    auto tenant_manager = std::make_shared<fileengine::TenantManager>(tenant_config);
+    auto tenant_manager = std::make_shared<fileengine::TenantManager>(tenant_config, database);
 
     // Initialize ACL manager
     auto acl_manager = std::make_shared<fileengine::AclManager>(database);
