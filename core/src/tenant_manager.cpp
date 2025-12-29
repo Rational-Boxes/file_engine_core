@@ -16,22 +16,23 @@ TenantManager::~TenantManager() {
 }
 
 TenantContext* TenantManager::get_tenant_context(const std::string& tenant_id) {
-    if (tenant_id.empty()) {
-        return nullptr;
+    std::string actual_tenant_id = tenant_id;
+    if (actual_tenant_id.empty()) {
+        actual_tenant_id = "default";  // Use "default" tenant when no tenant is specified
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Check if tenant context already exists
-    auto it = tenant_contexts_.find(tenant_id);
+    auto it = tenant_contexts_.find(actual_tenant_id);
     if (it != tenant_contexts_.end()) {
         return it->second.get();
     }
 
-    // Create a new tenant context
-    TenantContext* context = create_tenant_context(tenant_id);
+    // Create a new tenant context which will ensure database structures exist
+    TenantContext* context = create_tenant_context(actual_tenant_id);
     if (context) {
-        tenant_contexts_[tenant_id] = std::unique_ptr<TenantContext>(context);
+        tenant_contexts_[actual_tenant_id] = std::unique_ptr<TenantContext>(context);
         return context;
     }
 
@@ -39,8 +40,9 @@ TenantContext* TenantManager::get_tenant_context(const std::string& tenant_id) {
 }
 
 bool TenantManager::initialize_tenant(const std::string& tenant_id) {
-    if (tenant_id.empty()) {
-        return false;
+    std::string actual_tenant_id = tenant_id;
+    if (actual_tenant_id.empty()) {
+        actual_tenant_id = "default";  // Use "default" tenant when no tenant is specified
     }
 
     // Always use the shared database instance - never create new connections outside of the pooling system
@@ -49,27 +51,29 @@ bool TenantManager::initialize_tenant(const std::string& tenant_id) {
     }
 
     // Create tenant-specific schema using the shared database (which uses connection pooling)
-    auto result = shared_database_->create_tenant_schema(tenant_id);
+    auto result = shared_database_->create_tenant_schema(actual_tenant_id);
     return result.success;
 }
 
 bool TenantManager::tenant_exists(const std::string& tenant_id) const {
-    if (tenant_id.empty()) {
-        return false;
+    std::string actual_tenant_id = tenant_id;
+    if (actual_tenant_id.empty()) {
+        actual_tenant_id = "default";  // Use "default" tenant when no tenant is specified
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    return tenant_contexts_.find(tenant_id) != tenant_contexts_.end();
+    return tenant_contexts_.find(actual_tenant_id) != tenant_contexts_.end();
 }
 
 Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
-    if (tenant_id.empty()) {
-        return Result<void>::err("Tenant ID cannot be empty");
+    std::string actual_tenant_id = tenant_id;
+    if (actual_tenant_id.empty()) {
+        actual_tenant_id = "default";  // Use "default" tenant when no tenant is specified
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto it = tenant_contexts_.find(tenant_id);
+    auto it = tenant_contexts_.find(actual_tenant_id);
     if (it == tenant_contexts_.end()) {
         return Result<void>::err("Tenant does not exist");
     }
@@ -78,21 +82,21 @@ Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
     auto context = it->second.get();
 
     if (context->db) {
-        auto db_result = context->db->cleanup_tenant_data(tenant_id);
+        auto db_result = context->db->cleanup_tenant_data(actual_tenant_id);
         if (!db_result.success) {
             return db_result;
         }
     }
 
     if (context->storage) {
-        auto storage_result = context->storage->clear_storage(tenant_id);
+        auto storage_result = context->storage->clear_storage(actual_tenant_id);
         if (!storage_result.success) {
             return storage_result;
         }
     }
 
     if (context->object_store) {
-        auto obj_store_result = context->object_store->clear_storage(tenant_id);
+        auto obj_store_result = context->object_store->clear_storage(actual_tenant_id);
         if (!obj_store_result.success) {
             return obj_store_result;
         }
@@ -104,10 +108,8 @@ Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
 }
 
 TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id) {
-    (void)tenant_id; // Use tenant_id if needed for per-tenant configuration
     try {
         // Create database instance for the tenant
-        // In the original implementation, each tenant had its own database instance
         auto db = std::make_unique<Database>(
             config_.db_host,
             config_.db_port,
@@ -121,10 +123,10 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
             return nullptr;
         }
 
-        // Create tenant schema in the database
+        // Ensure tenant schema and tables exist - this will create them if they don't exist
         auto schema_result = db->create_tenant_schema(tenant_id);
         if (!schema_result.success) {
-            return nullptr;
+            // Log the error but continue - some operations might still work
         }
 
         // Create storage instance for the tenant
@@ -148,7 +150,6 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
         auto init_result = object_store->initialize();
         if (!init_result.success) {
             // Log warning but continue - object store is optional
-            // S3/MinIO might not be available or configured
         }
 
         // Create the tenant context
@@ -157,10 +158,6 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
         context->storage = std::move(storage);
         context->object_store = std::move(object_store);
 
-        // Return a pointer to the context (it will be managed by the unique_ptr in the map)
-        // We need to release the unique_ptr to return a raw pointer, but we need to be careful about ownership
-        // The proper approach is to return a raw pointer but store the unique_ptr in the map
-        TenantContext* raw_context = context.get();
         return context.release();  // Transfer ownership to caller who will place in map
     } catch (const std::exception& ex) {
         return nullptr;

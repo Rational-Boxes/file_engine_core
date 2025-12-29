@@ -1203,10 +1203,6 @@ Result<int64_t> Database::get_storage_capacity(const std::string& tenant) {
 }
 
 Result<void> Database::create_tenant_schema(const std::string& tenant) {
-    if (tenant.empty()) {
-        return Result<void>::err("Cannot create schema for empty tenant name");
-    }
-
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection for tenant schema creation");
@@ -1243,10 +1239,10 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "uid VARCHAR(64) UNIQUE NOT NULL, "
         "name TEXT NOT NULL, "
         "parent_uid VARCHAR(64), "
-        "size BIGINT, -- size in bytes, for files "
+        "size BIGINT, "
         "owner TEXT NOT NULL, "
-        "permission_map INTEGER NOT NULL, -- permission bit map"
-        "is_container BOOLEAN NOT NULL, -- folder flag"
+        "permission_map INTEGER NOT NULL, "
+        "is_container BOOLEAN NOT NULL, "
         "deleted BOOLEAN NOT NULL DEFAULT FALSE"
         ");";
 
@@ -1257,10 +1253,10 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
 
     std::string create_versions_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".versions ("
         "id BIGSERIAL PRIMARY KEY, "
-        "file_uid VARCHAR(64) NOT NULL, -- file UID (changed from file_uuid to match code usage) "
-        "version_timestamp BIGINT NOT NULL, -- timestamp (as per spec) "
-        "size BIGINT NOT NULL, -- size (as per spec) "
-        "storage_path TEXT NOT NULL -- storage path for the version (as per spec) "
+        "file_uid VARCHAR(64) NOT NULL, "
+        "version_timestamp BIGINT NOT NULL, "
+        "size BIGINT NOT NULL, "
+        "storage_path TEXT NOT NULL "
         ");";
 
     std::string create_idx_versions = "CREATE INDEX IF NOT EXISTS idx_versions_file_uid_" + escaped_schema +
@@ -1268,11 +1264,11 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
 
     std::string create_metadata_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".metadata ("
         "id BIGSERIAL PRIMARY KEY, "
-        "file_uid VARCHAR(64) NOT NULL, -- file UID (changed from file_uuid to match code usage) "
-        "version_timestamp BIGINT NOT NULL, -- timestamp (as per spec) "
-        "key_name TEXT NOT NULL, -- key name (as per spec) "
-        "value TEXT NOT NULL, -- value (as per spec) "
-        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP -- metadata creation date "
+        "file_uid VARCHAR(64) NOT NULL, "
+        "version_timestamp BIGINT NOT NULL, "
+        "key_name TEXT NOT NULL, "
+        "value TEXT NOT NULL, "
+        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP "
         ");";
 
     std::string create_idx_metadata = "CREATE INDEX IF NOT EXISTS idx_metadata_file_uid_" + escaped_schema +
