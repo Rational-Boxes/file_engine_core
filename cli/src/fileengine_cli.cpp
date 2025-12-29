@@ -10,6 +10,9 @@
 // Include generated gRPC files
 #include "../../build/core/generated/fileengine/fileservice.grpc.pb.h"
 
+// Include logging functionality
+#include "../include/logger.h"
+
 using fileengine_rpc::FileService;
 using fileengine_rpc::MakeDirectoryRequest;
 using fileengine_rpc::MakeDirectoryResponse;
@@ -75,35 +78,48 @@ public:
 
     // Helper function to create auth context with user, roles, and tenant
     AuthenticationContext create_auth_context(const std::string& user, const std::vector<std::string>& roles = {}, const std::string& tenant = "default", const std::vector<std::string>& claims = {}) {
+        fileengine::Logger::trace("AuthContext", "Creating auth context for user: ", user, ", tenant: ", tenant);
         AuthenticationContext auth_ctx;
         auth_ctx.set_user(user);
         auth_ctx.set_tenant(tenant);
         for (const auto& role : roles) {
             auth_ctx.add_roles(role);
+            fileengine::Logger::detail("AuthContext", "Added role: ", role);
         }
+        fileengine::Logger::detail("AuthContext", "Auth context created successfully");
         // Claims are not supported in the current proto, but parameter is kept for future use
         return auth_ctx;
     }
 
     // Directory operations
     bool make_directory(const std::string& parent_uid, const std::string& name, const std::string& user) {
+        fileengine::Logger::debug("Mkdir", "Attempting to create directory '", name, "' in parent '", parent_uid, "' for user '", user, "'");
+
         MakeDirectoryRequest request;
         request.set_parent_uid(parent_uid);
         request.set_name(name);
+        fileengine::Logger::detail("Mkdir", "Set parent UID: ", parent_uid, ", name: ", name);
+
         *request.mutable_auth() = create_auth_context(user);
         request.set_permissions(0755);
+        fileengine::Logger::detail("Mkdir", "Set permissions: 0755");
 
         MakeDirectoryResponse response;
         grpc::ClientContext context;
+        fileengine::Logger::trace("Mkdir", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->MakeDirectory(&context, request, &response);
+        fileengine::Logger::trace("Mkdir", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
 
         if (status.ok() && response.success()) {
+            fileengine::Logger::debug("Mkdir", "Directory created successfully with UID: ", response.uid());
             std::cout << "✓ Created directory '" << name << "' with UID: " << response.uid() << std::endl;
             return true;
         } else {
+            fileengine::Logger::debug("Mkdir", "Failed to create directory '", name, "', error: ", response.error());
             std::cout << "✗ Failed to create directory '" << name << "': " << response.error();
             if (!status.ok()) {
+                fileengine::Logger::detail("Mkdir", "gRPC error code: ", status.error_code(), ", message: ", status.error_message());
                 std::cout << " (gRPC Status: " << status.error_code() << " - " << status.error_message() << ")";
             }
             std::cout << std::endl;
@@ -112,16 +128,23 @@ public:
     }
 
     bool list_directory(const std::string& uid, const std::string& user, bool show_deleted = false) {
+        fileengine::Logger::debug("ListDir", "Attempting to list directory with UID: ", uid, " for user: ", user, ", show_deleted: ", show_deleted ? "true" : "false");
+
         ListDirectoryRequest request;
         request.set_uid(uid);
+        fileengine::Logger::detail("ListDir", "Set directory UID: ", uid);
+
         *request.mutable_auth() = create_auth_context(user);
 
         ListDirectoryResponse response;
         grpc::ClientContext context;
+        fileengine::Logger::trace("ListDir", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->ListDirectory(&context, request, &response);
+        fileengine::Logger::trace("ListDir", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
 
         if (status.ok() && response.success()) {
+            fileengine::Logger::debug("ListDir", "Directory listing successful, found ", response.entries_size(), " entries");
             if (show_deleted) {
                 std::cout << "Contents of directory (UID: " << uid << ", showing deleted files):" << std::endl;
             } else {
@@ -138,10 +161,13 @@ public:
                     type_str = "LINK";
                 }
 
+                fileengine::Logger::detail("ListDir", "Entry - Name: ", entry.name(), ", UID: ", entry.uid(), ", Type: ", type_str);
+
                 std::cout << "  [" << type_str << "] " << entry.name() << " (UID: " << entry.uid() << ")" << std::endl;
             }
             return true;
         } else {
+            fileengine::Logger::debug("ListDir", "Failed to list directory '", uid, "', error: ", response.error());
             std::cout << "✗ Failed to list directory '" << uid << "': " << response.error() << std::endl;
             return false;
         }
@@ -168,20 +194,28 @@ public:
 
     // File operations
     bool touch(const std::string& parent_uid, const std::string& name, const std::string& user) {
+        fileengine::Logger::debug("Touch", "Attempting to create file '", name, "' in parent '", parent_uid, "' for user '", user, "'");
+
         TouchRequest request;
         request.set_parent_uid(parent_uid);
         request.set_name(name);
+        fileengine::Logger::detail("Touch", "Set parent UID: ", parent_uid, ", name: ", name);
+
         *request.mutable_auth() = create_auth_context(user);
 
         TouchResponse response;
         grpc::ClientContext context;
+        fileengine::Logger::trace("Touch", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->Touch(&context, request, &response);
+        fileengine::Logger::trace("Touch", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
 
         if (status.ok() && response.success()) {
+            fileengine::Logger::debug("Touch", "File created successfully with UID: ", response.uid());
             std::cout << "✓ Created file '" << name << "' with UID: " << response.uid() << std::endl;
             return true;
         } else {
+            fileengine::Logger::debug("Touch", "Failed to create file '", name, "', error: ", response.error());
             std::cout << "✗ Failed to create file '" << name << "': " << response.error() << std::endl;
             return false;
         }
@@ -207,42 +241,58 @@ public:
     }
 
     std::vector<uint8_t> get_file(const std::string& uid, const std::string& user) {
+        fileengine::Logger::debug("GetFile", "Attempting to retrieve file with UID: ", uid, " for user: ", user);
+
         GetFileRequest request;
         request.set_uid(uid);
+        fileengine::Logger::detail("GetFile", "Set file UID: ", uid);
+
         *request.mutable_auth() = create_auth_context(user);
 
         GetFileResponse response;
         grpc::ClientContext context;
+        fileengine::Logger::trace("GetFile", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->GetFile(&context, request, &response);
+        fileengine::Logger::trace("GetFile", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
 
         if (status.ok() && response.success()) {
             std::string data_str = response.data();
             std::vector<uint8_t> data(data_str.begin(), data_str.end());
+            fileengine::Logger::debug("GetFile", "File retrieved successfully, size: ", data.size(), " bytes");
             std::cout << "✓ Retrieved file '" << uid << "' (" << data.size() << " bytes)" << std::endl;
             return data;
         } else {
+            fileengine::Logger::debug("GetFile", "Failed to retrieve file '", uid, "', error: ", response.error());
             std::cout << "✗ Failed to get file '" << uid << "': " << response.error() << std::endl;
             return std::vector<uint8_t>();  // Return empty vector on error
         }
     }
 
     bool put_file(const std::string& uid, const std::vector<uint8_t>& data, const std::string& user) {
+        fileengine::Logger::debug("PutFile", "Attempting to upload file to UID: ", uid, " for user: ", user, ", size: ", data.size(), " bytes");
+
         PutFileRequest request;
         request.set_uid(uid);
         std::string data_str(data.begin(), data.end());
         request.set_data(data_str);
+        fileengine::Logger::detail("PutFile", "Set file UID: ", uid, ", data size: ", data_str.size());
+
         *request.mutable_auth() = create_auth_context(user);
 
         PutFileResponse response;
         grpc::ClientContext context;
+        fileengine::Logger::trace("PutFile", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->PutFile(&context, request, &response);
+        fileengine::Logger::trace("PutFile", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
 
         if (status.ok() && response.success()) {
+            fileengine::Logger::debug("PutFile", "File uploaded successfully to UID: ", uid, ", size: ", data.size(), " bytes");
             std::cout << "✓ Uploaded file to UID: " << uid << " (" << data.size() << " bytes)" << std::endl;
             return true;
         } else {
+            fileengine::Logger::debug("PutFile", "Failed to upload file to UID '", uid, "', error: ", response.error());
             std::cout << "✗ Failed to upload file to '" << uid << "': " << response.error() << std::endl;
             return false;
         }
@@ -729,6 +779,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> roles = {};
     std::vector<std::string> claims = {};
     std::string server_address = "localhost:50051";
+    fileengine::LogLevel log_level = fileengine::LogLevel::NORMAL;
 
     // First, let's handle global options before the command, including config file
     int arg_offset = 1;
@@ -766,12 +817,22 @@ int main(int argc, char** argv) {
             if (arg_offset + 1 < argc) {
                 server_address = argv[++arg_offset];
             }
+        } else if (opt == "-v" || opt == "--verbose") {
+            log_level = fileengine::LogLevel::VERBOSE;
+        } else if (opt == "-vv" || opt == "--very-verbose") {
+            log_level = fileengine::LogLevel::VERY_VERBOSE;
+        } else if (opt == "-vvv" || opt == "--extremely-verbose") {
+            log_level = fileengine::LogLevel::EXTREMELY_VERBOSE;
         } else {
             std::cout << "Unknown option: " << opt << std::endl;
             return 1;
         }
         arg_offset++;
     }
+
+    // Set the logging level
+    fileengine::Logger::set_level(log_level);
+    fileengine::Logger::debug("Main", "Logging level set to: ", static_cast<int>(log_level));
 
     // Load configuration from file and environment
     auto config = fileengine::load_config(config_file);
@@ -797,6 +858,9 @@ int main(int argc, char** argv) {
         std::cout << "  -r, --roles ROLE1,ROLE2   - Roles for the user (comma separated)" << std::endl;
         std::cout << "  -c, --claims CLAIM1,CLAIM2 - Claims for the user (comma separated)" << std::endl;
         std::cout << "  --server ADDRESS          - Server address (default: localhost:50051)" << std::endl;
+        std::cout << "  -v, --verbose             - Enable verbose logging" << std::endl;
+        std::cout << "  -vv, --very-verbose       - Enable very verbose logging" << std::endl;
+        std::cout << "  -vvv, --extremely-verbose - Enable extremely verbose logging" << std::endl;
         std::cout << std::endl;
         std::cout << "Commands:" << std::endl;
         std::cout << "  connect <server_address>              - Connect to gRPC server (default: localhost:50051)" << std::endl;
