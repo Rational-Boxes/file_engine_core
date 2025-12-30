@@ -228,7 +228,12 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
     }
     
     // Check permissions - the user needs write permission on the parent directory
-    if (!parent_uid.empty()) {
+    if (parent_uid.empty()) {
+        // Root directory creation - only for system admin
+        if (user != "root") {
+            return Result<std::string>::err("Only root can create in root directory");
+        }
+    } else {
         auto perm_result = validate_user_permissions(parent_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
         if (!perm_result.success || !perm_result.value) {
             return Result<std::string>::err("User does not have permission to create file");

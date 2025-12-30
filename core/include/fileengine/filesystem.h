@@ -134,6 +134,11 @@ public:
                                                                            const std::string& version_timestamp,
                                                                            const std::string& tenant = "");
 
+    // Setter for ACL manager
+    virtual void set_acl_manager(std::shared_ptr<AclManager> acl_manager) {
+        acl_manager_ = acl_manager;
+    }
+
 private:
     std::shared_ptr<TenantManager> tenant_manager_;
     std::shared_ptr<AclManager> acl_manager_;

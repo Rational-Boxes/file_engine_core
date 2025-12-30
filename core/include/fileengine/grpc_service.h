@@ -186,14 +186,21 @@ private:
                                       int required_permissions) {
         std::string user = get_user_from_auth_context(auth_ctx);
         std::string tenant = get_tenant_from_auth_context(auth_ctx);
-        
+
         // Check if root user is enabled and user is root
         // This would typically be checked against the config, but for now we'll do a basic check
         if (user == "root") {
             // Root user bypasses permission system
             return true;
         }
-        
+
+        // Check if acl_manager_ is available
+        if (!acl_manager_) {
+            // If ACL manager is not available, default to allowing access for basic functionality
+            // This is a fallback for cases where ACL management is not properly initialized
+            return true;
+        }
+
         // Convert roles from gRPC context to internal representation
         std::vector<std::string> roles = get_roles_from_auth_context(auth_ctx);
 

@@ -143,39 +143,47 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
     LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
               "Acquired database connection for UID: " + uid);
 
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
     // Prepare SQL with INSERT/ON CONFLICT handling to avoid duplicates
-    const char* insert_sql = R"SQL(
-        INSERT INTO files (uid, name, parent_uid, size, owner, permission_map, is_container, deleted)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)
-        ON CONFLICT (uid) DO UPDATE SET
-            name = EXCLUDED.name,
-            parent_uid = EXCLUDED.parent_uid,
-            size = EXCLUDED.size,
-            owner = EXCLUDED.owner,
-            permission_map = EXCLUDED.permission_map,
-            is_container = EXCLUDED.is_container
-        RETURNING uid;
-    )SQL";
+    std::string insert_sql = "INSERT INTO \"" + schema_name + "\".files (uid, name, parent_uid, size, owner, permission_map, is_container, deleted) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+        "ON CONFLICT (uid) DO UPDATE SET "
+            "name = EXCLUDED.name, "
+            "parent_uid = EXCLUDED.parent_uid, "
+            "size = EXCLUDED.size, "
+            "owner = EXCLUDED.owner, "
+            "permission_map = EXCLUDED.permission_map, "
+            "is_container = EXCLUDED.is_container "
+        "RETURNING uid;";
 
     // Convert file type to integer
     int type_int = static_cast<int>(type);
     int64_t size = 0; // New files start with 0 size
     bool is_container = (type == FileType::DIRECTORY); // Check if it's a directory
 
-    const char* param_values[7] = {
-        uid.c_str(),          // $1
-        name.c_str(),         // $2
-        parent_uid.c_str(),   // $3
-        std::to_string(size).c_str(),      // $4
-        owner.c_str(),        // $5
-        std::to_string(permissions).c_str(), // $6
-        is_container ? "TRUE" : "FALSE"     // $7
+    // Prepare parameter values - ensure they are properly converted to strings
+    std::string size_str = std::to_string(size);
+    std::string perms_str = std::to_string(permissions);
+    std::string container_str = is_container ? "TRUE" : "FALSE";
+    std::string deleted_str = "FALSE"; // Files are not deleted by default
+
+    const char* param_values[8] = {
+        uid.c_str(),              // $1
+        name.c_str(),             // $2
+        parent_uid.c_str(),       // $3
+        size_str.c_str(),         // $4
+        owner.c_str(),            // $5
+        perms_str.c_str(),        // $6
+        container_str.c_str(),    // $7
+        deleted_str.c_str()       // $8
     };
 
     LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
               "Executing SQL INSERT with parameters for UID: " + uid);
 
-    PGresult* res = PQexecParams(pg_conn, insert_sql, 9, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 8, nullptr, param_values, nullptr, nullptr, 0);
 
     std::string result_uid;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -243,11 +251,14 @@ Result<bool> Database::delete_file(const std::string& uid, const std::string& te
 
     PGconn* pg_conn = conn->get_connection();
 
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
     // Soft delete - update the deleted flag
-    const char* delete_sql = "UPDATE files SET deleted = TRUE WHERE uid = $1;";
+    std::string delete_sql = "UPDATE \"" + schema_name + "\".files SET deleted = TRUE WHERE uid = $1;";
     const char* param_values[1] = {uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, delete_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, delete_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         int rows_affected = std::stoi(PQcmdTuples(res));
@@ -270,10 +281,13 @@ Result<bool> Database::undelete_file(const std::string& uid, const std::string& 
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* undelete_sql = "UPDATE files SET deleted = FALSE WHERE uid = $1;";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string undelete_sql = "UPDATE \"" + schema_name + "\".files SET deleted = FALSE WHERE uid = $1;";
     const char* param_values[1] = {uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, undelete_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, undelete_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         int rows_affected = std::stoi(PQcmdTuples(res));
@@ -296,15 +310,16 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = R"SQL(
-        SELECT name, parent_uid, size, owner, permission_map, is_container, deleted
-        FROM files
-        WHERE uid = $1 AND deleted = FALSE
-        LIMIT 1;
-    )SQL";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT name, parent_uid, size, owner, permission_map, is_container, deleted "
+                            "FROM \"" + schema_name + "\".files "
+                            "WHERE uid = $1 AND deleted = FALSE "
+                            "LIMIT 1;";
     const char* param_values[1] = {uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -374,10 +389,13 @@ Result<void> Database::update_file_name(const std::string& uid, const std::strin
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* update_sql = "UPDATE files SET name = $2 WHERE uid = $1;";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string update_sql = "UPDATE \"" + schema_name + "\".files SET name = $2 WHERE uid = $1;";
     const char* param_values[2] = {uid.c_str(), new_name.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, update_sql, 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         PQclear(res);
@@ -399,15 +417,16 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = R"SQL(
-        SELECT uid, name, size, owner, permission_map, is_container
-        FROM files
-        WHERE parent_uid = $1 AND deleted = FALSE
-        ORDER BY name;
-    )SQL";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container "
+                            "FROM \"" + schema_name + "\".files "
+                            "WHERE parent_uid = $1 AND deleted = FALSE "
+                            "ORDER BY name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     std::vector<FileInfo> result_files;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -452,15 +471,16 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = R"SQL(
-        SELECT uid, name, size, owner, permission_map, is_container, deleted
-        FROM files
-        WHERE parent_uid = $1
-        ORDER BY name;
-    )SQL";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container, deleted "
+                            "FROM \"" + schema_name + "\".files "
+                            "WHERE parent_uid = $1 "
+                            "ORDER BY name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     std::vector<FileInfo> result_files;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -506,15 +526,16 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = R"SQL(
-        SELECT uid, size, owner, permission_map, is_container
-        FROM files
-        WHERE name = $1 AND parent_uid = $2 AND deleted = FALSE
-        LIMIT 1;
-    )SQL";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT uid, size, owner, permission_map, is_container "
+                            "FROM \"" + schema_name + "\".files "
+                            "WHERE name = $1 AND parent_uid = $2 AND deleted = FALSE "
+                            "LIMIT 1;";
     const char* param_values[2] = {name.c_str(), parent_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -565,15 +586,16 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = R"SQL(
-        SELECT uid, size, owner, permission_map, is_container
-        FROM files
-        WHERE name = $1 AND parent_uid = $2
-        LIMIT 1;
-    )SQL";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT uid, size, owner, permission_map, is_container "
+                            "FROM \"" + schema_name + "\".files "
+                            "WHERE name = $1 AND parent_uid = $2 "
+                            "LIMIT 1;";
     const char* param_values[2] = {name.c_str(), parent_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -624,10 +646,13 @@ Result<int64_t> Database::get_file_size(const std::string& file_uid, const std::
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = "SELECT size FROM files WHERE uid = $1 AND deleted = FALSE LIMIT 1;";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT size FROM \"" + schema_name + "\".files WHERE uid = $1 AND deleted = FALSE LIMIT 1;";
     const char* param_values[1] = {file_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -657,10 +682,13 @@ Result<int64_t> Database::get_directory_size(const std::string& dir_uid, const s
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = "SELECT COALESCE(SUM(size), 0) FROM files WHERE parent_uid = $1 AND deleted = FALSE;";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT COALESCE(SUM(size), 0) FROM \"" + schema_name + "\".files WHERE parent_uid = $1 AND deleted = FALSE;";
     const char* param_values[1] = {dir_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -690,15 +718,16 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = R"SQL(
-        SELECT name, parent_uid, size, owner, permission_map, is_container, deleted
-        FROM files
-        WHERE uid = $1
-        LIMIT 1;
-    )SQL";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT name, parent_uid, size, owner, permission_map, is_container, deleted "
+                            "FROM \"" + schema_name + "\".files "
+                            "WHERE uid = $1 "
+                            "LIMIT 1;";
     const char* param_values[1] = {uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -773,12 +802,15 @@ Result<std::vector<std::string>> Database::uid_to_path(const std::string& uid, c
 
     PGconn* pg_conn = conn->get_connection();
 
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
     // Since we don't have a 'path' column in the schema, we need to return a constructed path
     // For now, just return a simple path based on the file name
-    const char* query_sql = "SELECT name FROM files WHERE uid = $1 AND deleted = FALSE;";
+    std::string query_sql = "SELECT name FROM \"" + schema_name + "\".files WHERE uid = $1 AND deleted = FALSE;";
     const char* param_values[1] = {uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     std::vector<std::string> paths;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -809,15 +841,18 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
 
     PGconn* pg_conn = conn->get_connection();
 
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
     // In this schema, we may not need to store versions separately, or they might be handled differently
     // For now, let's update the file's size since a new version might have a different size
-    const char* update_sql = "UPDATE files SET size = $2 WHERE uid = $1;";
+    std::string update_sql = "UPDATE \"" + schema_name + "\".files SET size = $2 WHERE uid = $1;";
     const char* param_values[2] = {
         file_uid.c_str(),
         std::to_string(size).c_str()
     };
 
-    PGresult* res = PQexecParams(pg_conn, update_sql, 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         int rows_affected = std::stoi(PQcmdTuples(res));
@@ -844,12 +879,15 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
 
     PGconn* pg_conn = conn->get_connection();
 
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
     // In the current schema, we don't store separate version info, so return the file's basic info
     // This is a simplification - in a real system, you'd need proper version storage
-    const char* query_sql = "SELECT size, owner FROM files WHERE uid = $1 LIMIT 1;";
+    std::string query_sql = "SELECT size, owner FROM \"" + schema_name + "\".files WHERE uid = $1 LIMIT 1;";
     const char* param_values[1] = {file_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -880,12 +918,15 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
 
     PGconn* pg_conn = conn->get_connection();
 
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
     // In the current schema, we don't store separate version info
     // For this implementation, we'll just return the current version timestamp
-    const char* query_sql = "SELECT uid FROM files WHERE uid = $1;";
+    std::string query_sql = "SELECT uid FROM \"" + schema_name + "\".files WHERE uid = $1;";
     const char* param_values[1] = {file_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     std::vector<std::string> versions;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -1113,7 +1154,9 @@ Result<std::vector<std::string>> Database::get_least_accessed_files(int limit, c
 
     PGconn* pg_conn = conn->get_connection();
 
-    std::string sql = "SELECT uid FROM files WHERE is_deleted = FALSE ORDER BY modified_at ASC LIMIT " + std::to_string(limit) + ";";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+    std::string sql = "SELECT uid FROM \"" + schema_name + "\".files WHERE is_deleted = FALSE ORDER BY modified_at ASC LIMIT " + std::to_string(limit) + ";";
 
     PGresult* res = PQexec(pg_conn, sql.c_str());
 
@@ -1143,7 +1186,9 @@ Result<std::vector<std::string>> Database::get_infrequently_accessed_files(int d
 
     PGconn* pg_conn = conn->get_connection();
 
-    std::string sql = "SELECT uid FROM files WHERE is_deleted = FALSE AND modified_at < (CURRENT_TIMESTAMP - INTERVAL '" + std::to_string(days_threshold) + " days') ORDER BY modified_at ASC;";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+    std::string sql = "SELECT uid FROM \"" + schema_name + "\".files WHERE is_deleted = FALSE AND modified_at < (CURRENT_TIMESTAMP - INTERVAL '" + std::to_string(days_threshold) + " days') ORDER BY modified_at ASC;";
 
     PGresult* res = PQexec(pg_conn, sql.c_str());
 
@@ -1173,9 +1218,11 @@ Result<int64_t> Database::get_storage_usage(const std::string& tenant) {
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* sql = "SELECT COALESCE(SUM(size), 0) FROM files WHERE is_deleted = FALSE;";
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+    std::string sql = "SELECT COALESCE(SUM(size), 0) FROM \"" + schema_name + "\".files WHERE is_deleted = FALSE;";
 
-    PGresult* res = PQexec(pg_conn, sql);
+    PGresult* res = PQexec(pg_conn, sql.c_str());
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to get storage usage: " + std::string(PQerrorMessage(pg_conn));

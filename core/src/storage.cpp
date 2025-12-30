@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <algorithm>
 
 namespace fileengine {
 
@@ -18,15 +19,24 @@ Storage::~Storage() {
 }
 
 std::string Storage::get_sha256_desaturated_path(const std::string& uid) const {
-    // For this implementation, we'll use the first few characters of the UUID to create subdirectories
+    // For this implementation, we'll use the first few characters of the UUID to create multiple subdirectories
     // This helps prevent filesystem performance issues with many files in one directory
-    if (uid.length() < 4) {
-        return uid;
+    // We'll create 3 levels of desaturation with 2 characters each: xx/yy/zz/
+
+    // Remove hyphens from UUID to get continuous hex characters
+    std::string clean_uid = uid;
+    clean_uid.erase(std::remove(clean_uid.begin(), clean_uid.end(), '-'), clean_uid.end());
+
+    if (clean_uid.length() < 6) {
+        return uid;  // Return original if not enough characters
     }
-    
-    // Use first 2 characters of UUID to create subdirectory
-    std::string subdir = uid.substr(0, 2);
-    return subdir;
+
+    // Use first 6 characters of cleaned UUID to create 3 levels of 2-character subdirectories
+    std::string level1 = clean_uid.substr(0, 2);  // First 2 chars
+    std::string level2 = clean_uid.substr(2, 2);  // Next 2 chars
+    std::string level3 = clean_uid.substr(4, 2);  // Next 2 chars
+
+    return level1 + "/" + level2 + "/" + level3;
 }
 
 std::string Storage::get_storage_path(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) const {

@@ -150,6 +150,7 @@ int main(int argc, char** argv) {
     // Initialize filesystem
     std::cout << "Initializing filesystem..." << std::endl;
     auto filesystem = std::make_shared<fileengine::FileSystem>(tenant_manager);
+    filesystem->set_acl_manager(acl_manager);
 
     // Initialize file culler for intelligent local storage management
     std::cout << "Initializing file culling system..." << std::endl;

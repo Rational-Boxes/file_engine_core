@@ -20,13 +20,21 @@ GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
 grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
                                             const fileengine_rpc::MakeDirectoryRequest* request,
                                             fileengine_rpc::MakeDirectoryResponse* response) {
-    std::cout << "MakeDirectory called" << std::endl;
-    LOG_DEBUG("GRPCService", "MakeDirectory called for parent_uid: " + request->parent_uid() + ", name: " + request->name());
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory called - entering method");
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - parent_uid: '" + request->parent_uid() + "', name: '" + request->name() + "'");
+
     // Check if server is in read-only mode
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - checking read-only mode");
     if (is_server_in_readonly_mode()) {
         response->set_success(false);
         response->set_error("Server is in read-only mode due to database disconnection");
-        LOG_ERROR("GRPCService", "MakeDirectory failed: Server is in read-only mode");
+        LOG_ERROR("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory failed: Server is in read-only mode");
+        LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory - exiting with read-only error");
         return grpc::Status::OK;
     }
 
@@ -34,26 +42,63 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
     std::string parent_uid = request->parent_uid();
     std::string name = request->name();
     auto auth_context = request->auth();
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - extracted request parameters - parent_uid: '" + parent_uid + "', name: '" + name + "'");
 
     // Determine tenant from auth context
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - getting tenant from auth context");
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - tenant: '" + tenant + "', user: '" + user + "'");
+
+    // Log the raw auth context for debugging
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - raw auth context - user: '" + auth_context.user() + "', tenant: '" + auth_context.tenant() + "'");
+
+    // Check permissions on parent directory
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - checking permissions for parent_uid: '" + parent_uid + "', empty check: " + (parent_uid.empty() ? "true" : "false"));
+    if (!parent_uid.empty() && !validate_user_permissions(parent_uid, auth_context, 0200)) { // WRITE permission
+        response->set_success(false);
+        response->set_error("User does not have permission to create directory in this location");
+        LOG_ERROR("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory failed: User " + user + " does not have permission to create directory in " + parent_uid);
+        LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory - exiting with permission error");
+        return grpc::Status::OK;
+    }
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - permission check passed");
 
     // Call the filesystem to create the directory
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - calling filesystem mkdir with parent_uid: '" + parent_uid + "', name: '" + name + "', tenant: '" + tenant + "', user: '" + user + "'");
     auto result = filesystem_->mkdir(parent_uid, name, user, request->permissions(), tenant);
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - filesystem mkdir completed, success: " + (result.success ? "true" : "false"));
 
     if (result.success) {
         response->set_success(true);
         response->set_uid(result.value);
         response->set_error("");
-        LOG_INFO("GRPCService", "MakeDirectory successful for parent_uid: " + request->parent_uid() + ", name: " + request->name());
+        LOG_INFO("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                 "MakeDirectory successful for parent_uid: " + request->parent_uid() + ", name: " + request->name() + ", UID: " + result.value);
+        LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory - exiting successfully");
     } else {
         response->set_success(false);
         response->set_uid("");
         response->set_error(result.error);
-        LOG_ERROR("GRPCService", "Failed to create directory: " + result.error);
+        LOG_ERROR("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory failed to create directory: " + result.error);
+        LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+                  "MakeDirectory - exiting with filesystem error: " + result.error);
     }
 
+    LOG_DEBUG("GRPCService::MakeDirectory", Logger::getInstance().detailed_log_prefix() +
+              "MakeDirectory - returning status OK");
     return grpc::Status::OK;
 }
 
@@ -209,43 +254,80 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
 grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
                                    const fileengine_rpc::TouchRequest* request,
                                    fileengine_rpc::TouchResponse* response) {
-    LOG_DEBUG("GRPCService", "Touch called for parent_uid: " + request->parent_uid() + ", name: " + request->name());
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch called - entering method");
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - parent_uid: '" + request->parent_uid() + "', name: '" + request->name() + "'");
+
     // Check if server is in read-only mode
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - checking read-only mode");
     if (is_server_in_readonly_mode()) {
         response->set_success(false);
         response->set_error("Server is in read-only mode due to database disconnection");
-        LOG_ERROR("GRPCService", "Touch failed: Server is in read-only mode");
+        LOG_ERROR("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch failed: Server is in read-only mode");
+        LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch - exiting with read-only error");
         return grpc::Status::OK;
     }
 
     std::string parent_uid = request->parent_uid();
     std::string name = request->name();
     auto auth_context = request->auth();
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - extracted request parameters - parent_uid: '" + parent_uid + "', name: '" + name + "'");
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - tenant: '" + tenant + "', user: '" + user + "'");
+
+    // Log the raw auth context for debugging
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - raw auth context - user: '" + auth_context.user() + "', tenant: '" + auth_context.tenant() + "'");
 
     // Check permissions on parent directory
-    if (!validate_user_permissions(parent_uid, auth_context, 0200)) { // WRITE permission
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - checking permissions for parent_uid: '" + parent_uid + "', empty check: " + (parent_uid.empty() ? "true" : "false"));
+    if (!parent_uid.empty() && !validate_user_permissions(parent_uid, auth_context, 0200)) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to create file in this directory");
-        LOG_ERROR("GRPCService", "Touch failed: User " + user + " does not have permission to create file in directory " + parent_uid);
+        LOG_ERROR("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch failed: User " + user + " does not have permission to create file in directory " + parent_uid);
+        LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch - exiting with permission error");
         return grpc::Status::OK;
     }
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - permission check passed");
 
+    // Call the filesystem to create the file
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - calling filesystem touch with parent_uid: '" + parent_uid + "', name: '" + name + "', tenant: '" + tenant + "', user: '" + user + "'");
     auto result = filesystem_->touch(parent_uid, name, user, tenant);
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - filesystem touch completed, success: " + (result.success ? "true" : "false"));
 
     response->set_success(result.success);
     if (result.success) {
         response->set_uid(result.value);
         response->set_error("");
-        LOG_INFO("GRPCService", "Touch successful for parent_uid: " + parent_uid + ", name: " + name);
+        LOG_INFO("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                 "Touch successful for parent_uid: " + parent_uid + ", name: " + name + ", UID: " + result.value);
+        LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch - exiting successfully");
     } else {
         response->set_uid("");
         response->set_error(result.error);
-        LOG_ERROR("GRPCService", "Touch failed for parent_uid: " + parent_uid + ", name: " + name + " with error: " + result.error);
+        LOG_ERROR("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch failed for parent_uid: " + parent_uid + ", name: " + name + " with error: " + result.error);
+        LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+                  "Touch - exiting with filesystem error: " + result.error);
     }
 
+    LOG_DEBUG("GRPCService::Touch", Logger::getInstance().detailed_log_prefix() +
+              "Touch - returning status OK");
     return grpc::Status::OK;
 }
 
@@ -319,43 +401,81 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
 grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
                                      const fileengine_rpc::PutFileRequest* request,
                                      fileengine_rpc::PutFileResponse* response) {
-    LOG_DEBUG("GRPCService", "PutFile called for uid: " + request->uid());
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile called - entering method");
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - file_uid: '" + request->uid() + "', data size: " + std::to_string(request->data().size()));
+
     // Check if server is in read-only mode
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - checking read-only mode");
     if (is_server_in_readonly_mode()) {
         response->set_success(false);
         response->set_error("Server is in read-only mode due to database disconnection");
-        LOG_ERROR("GRPCService", "PutFile failed: Server is in read-only mode");
+        LOG_ERROR("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile failed: Server is in read-only mode");
+        LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile - exiting with read-only error");
         return grpc::Status::OK;
     }
 
     std::string file_uid = request->uid();
     auto file_data = request->data();
     auto auth_context = request->auth();
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - extracted request parameters - file_uid: '" + file_uid + "', data size: " + std::to_string(file_data.size()));
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - tenant: '" + tenant + "', user: '" + user + "'");
+
+    // Log the raw auth context for debugging
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - raw auth context - user: '" + auth_context.user() + "', tenant: '" + auth_context.tenant() + "'");
 
     // Check permissions - user needs write access to the file
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - checking permissions for file_uid: '" + file_uid + "'");
     if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to write to file");
-        LOG_ERROR("GRPCService", "PutFile failed: User " + user + " does not have permission to write to file " + file_uid);
+        LOG_ERROR("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile failed: User " + user + " does not have permission to write to file " + file_uid);
+        LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile - exiting with permission error");
         return grpc::Status::OK;
     }
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - permission check passed");
 
     // Convert bytes to std::vector<uint8_t>
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - converting data to vector, size: " + std::to_string(file_data.size()));
     std::vector<uint8_t> data_vec(file_data.begin(), file_data.end());
 
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - calling filesystem put with file_uid: '" + file_uid + "', tenant: '" + tenant + "', user: '" + user + "'");
     auto result = filesystem_->put(file_uid, data_vec, user, tenant);
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - filesystem put completed, success: " + (result.success ? "true" : "false"));
 
     response->set_success(result.success);
     if (!result.success) {
         response->set_error(result.error);
-        LOG_ERROR("GRPCService", "PutFile failed for uid: " + file_uid + " with error: " + result.error);
+        LOG_ERROR("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile failed for uid: " + file_uid + " with error: " + result.error);
+        LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile - exiting with filesystem error: " + result.error);
     } else {
-        LOG_INFO("GRPCService", "PutFile successful for uid: " + file_uid);
+        LOG_INFO("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                 "PutFile successful for uid: " + file_uid);
+        LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+                  "PutFile - exiting successfully");
     }
 
+    LOG_DEBUG("GRPCService::PutFile", Logger::getInstance().detailed_log_prefix() +
+              "PutFile - returning status OK");
     return grpc::Status::OK;
 }
 
