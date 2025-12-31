@@ -170,6 +170,28 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
     std::string container_str = is_container ? "TRUE" : "FALSE";
     std::string deleted_str = "FALSE"; // Files are not deleted by default
 
+    // Validate parameters before executing query
+    if (uid.empty()) {
+        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: uid is empty");
+        connection_pool_->release(conn);
+        return Result<std::string>::err("Invalid parameter: uid is empty");
+    }
+
+    if (name.empty()) {
+        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: name is empty for uid: " + uid);
+        connection_pool_->release(conn);
+        return Result<std::string>::err("Invalid parameter: name is empty");
+    }
+
+    if (schema_name.empty()) {
+        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::string>::err("Invalid parameter: schema_name is empty");
+    }
+
     const char* param_values[8] = {
         uid.c_str(),              // $1
         name.c_str(),             // $2
@@ -181,8 +203,20 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
         deleted_str.c_str()       // $8
     };
 
+    // Validate that none of the parameter values are null
+    for (int i = 0; i < 8; ++i) {
+        if (param_values[i] == nullptr) {
+            LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+                      "Invalid parameter: param_values[" + std::to_string(i) + "] is null for uid: " + uid);
+            connection_pool_->release(conn);
+            return Result<std::string>::err("Invalid parameter: param_values[" + std::to_string(i) + "] is null");
+        }
+    }
+
     LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
-              "Executing SQL INSERT with parameters for UID: " + uid);
+              "Executing SQL INSERT with parameters for UID: " + uid +
+              ", name: " + name + ", parent_uid: " + parent_uid +
+              ", owner: " + owner + ", permissions: " + perms_str);
 
     PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 8, nullptr, param_values, nullptr, nullptr, 0);
 
@@ -314,11 +348,30 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
+    // Validate parameters before executing query
+    if (uid.empty()) {
+        LOG_ERROR("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: uid is empty");
+        connection_pool_->release(conn);
+        return Result<std::optional<FileInfo>>::err("Invalid parameter: uid is empty");
+    }
+
+    if (schema_name.empty()) {
+        LOG_ERROR("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
+    }
+
     std::string query_sql = "SELECT name, parent_uid, size, owner, permission_map, is_container, deleted "
                             "FROM \"" + schema_name + "\".files "
                             "WHERE uid = $1 AND deleted = FALSE "
                             "LIMIT 1;";
     const char* param_values[1] = {uid.c_str()};
+
+    // Log the query and parameters for debugging
+    LOG_DEBUG("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
+              "Executing query: " + query_sql + " with param[0]: '" + uid + "'");
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
@@ -421,11 +474,31 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
+    // Validate parameters before executing query
+    if (schema_name.empty()) {
+        LOG_ERROR("Database::list_files_in_directory", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
+    }
+
     std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container "
                             "FROM \"" + schema_name + "\".files "
                             "WHERE parent_uid = $1 AND deleted = FALSE "
                             "ORDER BY name;";
     const char* param_values[1] = {parent_uid.c_str()};
+
+    // Validate that the parameter value is not null
+    if (param_values[0] == nullptr) {
+        LOG_ERROR("Database::list_files_in_directory", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: parent_uid is null for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err("Invalid parameter: parent_uid is null");
+    }
+
+    LOG_DEBUG("Database::list_files_in_directory", Logger::getInstance().detailed_log_prefix() +
+              "Executing SQL query to list files in directory with parent_uid: " + parent_uid +
+              ", tenant: " + tenant + ", schema: " + schema_name);
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
@@ -475,11 +548,32 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
+    // Validate parameters before executing query
+    if (schema_name.empty()) {
+        LOG_ERROR("Database::list_files_in_directory_with_deleted", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
+    }
+
     std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container, deleted "
                             "FROM \"" + schema_name + "\".files "
                             "WHERE parent_uid = $1 "
                             "ORDER BY name;";
     const char* param_values[1] = {parent_uid.c_str()};
+
+
+    // Validate that the parameter value is not null
+    if (param_values[0] == nullptr) {
+        LOG_ERROR("Database::list_files_in_directory_with_deleted", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: parent_uid is null for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err("Invalid parameter: parent_uid is null");
+    }
+
+    LOG_DEBUG("Database::list_files_in_directory_with_deleted", Logger::getInstance().detailed_log_prefix() +
+              "Executing SQL query to list files in directory (with deleted) with parent_uid: " + parent_uid +
+              ", tenant: " + tenant + ", schema: " + schema_name);
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
@@ -530,11 +624,41 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
+    // Validate parameters before executing query
+    if (name.empty()) {
+        LOG_ERROR("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: name is empty for parent_uid: " + parent_uid);
+        connection_pool_->release(conn);
+        return Result<std::optional<FileInfo>>::err("Invalid parameter: name is empty");
+    }
+
+    if (schema_name.empty()) {
+        LOG_ERROR("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
+    }
+
     std::string query_sql = "SELECT uid, size, owner, permission_map, is_container "
                             "FROM \"" + schema_name + "\".files "
                             "WHERE name = $1 AND parent_uid = $2 AND deleted = FALSE "
                             "LIMIT 1;";
     const char* param_values[2] = {name.c_str(), parent_uid.c_str()};
+
+    // Validate that none of the parameter values are null
+    for (int i = 0; i < 2; ++i) {
+        if (param_values[i] == nullptr) {
+            LOG_ERROR("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+                      "Invalid parameter: param_values[" + std::to_string(i) + "] is null for name: " + name +
+                      ", parent_uid: " + parent_uid);
+            connection_pool_->release(conn);
+            return Result<std::optional<FileInfo>>::err("Invalid parameter: param_values[" + std::to_string(i) + "] is null");
+        }
+    }
+
+    LOG_DEBUG("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+              "Executing SQL query to get file by name: " + name + " and parent_uid: " + parent_uid +
+              ", tenant: " + tenant + ", schema: " + schema_name);
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
@@ -590,11 +714,41 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
+    // Validate parameters before executing query
+    if (name.empty()) {
+        LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: name is empty for parent_uid: " + parent_uid);
+        connection_pool_->release(conn);
+        return Result<std::optional<FileInfo>>::err("Invalid parameter: name is empty");
+    }
+
+    if (schema_name.empty()) {
+        LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
+    }
+
     std::string query_sql = "SELECT uid, size, owner, permission_map, is_container "
                             "FROM \"" + schema_name + "\".files "
                             "WHERE name = $1 AND parent_uid = $2 "
                             "LIMIT 1;";
     const char* param_values[2] = {name.c_str(), parent_uid.c_str()};
+
+    // Validate that none of the parameter values are null
+    for (int i = 0; i < 2; ++i) {
+        if (param_values[i] == nullptr) {
+            LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+                      "Invalid parameter: param_values[" + std::to_string(i) + "] is null for name: " + name +
+                      ", parent_uid: " + parent_uid);
+            connection_pool_->release(conn);
+            return Result<std::optional<FileInfo>>::err("Invalid parameter: param_values[" + std::to_string(i) + "] is null");
+        }
+    }
+
+    LOG_DEBUG("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+              "Executing SQL query to get file by name: " + name + " and parent_uid: " + parent_uid +
+              ", tenant: " + tenant + ", schema: " + schema_name);
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
