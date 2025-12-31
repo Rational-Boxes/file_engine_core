@@ -170,14 +170,6 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
     std::string container_str = is_container ? "TRUE" : "FALSE";
     std::string deleted_str = "FALSE"; // Files are not deleted by default
 
-    // Validate parameters before executing query
-    if (uid.empty()) {
-        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
-                  "Invalid parameter: uid is empty");
-        connection_pool_->release(conn);
-        return Result<std::string>::err("Invalid parameter: uid is empty");
-    }
-
     if (name.empty()) {
         LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: name is empty for uid: " + uid);
@@ -348,13 +340,8 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
-    // Validate parameters before executing query
-    if (uid.empty()) {
-        LOG_ERROR("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
-                  "Invalid parameter: uid is empty");
-        connection_pool_->release(conn);
-        return Result<std::optional<FileInfo>>::err("Invalid parameter: uid is empty");
-    }
+    // Note: Empty UID is valid for root directory which has an empty UID by design
+    // No need to validate that uid is not empty
 
     if (schema_name.empty()) {
         LOG_ERROR("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
