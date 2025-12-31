@@ -2,6 +2,7 @@
 .txt
 .bac
 .env
+.log
 build/
 build_*/
 *_build/

@@ -1,0 +1,84 @@
+Starting FileEngine gRPC Server...
+[2025-12-30 15:04:25.238] [INFO] [Server] Logger initialized with level: debug
+Config loaded:
+  DB Host: localhost
+  DB Port: 5434
+  DB Name: fileengine
+  Storage Path: /home/telendry/temp/fileengine
+  S3 Endpoint: http://localhost:9000
+  Log Level: debug
+  Log File: ./log/fileengine.log
+  Log to Console: true
+Connecting to database...
+[2025-12-30 15:04:25.238] [DEBUG] [Database] [thread:140204589146176] Attempting to connect to database using connection pool.
+[2025-12-30 15:04:25.238] [DEBUG] [ConnectionPool] [thread:140204589146176] Initializing connection pool with size: 10
+[2025-12-30 15:04:25.238] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.248] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.248] [INFO] [ConnectionPool] Successfully initialized connection #1 for pool.
+[2025-12-30 15:04:25.248] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.254] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.254] [INFO] [ConnectionPool] Successfully initialized connection #2 for pool.
+[2025-12-30 15:04:25.254] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.261] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.261] [INFO] [ConnectionPool] Successfully initialized connection #3 for pool.
+[2025-12-30 15:04:25.261] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.268] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.268] [INFO] [ConnectionPool] Successfully initialized connection #4 for pool.
+[2025-12-30 15:04:25.269] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.275] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.275] [INFO] [ConnectionPool] Successfully initialized connection #5 for pool.
+[2025-12-30 15:04:25.275] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.281] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.281] [INFO] [ConnectionPool] Successfully initialized connection #6 for pool.
+[2025-12-30 15:04:25.281] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.287] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.287] [INFO] [ConnectionPool] Successfully initialized connection #7 for pool.
+[2025-12-30 15:04:25.287] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.294] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.294] [INFO] [ConnectionPool] Successfully initialized connection #8 for pool.
+[2025-12-30 15:04:25.294] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.300] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.300] [INFO] [ConnectionPool] Successfully initialized connection #9 for pool.
+[2025-12-30 15:04:25.300] [DEBUG] [DatabaseConnection] [thread:140204589146176] Attempting to connect to database using conninfo: host=localhost port=5434 dbname=fileengine user=postgres password=postgres connect_timeout=5
+[2025-12-30 15:04:25.306] [INFO] [DatabaseConnection] Successfully connected to database.
+[2025-12-30 15:04:25.306] [INFO] [ConnectionPool] Successfully initialized connection #10 for pool.
+[2025-12-30 15:04:25.306] [INFO] [ConnectionPool] Successfully initialized all 10 connections in the pool.
+[2025-12-30 15:04:25.306] [INFO] [Database] Successfully initialized database connection pool.
+Database connected successfully.
+Database connection monitoring started.
+Ensuring database schema exists...
+[2025-12-30 15:04:25.306] [DEBUG] [Database] [thread:140204589146176] Attempting to create global schema.
+[2025-12-30 15:04:25.306] [DEBUG] [Database] [thread:140204589146176] Executing SQL to create global tables.
+NOTICE:  relation "file_access_stats" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_file_uid" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_hostname" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_last_accessed" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_access_count" already exists, skipping
+NOTICE:  relation "tenants" already exists, skipping
+[2025-12-30 15:04:25.307] [INFO] [Database] Successfully created or verified global tables.
+Database schema verified.
+Initializing object store...
+S3 storage initialized successfully.
+Initializing local storage...
+Initializing tenant manager...
+Initializing filesystem...
+[2025-12-30 15:04:25.307] [DEBUG] [FileSystem] [thread:140204589146176] [thread:140204589146176] [PERFORMANCE ENHANCEMENT] Starting async backup worker thread
+[2025-12-30 15:04:25.307] [DEBUG] [FileSystem] [thread:140204589146176] [thread:140204589146176] [PERFORMANCE ENHANCEMENT] Async backup worker thread started
+Initializing file culling system...
+Initializing object store sync...
+Object store sync initialized and started.
+[2025-12-30 15:04:25.307] [DEBUG] [FileSystem::backup_worker_loop] [thread:140204574164672] [thread:140204574164672] [PERFORMANCE ENHANCEMENT] Backup worker thread loop started
+File culling system initialized and started.
+Initializing gRPC service...
+[2025-12-30 15:04:25.307] [DEBUG] [FileSystem::backup_worker_loop] [thread:140204574164672] [thread:140204574164672] [CONCURRENCY] Backup worker entering wait state.
+Attempting to bind gRPC server to 0.0.0.0:50051
+Setting gRPC server to use 10 threads
+gRPC Server listening on 0.0.0.0:50051 with 10 threads
+
+Shutting down gRPC server...
+gRPC server shut down completed.
+[2025-12-30 15:09:25.311] [DEBUG] [FileSystem] [thread:140204589146176] [thread:140204589146176] [PERFORMANCE ENHANCEMENT] Stopping async backup worker thread
+[2025-12-30 15:09:25.311] [DEBUG] [FileSystem::backup_worker_loop] [thread:140204574164672] [thread:140204574164672] [CONCURRENCY] Backup worker woke up. Queue empty: true, Running: false
+[2025-12-30 15:09:25.311] [DEBUG] [FileSystem::backup_worker_loop] [thread:140204574164672] [thread:140204574164672] [CONCURRENCY] Backup worker shutting down (no more tasks and not running).
+[2025-12-30 15:09:25.311] [DEBUG] [FileSystem::backup_worker_loop] [thread:140204574164672] [thread:140204574164672] [PERFORMANCE ENHANCEMENT] Backup worker thread loop ended
+[2025-12-30 15:09:25.311] [DEBUG] [FileSystem] [thread:140204589146176] [thread:140204589146176] [PERFORMANCE ENHANCEMENT] Async backup worker thread stopped

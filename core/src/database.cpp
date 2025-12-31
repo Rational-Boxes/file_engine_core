@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <chrono>
 
 namespace fileengine {
 
@@ -844,30 +845,38 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
-    // In this schema, we may not need to store versions separately, or they might be handled differently
-    // For now, let's update the file's size since a new version might have a different size
-    std::string update_sql = "UPDATE \"" + schema_name + "\".files SET size = $2 WHERE uid = $1;";
-    const char* param_values[2] = {
+    // Insert the version into the versions table with its storage path
+    // Keep the version_timestamp as a string to avoid conversion issues
+    std::string insert_sql = "INSERT INTO \"" + schema_name + "\".versions (file_uid, version_timestamp, size, storage_path) "
+                             "VALUES ($1, $2, $3, $4) "
+                             "ON CONFLICT (file_uid, version_timestamp) DO UPDATE SET "
+                             "size = EXCLUDED.size, storage_path = EXCLUDED.storage_path "
+                             "RETURNING id;";
+    const char* param_values[4] = {
         file_uid.c_str(),
-        std::to_string(size).c_str()
+        version_timestamp.c_str(),  // Keep as string
+        std::to_string(size).c_str(),
+        storage_path.c_str()
     };
 
-    PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 4, nullptr, param_values, nullptr, nullptr, 0);
 
-    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
-        int rows_affected = std::stoi(PQcmdTuples(res));
-        PQclear(res);
-        connection_pool_->release(conn);
-        if (rows_affected > 0) {
-            return Result<int64_t>::ok(size);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        if (PQntuples(res) > 0) {
+            int64_t id = std::stoll(PQgetvalue(res, 0, 0));
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<int64_t>::ok(id);
         } else {
-            return Result<int64_t>::err("File not found for version update");
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<int64_t>::err("Failed to insert version record");
         }
     } else {
         std::string error = PQerrorMessage(pg_conn);
         PQclear(res);
         connection_pool_->release(conn);
-        return Result<int64_t>::err("Failed to update file size for version: " + error);
+        return Result<int64_t>::err("Failed to insert version: " + error);
     }
 }
 
@@ -882,22 +891,20 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
-    // In the current schema, we don't store separate version info, so return the file's basic info
-    // This is a simplification - in a real system, you'd need proper version storage
-    std::string query_sql = "SELECT size, owner FROM \"" + schema_name + "\".files WHERE uid = $1 LIMIT 1;";
-    const char* param_values[1] = {file_uid.c_str()};
+    // Query the versions table to get the storage path for this specific version
+    std::string query_sql = "SELECT storage_path FROM \"" + schema_name + "\".versions WHERE file_uid = $1 AND version_timestamp = $2 LIMIT 1;";
+    const char* param_values[2] = {file_uid.c_str(), version_timestamp.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
-            // For now, return a constructed storage path based on file UID
-            std::string path = "/storage/" + file_uid;  // Construct a simple path
+            std::string storage_path = PQgetvalue(res, 0, 0);
             PQclear(res);
             connection_pool_->release(conn);
-            return Result<std::optional<std::string>>::ok(path);
+            return Result<std::optional<std::string>>::ok(storage_path);
         } else {
-            // File not found
+            // Version not found
             PQclear(res);
             connection_pool_->release(conn);
             return Result<std::optional<std::string>>::ok(std::nullopt);
@@ -906,7 +913,7 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
         std::string error = PQerrorMessage(pg_conn);
         PQclear(res);
         connection_pool_->release(conn);
-        return Result<std::optional<std::string>>::err("Failed to get file storage path: " + error);
+        return Result<std::optional<std::string>>::err("Failed to get version storage path: " + error);
     }
 }
 
@@ -1301,7 +1308,7 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
     std::string create_versions_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".versions ("
         "id BIGSERIAL PRIMARY KEY, "
         "file_uid VARCHAR(64) NOT NULL, "
-        "version_timestamp BIGINT NOT NULL, "
+        "version_timestamp TEXT NOT NULL, "
         "size BIGINT NOT NULL, "
         "storage_path TEXT NOT NULL "
         ");";
@@ -1312,7 +1319,7 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
     std::string create_metadata_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".metadata ("
         "id BIGSERIAL PRIMARY KEY, "
         "file_uid VARCHAR(64) NOT NULL, "
-        "version_timestamp BIGINT NOT NULL, "
+        "version_timestamp TEXT NOT NULL, "
         "key_name TEXT NOT NULL, "
         "value TEXT NOT NULL, "
         "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP "

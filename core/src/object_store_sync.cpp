@@ -136,23 +136,28 @@ bool ObjectStoreSync::is_connection_healthy() const {
     if (!object_store_) {
         return false;
     }
-    
+
     // In a real implementation, this would check the actual connection
-    // For now, return true if object store is accessible
+    // For now, we'll return true if object store is accessible
+    // A more robust implementation would perform a connectivity test
     return true;
 }
 
 Result<void> ObjectStoreSync::attempt_recovery() {
-    // This would contain logic to recover from connection failures
+    // This contains logic to recover from connection failures
     // For example, attempting to reconnect to the object store
-    if (!is_connection_healthy()) {
-        if (object_store_) {
-            auto init_result = object_store_->initialize();
-            return init_result;
+    if (object_store_) {
+        // Try to reinitialize the object store connection
+        auto init_result = object_store_->initialize();
+        if (init_result.success) {
+            // Log success if needed
+        } else {
+            // Log error if needed
         }
+        return init_result;
+    } else {
+        return Result<void>::err("Object store not available");
     }
-    
-    return Result<void>::ok();
 }
 
 size_t ObjectStoreSync::get_synced_file_count() const {
