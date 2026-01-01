@@ -111,3 +111,35 @@ files to cull from the local storage when free space is running
 out. Uses last access and access frequency to determine what
 files to delete to recover space in the local cache. Only
 can be active when data is backed up to an object store.
+
+## Object-store integration
+
+The set of files needs to be stored in an S3 compatible service.
+The full history of all files is stored in object store for fully
+a immutable file system. This also allows for managing the local
+cache of file payloads to cull less used files to below a space
+usage threshold.
+
+The object-store integration needs to support both MinIO and native
+AWS S3 using the official AWS-SDK library.
+
+### On-demand upload to object store
+
+After writing  file payload to local storage, a background thread
+uploads it to the S3/object-store service. When a file that is
+defined in the database is accessed but the local store does not
+contain the payload, it is fetched from the object store.
+
+Implement functions for uploading and downloading a single file
+from S3/object-store as this will also be used in synchronization.
+
+### Storage synchronization
+
+This operation scans all local files and if not in the S3/object-store
+uploads them. This needs to run as a background thread that is started
+when the service loads. It runs once at start-up to make sure any local
+files are saved. Then it is idle unless the connection to the object-store
+fails. Then it wakes every FILEENGINE_S3_RETRY_SECONDS and attempts to
+conduct a synchronization. There needs to be a flag for a loss of connectivity
+that causes the sync thread to become active until connection restored
+and any new files synced up.
