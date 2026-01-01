@@ -58,6 +58,9 @@ public:
     // Check if the sync service is running
     bool is_sync_running() const;
 
+    // Perform comprehensive sync of all local files (for startup)
+    Result<void> perform_comprehensive_local_sync();
+
     ~ObjectStoreSync();
 
 private:

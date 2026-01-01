@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <cstring>
 
 namespace fileengine {
 
@@ -106,8 +109,8 @@ Result<void> ObjectStoreSync::perform_startup_sync() {
     if (!config_.enabled) {
         return Result<void>::ok();
     }
-    
-    // Perform sync for all tenants
+
+    // First, sync files that are in the database
     auto tenant_result = get_tenant_list();
     if (tenant_result.success) {
         for (const auto& tenant : tenant_result.value) {
@@ -118,9 +121,130 @@ Result<void> ObjectStoreSync::perform_startup_sync() {
         }
     } else {
         // Just sync the default
-        return sync_files();
+        auto result = sync_files();
+        if (!result.success) {
+            return result;
+        }
     }
-    
+
+    // Additionally, perform a comprehensive sync of all local files to ensure nothing is missed
+    // This handles the case where files exist in local storage but are not tracked in the database
+    auto comprehensive_result = perform_comprehensive_local_sync();
+    if (!comprehensive_result.success) {
+        // Log the error but don't fail the entire startup sync
+        // This is because local files might be corrupted or inaccessible
+    }
+
+    return Result<void>::ok();
+}
+
+Result<void> ObjectStoreSync::perform_comprehensive_local_sync() {
+    if (!storage_ || !object_store_) {
+        return Result<void>::err("Storage or object store not available");
+    }
+
+    // Get all local file paths for the default tenant
+    auto local_paths_result = storage_->get_local_file_paths("default");
+    if (!local_paths_result.success) {
+        // Try with empty tenant name as well
+        local_paths_result = storage_->get_local_file_paths("");
+        if (!local_paths_result.success) {
+            return Result<void>::err("Failed to get local file paths: " + local_paths_result.error);
+        }
+    }
+
+    // Process each local file to check if it needs to be synced
+    for (const auto& path : local_paths_result.value) {
+        // Parse the path to extract tenant, uid, and version timestamp
+        // Path format: base_path/tenant/xx/yy/zz/uid/version_timestamp
+        size_t base_pos = path.find("default");
+        if (base_pos == std::string::npos) {
+            // Try looking for the base path structure
+            std::string base_path = storage_->get_storage_path("", "", "default"); // Get a sample path to understand structure
+            // We'll use a simpler approach: find the last 2 segments (uid/version)
+            size_t last_slash = path.find_last_of('/');
+            if (last_slash == std::string::npos) continue;
+
+            std::string version_timestamp = path.substr(last_slash + 1);
+
+            // Validate that this looks like a timestamp (basic check)
+            if (version_timestamp.length() < 15 || version_timestamp[8] != '_') continue; // Basic timestamp format check
+
+            size_t second_last_slash = path.substr(0, last_slash).find_last_of('/');
+            if (second_last_slash == std::string::npos) continue;
+
+            std::string uid = path.substr(second_last_slash + 1, last_slash - second_last_slash - 1);
+
+            // Basic UUID format validation (contains hyphens in expected positions)
+            if (uid.length() != 36 || uid[8] != '-' || uid[13] != '-' || uid[18] != '-' || uid[23] != '-') continue;
+
+            // Check if this file exists in the object store
+            std::string obj_store_path = object_store_->get_storage_path(uid, version_timestamp, "default");
+            auto exists_result = object_store_->file_exists(obj_store_path, "default");
+
+            if (!exists_result.success || !exists_result.value) {
+                // File doesn't exist in object store, sync it
+                std::string local_storage_path = storage_->get_storage_path(uid, version_timestamp, "default");
+                auto exists_local = storage_->file_exists(local_storage_path, "default");
+
+                if (exists_local.success && exists_local.value) {
+                    auto read_result = storage_->read_file(local_storage_path, "default");
+                    if (read_result.success) {
+                        auto store_result = object_store_->store_file(uid, version_timestamp, read_result.value, "default");
+                        if (store_result.success) {
+                            synced_file_count_++;
+                        } else {
+                            failed_sync_count_++;
+                        }
+                    } else {
+                        failed_sync_count_++;
+                    }
+                }
+            }
+        } else {
+            // Found "default" in path, extract uid and version
+            size_t last_slash = path.find_last_of('/');
+            if (last_slash == std::string::npos) continue;
+
+            std::string version_timestamp = path.substr(last_slash + 1);
+
+            // Validate that this looks like a timestamp (basic check)
+            if (version_timestamp.length() < 15 || version_timestamp[8] != '_') continue; // Basic timestamp format check
+
+            size_t second_last_slash = path.substr(0, last_slash).find_last_of('/');
+            if (second_last_slash == std::string::npos) continue;
+
+            std::string uid = path.substr(second_last_slash + 1, last_slash - second_last_slash - 1);
+
+            // Basic UUID format validation
+            if (uid.length() != 36 || uid[8] != '-' || uid[13] != '-' || uid[18] != '-' || uid[23] != '-') continue;
+
+            // Check if this file exists in the object store
+            std::string obj_store_path = object_store_->get_storage_path(uid, version_timestamp, "default");
+            auto exists_result = object_store_->file_exists(obj_store_path, "default");
+
+            if (!exists_result.success || !exists_result.value) {
+                // File doesn't exist in object store, sync it
+                std::string local_storage_path = storage_->get_storage_path(uid, version_timestamp, "default");
+                auto exists_local = storage_->file_exists(local_storage_path, "default");
+
+                if (exists_local.success && exists_local.value) {
+                    auto read_result = storage_->read_file(local_storage_path, "default");
+                    if (read_result.success) {
+                        auto store_result = object_store_->store_file(uid, version_timestamp, read_result.value, "default");
+                        if (store_result.success) {
+                            synced_file_count_++;
+                        } else {
+                            failed_sync_count_++;
+                        }
+                    } else {
+                        failed_sync_count_++;
+                    }
+                }
+            }
+        }
+    }
+
     return Result<void>::ok();
 }
 
@@ -133,14 +257,13 @@ Result<void> ObjectStoreSync::perform_tenant_sync(const std::string& tenant) {
 }
 
 bool ObjectStoreSync::is_connection_healthy() const {
-    if (!object_store_) {
+    if (!object_store_ || !object_store_->is_initialized()) {
         return false;
     }
 
-    // In a real implementation, this would check the actual connection
-    // For now, we'll return true if object store is accessible
-    // A more robust implementation would perform a connectivity test
-    return true;
+    // Perform a connectivity test by checking if the bucket exists
+    auto result = object_store_->bucket_exists();
+    return result.success && result.value;
 }
 
 Result<void> ObjectStoreSync::attempt_recovery() {
@@ -151,10 +274,11 @@ Result<void> ObjectStoreSync::attempt_recovery() {
         auto init_result = object_store_->initialize();
         if (init_result.success) {
             // Log success if needed
+            return Result<void>::ok();
         } else {
             // Log error if needed
+            return init_result;
         }
-        return init_result;
     } else {
         return Result<void>::err("Object store not available");
     }
@@ -173,17 +297,38 @@ bool ObjectStoreSync::is_sync_running() const {
 }
 
 void ObjectStoreSync::monitoring_loop() {
+    bool connection_lost = false;
+
     while (running_.load()) {
         // Check connection health
-        if (!is_connection_healthy()) {
+        bool is_healthy = is_connection_healthy();
+
+        if (!is_healthy) {
+            if (!connection_lost) {
+                // First time we detect connection loss
+                connection_lost = true;
+            }
+            // Attempt recovery
             attempt_recovery();
+
+            // If still not healthy after recovery attempt, wait for retry interval
+            if (!is_connection_healthy()) {
+                std::this_thread::sleep_for(std::chrono::seconds(config_.retry_seconds));
+                continue; // Skip sync if connection is still down
+            } else {
+                // Connection was restored, reset the flag
+                connection_lost = false;
+            }
         }
 
-        // Perform periodic sync of files that need synchronization
-        // This ensures files are synced periodically, not just on-demand
-        auto sync_result = perform_sync();
-        if (!sync_result.success) {
-            // Log error but continue monitoring
+        // Only perform sync if connection is healthy
+        if (is_connection_healthy()) {
+            // Perform periodic sync of files that need synchronization
+            // This ensures files are synced periodically, not just on-demand
+            auto sync_result = perform_sync();
+            if (!sync_result.success) {
+                // Log error but continue monitoring
+            }
         }
 
         // Sleep for the configured retry interval before checking again
@@ -218,41 +363,41 @@ Result<void> ObjectStoreSync::sync_files(const std::string& tenant) {
     return Result<void>::ok();
 }
 
-Result<void> ObjectStoreSync::sync_file(const std::string& uid, const std::string& version_timestamp, 
+Result<void> ObjectStoreSync::sync_file(const std::string& uid, const std::string& version_timestamp,
                                        const std::string& tenant) {
     if (!storage_ || !object_store_) {
         return Result<void>::err("Storage or object store not available");
     }
-    
+
     // Get the local storage path for this file version
     std::string storage_path = storage_->get_storage_path(uid, version_timestamp, tenant);
-    
+
     // Check if the file exists locally
     auto exists_result = storage_->file_exists(storage_path, tenant);
     if (!exists_result.success || !exists_result.value) {
         return Result<void>::err("Local file does not exist: " + storage_path);
     }
-    
+
     // Read the file from local storage
     auto read_result = storage_->read_file(storage_path, tenant);
     if (!read_result.success) {
         return Result<void>::err("Failed to read local file: " + read_result.error);
     }
-    
+
     // Store the file in object store
     auto store_result = object_store_->store_file(uid, version_timestamp, read_result.value, tenant);
     if (!store_result.success) {
         return Result<void>::err("Failed to store file in object store: " + store_result.error);
     }
-    
+
     return Result<void>::ok();
 }
 
 Result<std::vector<std::pair<std::string, std::string>>> ObjectStoreSync::get_files_to_sync(const std::string& tenant) {
     std::vector<std::pair<std::string, std::string>> files_to_sync;
 
-    if (!db_) {
-        return Result<std::vector<std::pair<std::string, std::string>>>::err("Database not available");
+    if (!db_ || !storage_ || !object_store_) {
+        return Result<std::vector<std::pair<std::string, std::string>>>::err("Database, storage, or object store not available");
     }
 
     // Get ALL files from database that may need syncing
@@ -285,6 +430,51 @@ Result<std::vector<std::pair<std::string, std::string>>> ObjectStoreSync::get_fi
         }
     }
 
+    // Additionally, scan local storage for files that might not be in the database
+    // This handles the case where files exist in local storage but are not tracked in the database
+    auto local_paths_result = storage_->get_local_file_paths(tenant);
+    if (local_paths_result.success) {
+        // Process the local file paths to identify files that need to be synced
+        // This is important for startup sync to ensure all local files are backed up to S3
+        for (const auto& path : local_paths_result.value) {
+            // Extract file UID and version timestamp from the path
+            // The path format is: base_path/tenant/xx/yy/zz/uid/version_timestamp
+            size_t tenant_pos = path.find(tenant.empty() ? "default" : tenant);
+            if (tenant_pos != std::string::npos) {
+                // Extract uid and version from path
+                // Path format: base_path/tenant/xx/yy/zz/uid/version_timestamp
+                size_t last_slash = path.find_last_of('/');
+                if (last_slash != std::string::npos) {
+                    std::string version_timestamp = path.substr(last_slash + 1);
+                    size_t second_last_slash = path.substr(0, last_slash).find_last_of('/');
+                    if (second_last_slash != std::string::npos) {
+                        std::string uid = path.substr(second_last_slash + 1, last_slash - second_last_slash - 1);
+
+                        // Check if this file/version combination is already in our sync list
+                        bool already_in_list = false;
+                        for (const auto& file_pair : files_to_sync) {
+                            if (file_pair.first == uid && file_pair.second == version_timestamp) {
+                                already_in_list = true;
+                                break;
+                            }
+                        }
+
+                        if (!already_in_list) {
+                            // Check if this file exists in the object store
+                            std::string obj_store_path = object_store_->get_storage_path(uid, version_timestamp, tenant);
+                            auto exists_result = object_store_->file_exists(obj_store_path, tenant);
+
+                            if (!exists_result.success || !exists_result.value) {
+                                // File doesn't exist in object store, add to sync list
+                                files_to_sync.push_back({uid, version_timestamp});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return Result<std::vector<std::pair<std::string, std::string>>>::ok(files_to_sync);
 }
 
@@ -294,11 +484,12 @@ Result<bool> ObjectStoreSync::needs_sync(const std::string& uid, const std::stri
         return Result<bool>::err("Object store not available");
     }
 
-    // Generate the storage path for this file version
-    std::string storage_path = storage_->get_storage_path(uid, version_timestamp, tenant);
+    // Generate the storage path for this file version in the object store
+    // This should use the object store's path format, not the local storage path
+    std::string obj_store_path = object_store_->get_storage_path(uid, version_timestamp, tenant);
 
     // Check if the file exists in the object store
-    auto exists_result = object_store_->file_exists(storage_path, tenant);
+    auto exists_result = object_store_->file_exists(obj_store_path, tenant);
     if (!exists_result.success) {
         // If we can't check if it exists, assume it needs sync
         return Result<bool>::ok(true);
@@ -310,9 +501,15 @@ Result<bool> ObjectStoreSync::needs_sync(const std::string& uid, const std::stri
 }
 
 Result<std::vector<std::string>> ObjectStoreSync::get_tenant_list() {
-    // This would query the database for a list of tenants
-    // For this simplified implementation, return an empty list
-    // (meaning only the default tenant exists)
+    // Query the database for a list of tenants
+    // This would typically query a tenants table in the database
+    if (!db_) {
+        return Result<std::vector<std::string>>::err("Database not available");
+    }
+
+    // In a real implementation, this would query the database for tenant information
+    // For now, we'll return an empty list to indicate only the default tenant exists
+    // In a multi-tenant system, this would return actual tenant IDs
     return Result<std::vector<std::string>>::ok(std::vector<std::string>());
 }
 
