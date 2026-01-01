@@ -1,5 +1,5 @@
-#ifndef FILEENGINE_LOGGER_H
-#define FILEENGINE_LOGGER_H
+#ifndef FILEENGINE_SERVER_LOGGER_H
+#define FILEENGINE_SERVER_LOGGER_H
 
 #include <string>
 #include <fstream>
@@ -12,7 +12,7 @@
 
 namespace fileengine {
 
-enum class LogLevel {
+enum class ServerLogLevel {
     DEBUG = 0,
     INFO = 1,
     WARN = 2,
@@ -20,15 +20,15 @@ enum class LogLevel {
     FATAL = 4
 };
 
-class Logger {
+class ServerLogger {
 public:
-    static Logger& getInstance();
+    static ServerLogger& getInstance();
 
-    void initialize(const std::string& log_level, const std::string& log_file_path, 
-                   bool log_to_console, bool log_to_file, 
+    void initialize(const std::string& log_level, const std::string& log_file_path,
+                   bool log_to_console, bool log_to_file,
                    size_t rotation_size_mb = 10, int retention_days = 7);
 
-    void log(LogLevel level, const std::string& component, const std::string& message);
+    void log(ServerLogLevel level, const std::string& component, const std::string& message);
 
     void debug(const std::string& component, const std::string& message);
     void info(const std::string& component, const std::string& message);
@@ -40,35 +40,35 @@ public:
     std::string detailed_log_prefix();
 
 private:
-    Logger() = default;
-    ~Logger();
+    ServerLogger() = default;
+    ~ServerLogger();
 
-    std::string levelToString(LogLevel level);
+    std::string levelToString(ServerLogLevel level);
     std::string getCurrentTimestamp();
-    bool shouldLog(LogLevel level) const;
+    bool shouldLog(ServerLogLevel level) const;
     void rotate_log_file();
     uint64_t get_thread_id() const;
 
     std::ofstream log_file_;
-    LogLevel current_level_{LogLevel::INFO};
+    ServerLogLevel current_level_{ServerLogLevel::INFO};
     bool log_to_console_{true};
     bool log_to_file_{false};
     std::string log_file_path_;
     size_t rotation_size_mb_{10};
     int retention_days_{7};
     size_t current_size_{0};
-    
+
     std::mutex log_mutex_;
     bool initialized_{false};
 };
 
 // Macro for easy logging
-#define LOG_DEBUG(component, msg) fileengine::Logger::getInstance().debug(component, msg)
-#define LOG_INFO(component, msg) fileengine::Logger::getInstance().info(component, msg)
-#define LOG_WARN(component, msg) fileengine::Logger::getInstance().warn(component, msg)
-#define LOG_ERROR(component, msg) fileengine::Logger::getInstance().error(component, msg)
-#define LOG_FATAL(component, msg) fileengine::Logger::getInstance().fatal(component, msg)
+#define SERVER_LOG_DEBUG(component, msg) fileengine::ServerLogger::getInstance().debug(component, msg)
+#define SERVER_LOG_INFO(component, msg) fileengine::ServerLogger::getInstance().info(component, msg)
+#define SERVER_LOG_WARN(component, msg) fileengine::ServerLogger::getInstance().warn(component, msg)
+#define SERVER_LOG_ERROR(component, msg) fileengine::ServerLogger::getInstance().error(component, msg)
+#define SERVER_LOG_FATAL(component, msg) fileengine::ServerLogger::getInstance().fatal(component, msg)
 
 } // namespace fileengine
 
-#endif // FILEENGINE_LOGGER_H
+#endif // FILEENGINE_SERVER_LOGGER_H

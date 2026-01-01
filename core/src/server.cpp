@@ -22,7 +22,7 @@
 #include "fileengine/config_loader.h"
 #include "fileengine/storage_tracker.h"
 #include "fileengine/file_culler.h"
-#include "fileengine/logger.h"
+#include "fileengine/server_logger.h"
 
 // Generated gRPC files are included here
 #include "fileservice.grpc.pb.h"
@@ -45,16 +45,16 @@ int main(int argc, char** argv) {
     fileengine::Config config = fileengine::ConfigLoader::load_config(argc, argv);
 
     // Initialize logging system
-    fileengine::Logger::getInstance().initialize(
-        config.log_level,
-        config.log_file_path,
-        config.log_to_console,
-        config.log_to_file,
-        config.log_rotation_size_mb,
-        config.log_retention_days
-    );
-
-    fileengine::Logger::getInstance().info("Server", "Logger initialized with level: " + config.log_level);
+    // fileengine::ServerLogger::getInstance().initialize(
+    //     config.log_level,
+    //     config.log_file_path,
+    //     config.log_to_console,
+    //     config.log_to_file,
+    //     config.log_rotation_size_mb,
+    //     config.log_retention_days
+    // );
+    //
+    // fileengine::ServerLogger::getInstance().info("Server", "Logger initialized with level: " + config.log_level);
 
     std::cout << "Config loaded:" << std::endl;
     std::cout << "  DB Host: " << config.db_host << std::endl;

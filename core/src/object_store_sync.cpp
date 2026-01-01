@@ -179,8 +179,15 @@ void ObjectStoreSync::monitoring_loop() {
             attempt_recovery();
         }
 
-        // Sleep for a while before checking again
-        std::this_thread::sleep_for(std::chrono::seconds(30));  // Check every 30 seconds
+        // Perform periodic sync of files that need synchronization
+        // This ensures files are synced periodically, not just on-demand
+        auto sync_result = perform_sync();
+        if (!sync_result.success) {
+            // Log error but continue monitoring
+        }
+
+        // Sleep for the configured retry interval before checking again
+        std::this_thread::sleep_for(std::chrono::seconds(config_.retry_seconds));
     }
 }
 
@@ -243,22 +250,24 @@ Result<void> ObjectStoreSync::sync_file(const std::string& uid, const std::strin
 
 Result<std::vector<std::pair<std::string, std::string>>> ObjectStoreSync::get_files_to_sync(const std::string& tenant) {
     std::vector<std::pair<std::string, std::string>> files_to_sync;
-    
+
     if (!db_) {
         return Result<std::vector<std::pair<std::string, std::string>>>::err("Database not available");
     }
-    
-    // Get all files from database that may need syncing
-    // This is a simplified approach - in reality, we'd want to be more selective
-    // about which files need to be synced based on modification time, etc.
-    
-    // For this implementation, we'll get all files that have versions
-    auto all_files_result = db_->list_files_in_directory("", tenant);
+
+    // Get ALL files from database that may need syncing
+    // This ensures we catch all files, not just those in the root directory
+    auto all_files_result = db_->list_all_files(tenant);
     if (!all_files_result.success) {
-        return Result<std::vector<std::pair<std::string, std::string>>>::err("Failed to get files list");
+        return Result<std::vector<std::pair<std::string, std::string>>>::err("Failed to get all files list: " + all_files_result.error);
     }
-    
+
     for (const auto& file_info : all_files_result.value) {
+        // Skip directories since they don't have content to sync
+        if (file_info.type == FileType::DIRECTORY) {
+            continue;
+        }
+
         // Get all versions of this file
         auto versions_result = db_->list_versions(file_info.uid, tenant);
         if (versions_result.success) {
@@ -269,17 +278,35 @@ Result<std::vector<std::pair<std::string, std::string>>> ObjectStoreSync::get_fi
                     files_to_sync.push_back({file_info.uid, version});
                 }
             }
+        } else {
+            // If we can't get versions, try to sync the file anyway
+            // This handles cases where version records might be missing
+            files_to_sync.push_back({file_info.uid, file_info.version});
         }
     }
-    
+
     return Result<std::vector<std::pair<std::string, std::string>>>::ok(files_to_sync);
 }
 
-Result<bool> ObjectStoreSync::needs_sync(const std::string& uid, const std::string& version_timestamp, 
+Result<bool> ObjectStoreSync::needs_sync(const std::string& uid, const std::string& version_timestamp,
                                         const std::string& tenant) {
-    // For this implementation, we'll assume all files need sync
-    // In a real system, we'd compare metadata between local and remote storage
-    return Result<bool>::ok(true);
+    if (!object_store_) {
+        return Result<bool>::err("Object store not available");
+    }
+
+    // Generate the storage path for this file version
+    std::string storage_path = storage_->get_storage_path(uid, version_timestamp, tenant);
+
+    // Check if the file exists in the object store
+    auto exists_result = object_store_->file_exists(storage_path, tenant);
+    if (!exists_result.success) {
+        // If we can't check if it exists, assume it needs sync
+        return Result<bool>::ok(true);
+    }
+
+    // If the file doesn't exist in the object store, it needs sync
+    // If it does exist in the object store, it doesn't need sync (for this basic implementation)
+    return Result<bool>::ok(!exists_result.value);
 }
 
 Result<std::vector<std::string>> ObjectStoreSync::get_tenant_list() {

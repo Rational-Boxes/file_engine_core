@@ -1,6 +1,6 @@
 #include "fileengine/filesystem.h"
 #include "fileengine/utils.h"
-#include "fileengine/logger.h"
+#include "fileengine/server_logger.h"
 #include <algorithm>
 
 namespace fileengine {
@@ -19,128 +19,128 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
                                       const std::string& user, int permissions,
                                       const std::string& tenant) {
     // Detailed debug logging for entry
-    LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Entering mkdir operation - parent_uid: " + parent_uid +
               ", name: " + name + ", user: " + user + ", tenant: " + tenant);
 
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
-        LOG_ERROR("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Database not available for tenant: " + tenant);
         return Result<std::string>::err("Database not available for tenant: " + tenant);
     }
 
-    LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Validating permissions for user: " + user + " on parent: " + parent_uid);
 
     // Check permissions - the user needs write permission on the parent directory
     if (parent_uid.empty()) {
         // Root directory creation - only for system admin
-        LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Attempting root directory creation - only allowed for root user");
         if (user != "root") {
-            LOG_ERROR("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                       "Non-root user attempting to create in root directory");
             return Result<std::string>::err("Only root can create in root directory");
         }
     } else {
         auto perm_result = validate_user_permissions(parent_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
         if (!perm_result.success || !perm_result.value) {
-            LOG_ERROR("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                       "User " + user + " does not have permission to create directory in " + parent_uid);
             return Result<std::string>::err("User does not have permission to create directory");
         }
-        LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "User " + user + " has permission to create directory in " + parent_uid);
     }
 
     std::string new_uid = Utils::generate_uuid();
     std::string path = parent_uid.empty() ? "/" + name : parent_uid + "/" + name;
-    LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Generated new UID: " + new_uid + " for directory path: " + path);
 
     // Insert directory in database
-    LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Inserting directory in database with UID: " + new_uid);
     auto db_result = context->db->insert_file(new_uid, name, path, parent_uid,
                                               FileType::DIRECTORY, user, permissions, tenant);
     if (!db_result.success) {
-        LOG_ERROR("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Failed to create directory in database: " + db_result.error);
         return Result<std::string>::err("Failed to create directory in database: " + db_result.error);
     }
 
     // Apply default ACLs
     if (acl_manager_) {
-        LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Applying default ACLs for new directory: " + new_uid);
         auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
         if (!acl_result.success) {
             // Log error but don't fail the operation
-            LOG_WARN("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_WARN("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                      "Failed to apply default ACLs: " + acl_result.error);
         } else {
-            LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                       "Successfully applied default ACLs for: " + new_uid);
         }
     } else {
-        LOG_WARN("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_WARN("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                  "ACL manager not available for tenant: " + tenant);
     }
 
-    LOG_DEBUG("FileSystem::mkdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Successfully created directory with UID: " + new_uid);
     return Result<std::string>::ok(new_uid);
 }
 
 Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& user,
                                const std::string& tenant) {
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Entering rmdir operation - dir_uid: " + dir_uid +
               ", user: " + user + ", tenant: " + tenant);
 
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
-        LOG_ERROR("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Database not available for tenant: " + tenant);
         return Result<void>::err("Database not available for tenant: " + tenant);
     }
 
     // Check permissions - the user needs write permission on the directory
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Checking permissions for user: " + user + " on directory: " + dir_uid);
     auto perm_result = validate_user_permissions(dir_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
-        LOG_ERROR("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "User " + user + " does not have permission to remove directory " + dir_uid);
         return Result<void>::err("User does not have permission to remove directory");
     }
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "User " + user + " has permission to remove directory " + dir_uid);
 
     // First, check if directory is empty
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Checking if directory " + dir_uid + " is empty");
     auto list_result = listdir(dir_uid, user, tenant);
     if (list_result.success && !list_result.value.empty()) {
-        LOG_ERROR("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Directory " + dir_uid + " is not empty, contains " +
                   std::to_string(list_result.value.size()) + " items");
         return Result<void>::err("Directory is not empty");
     }
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Directory " + dir_uid + " is empty, proceeding with removal");
 
     // Mark directory as deleted in database
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Marking directory " + dir_uid + " as deleted in database");
     auto db_result = context->db->delete_file(dir_uid, tenant);
     if (!db_result.success) {
-        LOG_ERROR("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Failed to remove directory from database: " + db_result.error);
         return Result<void>::err("Failed to remove directory from database: " + db_result.error);
     }
-    LOG_DEBUG("FileSystem::rmdir", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Successfully marked directory " + dir_uid + " as deleted");
 
     return Result<void>::ok();
@@ -355,7 +355,7 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     // If we have an object store, consider backing up asynchronously using the async worker thread
 // TODO: Implement async worker thread to save to the object store so that the operation can return as soon as the local write is complete. Make sure to not conflict with the startup or connection recovery sync. Debug log-level needs to be very detailed.
     if (context->object_store) {
-        LOG_DEBUG("FileSystem::put", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::put", ServerLogger::getInstance().detailed_log_prefix() +
                   "[PERFORMANCE ENHANCEMENT] Object store available, scheduling async backup for file_uid: " + file_uid +
                   " [CONCURRENCY WARNING] Ensure this doesn't conflict with startup/connection recovery sync operations");
 
@@ -363,22 +363,24 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
         // This allows the PUT operation to return immediately after local storage is complete
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            backup_queue_.push({file_uid, tenant});
-            LOG_DEBUG("FileSystem::put", Logger::getInstance().detailed_log_prefix() +
-                      "[PERFORMANCE ENHANCEMENT] Backup task queued for file_uid: " + file_uid);
+            // Pass the version timestamp that was used when storing the file
+            backup_queue_.push({file_uid, tenant, version_timestamp});
+            SERVER_LOG_DEBUG("FileSystem::put", ServerLogger::getInstance().detailed_log_prefix() +
+                      "[PERFORMANCE ENHANCEMENT] Backup task queued for file_uid: " + file_uid +
+                      " with version: " + version_timestamp);
         }
         queue_cv_.notify_one(); // Wake up the backup worker thread
 
-        LOG_DEBUG("FileSystem::put", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::put", ServerLogger::getInstance().detailed_log_prefix() +
                   "[PERFORMANCE ENHANCEMENT] Async backup scheduled, returning immediately while backup continues in background");
     } else {
-        LOG_DEBUG("FileSystem::put", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::put", ServerLogger::getInstance().detailed_log_prefix() +
                   "[PERFORMANCE ENHANCEMENT] No object store available, skipping async backup for file_uid: " + file_uid);
     }
 
     // CRITICAL CONCURRENCY INFO: Operation completed successfully but potential race conditions may occur
     // during the async backup process that happens after this method returns
-    LOG_DEBUG("FileSystem::put", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::put", ServerLogger::getInstance().detailed_log_prefix() +
               "Put operation completed successfully for file_uid: " + file_uid +
               " [CONCURRENCY CRITICAL] NOTE: Race conditions possible during async operations after this point");
 
@@ -628,57 +630,83 @@ Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
     return result;
 }
 
-Result<void> FileSystem::backup_to_object_store(const std::string& file_uid, 
+Result<void> FileSystem::backup_to_object_store(const std::string& file_uid,
                                                 const std::string& tenant) {
     auto context = get_tenant_context(tenant);
-    if (!context || !context->db || !context->storage || !context->object_store) {
-        return Result<void>::err("Database, storage or object store not available for tenant: " + tenant);
+    if (!context || !context->storage || !context->object_store) {
+        return Result<void>::err("Storage or object store not available for tenant: " + tenant);
     }
-    
-    // Get the file info
-    auto file_info_result = context->db->get_file_by_uid(file_uid, tenant);
-    if (!file_info_result.success || !file_info_result.value.has_value()) {
-        return Result<void>::err("File does not exist");
+
+    // Get the most recent version timestamp from the versions table
+    // This ensures we're backing up the latest version that was actually stored
+    auto versions_result = context->db->list_versions(file_uid, tenant);
+    if (!versions_result.success || versions_result.value.empty()) {
+        return Result<void>::err("No versions found for file: " + file_uid);
     }
-    
-    // Get the current version
-    std::string current_version = file_info_result.value->version;
+
+    // Get the most recent version (list_versions returns versions sorted by timestamp)
+    // The last element in the list should be the most recent
+    std::string current_version = versions_result.value.back();
     if (current_version.empty()) {
-        // If no version is set, get the latest version
-        auto versions_result = list_versions(file_uid, file_info_result.value->owner, tenant);
-        if (!versions_result.success || versions_result.value.empty()) {
-            return Result<void>::err("No versions available for file");
-        }
-        current_version = versions_result.value[0]; // Latest version
+        return Result<void>::err("Version timestamp is empty for file: " + file_uid);
     }
-    
-    // Get the storage path for this version
-    auto path_result = context->db->get_version_storage_path(file_uid, current_version, tenant);
-    if (!path_result.success || !path_result.value.has_value()) {
-        return Result<void>::err("Version storage path not found");
-    }
-    
-    std::string storage_path = path_result.value.value();
-    
+
+    // Construct the local storage path directly using the desaturation pattern
+    // This avoids the need to query the database for storage paths
+    std::string local_storage_path = context->storage->get_storage_path(file_uid, current_version, tenant);
+
     // Read the file from local storage
-    auto storage_result = context->storage->read_file(storage_path, tenant);
+    auto storage_result = context->storage->read_file(local_storage_path, tenant);
     if (!storage_result.success) {
-        return Result<void>::err("Failed to read file from storage: " + storage_result.error);
+        return Result<void>::err("Failed to read file from local storage: " + storage_result.error);
     }
-    
-    // Store in object store
-    auto obj_store_result = context->object_store->store_file(file_uid, current_version, 
+
+    // Store in object store using the file UID and version timestamp
+    auto obj_store_result = context->object_store->store_file(file_uid, current_version,
                                                               storage_result.value, tenant);
     if (!obj_store_result.success) {
         return Result<void>::err("Failed to store file in object store: " + obj_store_result.error);
     }
-    
+
     return Result<void>::ok();
 }
 
-Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int keep_count, 
+Result<void> FileSystem::backup_to_object_store_with_version(const std::string& file_uid,
+                                                           const std::string& tenant,
+                                                           const std::string& version_timestamp) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->storage || !context->object_store) {
+        return Result<void>::err("Storage or object store not available for tenant: " + tenant);
+    }
+
+    // Validate that the version timestamp is not empty
+    if (version_timestamp.empty()) {
+        return Result<void>::err("Version timestamp is empty for file: " + file_uid);
+    }
+
+    // Construct the local storage path directly using the desaturation pattern
+    // This ensures we're backing up the specific version that was stored
+    std::string local_storage_path = context->storage->get_storage_path(file_uid, version_timestamp, tenant);
+
+    // Read the file from local storage
+    auto storage_result = context->storage->read_file(local_storage_path, tenant);
+    if (!storage_result.success) {
+        return Result<void>::err("Failed to read file from local storage: " + storage_result.error);
+    }
+
+    // Store in object store using the file UID and version timestamp
+    auto obj_store_result = context->object_store->store_file(file_uid, version_timestamp,
+                                                              storage_result.value, tenant);
+    if (!obj_store_result.success) {
+        return Result<void>::err("Failed to store file in object store: " + obj_store_result.error);
+    }
+
+    return Result<void>::ok();
+}
+
+Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int keep_count,
                                             const std::string& tenant) {
-    // This is a simplified implementation - in reality, this would involve 
+    // This is a simplified implementation - in reality, this would involve
     // deleting old versions from both local storage and object store
     return Result<void>::err("Purge old versions not fully implemented");
 }
@@ -912,10 +940,10 @@ Result<std::vector<uint8_t>> FileSystem::fetch_from_object_store_if_missing(cons
 }
 
 TenantContext* FileSystem::get_tenant_context(const std::string& tenant) {
-    LOG_DEBUG("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
               "Called for tenant: " + tenant);
     if (!tenant_manager_) {
-        LOG_WARN("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_WARN("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
                  "Tenant manager not available.");
         return nullptr;
     }
@@ -925,20 +953,20 @@ TenantContext* FileSystem::get_tenant_context(const std::string& tenant) {
 
     // If context doesn't exist, try to initialize the tenant first
     if (!context) {
-        LOG_INFO("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_INFO("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
                  "Tenant context not found for " + tenant + ", attempting initialization.");
         // Try to initialize the tenant (this should create the schema)
         if (tenant_manager_->initialize_tenant(tenant)) {
-            LOG_INFO("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_INFO("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
                      "Tenant " + tenant + " initialized successfully, re-getting context.");
             // Try getting the context again after initialization
             context = tenant_manager_->get_tenant_context(tenant);
         } else {
-            LOG_ERROR("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_ERROR("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
                       "Failed to initialize tenant: " + tenant);
         }
     } else {
-        LOG_DEBUG("FileSystem::get_tenant_context", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
                   "Tenant context found for: " + tenant);
     }
 
@@ -965,13 +993,13 @@ void FileSystem::start_async_backup_worker() {
         return; // Already running
     }
 
-    LOG_DEBUG("FileSystem", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem", ServerLogger::getInstance().detailed_log_prefix() +
               "[PERFORMANCE ENHANCEMENT] Starting async backup worker thread");
 
     backup_worker_running_.store(true);
     backup_worker_thread_ = std::thread(&FileSystem::backup_worker_loop, this);
 
-    LOG_DEBUG("FileSystem", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem", ServerLogger::getInstance().detailed_log_prefix() +
               "[PERFORMANCE ENHANCEMENT] Async backup worker thread started");
 }
 
@@ -980,7 +1008,7 @@ void FileSystem::stop_async_backup_worker() {
         return; // Already stopped
     }
 
-    LOG_DEBUG("FileSystem", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem", ServerLogger::getInstance().detailed_log_prefix() +
               "[PERFORMANCE ENHANCEMENT] Stopping async backup worker thread");
 
     backup_worker_running_.store(false);
@@ -990,12 +1018,12 @@ void FileSystem::stop_async_backup_worker() {
         backup_worker_thread_.join();
     }
 
-    LOG_DEBUG("FileSystem", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem", ServerLogger::getInstance().detailed_log_prefix() +
               "[PERFORMANCE ENHANCEMENT] Async backup worker thread stopped");
 }
 
 void FileSystem::backup_worker_loop() {
-    LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
               "[PERFORMANCE ENHANCEMENT] Backup worker thread loop started");
 
     while (backup_worker_running_.load()) {
@@ -1003,17 +1031,17 @@ void FileSystem::backup_worker_loop() {
         bool has_task = false;
 
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                   "[CONCURRENCY] Backup worker entering wait state.");
         queue_cv_.wait(lock, [this] {
             return !backup_queue_.empty() || !backup_worker_running_.load();
         });
-        LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                   "[CONCURRENCY] Backup worker woke up. Queue empty: " + (backup_queue_.empty() ? "true" : "false") +
                   ", Running: " + (backup_worker_running_.load() ? "true" : "false"));
 
         if (!backup_worker_running_.load() && backup_queue_.empty()) {
-            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                       "[CONCURRENCY] Backup worker shutting down (no more tasks and not running).");
             break; // Shutting down and no more tasks
         }
@@ -1023,46 +1051,47 @@ void FileSystem::backup_worker_loop() {
             task = backup_queue_.front();
             backup_queue_.pop();
             has_task = true;
-            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                       "[CONCURRENCY] Backup worker retrieved task from queue.");
         } else {
-            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                       "[CONCURRENCY] Backup worker woke up but no task available (likely shutdown signal).");
         }
 
         lock.unlock(); // Release lock before processing task to allow other threads to push tasks
 
         if (has_task) {
-            LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                       "[PERFORMANCE ENHANCEMENT] Processing backup task for file: " + task.file_uid +
                       ", tenant: " + task.tenant);
 
             // Perform the actual backup operation
             auto context = get_tenant_context(task.tenant);
             if (context && context->object_store) {
-                LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                           "[CONCURRENCY CRITICAL] Beginning object store backup for file: " + task.file_uid +
                           " [PERFORMANCE ENHANCEMENT: Async backup operation]");
 
-                auto backup_result = backup_to_object_store(task.file_uid, task.tenant);
+                // Use the version timestamp from the task to ensure we backup the correct version
+                auto backup_result = backup_to_object_store_with_version(task.file_uid, task.tenant, task.version_timestamp);
                 if (backup_result.success) {
-                    LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                    SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                               "[PERFORMANCE ENHANCEMENT] Successfully backed up file: " + task.file_uid +
                               " to object store");
                 } else {
-                    LOG_ERROR("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                    SERVER_LOG_ERROR("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                               "[PERFORMANCE ENHANCEMENT] Failed to backup file: " + task.file_uid +
                               " to object store, error: " + backup_result.error);
                 }
             } else {
-                LOG_WARN("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+                SERVER_LOG_WARN("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
                          "[PERFORMANCE ENHANCEMENT] No object store available for tenant: " + task.tenant +
                          ", skipping backup for file: " + task.file_uid);
             }
         }
     }
 
-    LOG_DEBUG("FileSystem::backup_worker_loop", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("FileSystem::backup_worker_loop", ServerLogger::getInstance().detailed_log_prefix() +
               "[PERFORMANCE ENHANCEMENT] Backup worker thread loop ended");
 }
 

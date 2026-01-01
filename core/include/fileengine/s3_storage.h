@@ -6,8 +6,14 @@
 #include <vector>
 #include <memory>
 
-// Comment out AWS dependencies for now since they might not be available
-// #include <aws/s3/S3Client.h>
+#ifdef USE_AWS_SDK
+#include <aws/core/Aws.h>
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/PutObjectRequest.h>
+#include <aws/s3/model/GetObjectRequest.h>
+#include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/client/ClientConfiguration.h>
+#endif
 
 namespace fileengine {
 
@@ -59,11 +65,26 @@ private:
     bool path_style_;
     bool initialized_;
 
-    // Commenting out AWS specific members for now
-    // std::shared_ptr<Aws::S3::S3Client> s3_client_;
+#ifdef USE_AWS_SDK
+    std::shared_ptr<Aws::S3::S3Client> s3_client_;
+#endif
 
     // Helper to generate storage key from path
     std::string path_to_key(const std::string& virtual_path, const std::string& version_timestamp) const;
+
+    // Helper function for base64 encoding
+    std::string base64_encode(const std::string& data);
+
+#ifndef USE_AWS_SDK
+    // Helper functions for AWS Signature Version 4 (only needed if not using AWS SDK)
+    std::string aws_sign_v4(const std::string& method, const std::string& path,
+                            const std::string& query, const std::string& headers,
+                            const std::string& payload_hash, const std::string& timestamp) const;
+    std::string sha256_hash(const std::string& str) const;
+    std::string hmac_sha256_hash(const std::string& key, const std::string& msg) const;
+    std::string get_current_iso8601_time() const;
+    std::string get_date_from_iso8601(const std::string& iso8601_time) const;
+#endif
 };
 
 } // namespace fileengine

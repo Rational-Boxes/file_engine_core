@@ -7,15 +7,16 @@
 #include <thread>
 #include <chrono>
 #include <cstdarg>
+#include <algorithm>
 
 namespace fileengine {
 
-Logger& ServerLogger::getInstance() {
-    static Logger instance;
+ServerLogger& ServerLogger::getInstance() {
+    static ServerLogger instance;
     return instance;
 }
 
-void Logger::initialize(const std::string& log_level, const std::string& log_file_path,
+void ServerLogger::initialize(const std::string& log_level, const std::string& log_file_path,
                        bool log_to_console, bool log_to_file,
                        size_t rotation_size_mb, int retention_days) {
     std::lock_guard<std::mutex> lock(log_mutex_);
@@ -25,17 +26,17 @@ void Logger::initialize(const std::string& log_level, const std::string& log_fil
     std::transform(upper_level.begin(), upper_level.end(), upper_level.begin(), ::toupper);
 
     if (upper_level == "DEBUG") {
-        current_level_ = LogLevel::DEBUG;
+        current_level_ = ServerLogLevel::DEBUG;
     } else if (upper_level == "INFO") {
-        current_level_ = LogLevel::INFO;
+        current_level_ = ServerLogLevel::INFO;
     } else if (upper_level == "WARN") {
-        current_level_ = LogLevel::WARN;
+        current_level_ = ServerLogLevel::WARN;
     } else if (upper_level == "ERROR") {
-        current_level_ = LogLevel::ERROR;
+        current_level_ = ServerLogLevel::ERROR;
     } else if (upper_level == "FATAL") {
-        current_level_ = LogLevel::FATAL;
+        current_level_ = ServerLogLevel::FATAL;
     } else {
-        current_level_ = LogLevel::INFO; // default
+        current_level_ = ServerLogLevel::INFO; // default
     }
 
     log_to_console_ = log_to_console;
@@ -57,7 +58,7 @@ void Logger::initialize(const std::string& log_level, const std::string& log_fil
     initialized_ = true;
 }
 
-void Logger::log(LogLevel level, const std::string& component, const std::string& message) {
+void ServerLogger::log(ServerLogLevel level, const std::string& component, const std::string& message) {
     if (!shouldLog(level)) {
         return;
     }
@@ -70,7 +71,7 @@ void Logger::log(LogLevel level, const std::string& component, const std::string
 
     // Log to console if enabled
     if (log_to_console_) {
-        if (level >= LogLevel::ERROR) {
+        if (level >= ServerLogLevel::ERROR) {
             std::cerr << formatted_message << std::endl;
         } else {
             std::cout << formatted_message << std::endl;
@@ -84,7 +85,7 @@ void Logger::log(LogLevel level, const std::string& component, const std::string
     }
 }
 
-void Logger::rotate_log_file() {
+void ServerLogger::rotate_log_file() {
     // For this minimal implementation, we'll just close and reopen the file
     if (log_file_.is_open()) {
         log_file_.close();
@@ -92,50 +93,50 @@ void Logger::rotate_log_file() {
     }
 }
 
-void Logger::debug(const std::string& component, const std::string& message) {
-    log(LogLevel::DEBUG, component, message);
+void ServerLogger::debug(const std::string& component, const std::string& message) {
+    log(ServerLogLevel::DEBUG, component, message);
 }
 
-std::string Logger::detailed_log_prefix() {
+std::string ServerLogger::detailed_log_prefix() {
     std::ostringstream prefix;
     prefix << "[thread:" << std::this_thread::get_id() << "] ";
     return prefix.str();
 }
 
-void Logger::info(const std::string& component, const std::string& message) {
-    log(LogLevel::INFO, component, message);
+void ServerLogger::info(const std::string& component, const std::string& message) {
+    log(ServerLogLevel::INFO, component, message);
 }
 
-void Logger::warn(const std::string& component, const std::string& message) {
-    log(LogLevel::WARN, component, message);
+void ServerLogger::warn(const std::string& component, const std::string& message) {
+    log(ServerLogLevel::WARN, component, message);
 }
 
-void Logger::error(const std::string& component, const std::string& message) {
-    log(LogLevel::ERROR, component, message);
+void ServerLogger::error(const std::string& component, const std::string& message) {
+    log(ServerLogLevel::ERROR, component, message);
 }
 
-void Logger::fatal(const std::string& component, const std::string& message) {
-    log(LogLevel::FATAL, component, message);
+void ServerLogger::fatal(const std::string& component, const std::string& message) {
+    log(ServerLogLevel::FATAL, component, message);
 }
 
-Logger::~Logger() {
+ServerLogger::~ServerLogger() {
     if (log_file_.is_open()) {
         log_file_.close();
     }
 }
 
-std::string Logger::levelToString(LogLevel level) {
+std::string ServerLogger::levelToString(ServerLogLevel level) {
     switch (level) {
-        case LogLevel::DEBUG: return "DEBUG";
-        case LogLevel::INFO: return "INFO";
-        case LogLevel::WARN: return "WARN";
-        case LogLevel::ERROR: return "ERROR";
-        case LogLevel::FATAL: return "FATAL";
+        case ServerLogLevel::DEBUG: return "DEBUG";
+        case ServerLogLevel::INFO: return "INFO";
+        case ServerLogLevel::WARN: return "WARN";
+        case ServerLogLevel::ERROR: return "ERROR";
+        case ServerLogLevel::FATAL: return "FATAL";
         default: return "UNKNOWN";
     }
 }
 
-std::string Logger::getCurrentTimestamp() {
+std::string ServerLogger::getCurrentTimestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
@@ -146,11 +147,11 @@ std::string Logger::getCurrentTimestamp() {
     return oss.str();
 }
 
-bool Logger::shouldLog(LogLevel level) const {
+bool ServerLogger::shouldLog(ServerLogLevel level) const {
     return level >= current_level_;
 }
 
-uint64_t Logger::get_thread_id() const {
+uint64_t ServerLogger::get_thread_id() const {
     return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
 }
 

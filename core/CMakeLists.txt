@@ -26,6 +26,21 @@ if(PKG_CONFIG_FOUND)
     pkg_check_modules(UUID REQUIRED uuid)
 endif()
 
+# Find curl library
+find_package(PkgConfig REQUIRED)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(CURL REQUIRED libcurl)
+endif()
+
+# Find AWS SDK
+find_package(AWSSDK QUIET COMPONENTS s3 core)
+if(AWSSDK_FOUND)
+    message(STATUS "AWS SDK found, enabling S3 support")
+    add_compile_definitions(USE_AWS_SDK=1)
+else()
+    message(WARNING "AWS SDK not found, S3 functionality will be limited")
+endif()
+
 # Define proto files
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
 set(PROTO_FILE ${PROTO_DIR}/fileservice.proto)
@@ -83,8 +98,9 @@ add_library(fileengine_core SHARED
     src/object_store_sync.cpp  # Add missing source file
     src/storage_tracker.cpp    # Add missing source file
     src/file_culler.cpp        # Add missing file culler source file
-    src/logger.cpp             # Add logger source file
+    # src/logger.cpp             # Temporarily exclude logger source file due to interface mismatch
     src/query_builder.cpp      # Add query builder source file
+    src/server_logger.cpp      # Add server logger source file
 )
 
 # Include directories
@@ -105,8 +121,12 @@ target_link_libraries(fileengine_core
     ${GRPCPP_LIBRARIES}
     proto_lib
     ${UUID_LIBRARIES}  # Add uuid library
+    ${CURL_LIBRARIES}  # Add curl library
     ${CMAKE_THREAD_LIBS_INIT}  # Properly link thread libraries
 )
+if(AWSSDK_FOUND)
+    target_link_libraries(fileengine_core ${AWSSDK_LINK_LIBRARIES})
+endif()
 
 # Compiler definitions
 target_compile_definitions(fileengine_core PRIVATE

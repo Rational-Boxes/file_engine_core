@@ -1,18 +1,18 @@
 #include "fileengine/connection_pool.h"
-#include "fileengine/logger.h"
+#include "fileengine/server_logger.h"
 #include <sstream>
 
 namespace fileengine {
 
 DatabaseConnection::DatabaseConnection(const std::string& conninfo) {
-    LOG_DEBUG("DatabaseConnection", "Attempting to connect to database using conninfo: " + conninfo);
+    SERVER_LOG_DEBUG("DatabaseConnection", "Attempting to connect to database using conninfo: " + conninfo);
     conn_ = PQconnectdb(conninfo.c_str());
     if (!is_valid()) {
         std::string error_message = "Failed to connect to database: " + std::string(PQerrorMessage(conn_));
-        LOG_ERROR("DatabaseConnection", error_message);
+        SERVER_LOG_ERROR("DatabaseConnection", error_message);
         throw std::runtime_error(error_message);
     }
-    LOG_INFO("DatabaseConnection", "Successfully connected to database.");
+    SERVER_LOG_INFO("DatabaseConnection", "Successfully connected to database.");
 }
 
 DatabaseConnection::~DatabaseConnection() {
@@ -37,14 +37,14 @@ ConnectionPool::~ConnectionPool() {
 }
 
 bool ConnectionPool::initialize() {
-    LOG_DEBUG("ConnectionPool", "Initializing connection pool with size: " + std::to_string(pool_size_));
+    SERVER_LOG_DEBUG("ConnectionPool", "Initializing connection pool with size: " + std::to_string(pool_size_));
     for (int i = 0; i < pool_size_; ++i) {
         try {
             auto conn = std::make_shared<DatabaseConnection>(connection_info_);
             available_connections_.push(conn);
-            LOG_INFO("ConnectionPool", "Successfully initialized connection #" + std::to_string(i + 1) + " for pool.");
+            SERVER_LOG_INFO("ConnectionPool", "Successfully initialized connection #" + std::to_string(i + 1) + " for pool.");
         } catch (const std::exception& e) {
-            LOG_ERROR("ConnectionPool", "Failed to initialize database connection #" + std::to_string(i + 1) + ": " + std::string(e.what()));
+            SERVER_LOG_ERROR("ConnectionPool", "Failed to initialize database connection #" + std::to_string(i + 1) + ": " + std::string(e.what()));
             // Clear any connections that might have been successfully created before the failure
             while (!available_connections_.empty()) {
                 available_connections_.pop();
@@ -52,7 +52,7 @@ bool ConnectionPool::initialize() {
             return false;
         }
     }
-    LOG_INFO("ConnectionPool", "Successfully initialized all " + std::to_string(pool_size_) + " connections in the pool.");
+    SERVER_LOG_INFO("ConnectionPool", "Successfully initialized all " + std::to_string(pool_size_) + " connections in the pool.");
     return true;
 }
 

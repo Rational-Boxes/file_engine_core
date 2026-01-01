@@ -79,9 +79,12 @@ public:
                                            const std::string& tenant = "");
 
     // S3 archival operations
-    virtual Result<void> backup_to_object_store(const std::string& file_uid, 
+    virtual Result<void> backup_to_object_store(const std::string& file_uid,
                                                 const std::string& tenant = "");
-    virtual Result<void> purge_old_versions(const std::string& file_uid, int keep_count, 
+    virtual Result<void> backup_to_object_store_with_version(const std::string& file_uid,
+                                                             const std::string& tenant,
+                                                             const std::string& version_timestamp);
+    virtual Result<void> purge_old_versions(const std::string& file_uid, int keep_count,
                                             const std::string& tenant = "");
 
     // Cache management operations
@@ -159,6 +162,7 @@ private:
     struct BackupTask {
         std::string file_uid;
         std::string tenant;
+        std::string version_timestamp;  // Added to ensure backup uses the correct version
     };
 
     std::queue<BackupTask> backup_queue_;

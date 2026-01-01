@@ -39,6 +39,7 @@ public:
     virtual Result<void> update_file_name(const std::string& uid, const std::string& new_name, const std::string& tenant = "") = 0;
     virtual Result<std::vector<FileInfo>> list_files_in_directory(const std::string& parent_uid, const std::string& tenant = "") = 0;
     virtual Result<std::vector<FileInfo>> list_files_in_directory_with_deleted(const std::string& parent_uid, const std::string& tenant = "") = 0;
+    virtual Result<std::vector<FileInfo>> list_all_files(const std::string& tenant = "") = 0;
     virtual Result<std::optional<FileInfo>> get_file_by_name_and_parent(const std::string& name, const std::string& parent_uid, const std::string& tenant = "") = 0;
     virtual Result<std::optional<FileInfo>> get_file_by_name_and_parent_include_deleted(const std::string& name, const std::string& parent_uid, const std::string& tenant = "") = 0;
     virtual Result<int64_t> get_file_size(const std::string& file_uid, const std::string& tenant = "") = 0;

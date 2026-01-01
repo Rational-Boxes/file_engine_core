@@ -1,6 +1,6 @@
 #include "fileengine/database.h"
 #include "fileengine/utils.h"
-#include "fileengine/logger.h"
+#include "fileengine/server_logger.h"
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -26,16 +26,16 @@ Database::~Database() {
 }
 
 bool Database::connect() {
-    LOG_DEBUG("Database", "Attempting to connect to database using connection pool.");
+    SERVER_LOG_DEBUG("Database", "Attempting to connect to database using connection pool.");
     if (!connection_pool_) {
-        LOG_ERROR("Database", "Connection pool not initialized during connect attempt.");
+        SERVER_LOG_ERROR("Database", "Connection pool not initialized during connect attempt.");
         return false;
     }
     bool connected = connection_pool_->initialize();
     if (connected) {
-        LOG_INFO("Database", "Successfully initialized database connection pool.");
+        SERVER_LOG_INFO("Database", "Successfully initialized database connection pool.");
     } else {
-        LOG_ERROR("Database", "Failed to initialize database connection pool.");
+        SERVER_LOG_ERROR("Database", "Failed to initialize database connection pool.");
     }
     return connected;
 }
@@ -59,10 +59,10 @@ bool Database::is_connected() const {
 }
 
 Result<void> Database::create_schema() {
-    LOG_DEBUG("Database", "Attempting to create global schema.");
+    SERVER_LOG_DEBUG("Database", "Attempting to create global schema.");
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
-        LOG_ERROR("Database", "Failed to acquire database connection for schema creation.");
+        SERVER_LOG_ERROR("Database", "Failed to acquire database connection for schema creation.");
         return Result<void>::err("Failed to acquire database connection for schema creation");
     }
 
@@ -97,17 +97,17 @@ Result<void> Database::create_schema() {
     )SQL";
 
     // Execute global schema SQL statements
-    LOG_DEBUG("Database", "Executing SQL to create global tables.");
+    SERVER_LOG_DEBUG("Database", "Executing SQL to create global tables.");
     PGresult* res1 = PQexec(pg_conn, global_tables_sql);
     if (PQresultStatus(res1) != PGRES_COMMAND_OK) {
         std::string error_msg = "Failed to create global tables: " + std::string(PQerrorMessage(pg_conn));
-        LOG_ERROR("Database", error_msg);
+        SERVER_LOG_ERROR("Database", error_msg);
         Result<void> result_err = Result<void>::err(error_msg);
         PQclear(res1);
         connection_pool_->release(conn);
         return result_err;
     }
-    LOG_INFO("Database", "Successfully created or verified global tables.");
+    SERVER_LOG_INFO("Database", "Successfully created or verified global tables.");
     PQclear(res1);
 
     // Release the connection back to the pool
@@ -126,7 +126,7 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
                                           const std::string& path, const std::string& parent_uid,
                                           FileType type, const std::string& owner,
                                           int permissions, const std::string& tenant) {
-    LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
               "Entering insert_file operation - uid: " + uid +
               ", name: " + name + ", path: " + path +
               ", parent_uid: " + parent_uid + ", type: " + std::to_string(static_cast<int>(type)) +
@@ -135,13 +135,13 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
 
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
-        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "Failed to acquire database connection for UID: " + uid);
         return Result<std::string>::err("Failed to acquire database connection");
     }
 
     PGconn* pg_conn = conn->get_connection();
-    LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
               "Acquired database connection for UID: " + uid);
 
     // Get the schema name for this tenant
@@ -171,14 +171,14 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
     std::string deleted_str = "FALSE"; // Files are not deleted by default
 
     if (name.empty()) {
-        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: name is empty for uid: " + uid);
         connection_pool_->release(conn);
         return Result<std::string>::err("Invalid parameter: name is empty");
     }
 
     if (schema_name.empty()) {
-        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: schema_name is empty for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::string>::err("Invalid parameter: schema_name is empty");
@@ -198,14 +198,14 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
     // Validate that none of the parameter values are null
     for (int i = 0; i < 8; ++i) {
         if (param_values[i] == nullptr) {
-            LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_ERROR("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                       "Invalid parameter: param_values[" + std::to_string(i) + "] is null for uid: " + uid);
             connection_pool_->release(conn);
             return Result<std::string>::err("Invalid parameter: param_values[" + std::to_string(i) + "] is null");
         }
     }
 
-    LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
               "Executing SQL INSERT with parameters for UID: " + uid +
               ", name: " + name + ", parent_uid: " + parent_uid +
               ", owner: " + owner + ", permissions: " + perms_str);
@@ -218,21 +218,21 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
             result_uid = PQgetvalue(res, 0, 0);
         }
         if (result_uid.empty()) {
-            LOG_WARN("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_WARN("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                      "File/directory with UID already exists: " + uid);
             // The insert was ignored due to conflict - return error for duplicate prevention
             PQclear(res);
             connection_pool_->release(conn);
             return Result<std::string>::err("File/directory with this UID already exists");
         }
-        LOG_DEBUG("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_DEBUG("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "Successfully inserted file with UID: " + result_uid);
         PQclear(res);
         connection_pool_->release(conn);
         return Result<std::string>::ok(result_uid);
     } else {
         std::string error = PQerrorMessage(pg_conn);
-        LOG_ERROR("Database::insert_file", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "Failed to insert file with UID: " + uid + ", error: " + error);
         PQclear(res);
         connection_pool_->release(conn);
@@ -344,7 +344,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
     // No need to validate that uid is not empty
 
     if (schema_name.empty()) {
-        LOG_ERROR("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::get_file_by_uid", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: schema_name is empty for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
@@ -357,7 +357,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
     const char* param_values[1] = {uid.c_str()};
 
     // Log the query and parameters for debugging
-    LOG_DEBUG("Database::get_file_by_uid", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::get_file_by_uid", ServerLogger::getInstance().detailed_log_prefix() +
               "Executing query: " + query_sql + " with param[0]: '" + uid + "'");
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
@@ -463,7 +463,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
 
     // Validate parameters before executing query
     if (schema_name.empty()) {
-        LOG_ERROR("Database::list_files_in_directory", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::list_files_in_directory", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: schema_name is empty for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
@@ -477,13 +477,13 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
 
     // Validate that the parameter value is not null
     if (param_values[0] == nullptr) {
-        LOG_ERROR("Database::list_files_in_directory", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::list_files_in_directory", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: parent_uid is null for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::vector<FileInfo>>::err("Invalid parameter: parent_uid is null");
     }
 
-    LOG_DEBUG("Database::list_files_in_directory", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::list_files_in_directory", ServerLogger::getInstance().detailed_log_prefix() +
               "Executing SQL query to list files in directory with parent_uid: " + parent_uid +
               ", tenant: " + tenant + ", schema: " + schema_name);
 
@@ -537,7 +537,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
 
     // Validate parameters before executing query
     if (schema_name.empty()) {
-        LOG_ERROR("Database::list_files_in_directory_with_deleted", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::list_files_in_directory_with_deleted", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: schema_name is empty for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
@@ -552,13 +552,13 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
 
     // Validate that the parameter value is not null
     if (param_values[0] == nullptr) {
-        LOG_ERROR("Database::list_files_in_directory_with_deleted", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::list_files_in_directory_with_deleted", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: parent_uid is null for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::vector<FileInfo>>::err("Invalid parameter: parent_uid is null");
     }
 
-    LOG_DEBUG("Database::list_files_in_directory_with_deleted", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::list_files_in_directory_with_deleted", ServerLogger::getInstance().detailed_log_prefix() +
               "Executing SQL query to list files in directory (with deleted) with parent_uid: " + parent_uid +
               ", tenant: " + tenant + ", schema: " + schema_name);
 
@@ -600,6 +600,74 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
     }
 }
 
+Result<std::vector<FileInfo>> Database::list_all_files(const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<FileInfo>>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    // Validate parameters before executing query
+    if (schema_name.empty()) {
+        SERVER_LOG_ERROR("Database::list_all_files", ServerLogger::getInstance().detailed_log_prefix() +
+                  "Invalid parameter: schema_name is empty for tenant: " + tenant);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
+    }
+
+    std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container "
+                            "FROM \"" + schema_name + "\".files "
+                            "ORDER BY uid;";
+    const char* param_values[0] = {}; // No parameters for this query
+
+    SERVER_LOG_DEBUG("Database::list_all_files", ServerLogger::getInstance().detailed_log_prefix() +
+              "Executing SQL query to list all files for tenant: " + tenant + ", schema: " + schema_name);
+
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 0, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        std::vector<FileInfo> files;
+        int num_tuples = PQntuples(res);
+
+        for (int i = 0; i < num_tuples; ++i) {
+            FileInfo info;
+            info.uid = PQgetvalue(res, i, 0);
+            info.name = PQgetvalue(res, i, 1);
+            info.size = std::stoll(PQgetvalue(res, i, 2));
+            info.owner = PQgetvalue(res, i, 3);
+            info.permissions = std::stoi(PQgetvalue(res, i, 4));
+            bool is_container = (strcmp(PQgetvalue(res, i, 5), "t") == 0 || strcmp(PQgetvalue(res, i, 5), "1") == 0);
+            info.type = is_container ? FileType::DIRECTORY : FileType::REGULAR_FILE;
+
+            // Set default values for other fields
+            info.path = "/" + info.name;  // Simple path calculation
+            info.parent_uid = "";  // For top-level files
+            auto now = std::chrono::system_clock::now();
+            info.created_at = now;
+            info.modified_at = now;
+            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            info.version_count = 1; // For this implementation, use 1
+
+            files.push_back(info);
+        }
+
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::ok(files);
+    } else {
+        std::string error = PQerrorMessage(pg_conn);
+        SERVER_LOG_ERROR("Database::list_all_files", ServerLogger::getInstance().detailed_log_prefix() +
+                  "Query failed: " + error);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err("Query failed: " + error);
+    }
+}
+
 Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std::string& name, const std::string& parent_uid, const std::string& tenant) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
@@ -613,14 +681,14 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
 
     // Validate parameters before executing query
     if (name.empty()) {
-        LOG_ERROR("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::get_file_by_name_and_parent", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: name is empty for parent_uid: " + parent_uid);
         connection_pool_->release(conn);
         return Result<std::optional<FileInfo>>::err("Invalid parameter: name is empty");
     }
 
     if (schema_name.empty()) {
-        LOG_ERROR("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::get_file_by_name_and_parent", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: schema_name is empty for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
@@ -635,7 +703,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
     // Validate that none of the parameter values are null
     for (int i = 0; i < 2; ++i) {
         if (param_values[i] == nullptr) {
-            LOG_ERROR("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_ERROR("Database::get_file_by_name_and_parent", ServerLogger::getInstance().detailed_log_prefix() +
                       "Invalid parameter: param_values[" + std::to_string(i) + "] is null for name: " + name +
                       ", parent_uid: " + parent_uid);
             connection_pool_->release(conn);
@@ -643,7 +711,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
         }
     }
 
-    LOG_DEBUG("Database::get_file_by_name_and_parent", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::get_file_by_name_and_parent", ServerLogger::getInstance().detailed_log_prefix() +
               "Executing SQL query to get file by name: " + name + " and parent_uid: " + parent_uid +
               ", tenant: " + tenant + ", schema: " + schema_name);
 
@@ -703,14 +771,14 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
 
     // Validate parameters before executing query
     if (name.empty()) {
-        LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: name is empty for parent_uid: " + parent_uid);
         connection_pool_->release(conn);
         return Result<std::optional<FileInfo>>::err("Invalid parameter: name is empty");
     }
 
     if (schema_name.empty()) {
-        LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+        SERVER_LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", ServerLogger::getInstance().detailed_log_prefix() +
                   "Invalid parameter: schema_name is empty for tenant: " + tenant);
         connection_pool_->release(conn);
         return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
@@ -725,7 +793,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
     // Validate that none of the parameter values are null
     for (int i = 0; i < 2; ++i) {
         if (param_values[i] == nullptr) {
-            LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+            SERVER_LOG_ERROR("Database::get_file_by_name_and_parent_include_deleted", ServerLogger::getInstance().detailed_log_prefix() +
                       "Invalid parameter: param_values[" + std::to_string(i) + "] is null for name: " + name +
                       ", parent_uid: " + parent_uid);
             connection_pool_->release(conn);
@@ -733,7 +801,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
         }
     }
 
-    LOG_DEBUG("Database::get_file_by_name_and_parent_include_deleted", Logger::getInstance().detailed_log_prefix() +
+    SERVER_LOG_DEBUG("Database::get_file_by_name_and_parent_include_deleted", ServerLogger::getInstance().detailed_log_prefix() +
               "Executing SQL query to get file by name: " + name + " and parent_uid: " + parent_uid +
               ", tenant: " + tenant + ", schema: " + schema_name);
 
