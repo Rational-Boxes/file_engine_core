@@ -152,6 +152,15 @@ int main(int argc, char** argv) {
     auto filesystem = std::make_shared<fileengine::FileSystem>(tenant_manager);
     filesystem->set_acl_manager(acl_manager);
 
+    // Initialize the default tenant to ensure root directory exists
+    std::cout << "Initializing default tenant..." << std::endl;
+    bool default_tenant_init = tenant_manager->initialize_tenant("default");
+    if (default_tenant_init) {
+        std::cout << "Default tenant initialized successfully." << std::endl;
+    } else {
+        std::cerr << "Warning: Failed to initialize default tenant" << std::endl;
+    }
+
     // Initialize file culler for intelligent local storage management
     std::cout << "Initializing file culling system..." << std::endl;
     auto file_culler = std::make_unique<fileengine::FileCuller>(storage.get(), s3_storage.get(), storage_tracker.get());

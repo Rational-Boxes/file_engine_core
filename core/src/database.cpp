@@ -386,7 +386,18 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             PQclear(res);
@@ -508,7 +519,18 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             result_files.push_back(info);
@@ -584,7 +606,18 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             result_files.push_back(info);
@@ -649,7 +682,18 @@ Result<std::vector<FileInfo>> Database::list_all_files(const std::string& tenant
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             files.push_back(info);
@@ -738,7 +782,18 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             PQclear(res);
@@ -828,7 +883,18 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             PQclear(res);
@@ -969,7 +1035,18 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
             info.modified_at = now;
-            info.version = Utils::get_timestamp_string(); // Use current timestamp as version
+            // Get the latest version from the versions table
+            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
+            const char* version_param_values[1] = {info.uid.c_str()};
+
+            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
+            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
+                info.version = PQgetvalue(version_res, 0, 0);
+            } else {
+                // If no version is found in the versions table, use a default
+                info.version = "";
+            }
+            PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
             PQclear(res);
@@ -1137,9 +1214,8 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
-    // In the current schema, we don't store separate version info
-    // For this implementation, we'll just return the current version timestamp
-    std::string query_sql = "SELECT uid FROM \"" + schema_name + "\".files WHERE uid = $1;";
+    // Query the versions table to get all versions for this file
+    std::string query_sql = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC;";
     const char* param_values[1] = {file_uid.c_str()};
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
@@ -1147,9 +1223,9 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
     std::vector<std::string> versions;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         int nrows = PQntuples(res);
-        if (nrows > 0) {
-            // Return a single current version timestamp
-            versions.push_back(Utils::get_timestamp_string()); // Current timestamp as the "version"
+        for (int i = 0; i < nrows; ++i) {
+            std::string version_timestamp = PQgetvalue(res, i, 0);
+            versions.push_back(version_timestamp);
         }
         PQclear(res);
         connection_pool_->release(conn);
@@ -1158,7 +1234,7 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
         std::string error = PQerrorMessage(pg_conn);
         PQclear(res);
         connection_pool_->release(conn);
-        return Result<std::vector<std::string>>::err("Failed to check file existence for versions: " + error);
+        return Result<std::vector<std::string>>::err("Failed to list versions: " + error);
     }
 }
 
@@ -1625,6 +1701,49 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
             PQclear(res);
             connection_pool_->release(conn);
             return Result<void>::err("Failed to create root directory: " + error);
+        }
+        PQclear(res);
+
+        // Add default ACLs for the root directory
+        // Grant full permissions to system user
+        std::string insert_root_acl_sql = "INSERT INTO acls (resource_uid, principal, principal_type, permissions) "
+            "VALUES ('', 'system', 0, 755) "
+            "ON CONFLICT (resource_uid, principal, principal_type) "
+            "DO UPDATE SET permissions = 755, updated_at = CURRENT_TIMESTAMP;";
+        res = PQexec(pg_conn, insert_root_acl_sql.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to create root directory ACL: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<void>::err(error);
+        }
+        PQclear(res);
+
+        // Grant full permissions to root user
+        std::string insert_root_user_acl_sql = "INSERT INTO acls (resource_uid, principal, principal_type, permissions) "
+            "VALUES ('', 'root', 0, 755) "
+            "ON CONFLICT (resource_uid, principal, principal_type) "
+            "DO UPDATE SET permissions = 755, updated_at = CURRENT_TIMESTAMP;";
+        res = PQexec(pg_conn, insert_root_user_acl_sql.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to create root directory ACL for 'root' user: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<void>::err(error);
+        }
+        PQclear(res);
+
+        // Grant read permissions to 'other' category for root directory
+        std::string insert_root_other_acl_sql = "INSERT INTO acls (resource_uid, principal, principal_type, permissions) "
+            "VALUES ('', 'other', 2, 444) "
+            "ON CONFLICT (resource_uid, principal, principal_type) "
+            "DO UPDATE SET permissions = 444, updated_at = CURRENT_TIMESTAMP;";
+        res = PQexec(pg_conn, insert_root_other_acl_sql.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to create root directory ACL for 'other': " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<void>::err(error);
         }
         PQclear(res);
     }

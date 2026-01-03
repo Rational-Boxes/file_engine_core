@@ -520,6 +520,7 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
             return storage_result;
         } else {
             SERVER_LOG_ERROR("FileSystem::get", "Failed to read file from local storage: " + storage_result.error);
+            return Result<std::vector<uint8_t>>::err("Failed to read file from local storage: " + storage_result.error);
         }
     }
 
