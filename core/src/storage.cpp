@@ -86,16 +86,16 @@ Result<std::vector<uint8_t>> Storage::read_file(const std::string& storage_path,
     if (!file.is_open()) {
         return Result<std::vector<uint8_t>>::err("Failed to open file for reading: " + storage_path);
     }
-    
+
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
-    
+
     std::vector<uint8_t> buffer(size);
     if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
         file.close();
         return Result<std::vector<uint8_t>>::err("Failed to read file: " + storage_path);
     }
-    
+
     file.close();
     return Result<std::vector<uint8_t>>::ok(buffer);
 }

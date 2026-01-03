@@ -387,26 +387,26 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     return Result<void>::ok();
 }
 
-Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid, 
-                                              const std::string& user, 
+Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
+                                              const std::string& user,
                                               const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<std::vector<uint8_t>>::err("Database not available for tenant: " + tenant);
     }
-    
+
     // Check permissions - the user needs read permission on the file
     auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<uint8_t>>::err("User does not have permission to read file");
     }
-    
-    // Get the file info
+
+    // Get the file info to determine the current version
     auto file_info_result = context->db->get_file_by_uid(file_uid, tenant);
     if (!file_info_result.success || !file_info_result.value.has_value()) {
         return Result<std::vector<uint8_t>>::err("File does not exist");
     }
-    
+
     std::string current_version = file_info_result.value->version;
     if (current_version.empty()) {
         // If no version is set, get the latest version
@@ -416,59 +416,114 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
         }
         current_version = versions_result.value[0]; // Latest version
     }
-    
-    // Get the storage path for this version
-    auto path_result = context->db->get_version_storage_path(file_uid, current_version, tenant);
-    if (!path_result.success || !path_result.value.has_value()) {
-        // If not in local storage, try to fetch from object store
-        if (context->object_store) {
-            auto fetch_result = fetch_from_object_store_if_missing(file_uid, current_version, tenant);
-            if (fetch_result.success) {
-                return fetch_result;
-            }
-        }
-        return Result<std::vector<uint8_t>>::err("Version storage path not found");
-    }
-    
-    std::string storage_path = path_result.value.value();
-    
-    // If we have a cache manager, try to get from cache first
-    if (cache_manager_) {
-        auto cache_result = cache_manager_->get_file(storage_path, tenant);
-        if (cache_result.success) {
-            return cache_result;
-        }
-    }
-    
-    // Get from storage
+
+    // Determine expected locations for the file
+    std::string local_storage_path = context->storage->get_storage_path(file_uid, current_version, tenant);
+    std::string s3_storage_path = context->object_store ?
+        context->object_store->get_storage_path(file_uid, current_version, tenant) : "N/A";
+
+    SERVER_LOG_DEBUG("FileSystem::get", "File UID: " + file_uid);
+    SERVER_LOG_DEBUG("FileSystem::get", "Current version: " + current_version);
+    SERVER_LOG_DEBUG("FileSystem::get", "Tenant: " + tenant);
+    SERVER_LOG_DEBUG("FileSystem::get", "Local storage path: " + local_storage_path);
+    SERVER_LOG_DEBUG("FileSystem::get", "S3 storage path: " + s3_storage_path);
+
+    // Check if file exists locally
+    bool file_exists_locally = false;
     if (context->storage) {
-        auto storage_result = context->storage->read_file(storage_path, tenant);
+        SERVER_LOG_DEBUG("FileSystem::get", "Checking if file exists locally at: " + local_storage_path);
+        auto exists_result = context->storage->file_exists(local_storage_path, tenant);
+        SERVER_LOG_DEBUG("FileSystem::get", "Local file exists result: " + std::string(exists_result.success ? "success" : "error"));
+        if (exists_result.success) {
+            SERVER_LOG_DEBUG("FileSystem::get", "Local file exists: " + std::string(exists_result.value ? "true" : "false"));
+            file_exists_locally = exists_result.value;
+        } else {
+            SERVER_LOG_DEBUG("FileSystem::get", "Error checking local file existence: " + exists_result.error);
+        }
+    } else {
+        SERVER_LOG_DEBUG("FileSystem::get", "No storage context available");
+    }
+
+    // If file doesn't exist locally, attempt to restore from S3
+    if (!file_exists_locally && context->object_store) {
+        SERVER_LOG_DEBUG("FileSystem::get", "File does not exist locally, attempting to restore from S3");
+
+        // Compose the path to the remote payload in object store
+        std::string remote_payload_path = context->object_store->get_storage_path(file_uid, current_version, tenant);
+        SERVER_LOG_DEBUG("FileSystem::get", "Remote payload path: " + remote_payload_path);
+
+        // Check if the payload exists in the remote object store
+        SERVER_LOG_DEBUG("FileSystem::get", "Checking if file exists in S3 at: " + remote_payload_path);
+        auto remote_exists_result = context->object_store->file_exists(remote_payload_path, tenant);
+        SERVER_LOG_DEBUG("FileSystem::get", "S3 file exists result: " + std::string(remote_exists_result.success ? "success" : "error"));
+
+        if (remote_exists_result.success && remote_exists_result.value) {
+            SERVER_LOG_DEBUG("FileSystem::get", "S3 file exists: true");
+
+            // Read from the remote object store
+            SERVER_LOG_DEBUG("FileSystem::get", "Reading file from S3 at: " + remote_payload_path);
+            auto object_store_result = context->object_store->read_file(remote_payload_path, tenant);
+            SERVER_LOG_DEBUG("FileSystem::get", "S3 read result: " + std::string(object_store_result.success ? "success" : "error"));
+
+            if (object_store_result.success) {
+                SERVER_LOG_DEBUG("FileSystem::get", "Successfully read " + std::to_string(object_store_result.value.size()) + " bytes from S3");
+
+                // Store the payload locally at the expected local path (for future access)
+                if (context->storage) {
+                    SERVER_LOG_DEBUG("FileSystem::get", "Storing file locally at: " + local_storage_path);
+                    auto store_result = context->storage->store_file(file_uid, current_version,
+                                                                     object_store_result.value, tenant);
+                    SERVER_LOG_DEBUG("FileSystem::get", "Local store result: " + std::string(store_result.success ? "success" : "error"));
+
+                    if (store_result.success) {
+                        SERVER_LOG_DEBUG("FileSystem::get", "File successfully restored to local storage at: " + store_result.value);
+                    } else {
+                        SERVER_LOG_WARN("FileSystem::get", "Failed to store file locally: " + store_result.error + " (continuing with S3 data)");
+                    }
+                } else {
+                    SERVER_LOG_WARN("FileSystem::get", "No storage context available for local storage (continuing with S3 data)");
+                }
+
+                // Add to cache if available
+                if (cache_manager_) {
+                    cache_manager_->add_file(local_storage_path, object_store_result.value, tenant);
+                    SERVER_LOG_DEBUG("FileSystem::get", "Added file to cache");
+                }
+
+                // Return the data directly from S3 (don't re-read from disk)
+                SERVER_LOG_DEBUG("FileSystem::get", "Returning file data restored from S3");
+                return Result<std::vector<uint8_t>>::ok(object_store_result.value);
+            } else {
+                SERVER_LOG_ERROR("FileSystem::get", "Failed to read file from S3: " + object_store_result.error);
+            }
+        } else if (!remote_exists_result.success) {
+            SERVER_LOG_ERROR("FileSystem::get", "Error checking S3 file existence: " + remote_exists_result.error);
+        } else {
+            SERVER_LOG_DEBUG("FileSystem::get", "File does not exist in S3 at the expected path");
+        }
+    } else if (!context->object_store) {
+        SERVER_LOG_DEBUG("FileSystem::get", "No object store context available");
+    } else {
+        SERVER_LOG_DEBUG("FileSystem::get", "File exists locally, no need to restore from S3");
+    }
+
+    // Now read the file from local storage (either it was already there, or restoration from S3 failed)
+    if (file_exists_locally && context->storage) {
+        SERVER_LOG_DEBUG("FileSystem::get", "Reading file from local storage at: " + local_storage_path);
+        auto storage_result = context->storage->read_file(local_storage_path, tenant);
         if (storage_result.success) {
+            SERVER_LOG_DEBUG("FileSystem::get", "Successfully read " + std::to_string(storage_result.value.size()) + " bytes from local storage");
             // Add to cache if available
             if (cache_manager_) {
-                cache_manager_->add_file(storage_path, storage_result.value, tenant);
+                cache_manager_->add_file(local_storage_path, storage_result.value, tenant);
             }
             return storage_result;
+        } else {
+            SERVER_LOG_ERROR("FileSystem::get", "Failed to read file from local storage: " + storage_result.error);
         }
     }
-    
-    // If not in storage, try object store
-    if (context->object_store) {
-        auto obj_store_path = context->object_store->get_storage_path(file_uid, current_version, tenant);
-        auto object_store_result = context->object_store->read_file(obj_store_path, tenant);
-        if (object_store_result.success) {
-            // Add to local storage and cache
-            if (context->storage) {
-                auto store_result = context->storage->store_file(file_uid, current_version, 
-                                                                 object_store_result.value, tenant);
-                if (store_result.success && cache_manager_) {
-                    cache_manager_->add_file(store_result.value, object_store_result.value, tenant);
-                }
-            }
-            return object_store_result;
-        }
-    }
-    
+
+    SERVER_LOG_ERROR("FileSystem::get", "File content not found in storage or object store");
     return Result<std::vector<uint8_t>>::err("File content not found in storage or object store");
 }
 

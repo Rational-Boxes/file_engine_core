@@ -74,20 +74,42 @@ Result<std::vector<uint8_t>> CacheManager::get_file(const std::string& storage_p
     if (object_store_) {
         SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "File not in storage, attempting to load from object store: " + storage_path);
-        auto object_store_result = object_store_->read_file(storage_path, tenant);
-        if (object_store_result.success) {
-            SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
-                      "File loaded from object store successfully, adding to cache: " + storage_path +
-                      " [CONCURRENCY WARNING: add_file may trigger eviction]");
-            // Add to local storage and cache
-            add_file(storage_path, object_store_result.value, tenant);
-            SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
-                      "File successfully retrieved from object store and added to cache: " + storage_path);
-            return object_store_result;
+
+        // Extract uid and version from the storage path to construct the object store path
+        // Path format: base_path/tenant/xx/yy/zz/uid/version_timestamp
+        std::string path_str = storage_path;
+        size_t last_slash = path_str.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            std::string version_timestamp = path_str.substr(last_slash + 1);
+
+            size_t second_last_slash = path_str.substr(0, last_slash).find_last_of('/');
+            if (second_last_slash != std::string::npos) {
+                std::string uid = path_str.substr(second_last_slash + 1, last_slash - second_last_slash - 1);
+
+                // Construct the object store path
+                std::string obj_store_path = object_store_->get_storage_path(uid, version_timestamp, tenant);
+                auto object_store_result = object_store_->read_file(obj_store_path, tenant);
+                if (object_store_result.success) {
+                    SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
+                              "File loaded from object store successfully, adding to cache: " + storage_path +
+                              " [CONCURRENCY WARNING: add_file may trigger eviction]");
+                    // Add to local storage and cache
+                    add_file(storage_path, object_store_result.value, tenant);
+                    SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
+                              "File successfully retrieved from object store and added to cache: " + storage_path);
+                    return object_store_result;
+                } else {
+                    SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
+                              "File not found in object store: " + obj_store_path +
+                              ", error: " + object_store_result.error);
+                }
+            } else {
+                SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
+                          "Could not extract UID from storage path: " + storage_path);
+            }
         } else {
             SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
-                      "File not found in object store: " + storage_path +
-                      ", error: " + object_store_result.error);
+                      "Could not parse storage path: " + storage_path);
         }
     } else {
         SERVER_LOG_DEBUG("CacheManager::get_file", ServerLogger::getInstance().detailed_log_prefix() +
