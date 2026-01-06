@@ -1260,16 +1260,23 @@ Result<void> Database::set_metadata(const std::string& file_uid, const std::stri
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* sql = R"(
-        INSERT INTO metadata (file_uid, version_timestamp, key_name, value)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (file_uid, version_timestamp, key_name)
-        DO UPDATE SET value = $4, created_at = CURRENT_TIMESTAMP;
-    )";
+    // Get the schema prefix for the tenant
+    std::string schema_prefix = get_schema_prefix(tenant);
+
+    // Escape the schema name to prevent SQL injection
+    std::string escaped_schema = schema_prefix;
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '-', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '.', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), ' ', '_');
+
+    std::string sql = "INSERT INTO \"" + escaped_schema + "\".metadata (file_uid, version_timestamp, key_name, value) "
+                      "VALUES ($1, $2, $3, $4) "
+                      "ON CONFLICT (file_uid, version_timestamp, key_name) "
+                      "DO UPDATE SET value = $4, created_at = CURRENT_TIMESTAMP;";
 
     const char* params[4] = {file_uid.c_str(), version_timestamp.c_str(), key.c_str(), value.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, sql, 4, nullptr, params, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 4, nullptr, params, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to set metadata: " + std::string(PQerrorMessage(pg_conn));
@@ -1291,10 +1298,19 @@ Result<std::optional<std::string>> Database::get_metadata(const std::string& fil
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* sql = "SELECT value FROM metadata WHERE file_uid = $1 AND version_timestamp = $2 AND key_name = $3;";
+    // Get the schema prefix for the tenant
+    std::string schema_prefix = get_schema_prefix(tenant);
+
+    // Escape the schema name to prevent SQL injection
+    std::string escaped_schema = schema_prefix;
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '-', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '.', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), ' ', '_');
+
+    std::string sql = "SELECT value FROM \"" + escaped_schema + "\".metadata WHERE file_uid = $1 AND version_timestamp = $2 AND key_name = $3;";
     const char* params[3] = {file_uid.c_str(), version_timestamp.c_str(), key.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, sql, 3, nullptr, params, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to get metadata: " + std::string(PQerrorMessage(pg_conn));
@@ -1324,10 +1340,19 @@ Result<std::map<std::string, std::string>> Database::get_all_metadata(const std:
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* sql = "SELECT key_name, value FROM metadata WHERE file_uid = $1 AND version_timestamp = $2;";
+    // Get the schema prefix for the tenant
+    std::string schema_prefix = get_schema_prefix(tenant);
+
+    // Escape the schema name to prevent SQL injection
+    std::string escaped_schema = schema_prefix;
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '-', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '.', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), ' ', '_');
+
+    std::string sql = "SELECT key_name, value FROM \"" + escaped_schema + "\".metadata WHERE file_uid = $1 AND version_timestamp = $2;";
     const char* params[2] = {file_uid.c_str(), version_timestamp.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, sql, 2, nullptr, params, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to get all metadata: " + std::string(PQerrorMessage(pg_conn));
@@ -1357,10 +1382,19 @@ Result<void> Database::delete_metadata(const std::string& file_uid, const std::s
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* sql = "DELETE FROM metadata WHERE file_uid = $1 AND version_timestamp = $2 AND key_name = $3;";
+    // Get the schema prefix for the tenant
+    std::string schema_prefix = get_schema_prefix(tenant);
+
+    // Escape the schema name to prevent SQL injection
+    std::string escaped_schema = schema_prefix;
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '-', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), '.', '_');
+    std::replace(escaped_schema.begin(), escaped_schema.end(), ' ', '_');
+
+    std::string sql = "DELETE FROM \"" + escaped_schema + "\".metadata WHERE file_uid = $1 AND version_timestamp = $2 AND key_name = $3;";
     const char* params[3] = {file_uid.c_str(), version_timestamp.c_str(), key.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, sql, 3, nullptr, params, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to delete metadata: " + std::string(PQerrorMessage(pg_conn));
@@ -1607,7 +1641,8 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "version_timestamp TEXT NOT NULL, "
         "key_name TEXT NOT NULL, "
         "value TEXT NOT NULL, "
-        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP "
+        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "UNIQUE (file_uid, version_timestamp, key_name) "
         ");";
 
     std::string create_idx_metadata = "CREATE INDEX IF NOT EXISTS idx_metadata_file_uid_" + escaped_schema +
