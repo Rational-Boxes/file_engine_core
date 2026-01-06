@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
 
     // Create gRPC service
     std::cout << "Initializing gRPC service..." << std::endl;
-    fileengine::GRPCFileService service(filesystem, tenant_manager, acl_manager);
+    fileengine::GRPCFileService service(filesystem, tenant_manager, acl_manager, std::move(storage_tracker));
 
     std::string server_address = config.server_address + ":" + std::to_string(config.server_port);
     std::cout << "Attempting to bind gRPC server to " << server_address << std::endl;

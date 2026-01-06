@@ -566,8 +566,35 @@ public:
 
     // Diagnostic operations
     bool storage_usage(const std::string& user) {
-        std::cout << "✗ Storage usage operation not supported in this build" << std::endl;
-        return false;
+        StorageUsageRequest request;
+        *request.mutable_auth() = create_auth_context(user);
+        request.set_tenant("default"); // Using default tenant
+
+        StorageUsageResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->GetStorageUsage(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            // Convert bytes to more readable format
+            double total_gb = response.total_space() / (1024.0 * 1024.0 * 1024.0);
+            double used_gb = response.used_space() / (1024.0 * 1024.0 * 1024.0);
+            double available_gb = response.available_space() / (1024.0 * 1024.0 * 1024.0);
+
+            std::cout << "Storage Usage:" << std::endl;
+            std::cout << "  Total Space: " << response.total_space() << " bytes (" << std::fixed << std::setprecision(2) << total_gb << " GB)" << std::endl;
+            std::cout << "  Used Space:  " << response.used_space() << " bytes (" << std::fixed << std::setprecision(2) << used_gb << " GB)" << std::endl;
+            std::cout << "  Available:   " << response.available_space() << " bytes (" << std::fixed << std::setprecision(2) << available_gb << " GB)" << std::endl;
+            std::cout << "  Usage:       " << std::fixed << std::setprecision(2) << (response.usage_percentage() * 100.0) << "%" << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to get storage usage: " << response.error();
+            if (!status.ok()) {
+                std::cout << " (gRPC Status: " << status.error_code() << " - " << status.error_message() << ")";
+            }
+            std::cout << std::endl;
+            return false;
+        }
     }
 
     bool trigger_sync(const std::string& user) {

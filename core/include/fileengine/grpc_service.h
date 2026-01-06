@@ -13,6 +13,7 @@
 #include "fileengine/tenant_manager.h"
 #include "fileengine/acl_manager.h"
 #include "fileengine/connection_pool_manager.h"
+#include "fileengine/storage_tracker.h"
 
 namespace fileengine {
 
@@ -21,7 +22,8 @@ class GRPCFileService final : public fileengine_rpc::FileService::Service {
 public:
     explicit GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                              std::shared_ptr<TenantManager> tenant_manager,
-                             std::shared_ptr<AclManager> acl_manager);
+                             std::shared_ptr<AclManager> acl_manager,
+                             std::unique_ptr<StorageTracker> storage_tracker);
 
     // Directory operations
     grpc::Status MakeDirectory(grpc::ServerContext* context,
@@ -160,6 +162,7 @@ private:
     std::shared_ptr<FileSystem> filesystem_;
     std::shared_ptr<TenantManager> tenant_manager_;
     std::shared_ptr<AclManager> acl_manager_;
+    std::unique_ptr<StorageTracker> storage_tracker_;
 
     // Helper function to extract tenant from auth context
     inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {

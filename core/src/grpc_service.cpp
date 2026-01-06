@@ -12,8 +12,10 @@ namespace fileengine {
 
 GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                                  std::shared_ptr<TenantManager> tenant_manager,
-                                 std::shared_ptr<AclManager> acl_manager)
-    : filesystem_(filesystem), tenant_manager_(tenant_manager), acl_manager_(acl_manager) {
+                                 std::shared_ptr<AclManager> acl_manager,
+                                 std::unique_ptr<StorageTracker> storage_tracker)
+    : filesystem_(filesystem), tenant_manager_(tenant_manager), acl_manager_(acl_manager),
+      storage_tracker_(std::move(storage_tracker)) {
 }
 
 // Directory operations
@@ -1338,17 +1340,42 @@ grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
                                             fileengine_rpc::StorageUsageResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetStorageUsage called for tenant: " + request->tenant());
     auto auth_context = request->auth();
-    std::string tenant = request->tenant();
+    std::string tenant = request->tenant().empty() ? "default" : request->tenant();
 
-    // In a real implementation, this would check storage usage
-    // For this example, we'll return some simulated values
-    response->set_success(true);
-    response->set_error("");
-    response->set_total_space(1024 * 1024 * 1024);  // 1GB
-    response->set_used_space(512 * 1024 * 1024);    // 512MB
-    response->set_available_space(512 * 1024 * 1024); // 512MB
-    response->set_usage_percentage(0.5); // 50%
-    SERVER_LOG_INFO("GRPCService", "GetStorageUsage successful for tenant: " + tenant);
+    try {
+        if (storage_tracker_) {
+            fileengine::StorageUsage usage;
+            if (tenant == "default" || tenant.empty()) {
+                // Get overall storage usage if no specific tenant requested
+                usage = storage_tracker_->get_overall_storage_report();
+            } else {
+                // Get storage usage for specific tenant
+                usage = storage_tracker_->get_tenant_usage(tenant);
+            }
+
+            response->set_success(true);
+            response->set_error("");
+            response->set_total_space(usage.total_space_bytes);
+            response->set_used_space(usage.used_space_bytes);
+            response->set_available_space(usage.available_space_bytes);
+            response->set_usage_percentage(usage.usage_percentage);
+        } else {
+            // Fallback to simulated values if storage tracker is not available
+            response->set_success(true);
+            response->set_error("");
+            response->set_total_space(1024 * 1024 * 1024);  // 1GB
+            response->set_used_space(512 * 1024 * 1024);    // 512MB
+            response->set_available_space(512 * 1024 * 1024); // 512MB
+            response->set_usage_percentage(0.5); // 50%
+        }
+
+        SERVER_LOG_INFO("GRPCService", "GetStorageUsage successful for tenant: " + tenant);
+    } catch (const std::exception& e) {
+        SERVER_LOG_ERROR("GRPCService", "GetStorageUsage failed: " + std::string(e.what()));
+        response->set_success(false);
+        response->set_error("Failed to get storage usage: " + std::string(e.what()));
+        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+    }
 
     return grpc::Status::OK;
 }
