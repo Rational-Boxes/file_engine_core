@@ -92,15 +92,15 @@ public:
     }
 
     // Directory operations
-    bool make_directory(const std::string& parent_uid, const std::string& name, const std::string& user) {
-        fileengine::Logger::debug("Mkdir", "Attempting to create directory '", name, "' in parent '", parent_uid, "' for user '", user, "'");
+    bool make_directory(const std::string& parent_uid, const std::string& name, const std::string& user, const std::string& tenant = "default") {
+        fileengine::Logger::debug("Mkdir", "Attempting to create directory '", name, "' in parent '", parent_uid, "' for user '", user, "' in tenant '", tenant, "'");
 
         MakeDirectoryRequest request;
         request.set_parent_uid(parent_uid);
         request.set_name(name);
         fileengine::Logger::detail("Mkdir", "Set parent UID: ", parent_uid, ", name: ", name);
 
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
         request.set_permissions(0755);
         fileengine::Logger::detail("Mkdir", "Set permissions: 0755");
 
@@ -113,11 +113,11 @@ public:
 
         if (status.ok() && response.success()) {
             fileengine::Logger::debug("Mkdir", "Directory created successfully with UID: ", response.uid());
-            std::cout << "✓ Created directory '" << name << "' with UID: " << response.uid() << std::endl;
+            std::cout << "✓ Created directory '" << name << "' with UID: " << response.uid() << " in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
             fileengine::Logger::debug("Mkdir", "Failed to create directory '", name, "', error: ", response.error());
-            std::cout << "✗ Failed to create directory '" << name << "': " << response.error();
+            std::cout << "✗ Failed to create directory '" << name << "' in tenant '" << tenant << "': " << response.error();
             if (!status.ok()) {
                 fileengine::Logger::detail("Mkdir", "gRPC error code: ", status.error_code(), ", message: ", status.error_message());
                 std::cout << " (gRPC Status: " << status.error_code() << " - " << status.error_message() << ")";
@@ -127,14 +127,14 @@ public:
         }
     }
 
-    bool list_directory(const std::string& uid, const std::string& user, bool show_deleted = false) {
-        fileengine::Logger::debug("ListDir", "Attempting to list directory with UID: ", uid, " for user: ", user, ", show_deleted: ", show_deleted ? "true" : "false");
+    bool list_directory(const std::string& uid, const std::string& user, bool show_deleted = false, const std::string& tenant = "default") {
+        fileengine::Logger::debug("ListDir", "Attempting to list directory with UID: ", uid, " for user: ", user, ", show_deleted: ", show_deleted ? "true" : "false", ", tenant: ", tenant);
 
         ListDirectoryRequest request;
         request.set_uid(uid);
         fileengine::Logger::detail("ListDir", "Set directory UID: ", uid);
 
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         ListDirectoryResponse response;
         grpc::ClientContext context;
@@ -146,9 +146,9 @@ public:
         if (status.ok() && response.success()) {
             fileengine::Logger::debug("ListDir", "Directory listing successful, found ", response.entries_size(), " entries");
             if (show_deleted) {
-                std::cout << "Contents of directory (UID: " << uid << ", showing deleted files):" << std::endl;
+                std::cout << "Contents of directory (UID: " << uid << ", showing deleted files) in tenant '" << tenant << "':" << std::endl;
             } else {
-                std::cout << "Contents of directory (UID: " << uid << "):" << std::endl;
+                std::cout << "Contents of directory (UID: " << uid << ") in tenant '" << tenant << "':" << std::endl;
             }
 
             for (const auto& entry : response.entries()) {
@@ -168,7 +168,7 @@ public:
             return true;
         } else {
             fileengine::Logger::debug("ListDir", "Failed to list directory '", uid, "', error: ", response.error());
-            std::cout << "✗ Failed to list directory '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to list directory '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -193,15 +193,15 @@ public:
     }
 
     // File operations
-    bool touch(const std::string& parent_uid, const std::string& name, const std::string& user) {
-        fileengine::Logger::debug("Touch", "Attempting to create file '", name, "' in parent '", parent_uid, "' for user '", user, "'");
+    bool touch(const std::string& parent_uid, const std::string& name, const std::string& user, const std::string& tenant = "default") {
+        fileengine::Logger::debug("Touch", "Attempting to create file '", name, "' in parent '", parent_uid, "' for user '", user, "' in tenant '", tenant, "'");
 
         TouchRequest request;
         request.set_parent_uid(parent_uid);
         request.set_name(name);
         fileengine::Logger::detail("Touch", "Set parent UID: ", parent_uid, ", name: ", name);
 
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         TouchResponse response;
         grpc::ClientContext context;
@@ -212,11 +212,11 @@ public:
 
         if (status.ok() && response.success()) {
             fileengine::Logger::debug("Touch", "File created successfully with UID: ", response.uid());
-            std::cout << "✓ Created file '" << name << "' with UID: " << response.uid() << std::endl;
+            std::cout << "✓ Created file '" << name << "' with UID: " << response.uid() << " in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
             fileengine::Logger::debug("Touch", "Failed to create file '", name, "', error: ", response.error());
-            std::cout << "✗ Failed to create file '" << name << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to create file '" << name << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -299,10 +299,10 @@ public:
     }
 
     // Stat operation
-    bool stat(const std::string& uid, const std::string& user) {
+    bool stat(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         StatRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         StatResponse response;
         grpc::ClientContext context;
@@ -311,7 +311,7 @@ public:
 
         if (status.ok() && response.success()) {
             const auto& info = response.info();
-            std::cout << "File Info for UID: " << info.uid() << std::endl;
+            std::cout << "File Info for UID: " << info.uid() << " in tenant '" << tenant << "':" << std::endl;
             std::cout << "  Name: " << info.name() << std::endl;
             std::cout << "  Type: ";
 
@@ -341,16 +341,16 @@ public:
             std::cout << "  Version: " << info.version() << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to get file info for '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to get file info for '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
 
     // File existence check
-    bool exists(const std::string& uid, const std::string& user) {
+    bool exists(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         ExistsRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         ExistsResponse response;
         grpc::ClientContext context;
@@ -359,13 +359,13 @@ public:
 
         if (status.ok() && response.success()) {
             if (response.exists()) {
-                std::cout << "✓ Resource with UID '" << uid << "' exists" << std::endl;
+                std::cout << "✓ Resource with UID '" << uid << "' exists in tenant '" << tenant << "'" << std::endl;
             } else {
-                std::cout << "✗ Resource with UID '" << uid << "' does not exist" << std::endl;
+                std::cout << "✗ Resource with UID '" << uid << "' does not exist in tenant '" << tenant << "'" << std::endl;
             }
             return response.exists();
         } else {
-            std::cout << "✗ Failed to check existence for '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to check existence for '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -481,12 +481,12 @@ public:
     }
 
     // Metadata operations
-    bool set_metadata(const std::string& uid, const std::string& key, const std::string& value, const std::string& user) {
+    bool set_metadata(const std::string& uid, const std::string& key, const std::string& value, const std::string& user, const std::string& tenant = "default") {
         SetMetadataRequest request;
         request.set_uid(uid);
         request.set_key(key);
         request.set_value(value);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         SetMetadataResponse response;
         grpc::ClientContext context;
@@ -494,19 +494,19 @@ public:
         grpc::Status status = stub_->SetMetadata(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "✓ Set metadata '" << key << "' = '" << value << "' for resource '" << uid << "'" << std::endl;
+            std::cout << "✓ Set metadata '" << key << "' = '" << value << "' for resource '" << uid << "' in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to set metadata '" << key << "' for '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to set metadata '" << key << "' for '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
 
-    bool get_metadata(const std::string& uid, const std::string& key, const std::string& user) {
+    bool get_metadata(const std::string& uid, const std::string& key, const std::string& user, const std::string& tenant = "default") {
         GetMetadataRequest request;
         request.set_uid(uid);
         request.set_key(key);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         GetMetadataResponse response;
         grpc::ClientContext context;
@@ -514,18 +514,18 @@ public:
         grpc::Status status = stub_->GetMetadata(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "Metadata '" << key << "' for resource '" << uid << "': " << response.value() << std::endl;
+            std::cout << "Metadata '" << key << "' for resource '" << uid << "' in tenant '" << tenant << "': " << response.value() << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to get metadata '" << key << "' for '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to get metadata '" << key << "' for '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
 
-    bool get_all_metadata(const std::string& uid, const std::string& user) {
+    bool get_all_metadata(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         GetAllMetadataRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         GetAllMetadataResponse response;
         grpc::ClientContext context;
@@ -533,22 +533,22 @@ public:
         grpc::Status status = stub_->GetAllMetadata(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "All metadata for resource '" << uid << "':" << std::endl;
+            std::cout << "All metadata for resource '" << uid << "' in tenant '" << tenant << "':" << std::endl;
             for (const auto& pair : response.metadata()) {
                 std::cout << "  " << pair.first << " = " << pair.second << std::endl;
             }
             return true;
         } else {
-            std::cout << "✗ Failed to get all metadata for '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to get all metadata for '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
 
-    bool delete_metadata(const std::string& uid, const std::string& key, const std::string& user) {
+    bool delete_metadata(const std::string& uid, const std::string& key, const std::string& user, const std::string& tenant = "default") {
         DeleteMetadataRequest request;
         request.set_uid(uid);
         request.set_key(key);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         DeleteMetadataResponse response;
         grpc::ClientContext context;
@@ -556,10 +556,10 @@ public:
         grpc::Status status = stub_->DeleteMetadata(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "✓ Deleted metadata '" << key << "' for resource '" << uid << "'" << std::endl;
+            std::cout << "✓ Deleted metadata '" << key << "' for resource '" << uid << "' in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to delete metadata '" << key << "' for '" << uid << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to delete metadata '" << key << "' for '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -803,6 +803,7 @@ int main(int argc, char** argv) {
     // Load configuration first
     std::string config_file = ".env";
     std::string user = "cli_user";
+    std::string tenant = "default";
     std::vector<std::string> roles = {};
     std::vector<std::string> claims = {};
     std::string server_address = "localhost:50051";
@@ -819,6 +820,10 @@ int main(int argc, char** argv) {
         } else if (opt == "-u" || opt == "--user") {
             if (arg_offset + 1 < argc) {
                 user = argv[++arg_offset];
+            }
+        } else if (opt == "-t" || opt == "--tenant") {
+            if (arg_offset + 1 < argc) {
+                tenant = argv[++arg_offset];
             }
         } else if (opt == "-r" || opt == "--roles") {
             if (arg_offset + 1 < argc) {
@@ -882,12 +887,14 @@ int main(int argc, char** argv) {
         std::cout << "Options:" << std::endl;
         std::cout << "  --config FILE             - Configuration file (default: .env)" << std::endl;
         std::cout << "  -u, --user USER           - Username for authentication (default: cli_user)" << std::endl;
+        std::cout << "  -t, --tenant TENANT       - Tenant for operations (default: default)" << std::endl;
         std::cout << "  -r, --roles ROLE1,ROLE2   - Roles for the user (comma separated)" << std::endl;
         std::cout << "  -c, --claims CLAIM1,CLAIM2 - Claims for the user (comma separated)" << std::endl;
         std::cout << "  --server ADDRESS          - Server address (default: localhost:50051)" << std::endl;
         std::cout << "  -v, --verbose             - Enable verbose logging" << std::endl;
         std::cout << "  -vv, --very-verbose       - Enable very verbose logging" << std::endl;
         std::cout << "  -vvv, --extremely-verbose - Enable extremely verbose logging" << std::endl;
+        std::cout << "  (Tenant option applies to all operations)" << std::endl;
         std::cout << std::endl;
         std::cout << "Commands:" << std::endl;
         std::cout << "  connect <server_address>              - Connect to gRPC server (default: localhost:50051)" << std::endl;
@@ -909,27 +916,32 @@ int main(int argc, char** argv) {
         std::cout << "  rename <uid> <new_name>               - Rename file/directory" << std::endl;
         std::cout << "  move <uid> <new_parent_uid>           - Move file/directory to new parent" << std::endl;
         std::cout << "  copy <source_uid> <dest_parent_uid>   - Copy file to destination parent" << std::endl;
+        std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Versioning operations:" << std::endl;
         std::cout << "  versions <uid>                        - List all versions for a resource" << std::endl;
         std::cout << "  getversion <uid> <version>            - Get specific version of resource" << std::endl;
         std::cout << "  restore <uid> <version>               - Restore resource to specific version" << std::endl;
+        std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Metadata operations:" << std::endl;
         std::cout << "  setmeta <uid> <key> <value>           - Set metadata for resource" << std::endl;
         std::cout << "  getmeta <uid> <key>                   - Get metadata for resource" << std::endl;
         std::cout << "  allmeta <uid>                         - Get all metadata for resource" << std::endl;
         std::cout << "  delmeta <uid> <key>                   - Delete metadata for resource" << std::endl;
+        std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Permission operations:" << std::endl;
         std::cout << "  grant <resource_uid> <user> <perm>    - Grant permission (r/w/x)" << std::endl;
         std::cout << "  revoke <resource_uid> <user> <perm>   - Revoke permission (r/w/x)" << std::endl;
         std::cout << "  check <resource_uid> <user> <perm>    - Check permission (r/w/x)" << std::endl;
+        std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Diagnostic operations:" << std::endl;
         std::cout << "  usage                                 - Show storage usage statistics" << std::endl;
         std::cout << "  sync                                  - Trigger synchronization" << std::endl;
         std::cout << "  purge <uid> <days>                    - Purge versions older than specified days" << std::endl;
+        std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         return 0;
     }
 
@@ -949,20 +961,20 @@ int main(int argc, char** argv) {
         std::cout << "Already connected to: " << server_address << std::endl;
     }
     else if (command == "mkdir" && argc - arg_offset == 3) {  // command + 2 args
-        client.make_directory(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.make_directory(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "ls" && argc - arg_offset == 2) {  // command + 1 arg
-        client.list_directory(argv[arg_offset + 1], user, false);
+        client.list_directory(argv[arg_offset + 1], user, false, tenant);
     }
     else if (command == "ls" && argc - arg_offset == 3) {  // command + 2 args
         bool show_deleted = (std::string(argv[arg_offset + 2]) == "true" || std::string(argv[arg_offset + 2]) == "1");
-        client.list_directory(argv[arg_offset + 1], user, show_deleted);
+        client.list_directory(argv[arg_offset + 1], user, show_deleted, tenant);
     }
     else if (command == "lsd" && argc - arg_offset == 2) {  // command + 1 arg
-        client.list_directory(argv[arg_offset + 1], user, true);
+        client.list_directory(argv[arg_offset + 1], user, true, tenant);
     }
     else if (command == "touch" && argc - arg_offset == 3) {  // command + 2 args
-        client.touch(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.touch(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "rm" && argc - arg_offset == 2) {  // command + 1 arg
         client.remove_file(argv[arg_offset + 1], user);
@@ -974,10 +986,10 @@ int main(int argc, char** argv) {
         client.undelete_file(argv[arg_offset + 1], user);
     }
     else if (command == "stat" && argc - arg_offset == 2) {  // command + 1 arg
-        client.stat(argv[arg_offset + 1], user);
+        client.stat(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "exists" && argc - arg_offset == 2) {  // command + 1 arg
-        client.exists(argv[arg_offset + 1], user);
+        client.exists(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "put" && argc - arg_offset == 3) {  // command + 2 args
         // Read file from disk
@@ -1048,16 +1060,16 @@ int main(int argc, char** argv) {
         }
     }
     else if (command == "setmeta" && argc - arg_offset == 4) {  // command + 3 args
-        client.set_metadata(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user);
+        client.set_metadata(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user, tenant);
     }
     else if (command == "getmeta" && argc - arg_offset == 3) {  // command + 2 args
-        client.get_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.get_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "allmeta" && argc - arg_offset == 2) {  // command + 1 arg
-        client.get_all_metadata(argv[arg_offset + 1], user);
+        client.get_all_metadata(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "delmeta" && argc - arg_offset == 3) {  // command + 2 args
-        client.delete_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.delete_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "grant" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
