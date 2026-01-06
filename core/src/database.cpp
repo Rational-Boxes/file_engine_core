@@ -1066,6 +1066,40 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
     }
 }
 
+Result<void> Database::update_file_parent(const std::string& uid, const std::string& new_parent_uid, const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string update_sql = "UPDATE \"" + schema_name + "\".files SET parent_uid = $2 WHERE uid = $1;";
+    const char* param_values[2] = {uid.c_str(), new_parent_uid.c_str()};
+
+    PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+        int rows_affected = std::stoi(PQcmdTuples(res));
+        if (rows_affected == 0) {
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<void>::err("File with UID not found: " + uid);
+        }
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::ok();
+    } else {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to update file parent: " + error);
+    }
+}
+
 Result<std::string> Database::path_to_uid(const std::string& path, const std::string& tenant) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {

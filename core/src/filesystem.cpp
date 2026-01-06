@@ -592,18 +592,195 @@ Result<bool> FileSystem::exists(const std::string& file_uid, const std::string& 
     return Result<bool>::ok(db_result.value.has_value());
 }
 
-Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst_uid, 
+Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst_uid,
                               const std::string& user, const std::string& tenant) {
-    // This is a simplified implementation - in reality, move would involve updating 
-    // the parent_uid in the database and potentially moving the actual file data
-    return Result<void>::err("Move operation not fully implemented");
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<void>::err("Database not available for tenant: " + tenant);
+    }
+
+    // Check permissions - the user needs write permission on both source and destination
+    auto src_perm_result = validate_user_permissions(src_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    if (!src_perm_result.success || !src_perm_result.value) {
+        return Result<void>::err("User does not have permission to move source file");
+    }
+
+    // For move operation, dst_uid represents the new parent directory
+    auto dst_perm_result = validate_user_permissions(dst_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    if (!dst_perm_result.success || !dst_perm_result.value) {
+        return Result<void>::err("User does not have permission to move to destination directory");
+    }
+
+    // Get the source file info to check if it exists and to get its type
+    auto src_info_result = context->db->get_file_by_uid(src_uid, tenant);
+    if (!src_info_result.success || !src_info_result.value.has_value()) {
+        return Result<void>::err("Source file does not exist");
+    }
+
+    // Get the destination directory info to ensure it's a directory
+    auto dst_info_result = context->db->get_file_by_uid(dst_uid, tenant);
+    if (!dst_info_result.success || !dst_info_result.value.has_value()) {
+        return Result<void>::err("Destination directory does not exist");
+    }
+
+    if (dst_info_result.value->type != FileType::DIRECTORY) {
+        return Result<void>::err("Destination is not a directory");
+    }
+
+    // Update the parent_uid in the database to move the file/directory
+    auto db_result = context->db->update_file_parent(src_uid, dst_uid, tenant);
+    if (!db_result.success) {
+        return Result<void>::err("Failed to move file in database: " + db_result.error);
+    }
+
+    return Result<void>::ok();
 }
 
-Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst_uid, 
+Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst_uid,
                               const std::string& user, const std::string& tenant) {
-    // This is a simplified implementation - in reality, copy would involve 
-    // creating a new file and copying the content
-    return Result<void>::err("Copy operation not fully implemented");
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db || !context->storage) {
+        return Result<void>::err("Database or storage not available for tenant: " + tenant);
+    }
+
+    // Check permissions - the user needs read permission on source and write permission on destination
+    auto src_perm_result = validate_user_permissions(src_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    if (!src_perm_result.success || !src_perm_result.value) {
+        return Result<void>::err("User does not have permission to read source file");
+    }
+
+    // For copy operation, dst_uid represents the new parent directory
+    auto dst_perm_result = validate_user_permissions(dst_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    if (!dst_perm_result.success || !dst_perm_result.value) {
+        return Result<void>::err("User does not have permission to write to destination directory");
+    }
+
+    // Get the source file info to check if it exists and to get its type
+    auto src_info_result = context->db->get_file_by_uid(src_uid, tenant);
+    if (!src_info_result.success || !src_info_result.value.has_value()) {
+        return Result<void>::err("Source file does not exist");
+    }
+
+    auto src_info = src_info_result.value.value();
+
+    // Get the destination directory info to ensure it's a directory
+    auto dst_info_result = context->db->get_file_by_uid(dst_uid, tenant);
+    if (!dst_info_result.success || !dst_info_result.value.has_value()) {
+        return Result<void>::err("Destination directory does not exist");
+    }
+
+    if (dst_info_result.value->type != FileType::DIRECTORY) {
+        return Result<void>::err("Destination is not a directory");
+    }
+
+    // Generate a new UID for the copied file
+    std::string new_uid = Utils::generate_uuid();
+    std::string new_path = dst_uid + "/" + src_info.name; // Construct new path
+
+    // If it's a directory, we need to recursively copy all contents
+    if (src_info.type == FileType::DIRECTORY) {
+        // Create the new directory in the database
+        auto db_result = context->db->insert_file(new_uid, src_info.name, new_path, dst_uid,
+                                                  FileType::DIRECTORY, user, src_info.permissions, tenant);
+        if (!db_result.success) {
+            return Result<void>::err("Failed to create directory in database: " + db_result.error);
+        }
+
+        // Apply default ACLs to the new directory
+        if (acl_manager_) {
+            auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
+            if (!acl_result.success) {
+                // Log error but don't fail the operation
+            }
+        }
+
+        // List all entries in the source directory
+        auto list_result = listdir(src_uid, user, tenant);
+        if (list_result.success) {
+            // Recursively copy each entry in the source directory
+            for (const auto& entry : list_result.value) {
+                Result<void> copy_result = copy(entry.uid, new_uid, user, tenant);
+                if (!copy_result.success) {
+                    return Result<void>::err("Failed to copy directory contents: " + copy_result.error);
+                }
+            }
+        }
+
+        return Result<void>::ok();
+    } else {
+        // It's a regular file - copy the file content and metadata
+        // Get the current version of the source file
+        auto versions_result = list_versions(src_uid, user, tenant);
+        if (!versions_result.success || versions_result.value.empty()) {
+            return Result<void>::err("No versions available for source file");
+        }
+
+        // Get the latest version
+        std::string latest_version = versions_result.value.back();
+
+        // Read the file content from storage
+        std::string src_storage_path = context->storage->get_storage_path(src_uid, latest_version, tenant);
+        auto storage_result = context->storage->read_file(src_storage_path, tenant);
+        if (!storage_result.success) {
+            return Result<void>::err("Failed to read source file from storage: " + storage_result.error);
+        }
+
+        // Store the file content with the new UID
+        auto store_result = context->storage->store_file(new_uid, latest_version, storage_result.value, tenant);
+        if (!store_result.success) {
+            return Result<void>::err("Failed to store copied file: " + store_result.error);
+        }
+
+        // Record file creation in storage tracker for cache management
+        if (context->storage_tracker) {
+            context->storage_tracker->record_file_creation(store_result.value, storage_result.value.size(), tenant);
+        }
+
+        // Create the new file entry in the database
+        auto db_result = context->db->insert_file(new_uid, src_info.name, new_path, dst_uid,
+                                                  FileType::REGULAR_FILE, user, src_info.permissions, tenant);
+        if (!db_result.success) {
+            return Result<void>::err("Failed to create file in database: " + db_result.error);
+        }
+
+        // Update the file's current version in the database
+        auto update_result = context->db->update_file_current_version(new_uid, latest_version, tenant);
+        if (!update_result.success) {
+            return Result<void>::err("Failed to update current version: " + update_result.error);
+        }
+
+        // Record the version in the database
+        auto insert_version_result = context->db->insert_version(new_uid, latest_version, storage_result.value.size(),
+                                                                 store_result.value, tenant);
+        if (!insert_version_result.success) {
+            return Result<void>::err("Failed to record version: " + insert_version_result.error);
+        }
+
+        // Update the modification time
+        auto update_time_result = context->db->update_file_modified(new_uid, tenant);
+        if (!update_time_result.success) {
+            // Log error but don't fail the operation
+        }
+
+        // Apply default ACLs to the new file
+        if (acl_manager_) {
+            auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
+            if (!acl_result.success) {
+                // Log error but don't fail the operation
+            }
+        }
+
+        // If we have an object store, schedule a backup for the copied file
+        if (context->object_store) {
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                backup_queue_.push({new_uid, tenant, latest_version});
+            }
+            queue_cv_.notify_one(); // Wake up the backup worker thread
+        }
+
+        return Result<void>::ok();
+    }
 }
 
 Result<void> FileSystem::rename(const std::string& uid, const std::string& new_name, 

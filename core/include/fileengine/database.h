@@ -55,6 +55,7 @@ public:
     Result<int64_t> get_file_size(const std::string& file_uid, const std::string& tenant) override;
     Result<int64_t> get_directory_size(const std::string& dir_uid, const std::string& tenant) override;
     Result<std::optional<FileInfo>> get_file_by_uid_include_deleted(const std::string& uid, const std::string& tenant) override;
+    Result<void> update_file_parent(const std::string& uid, const std::string& new_parent_uid, const std::string& tenant) override;
 
     // Path-to-UUID mapping (for backward compatibility)
     Result<std::string> path_to_uid(const std::string& path, const std::string& tenant) override;

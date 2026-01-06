@@ -45,6 +45,7 @@ public:
     virtual Result<int64_t> get_file_size(const std::string& file_uid, const std::string& tenant = "") = 0;
     virtual Result<int64_t> get_directory_size(const std::string& dir_uid, const std::string& tenant = "") = 0;
     virtual Result<std::optional<FileInfo>> get_file_by_uid_include_deleted(const std::string& uid, const std::string& tenant = "") = 0;
+    virtual Result<void> update_file_parent(const std::string& uid, const std::string& new_parent_uid, const std::string& tenant = "") = 0;
 
     // Path-to-UUID mapping (for backward compatibility)
     virtual Result<std::string> path_to_uid(const std::string& path, const std::string& tenant = "") = 0;
