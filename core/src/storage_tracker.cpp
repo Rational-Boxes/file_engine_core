@@ -1,4 +1,5 @@
 #include "fileengine/storage_tracker.h"
+#include "fileengine/server_logger.h"
 #include <sys/statvfs.h>
 #include <filesystem>
 #include <algorithm>
@@ -7,7 +8,56 @@ namespace fileengine {
 
 StorageTracker::StorageTracker(const std::string& base_path) : base_path_(base_path) {
     overall_usage_ = get_filesystem_stats();
+
+    // Initialize file_usage_map_ with existing files in the storage directory
+    initialize_from_existing_files();
+
     update_usage_stats();
+}
+
+void StorageTracker::initialize_from_existing_files() {
+    std::lock_guard<std::mutex> lock(usage_mutex_);
+
+    try {
+        std::string search_path = base_path_ + "/default";  // Assuming default tenant for now
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(search_path)) {
+            if (entry.is_regular_file()) {
+                std::string file_path = entry.path().string();
+                size_t file_size = entry.file_size();
+
+                // Extract tenant from path (assuming path format: base_path/tenant/xx/yy/zz/uid/version)
+                std::string tenant = "default";
+                std::string uid = "unknown";  // We'll extract this from the path
+
+                // Parse the path to extract tenant and uid
+                std::filesystem::path path_obj(file_path);
+                auto path_parts = path_obj.parent_path().parent_path().parent_path().parent_path().parent_path();
+                if (path_parts.has_filename()) {
+                    tenant = path_parts.filename().string();
+                }
+
+                // Extract uid from path (the directory just before the version file)
+                auto uid_path = path_obj.parent_path();
+                if (uid_path.has_filename()) {
+                    uid = uid_path.filename().string();
+                }
+
+                FileUsage file_usage;
+                file_usage.file_path = file_path;
+                file_usage.size_bytes = file_size;
+                file_usage.last_accessed = std::chrono::steady_clock::now();
+                file_usage.last_modified = std::chrono::steady_clock::now();
+                file_usage.tenant = tenant;
+                file_usage.access_count = 0;  // Start with 0 access count for existing files
+
+                file_usage_map_[file_path] = file_usage;
+            }
+        }
+    } catch (const std::exception& e) {
+        // Handle error appropriately
+        SERVER_LOG_ERROR("StorageTracker", "Error initializing from existing files: " + std::string(e.what()));
+    }
 }
 
 StorageUsage StorageTracker::get_current_usage() {

@@ -114,6 +114,9 @@ int main(int argc, char** argv) {
         std::cout << "S3 storage initialized successfully." << std::endl;
     }
 
+    // Initialize storage tracker
+    auto storage_tracker = std::make_unique<fileengine::StorageTracker>(config.storage_base_path);
+
     // Initialize storage
     std::cout << "Initializing local storage..." << std::endl;
     auto storage = std::make_unique<fileengine::Storage>(config.storage_base_path, config.encrypt_data, config.compress_data);
@@ -136,13 +139,10 @@ int main(int argc, char** argv) {
     tenant_config.encrypt_data = config.encrypt_data;
     tenant_config.compress_data = config.compress_data;
 
-    auto tenant_manager = std::make_shared<fileengine::TenantManager>(tenant_config, database);
+    auto tenant_manager = std::make_shared<fileengine::TenantManager>(tenant_config, database, storage_tracker.get());
 
     // Initialize ACL manager
     auto acl_manager = std::make_shared<fileengine::AclManager>(database);
-
-    // Initialize storage tracker
-    auto storage_tracker = std::make_unique<fileengine::StorageTracker>(config.storage_base_path);
 
     // Initialize cache manager
     auto cache_manager = std::make_unique<fileengine::CacheManager>(storage.get(), s3_storage.get(), config.cache_threshold);
@@ -152,6 +152,13 @@ int main(int argc, char** argv) {
     auto filesystem = std::make_shared<fileengine::FileSystem>(tenant_manager);
     filesystem->set_acl_manager(acl_manager);
 
+    // Initialize file culling system
+    std::cout << "Initializing file culling system..." << std::endl;
+    auto file_culler = std::make_unique<fileengine::FileCuller>(storage.get(), s3_storage.get(), storage_tracker.get());
+
+    // Set the file culler for cache management (create a separate instance for the filesystem)
+    filesystem->set_file_culler(std::make_unique<fileengine::FileCuller>(storage.get(), s3_storage.get(), storage_tracker.get()));
+
     // Initialize the default tenant to ensure root directory exists
     std::cout << "Initializing default tenant..." << std::endl;
     bool default_tenant_init = tenant_manager->initialize_tenant("default");
@@ -160,10 +167,6 @@ int main(int argc, char** argv) {
     } else {
         std::cerr << "Warning: Failed to initialize default tenant" << std::endl;
     }
-
-    // Initialize file culler for intelligent local storage management
-    std::cout << "Initializing file culling system..." << std::endl;
-    auto file_culler = std::make_unique<fileengine::FileCuller>(storage.get(), s3_storage.get(), storage_tracker.get());
 
     // Configure and initialize object store sync
     std::cout << "Initializing object store sync..." << std::endl;

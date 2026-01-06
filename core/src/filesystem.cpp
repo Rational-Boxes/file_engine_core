@@ -7,6 +7,8 @@ namespace fileengine {
 
 FileSystem::FileSystem(std::shared_ptr<TenantManager> tenant_manager)
     : tenant_manager_(tenant_manager) {
+    // Initialize file culler (cache management) - will be set by the server with proper dependencies
+    // The actual initialization will happen when the server sets it up with storage tracker
     // Start the async backup worker thread
     start_async_backup_worker();
 }
@@ -327,10 +329,37 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     // Generate a new version timestamp
     std::string version_timestamp = Utils::get_timestamp_string();
     
+    // Check if we need to perform cache pruning before storing
+    // Only proceed with cache management if object store is available to prevent data loss
+    if (file_culler_ && context->object_store) {
+        // Verify object store is initialized and available
+        bool object_store_available = context->object_store->is_initialized();
+        if (object_store_available) {
+            // Try to perform culling to free up space for the specific file size
+            size_t file_size = data.size();
+            auto culling_result = file_culler_->perform_culling_for_space(file_size);
+            if (!culling_result.success) {
+                // Log the error but continue with the operation
+                SERVER_LOG_WARN("FileSystem::put", "Cache culling failed: " + culling_result.error);
+            }
+        } else {
+            // If object store is not available, we cannot safely cull local files
+            return Result<void>::err("Object store not available - cannot perform cache culling to make space");
+        }
+    } else if (file_culler_ && !context->object_store) {
+        // If culling is enabled but no object store is configured, return an error to prevent data loss
+        return Result<void>::err("Cache culling requires object store configuration to prevent data loss");
+    }
+
     // Store the file in storage
     auto storage_result = context->storage->store_file(file_uid, version_timestamp, data, tenant);
     if (!storage_result.success) {
         return Result<void>::err("Failed to store file in storage: " + storage_result.error);
+    }
+
+    // Record file creation in storage tracker for cache management
+    if (context->storage_tracker) {
+        context->storage_tracker->record_file_creation(storage_result.value, data.size(), tenant);
     }
     
     // Update the file's current version in the database

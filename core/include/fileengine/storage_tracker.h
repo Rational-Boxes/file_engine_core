@@ -75,6 +75,10 @@ private:
     
     // Helper to update tenant usage
     void update_tenant_usage(const std::string& tenant);
+
+private:
+    // Helper to initialize from existing files on startup
+    void initialize_from_existing_files();
 };
 
 } // namespace fileengine

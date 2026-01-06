@@ -7,6 +7,7 @@
 #include "acl_manager.h"
 #include "cache_manager.h"
 #include "tenant_manager.h"
+#include "file_culler.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -142,10 +143,16 @@ public:
         acl_manager_ = acl_manager;
     }
 
+    // Setter for FileCuller
+    virtual void set_file_culler(std::unique_ptr<FileCuller> file_culler) {
+        file_culler_ = std::move(file_culler);
+    }
+
 private:
     std::shared_ptr<TenantManager> tenant_manager_;
     std::shared_ptr<AclManager> acl_manager_;
     std::unique_ptr<CacheManager> cache_manager_;
+    std::unique_ptr<FileCuller> file_culler_;
     
     // Helper to get tenant context for operations
     TenantContext* get_tenant_context(const std::string& tenant);

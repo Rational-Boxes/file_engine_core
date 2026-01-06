@@ -5,8 +5,8 @@
 
 namespace fileengine {
 
-TenantManager::TenantManager(const TenantConfig& config, std::shared_ptr<IDatabase> shared_db)
-    : config_(config), shared_database_(shared_db) {
+TenantManager::TenantManager(const TenantConfig& config, std::shared_ptr<IDatabase> shared_db, class StorageTracker* storage_tracker)
+    : config_(config), shared_database_(shared_db), storage_tracker_(storage_tracker) {
 }
 
 TenantManager::~TenantManager() {
@@ -157,6 +157,7 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
         context->db = std::move(db);
         context->storage = std::move(storage);
         context->object_store = std::move(object_store);
+        context->storage_tracker = storage_tracker_;
 
         return context.release();  // Transfer ownership to caller who will place in map
     } catch (const std::exception& ex) {

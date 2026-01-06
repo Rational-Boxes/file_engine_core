@@ -37,7 +37,10 @@ public:
     
     // Perform a manual culling operation
     Result<void> perform_culling();
-    
+
+    // Perform culling to free up specific amount of space
+    Result<void> perform_culling_for_space(size_t required_bytes);
+
     // Get culling statistics
     size_t get_culled_file_count() const;
     size_t get_culled_byte_count() const;

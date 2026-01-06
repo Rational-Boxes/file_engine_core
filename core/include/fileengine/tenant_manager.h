@@ -32,11 +32,12 @@ struct TenantContext {
     std::unique_ptr<IDatabase> db;
     std::unique_ptr<IStorage> storage;
     std::unique_ptr<IObjectStore> object_store;
+    class StorageTracker* storage_tracker;  // Pointer to shared storage tracker
 };
 
 class TenantManager {
 public:
-    TenantManager(const TenantConfig& config, std::shared_ptr<IDatabase> shared_db = nullptr);
+    TenantManager(const TenantConfig& config, std::shared_ptr<IDatabase> shared_db = nullptr, class StorageTracker* storage_tracker = nullptr);
     ~TenantManager();
 
     TenantContext* get_tenant_context(const std::string& tenant_id);
@@ -50,6 +51,7 @@ private:
 
     TenantConfig config_;
     std::shared_ptr<IDatabase> shared_database_;
+    class StorageTracker* storage_tracker_;
     std::map<std::string, std::unique_ptr<TenantContext>> tenant_contexts_;
     mutable std::mutex mutex_;
 };
