@@ -185,3 +185,85 @@ install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/
     DESTINATION include
     FILES_MATCHING PATTERN "*.h"
 )
+
+# Install a default configuration file to /etc/fileengine
+install(CODE "
+    # Create /etc/fileengine directory if it doesn't exist
+    execute_process(
+        COMMAND \${CMAKE_COMMAND} -E make_directory /etc/fileengine
+        RESULT_VARIABLE MKDIR_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+
+    # Create a default configuration file if one doesn't already exist
+    if(MKDIR_RESULT EQUAL 0 OR MKDIR_RESULT EQUAL \"\")
+        # Check if the config file already exists
+        execute_process(
+            COMMAND sh -c \"test -f /etc/fileengine/core.conf\"
+            RESULT_VARIABLE CONFIG_EXISTS
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+
+        if(NOT CONFIG_EXISTS EQUAL 0)
+            # Create a default configuration file
+            execute_process(
+                COMMAND sh -c \"echo '# FileEngine Core Service Configuration
+# This file is created during installation
+
+# Database Configuration
+FILEENGINE_PG_HOST=localhost
+FILEENGINE_PG_PORT=5432
+FILEENGINE_PG_DATABASE=fileengine
+FILEENGINE_PG_USER=fileengine_user
+FILEENGINE_PG_PASSWORD=fileengine_password
+
+# Storage Configuration
+FILEENGINE_STORAGE_BASE=/var/lib/fileengine/storage
+
+# Encryption and Compression Settings
+FILEENGINE_ENCRYPT_DATA=false
+FILEENGINE_COMPRESS_DATA=false
+AT_REST_KEY=
+
+# S3/MinIO Configuration
+FILEENGINE_S3_ENDPOINT=http://localhost:9000
+FILEENGINE_S3_REGION=us-east-1
+FILEENGINE_S3_BUCKET=fileengine
+FILEENGINE_S3_ACCESS_KEY=minioadmin
+FILEENGINE_S3_SECRET_KEY=minioadmin
+FILEENGINE_S3_PATH_STYLE=true
+
+# Cache Configuration
+FILEENGINE_CACHE_THRESHOLD=0.8
+FILEENGINE_MAX_CACHE_SIZE_MB=1024
+
+# Server Configuration
+FILEENGINE_GRPC_HOST=0.0.0.0
+FILEENGINE_GRPC_PORT=50051
+FILEENGINE_HTTP_THREAD_POOL=10
+
+# Security Configuration
+FILEENGINE_ROOT_USER=false
+
+# Sync Configuration
+FILEENGINE_S3_SYNC_SUPPORT=true
+FILEENGINE_S3_RETRY_SECONDS=60
+FILEENGINE_S3_SYNC_ON_STARTUP=true
+FILEENGINE_S3_SYNC_ON_DEMAND=true
+FILEENGINE_S3_SYNC_PATTERN=all
+FILEENGINE_S3_SYNC_BIDIRECTIONAL=true
+
+# Logging Configuration
+FILEENGINE_LOG_LEVEL=INFO
+FILEENGINE_LOG_FILE_PATH=/var/log/fileengine.log
+FILEENGINE_LOG_TO_CONSOLE=true
+FILEENGINE_LOG_TO_FILE=false
+FILEENGINE_LOG_ROTATION_SIZE_MB=10
+FILEENGINE_LOG_RETENTION_DAYS=7
+' > /etc/fileengine/core.conf\"
+            )
+        endif()
+    endif()
+")
