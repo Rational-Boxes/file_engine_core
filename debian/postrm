@@ -10,6 +10,9 @@ case "$1" in
         # Remove the fileengine user and group
         deluser --system fileengine 2>/dev/null || true
         delgroup --system fileengine 2>/dev/null || true
+
+        # Remove logrotate configuration if it exists
+        rm -f /etc/logrotate.d/fileengine
     ;;
     upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
     ;;

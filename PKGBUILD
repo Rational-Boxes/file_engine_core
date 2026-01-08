@@ -35,7 +35,10 @@ package() {
     
     # Install default config
     install -Dm644 "${srcdir}/fileengine.conf" "${pkgdir}/etc/fileengine/core.conf"
-    
+
+    # Install logrotate configuration
+    install -Dm644 "${srcdir}/fileengine.logrotate" "${pkgdir}/etc/logrotate.d/fileengine"
+
     # Install documentation
     install -Dm644 "${srcdir}/README.md" "${pkgdir}/usr/share/doc/fileengine/README.md"
     install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/fileengine/LICENSE"

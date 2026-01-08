@@ -1,0 +1,13 @@
+/var/log/fileengine.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    create 640 fileengine fileengine
+    postrotate
+        # Reload the service after log rotation
+        systemctl reload-or-restart fileengine.service > /dev/null 2>&1 || true
+    endscript
+}

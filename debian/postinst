@@ -18,6 +18,7 @@ case "$1" in
         install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine
         install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine/storage
         install -d -o fileengine -g fileengine -m 750 /var/log/fileengine
+        install -d -o root -g root -m 755 /etc/logrotate.d
         
         # Reload systemd daemon to recognize new service
         if [ -d /run/systemd/system ]; then

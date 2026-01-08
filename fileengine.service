@@ -15,6 +15,10 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=fileengine
 
+# Create necessary directories
+StateDirectory=fileengine
+LogsDirectory=fileengine
+
 # Security settings
 NoNewPrivileges=true
 PrivateTmp=true

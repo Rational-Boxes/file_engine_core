@@ -55,13 +55,19 @@ install -m 644 ../fileengine.service $RPM_BUILD_ROOT%{_unitdir}/fileengine.servi
 mkdir -p $RPM_BUILD_ROOT/etc/fileengine
 install -m 644 ../core.conf $RPM_BUILD_ROOT/etc/fileengine/core.conf
 
+# Install logrotate configuration
+mkdir -p $RPM_BUILD_ROOT/etc/logrotate.d
+install -m 644 ../fileengine.logrotate $RPM_BUILD_ROOT/etc/logrotate.d/fileengine
+
 %post
 # Create fileengine user if it doesn't exist
 getent group fileengine >/dev/null || groupadd -r fileengine
 getent passwd fileengine >/dev/null || useradd -r -g fileengine -d /var/lib/fileengine -s /sbin/nologin -c "FileEngine Core Service" fileengine
-# Create storage directory
+# Create necessary directories
 mkdir -p /var/lib/fileengine/storage
+mkdir -p /var/log/fileengine
 chown -R fileengine:fileengine /var/lib/fileengine
+chown -R fileengine:fileengine /var/log/fileengine
 # Enable and start the service
 %systemd_post fileengine.service
 
@@ -77,6 +83,7 @@ chown -R fileengine:fileengine /var/lib/fileengine
 %attr(644,root,root) %{_libdir}/libfileengine_core.so
 %attr(644,root,root) %{_datadir}/fileengine/
 %config(noreplace) /etc/fileengine/core.conf
+%config(noreplace) /etc/logrotate.d/fileengine
 %{_unitdir}/fileengine.service
 %dir /var/lib/fileengine
 %dir /var/log/fileengine

@@ -102,3 +102,10 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/fileengine.service
     DESTINATION /etc/systemd/system/
     PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
 )
+
+# Install logrotate configuration file
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/fileengine.logrotate
+    DESTINATION /etc/logrotate.d/
+    RENAME fileengine
+    PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+)

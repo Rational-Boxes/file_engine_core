@@ -2,6 +2,7 @@ usr/bin/fileengine_server
 usr/bin/fileengine_cli
 usr/lib/libfileengine_core.so
 etc/fileengine/core.conf
+etc/logrotate.d/fileengine
 usr/lib/systemd/system/fileengine.service
 usr/share/doc/fileengine-core/*
 usr/share/man/man1/*
