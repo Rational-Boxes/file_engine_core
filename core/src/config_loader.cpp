@@ -11,8 +11,6 @@
 
 namespace fileengine {
 
-// Loads FILEENGINE_LOG_LEVEL and validates conventional log-levels for the logging subsystem
-
 std::string ConfigLoader::get_env_var(const std::string& var, const std::string& default_val) {
     const char* env_val = std::getenv(var.c_str());
     return env_val ? std::string(env_val) : default_val;
@@ -46,8 +44,8 @@ std::map<std::string, std::string> ConfigLoader::parse_env_file(const std::strin
             value.erase(value.find_last_not_of(" \t\r\n") + 1);
 
             // Remove quotes if present
-            if (value.length() >= 2 && 
-                ((value.front() == '"' && value.back() == '"') || 
+            if (value.length() >= 2 &&
+                ((value.front() == '"' && value.back() == '"') ||
                  (value.front() == '\'' && value.back() == '\''))) {
                 value = value.substr(1, value.length() - 2);
             }
@@ -67,16 +65,16 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     // Database configuration
     it = env_vars.find("FILEENGINE_PG_HOST");
     if (it != env_vars.end()) config.db_host = it->second;
-    
+
     it = env_vars.find("FILEENGINE_PG_PORT");
     if (it != env_vars.end()) config.db_port = std::stoi(it->second);
-    
+
     it = env_vars.find("FILEENGINE_PG_DATABASE");
     if (it != env_vars.end()) config.db_name = it->second;
-    
+
     it = env_vars.find("FILEENGINE_PG_USER");
     if (it != env_vars.end()) config.db_user = it->second;
-    
+
     it = env_vars.find("FILEENGINE_PG_PASSWORD");
     if (it != env_vars.end()) config.db_password = it->second;
 
@@ -97,29 +95,29 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     // S3/MinIO configuration
     it = env_vars.find("FILEENGINE_S3_ENDPOINT");
     if (it != env_vars.end()) config.s3_endpoint = it->second;
-    
+
     it = env_vars.find("FILEENGINE_S3_REGION");
     if (it != env_vars.end()) config.s3_region = it->second;
-    
+
     it = env_vars.find("FILEENGINE_S3_BUCKET");
     if (it != env_vars.end()) config.s3_bucket = it->second;
-    
+
     it = env_vars.find("FILEENGINE_S3_ACCESS_KEY");
     if (it != env_vars.end()) config.s3_access_key = it->second;
-    
+
     it = env_vars.find("FILEENGINE_S3_SECRET_KEY");
     if (it != env_vars.end()) config.s3_secret_key = it->second;
-    
+
     it = env_vars.find("FILEENGINE_S3_PATH_STYLE");
     if (it != env_vars.end()) config.s3_path_style = (it->second == "true" || it->second == "TRUE" || it->second == "1");
 
     // Cache configuration
     it = env_vars.find("FILEENGINE_CACHE_THRESHOLD");
     if (it != env_vars.end()) config.cache_threshold = std::stod(it->second);
-    
+
     it = env_vars.find("FILEENGINE_MAX_CACHE_SIZE_MB");
     if (it != env_vars.end()) config.max_cache_size_mb = std::stoul(it->second);
-    
+
     it = env_vars.find("FILEENGINE_MULTI_TENANT_ENABLED");
     if (it != env_vars.end()) config.multi_tenant_enabled = (it->second == "true" || it->second == "1");
 
@@ -129,7 +127,7 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
 
     it = env_vars.find("FILEENGINE_GRPC_PORT");
     if (it != env_vars.end()) config.server_port = std::stoi(it->second);
-    
+
     it = env_vars.find("FILEENGINE_HTTP_THREAD_POOL");
     if (it != env_vars.end()) config.thread_pool_size = std::stoi(it->second);
 
@@ -140,7 +138,7 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     // Sync configuration
     it = env_vars.find("FILEENGINE_S3_SYNC_SUPPORT");
     if (it != env_vars.end()) config.sync_enabled = (it->second == "true" || it->second == "minio" || it->second == "s3");
-    
+
     it = env_vars.find("FILEENGINE_S3_RETRY_SECONDS");
     if (it != env_vars.end()) config.sync_retry_seconds = std::stoi(it->second);
 
@@ -330,17 +328,234 @@ Config ConfigLoader::load_from_cmd_args(int argc, char* argv[]) {
 }
 
 Config ConfigLoader::load_config(int argc, char* argv[]) {
-    // 1. Load from file (lowest priority)
-    std::string config_file = ".env";
+    Config config;
+
+    // 1. Load from system config file first (lowest priority)
+    Config system_config = load_from_file("/etc/fileengine/core.conf");
+    config = system_config;  // Start with system config
+
+    // 2. Load from .env file in working directory (overrides system config)
+    Config default_file_config = load_from_file(".env");
+    auto default_file_vars = parse_env_file(".env");
+    auto it = default_file_vars.end();
+
+    // Apply .env file settings (higher priority than system config)
+    // Database configuration
+    it = default_file_vars.find("FILEENGINE_PG_HOST");
+    if (it != default_file_vars.end()) config.db_host = it->second;
+
+    it = default_file_vars.find("FILEENGINE_PG_PORT");
+    if (it != default_file_vars.end()) config.db_port = std::stoi(it->second);
+
+    it = default_file_vars.find("FILEENGINE_PG_DATABASE");
+    if (it != default_file_vars.end()) config.db_name = it->second;
+
+    it = default_file_vars.find("FILEENGINE_PG_USER");
+    if (it != default_file_vars.end()) config.db_user = it->second;
+
+    it = default_file_vars.find("FILEENGINE_PG_PASSWORD");
+    if (it != default_file_vars.end()) config.db_password = it->second;
+
+    // Storage configuration
+    it = default_file_vars.find("FILEENGINE_STORAGE_BASE");
+    if (it != default_file_vars.end()) config.storage_base_path = it->second;
+
+    // Compression and encryption settings
+    it = default_file_vars.find("FILEENGINE_ENCRYPT_DATA");
+    if (it != default_file_vars.end()) config.encrypt_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    it = default_file_vars.find("FILEENGINE_COMPRESS_DATA");
+    if (it != default_file_vars.end()) config.compress_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    it = default_file_vars.find("AT_REST_KEY");
+    if (it != default_file_vars.end()) config.encryption_key = it->second;
+
+    // S3/MinIO configuration
+    it = default_file_vars.find("FILEENGINE_S3_ENDPOINT");
+    if (it != default_file_vars.end()) config.s3_endpoint = it->second;
+
+    it = default_file_vars.find("FILEENGINE_S3_REGION");
+    if (it != default_file_vars.end()) config.s3_region = it->second;
+
+    it = default_file_vars.find("FILEENGINE_S3_BUCKET");
+    if (it != default_file_vars.end()) config.s3_bucket = it->second;
+
+    it = default_file_vars.find("FILEENGINE_S3_ACCESS_KEY");
+    if (it != default_file_vars.end()) config.s3_access_key = it->second;
+
+    it = default_file_vars.find("FILEENGINE_S3_SECRET_KEY");
+    if (it != default_file_vars.end()) config.s3_secret_key = it->second;
+
+    it = default_file_vars.find("FILEENGINE_S3_PATH_STYLE");
+    if (it != default_file_vars.end()) config.s3_path_style = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    // Cache configuration
+    it = default_file_vars.find("FILEENGINE_CACHE_THRESHOLD");
+    if (it != default_file_vars.end()) config.cache_threshold = std::stod(it->second);
+
+    it = default_file_vars.find("FILEENGINE_MAX_CACHE_SIZE_MB");
+    if (it != default_file_vars.end()) config.max_cache_size_mb = std::stoul(it->second);
+
+    it = default_file_vars.find("FILEENGINE_MULTI_TENANT_ENABLED");
+    if (it != default_file_vars.end()) config.multi_tenant_enabled = (it->second == "true" || it->second == "1");
+
+    // Server configuration - Changed to match .env file
+    it = default_file_vars.find("FILEENGINE_GRPC_HOST");
+    if (it != default_file_vars.end()) config.server_address = it->second;
+
+    it = default_file_vars.find("FILEENGINE_GRPC_PORT");
+    if (it != default_file_vars.end()) config.server_port = std::stoi(it->second);
+
+    it = default_file_vars.find("FILEENGINE_HTTP_THREAD_POOL");
+    if (it != default_file_vars.end()) config.thread_pool_size = std::stoi(it->second);
+
+    // Security configuration
+    it = default_file_vars.find("FILEENGINE_ROOT_USER");
+    if (it != default_file_vars.end()) config.root_user_enabled = (it->second == "true" || it->second == "1");
+
+    // Sync configuration
+    it = default_file_vars.find("FILEENGINE_S3_SYNC_SUPPORT");
+    if (it != default_file_vars.end()) config.sync_enabled = (it->second == "true" || it->second == "minio" || it->second == "s3");
+
+    it = default_file_vars.find("FILEENGINE_S3_RETRY_SECONDS");
+    if (it != default_file_vars.end()) config.sync_retry_seconds = std::stoi(it->second);
+
+    it = default_file_vars.find("FILEENGINE_S3_SYNC_ON_STARTUP");
+    if (it != default_file_vars.end()) config.sync_on_startup = (it->second == "true");
+
+    it = default_file_vars.find("FILEENGINE_S3_SYNC_ON_DEMAND");
+    if (it != default_file_vars.end()) config.sync_on_demand = (it->second == "true");
+
+    it = default_file_vars.find("FILEENGINE_S3_SYNC_PATTERN");
+    if (it != default_file_vars.end()) config.sync_pattern = it->second;
+
+    it = default_file_vars.find("FILEENGINE_S3_SYNC_BIDIRECTIONAL");
+    if (it != default_file_vars.end()) config.sync_bidirectional = (it->second == "true");
+
+    // Logging configuration
+    if (default_file_vars.count("FILEENGINE_LOG_LEVEL")) config.log_level = default_file_vars.at("FILEENGINE_LOG_LEVEL");
+    if (default_file_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = default_file_vars.at("FILEENGINE_LOG_FILE_PATH");
+    if (default_file_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (default_file_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
+    if (default_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (default_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
+    if (default_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(default_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
+    if (default_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(default_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
+
+    // 3. Load from config file specified on command line with --config or -c (overrides .env and system config)
+    std::string config_file = ".env"; // Default if no --config specified
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--config" && i + 1 < argc) {
+        if ((arg == "--config" || arg == "-c") && i + 1 < argc) {
             config_file = argv[++i];
         }
     }
-    Config config = load_from_file(config_file.c_str());
 
-    // 2. Load from environment (medium priority)
+    // Load the specified config file
+    auto cmdline_file_vars = parse_env_file(config_file.c_str());
+
+    // Apply command-line specified config file settings (higher priority than .env)
+    it = cmdline_file_vars.end();
+
+    // Database configuration
+    it = cmdline_file_vars.find("FILEENGINE_PG_HOST");
+    if (it != cmdline_file_vars.end()) config.db_host = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_PG_PORT");
+    if (it != cmdline_file_vars.end()) config.db_port = std::stoi(it->second);
+
+    it = cmdline_file_vars.find("FILEENGINE_PG_DATABASE");
+    if (it != cmdline_file_vars.end()) config.db_name = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_PG_USER");
+    if (it != cmdline_file_vars.end()) config.db_user = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_PG_PASSWORD");
+    if (it != cmdline_file_vars.end()) config.db_password = it->second;
+
+    // Storage configuration
+    it = cmdline_file_vars.find("FILEENGINE_STORAGE_BASE");
+    if (it != cmdline_file_vars.end()) config.storage_base_path = it->second;
+
+    // Compression and encryption settings
+    it = cmdline_file_vars.find("FILEENGINE_ENCRYPT_DATA");
+    if (it != cmdline_file_vars.end()) config.encrypt_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    it = cmdline_file_vars.find("FILEENGINE_COMPRESS_DATA");
+    if (it != cmdline_file_vars.end()) config.compress_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    it = cmdline_file_vars.find("AT_REST_KEY");
+    if (it != cmdline_file_vars.end()) config.encryption_key = it->second;
+
+    // S3/MinIO configuration
+    it = cmdline_file_vars.find("FILEENGINE_S3_ENDPOINT");
+    if (it != cmdline_file_vars.end()) config.s3_endpoint = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_REGION");
+    if (it != cmdline_file_vars.end()) config.s3_region = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_BUCKET");
+    if (it != cmdline_file_vars.end()) config.s3_bucket = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_ACCESS_KEY");
+    if (it != cmdline_file_vars.end()) config.s3_access_key = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_SECRET_KEY");
+    if (it != cmdline_file_vars.end()) config.s3_secret_key = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_PATH_STYLE");
+    if (it != cmdline_file_vars.end()) config.s3_path_style = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    // Cache configuration
+    it = cmdline_file_vars.find("FILEENGINE_CACHE_THRESHOLD");
+    if (it != cmdline_file_vars.end()) config.cache_threshold = std::stod(it->second);
+
+    it = cmdline_file_vars.find("FILEENGINE_MAX_CACHE_SIZE_MB");
+    if (it != cmdline_file_vars.end()) config.max_cache_size_mb = std::stoul(it->second);
+
+    it = cmdline_file_vars.find("FILEENGINE_MULTI_TENANT_ENABLED");
+    if (it != cmdline_file_vars.end()) config.multi_tenant_enabled = (it->second == "true" || it->second == "1");
+
+    // Server configuration - Changed to match .env file
+    it = cmdline_file_vars.find("FILEENGINE_GRPC_HOST");
+    if (it != cmdline_file_vars.end()) config.server_address = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_GRPC_PORT");
+    if (it != cmdline_file_vars.end()) config.server_port = std::stoi(it->second);
+
+    it = cmdline_file_vars.find("FILEENGINE_HTTP_THREAD_POOL");
+    if (it != cmdline_file_vars.end()) config.thread_pool_size = std::stoi(it->second);
+
+    // Security configuration
+    it = cmdline_file_vars.find("FILEENGINE_ROOT_USER");
+    if (it != cmdline_file_vars.end()) config.root_user_enabled = (it->second == "true" || it->second == "1");
+
+    // Sync configuration
+    it = cmdline_file_vars.find("FILEENGINE_S3_SYNC_SUPPORT");
+    if (it != cmdline_file_vars.end()) config.sync_enabled = (it->second == "true" || it->second == "minio" || it->second == "s3");
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_RETRY_SECONDS");
+    if (it != cmdline_file_vars.end()) config.sync_retry_seconds = std::stoi(it->second);
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_SYNC_ON_STARTUP");
+    if (it != cmdline_file_vars.end()) config.sync_on_startup = (it->second == "true");
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_SYNC_ON_DEMAND");
+    if (it != cmdline_file_vars.end()) config.sync_on_demand = (it->second == "true");
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_SYNC_PATTERN");
+    if (it != cmdline_file_vars.end()) config.sync_pattern = it->second;
+
+    it = cmdline_file_vars.find("FILEENGINE_S3_SYNC_BIDIRECTIONAL");
+    if (it != cmdline_file_vars.end()) config.sync_bidirectional = (it->second == "true");
+
+    // Logging configuration
+    if (cmdline_file_vars.count("FILEENGINE_LOG_LEVEL")) config.log_level = cmdline_file_vars.at("FILEENGINE_LOG_LEVEL");
+    if (cmdline_file_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = cmdline_file_vars.at("FILEENGINE_LOG_FILE_PATH");
+    if (cmdline_file_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (cmdline_file_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
+    if (cmdline_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (cmdline_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
+    if (cmdline_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(cmdline_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
+    if (cmdline_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(cmdline_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
+
+    // 4. Load from environment variables (overrides config files)
     Config env_config = load_from_env();
     if (!env_config.db_host.empty() && env_config.db_host != "localhost") config.db_host = env_config.db_host;
     if (env_config.db_port != 5432) config.db_port = env_config.db_port;
@@ -382,7 +597,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_config.log_rotation_size_mb != 10) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
     if (env_config.log_retention_days != 7) config.log_retention_days = env_config.log_retention_days;
 
-    // 3. Load from command-line arguments (highest priority)
+    // 5. Load from command-line arguments (highest priority)
     Config cmd_config = load_from_cmd_args(argc, argv);
     if (!cmd_config.db_host.empty()) config.db_host = cmd_config.db_host;
     if (cmd_config.db_port != -1) config.db_port = cmd_config.db_port;
