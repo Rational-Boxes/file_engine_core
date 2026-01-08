@@ -36,3 +36,63 @@ endif()
 
 # Add tests
 add_subdirectory(tests)
+
+# Set default installation prefix to /opt/file_engine_core
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "/opt/file_engine_core")
+endif()
+
+# Create a post-install script to set up symlinks to standard locations (requires root)
+install(CODE "
+    # Create symbolic links to standard locations if running with sufficient privileges
+    execute_process(
+        COMMAND \${CMAKE_COMMAND} -E make_directory /usr/local/bin
+        RESULT_VARIABLE MKDIR_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    if(MKDIR_RESULT EQUAL 0 OR MKDIR_RESULT EQUAL \"\")
+        execute_process(
+            COMMAND \${CMAKE_COMMAND} -E create_symlink ${CMAKE_INSTALL_PREFIX}/bin/fileengine_server /usr/local/bin/fileengine_server
+            RESULT_VARIABLE LINK_RESULT1
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+        execute_process(
+            COMMAND \${CMAKE_COMMAND} -E create_symlink ${CMAKE_INSTALL_PREFIX}/bin/fileengine_cli /usr/local/bin/fileengine_cli
+            RESULT_VARIABLE LINK_RESULT2
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+    endif()
+
+    execute_process(
+        COMMAND \${CMAKE_COMMAND} -E make_directory /usr/local/lib
+        RESULT_VARIABLE MKDIR_RESULT2
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    if(MKDIR_RESULT2 EQUAL 0 OR MKDIR_RESULT2 EQUAL \"\")
+        execute_process(
+            COMMAND \${CMAKE_COMMAND} -E create_symlink ${CMAKE_INSTALL_PREFIX}/lib/libfileengine_core.so /usr/local/lib/libfileengine_core.so
+            RESULT_VARIABLE LINK_RESULT3
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+    endif()
+
+    execute_process(
+        COMMAND \${CMAKE_COMMAND} -E make_directory /usr/local/include
+        RESULT_VARIABLE MKDIR_RESULT3
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    if(MKDIR_RESULT3 EQUAL 0 OR MKDIR_RESULT3 EQUAL \"\")
+        execute_process(
+            COMMAND \${CMAKE_COMMAND} -E create_symlink ${CMAKE_INSTALL_PREFIX}/include/fileengine /usr/local/include/fileengine
+            RESULT_VARIABLE LINK_RESULT4
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+    endif()
+")

@@ -52,3 +52,8 @@ target_link_libraries(fileengine_cli
     ${LIBPQ_LIBRARIES}
     pthread
 )
+
+# Installation target for CLI
+install(TARGETS fileengine_cli
+    RUNTIME DESTINATION bin
+)

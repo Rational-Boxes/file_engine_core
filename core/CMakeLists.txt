@@ -163,3 +163,25 @@ target_link_libraries(fileengine_server
 
 add_dependencies(fileengine_core generated_files)
 add_dependencies(fileengine_server generated_files)
+
+# Installation targets
+install(TARGETS fileengine_core
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+install(TARGETS fileengine_server
+    RUNTIME DESTINATION bin
+)
+
+# Install header files
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# Install generated files
+install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h"
+)
