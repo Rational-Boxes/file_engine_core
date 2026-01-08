@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
     tenant_config.s3_path_style = !config.s3_path_style; // path_style flag is inverted in constructor
     tenant_config.encrypt_data = config.encrypt_data;
     tenant_config.compress_data = config.compress_data;
+    tenant_config.encryption_key = config.encryption_key;  // Added for encryption support
 
     auto tenant_manager = std::make_shared<fileengine::TenantManager>(tenant_config, database, storage_tracker.get());
 

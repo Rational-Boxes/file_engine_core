@@ -128,6 +128,10 @@ bool Storage::is_encryption_enabled() const {
     return encrypt_data_;
 }
 
+bool Storage::is_compression_enabled() const {
+    return compress_data_;
+}
+
 Result<void> Storage::create_tenant_directory(const std::string& tenant) {
     if (tenant.empty()) {
         return Result<void>::err("Tenant name cannot be empty");

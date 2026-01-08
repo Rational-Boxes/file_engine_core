@@ -26,6 +26,7 @@ struct TenantConfig {
     bool s3_path_style;
     bool encrypt_data;
     bool compress_data;
+    std::string encryption_key;  // Added for encryption support
 };
 
 struct TenantContext {
@@ -33,6 +34,7 @@ struct TenantContext {
     std::unique_ptr<IStorage> storage;
     std::unique_ptr<IObjectStore> object_store;
     class StorageTracker* storage_tracker;  // Pointer to shared storage tracker
+    TenantConfig config;  // Added to store tenant-specific configuration including encryption key
 };
 
 class TenantManager {

@@ -1,6 +1,7 @@
 #include "fileengine/filesystem.h"
 #include "fileengine/utils.h"
 #include "fileengine/server_logger.h"
+#include "fileengine/crypto_utils.h"
 #include <algorithm>
 
 namespace fileengine {
@@ -351,8 +352,40 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
         return Result<void>::err("Cache culling requires object store configuration to prevent data loss");
     }
 
-    // Store the file in storage
-    auto storage_result = context->storage->store_file(file_uid, version_timestamp, data, tenant);
+    // Process data for storage (compress and encrypt if enabled)
+    std::vector<uint8_t> processed_data = data;
+
+    // Check if compression is enabled for this tenant/context
+    if (context->storage && context->storage->is_compression_enabled()) {
+        try {
+            processed_data = fileengine::CryptoUtils::compress_data(processed_data);
+            SERVER_LOG_DEBUG("FileSystem::put", "Data compressed from " + std::to_string(data.size()) +
+                             " to " + std::to_string(processed_data.size()) + " bytes");
+        } catch (const std::exception& e) {
+            SERVER_LOG_ERROR("FileSystem::put", "Compression failed: " + std::string(e.what()));
+            return Result<void>::err("Failed to compress data: " + std::string(e.what()));
+        }
+    }
+
+    // Check if encryption is enabled for this tenant/context
+    if (context->storage && context->storage->is_encryption_enabled()) {
+        try {
+            // Get the encryption key from the config
+            std::string encryption_key = context->config.encryption_key;
+            if (encryption_key.empty()) {
+                return Result<void>::err("Encryption key not available");
+            }
+
+            processed_data = fileengine::CryptoUtils::encrypt_data(processed_data, encryption_key);
+            SERVER_LOG_DEBUG("FileSystem::put", "Data encrypted successfully");
+        } catch (const std::exception& e) {
+            SERVER_LOG_ERROR("FileSystem::put", "Encryption failed: " + std::string(e.what()));
+            return Result<void>::err("Failed to encrypt data: " + std::string(e.what()));
+        }
+    }
+
+    // Store the processed file in storage
+    auto storage_result = context->storage->store_file(file_uid, version_timestamp, processed_data, tenant);
     if (!storage_result.success) {
         return Result<void>::err("Failed to store file in storage: " + storage_result.error);
     }
@@ -542,11 +575,43 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
         auto storage_result = context->storage->read_file(local_storage_path, tenant);
         if (storage_result.success) {
             SERVER_LOG_DEBUG("FileSystem::get", "Successfully read " + std::to_string(storage_result.value.size()) + " bytes from local storage");
+
+            // Process data after reading (decrypt and decompress if needed)
+            std::vector<uint8_t> processed_data = storage_result.value;
+
+            // Check if encryption is enabled for this tenant/context
+            if (context->storage && context->storage->is_encryption_enabled()) {
+                try {
+                    // Get the encryption key from the config
+                    std::string encryption_key = context->config.encryption_key;
+                    if (encryption_key.empty()) {
+                        return Result<std::vector<uint8_t>>::err("Encryption key not available");
+                    }
+
+                    processed_data = fileengine::CryptoUtils::decrypt_data(processed_data, encryption_key);
+                    SERVER_LOG_DEBUG("FileSystem::get", "Data decrypted successfully");
+                } catch (const std::exception& e) {
+                    SERVER_LOG_ERROR("FileSystem::get", "Decryption failed: " + std::string(e.what()));
+                    return Result<std::vector<uint8_t>>::err("Failed to decrypt data: " + std::string(e.what()));
+                }
+            }
+
+            // Check if compression is enabled for this tenant/context
+            if (context->storage && context->storage->is_compression_enabled()) {
+                try {
+                    processed_data = fileengine::CryptoUtils::decompress_data(processed_data);
+                    SERVER_LOG_DEBUG("FileSystem::get", "Data decompressed successfully");
+                } catch (const std::exception& e) {
+                    SERVER_LOG_ERROR("FileSystem::get", "Decompression failed: " + std::string(e.what()));
+                    return Result<std::vector<uint8_t>>::err("Failed to decompress data: " + std::string(e.what()));
+                }
+            }
+
             // Add to cache if available
             if (cache_manager_) {
-                cache_manager_->add_file(local_storage_path, storage_result.value, tenant);
+                cache_manager_->add_file(local_storage_path, processed_data, tenant);
             }
-            return storage_result;
+            return Result<std::vector<uint8_t>>::ok(processed_data);
         } else {
             SERVER_LOG_ERROR("FileSystem::get", "Failed to read file from local storage: " + storage_result.error);
             return Result<std::vector<uint8_t>>::err("Failed to read file from local storage: " + storage_result.error);
@@ -861,11 +926,42 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
     if (context->storage) {
         auto storage_result = context->storage->read_file(storage_path, tenant);
         if (storage_result.success) {
+            // Process data after reading (decrypt and decompress if needed)
+            std::vector<uint8_t> processed_data = storage_result.value;
+
+            // Check if encryption is enabled for this tenant/context
+            if (context->storage && context->storage->is_encryption_enabled()) {
+                try {
+                    // Get the encryption key from the config
+                    std::string encryption_key = context->config.encryption_key;
+                    if (encryption_key.empty()) {
+                        return Result<std::vector<uint8_t>>::err("Encryption key not available");
+                    }
+
+                    processed_data = fileengine::CryptoUtils::decrypt_data(processed_data, encryption_key);
+                    SERVER_LOG_DEBUG("FileSystem::get_version", "Version data decrypted successfully");
+                } catch (const std::exception& e) {
+                    SERVER_LOG_ERROR("FileSystem::get_version", "Decryption failed: " + std::string(e.what()));
+                    return Result<std::vector<uint8_t>>::err("Failed to decrypt version data: " + std::string(e.what()));
+                }
+            }
+
+            // Check if compression is enabled for this tenant/context
+            if (context->storage && context->storage->is_compression_enabled()) {
+                try {
+                    processed_data = fileengine::CryptoUtils::decompress_data(processed_data);
+                    SERVER_LOG_DEBUG("FileSystem::get_version", "Version data decompressed successfully");
+                } catch (const std::exception& e) {
+                    SERVER_LOG_ERROR("FileSystem::get_version", "Decompression failed: " + std::string(e.what()));
+                    return Result<std::vector<uint8_t>>::err("Failed to decompress version data: " + std::string(e.what()));
+                }
+            }
+
             // Add to cache if available
             if (cache_manager_) {
-                cache_manager_->add_file(storage_path, storage_result.value, tenant);
+                cache_manager_->add_file(storage_path, processed_data, tenant);
             }
-            return storage_result;
+            return Result<std::vector<uint8_t>>::ok(processed_data);
         }
     }
     

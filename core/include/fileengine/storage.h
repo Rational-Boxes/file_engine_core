@@ -29,6 +29,9 @@ public:
     // Check if encryption is enabled
     bool is_encryption_enabled() const override;
 
+    // Check if compression is enabled
+    bool is_compression_enabled() const override;
+
     // Tenant management operations
     Result<void> create_tenant_directory(const std::string& tenant) override;
     Result<bool> tenant_directory_exists(const std::string& tenant) override;

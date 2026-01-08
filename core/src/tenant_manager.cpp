@@ -150,6 +150,7 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
         context->storage = std::move(storage);
         context->object_store = std::move(object_store);
         context->storage_tracker = storage_tracker_;
+        context->config = config_;  // Copy the tenant configuration
 
         // Create the tenant directory in storage if it doesn't exist
         if (!tenant_id.empty() && tenant_id != "default") {

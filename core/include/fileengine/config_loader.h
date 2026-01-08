@@ -18,6 +18,7 @@ struct Config {
     std::string storage_base_path = "/tmp/fileengine_storage";
     bool encrypt_data = false;
     bool compress_data = false;
+    std::string encryption_key;  // Added for encryption support
     
     // S3/MinIO configuration
     std::string s3_endpoint = "http://localhost:9000";

@@ -26,6 +26,9 @@ public:
     // Check if encryption is enabled
     virtual bool is_encryption_enabled() const = 0;
 
+    // Check if compression is enabled
+    virtual bool is_compression_enabled() const = 0;
+
     // Tenant management operations
     virtual Result<void> create_tenant_directory(const std::string& tenant) = 0;
     virtual Result<bool> tenant_directory_exists(const std::string& tenant) = 0;

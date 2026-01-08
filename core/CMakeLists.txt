@@ -14,6 +14,15 @@ if(PkgConfig_FOUND)
     pkg_check_modules(LIBPQ REQUIRED libpq)
 endif()
 
+# Find zlib
+find_package(PkgConfig REQUIRED)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(ZLIB REQUIRED zlib)
+endif()
+
+# Find OpenSSL
+find_package(OpenSSL REQUIRED)
+
 # Find Protobuf
 find_package(Protobuf REQUIRED)
 if(NOT PROTOBUF_FOUND)
@@ -101,6 +110,7 @@ add_library(fileengine_core SHARED
     # src/logger.cpp             # Temporarily exclude logger source file due to interface mismatch
     src/query_builder.cpp      # Add query builder source file
     src/server_logger.cpp      # Add server logger source file
+    src/crypto_utils.cpp       # Add crypto utilities source file
 )
 
 # Include directories
@@ -122,6 +132,8 @@ target_link_libraries(fileengine_core
     proto_lib
     ${UUID_LIBRARIES}  # Add uuid library
     ${CURL_LIBRARIES}  # Add curl library
+    ${ZLIB_LIBRARIES}  # Add zlib library for compression
+    OpenSSL::Crypto    # Add OpenSSL library for encryption
     ${CMAKE_THREAD_LIBS_INIT}  # Properly link thread libraries
 )
 if(AWSSDK_FOUND)

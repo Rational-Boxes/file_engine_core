@@ -87,9 +87,12 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     // Compression and encryption settings
     it = env_vars.find("FILEENGINE_ENCRYPT_DATA");
     if (it != env_vars.end()) config.encrypt_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
-    
+
     it = env_vars.find("FILEENGINE_COMPRESS_DATA");
     if (it != env_vars.end()) config.compress_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
+
+    it = env_vars.find("AT_REST_KEY");
+    if (it != env_vars.end()) config.encryption_key = it->second;
 
     // S3/MinIO configuration
     it = env_vars.find("FILEENGINE_S3_ENDPOINT");
@@ -181,6 +184,9 @@ Config ConfigLoader::load_from_env() {
 
     env_value = get_env_var("FILEENGINE_COMPRESS_DATA", "");
     if (!env_value.empty()) config.compress_data = (env_value == "true" || env_value == "TRUE" || env_value == "1");
+
+    env_value = get_env_var("AT_REST_KEY", "");
+    if (!env_value.empty()) config.encryption_key = env_value;
 
     env_value = get_env_var("FILEENGINE_S3_ENDPOINT", "");
     if (!env_value.empty()) config.s3_endpoint = env_value;
@@ -344,6 +350,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (!env_config.storage_base_path.empty() && env_config.storage_base_path != "/tmp/fileengine_storage") config.storage_base_path = env_config.storage_base_path;
     if (env_config.encrypt_data) config.encrypt_data = env_config.encrypt_data;
     if (env_config.compress_data) config.compress_data = env_config.compress_data;
+    if (!env_config.encryption_key.empty()) config.encryption_key = env_config.encryption_key;
     if (!env_config.s3_endpoint.empty() && env_config.s3_endpoint != "http://localhost:9000") config.s3_endpoint = env_config.s3_endpoint;
     if (!env_config.s3_region.empty() && env_config.s3_region != "us-east-1") config.s3_region = env_config.s3_region;
     if (!env_config.s3_bucket.empty() && env_config.s3_bucket != "fileengine") config.s3_bucket = env_config.s3_bucket;
