@@ -96,3 +96,9 @@ install(CODE "
         )
     endif()
 ")
+
+# Install systemd service file
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/fileengine.service
+    DESTINATION /etc/systemd/system/
+    PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+)

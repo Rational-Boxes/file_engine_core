@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Stop the service if it's running
+        if systemctl is-active --quiet fileengine.service; then
+            systemctl stop fileengine.service
+        fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

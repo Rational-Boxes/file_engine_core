@@ -1,0 +1,42 @@
+Source: fileengine-core
+Section: utils
+Priority: optional
+Maintainer: FileEngine Team <maintainer@fileengine.example.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               pkg-config,
+               libpq-dev,
+               libssl-dev,
+               zlib1g-dev,
+               libcurl4-openssl-dev,
+               libuuid1,
+               libgrpc++-dev,
+               libprotobuf-dev,
+               protobuf-compiler,
+               protobuf-compiler-grpc,
+               libaws-sdk-cpp-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/fileengine/fileengine-core
+
+Package: fileengine-core
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         postgresql-client,
+         openssl,
+         libcurl4,
+         libuuid1
+Description: A distributed virtual filesystem with horizontal scaling and hybrid cloud/on-premises deployment support
+ FileEngine Core is a simplified, focused implementation of a distributed
+ virtual filesystem with horizontal scaling and hybrid cloud/on-premises
+ deployment support. It provides features like:
+ .
+ * UUID-based file identification for distributed handling
+ * Automatic versioning with microsecond precision timestamps
+ * POSIX-compliant ACLs for granular access control
+ * Intelligent file culling with configurable thresholds
+ * Hybrid cloud/on-premises deployment support
+ * S3/MinIO integration with automatic synchronization
+ * Detailed storage tracking per host and tenant
+ .
+ This package provides the core FileEngine server and client tools.

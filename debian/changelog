@@ -1,0 +1,9 @@
+fileengine-core (1.0.0-1) unstable; urgency=low
+
+  * Initial release of FileEngine Core
+  * Implements distributed virtual filesystem with horizontal scaling
+  * Supports hybrid cloud/on-premises deployment
+  * Includes encryption and compression support
+  * Provides S3/MinIO integration
+
+ -- FileEngine Team <maintainer@fileengine.example.com>  Wed, 07 Jan 2026 17:00:00 +0000

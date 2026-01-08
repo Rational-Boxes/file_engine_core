@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    configure)
+        # Create fileengine group and user if they don't exist
+        if ! getent group fileengine >/dev/null; then
+            addgroup --system fileengine || true
+        fi
+        
+        if ! getent passwd fileengine >/dev/null; then
+            adduser --system --ingroup fileengine --home /var/lib/fileengine \
+                --shell /bin/false --no-create-home \
+                --gecos "FileEngine Core Service" fileengine || true
+        fi
+        
+        # Create necessary directories
+        install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine
+        install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine/storage
+        install -d -o fileengine -g fileengine -m 750 /var/log/fileengine
+        
+        # Reload systemd daemon to recognize new service
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        
+        # Enable the service
+        systemctl enable fileengine.service >/dev/null || true
+    ;;
+esac
+
+# Automatically added debconf and extattr dependencies
+#DEBHELPER#
+
+exit 0
