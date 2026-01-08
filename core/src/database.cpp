@@ -1663,7 +1663,8 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "file_uid VARCHAR(64) NOT NULL, "
         "version_timestamp TEXT NOT NULL, "
         "size BIGINT NOT NULL, "
-        "storage_path TEXT NOT NULL "
+        "storage_path TEXT NOT NULL, "
+        "UNIQUE (file_uid, version_timestamp) "
         ");";
 
     std::string create_idx_versions = "CREATE INDEX IF NOT EXISTS idx_versions_file_uid_" + escaped_schema +
