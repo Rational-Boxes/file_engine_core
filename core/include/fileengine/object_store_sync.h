@@ -59,7 +59,7 @@ public:
     bool is_sync_running() const;
 
     // Perform comprehensive sync of all local files (for startup)
-    Result<void> perform_comprehensive_local_sync();
+    Result<void> perform_comprehensive_local_sync(const std::string& tenant = "");
 
     ~ObjectStoreSync();
 

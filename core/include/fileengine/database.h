@@ -89,6 +89,7 @@ public:
 
     // Tenant management operations
     Result<void> cleanup_tenant_data(const std::string& tenant) override;
+    Result<std::vector<std::string>> list_tenants() override;
 
     // ACL operations
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,

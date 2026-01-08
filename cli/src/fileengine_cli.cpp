@@ -173,10 +173,10 @@ public:
         }
     }
 
-    bool remove_directory(const std::string& uid, const std::string& user) {
+    bool remove_directory(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         RemoveDirectoryRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         RemoveDirectoryResponse response;
         grpc::ClientContext context;
@@ -221,10 +221,10 @@ public:
         }
     }
 
-    bool remove_file(const std::string& uid, const std::string& user) {
+    bool remove_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         RemoveFileRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         RemoveFileResponse response;
         grpc::ClientContext context;
@@ -240,14 +240,14 @@ public:
         }
     }
 
-    std::vector<uint8_t> get_file(const std::string& uid, const std::string& user) {
+    std::vector<uint8_t> get_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         fileengine::Logger::debug("GetFile", "Attempting to retrieve file with UID: ", uid, " for user: ", user);
 
         GetFileRequest request;
         request.set_uid(uid);
         fileengine::Logger::detail("GetFile", "Set file UID: ", uid);
 
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         GetFileResponse response;
         grpc::ClientContext context;
@@ -269,7 +269,7 @@ public:
         }
     }
 
-    bool put_file(const std::string& uid, const std::vector<uint8_t>& data, const std::string& user) {
+    bool put_file(const std::string& uid, const std::vector<uint8_t>& data, const std::string& user, const std::string& tenant = "default") {
         fileengine::Logger::debug("PutFile", "Attempting to upload file to UID: ", uid, " for user: ", user, ", size: ", data.size(), " bytes");
 
         PutFileRequest request;
@@ -278,7 +278,7 @@ public:
         request.set_data(data_str);
         fileengine::Logger::detail("PutFile", "Set file UID: ", uid, ", data size: ", data_str.size());
 
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         PutFileResponse response;
         grpc::ClientContext context;
@@ -371,11 +371,11 @@ public:
     }
 
     // Rename operation
-    bool rename(const std::string& uid, const std::string& new_name, const std::string& user) {
+    bool rename(const std::string& uid, const std::string& new_name, const std::string& user, const std::string& tenant = "default") {
         RenameRequest request;
         request.set_uid(uid);
         request.set_new_name(new_name);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         RenameResponse response;
         grpc::ClientContext context;
@@ -392,11 +392,11 @@ public:
     }
 
     // Move operation
-    bool move(const std::string& uid, const std::string& new_parent_uid, const std::string& user) {
+    bool move(const std::string& uid, const std::string& new_parent_uid, const std::string& user, const std::string& tenant = "default") {
         MoveRequest request;
         request.set_source_uid(uid);
         request.set_destination_parent_uid(new_parent_uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         MoveResponse response;
         grpc::ClientContext context;
@@ -413,11 +413,11 @@ public:
     }
 
     // Copy operation
-    bool copy(const std::string& source_uid, const std::string& destination_parent_uid, const std::string& user) {
+    bool copy(const std::string& source_uid, const std::string& destination_parent_uid, const std::string& user, const std::string& tenant = "default") {
         CopyRequest request;
         request.set_source_uid(source_uid);
         request.set_destination_parent_uid(destination_parent_uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         CopyResponse response;
         grpc::ClientContext context;
@@ -435,25 +435,25 @@ public:
     }
 
     // Versioning operations
-    bool list_versions(const std::string& uid, const std::string& user) {
+    bool list_versions(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         std::cout << "✗ List versions operation not supported in this build" << std::endl;
         return false;
     }
 
-    bool get_version(const std::string& uid, int version_number, const std::string& user) {
+    bool get_version(const std::string& uid, int version_number, const std::string& user, const std::string& tenant = "default") {
         std::cout << "✗ Get version operation not supported in this build" << std::endl;
         return false;
     }
 
-    bool restore_to_version(const std::string& uid, int version_number, const std::string& user) {
+    bool restore_to_version(const std::string& uid, int version_number, const std::string& user, const std::string& tenant = "default") {
         std::cout << "✗ Restore to version operation not supported in this build" << std::endl;
         return false;
     }
 
-    bool delete_file(const std::string& uid, const std::string& user) {
+    bool delete_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         RemoveFileRequest request;  // Using the same request as remove_file but could have a soft-delete version
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         RemoveFileResponse response;
         grpc::ClientContext context;
@@ -469,7 +469,7 @@ public:
         }
     }
 
-    bool undelete_file(const std::string& uid, const std::string& user) {
+    bool undelete_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         // Assuming there's an UndeleteFile RPC; if not available, would need to implement differently
         // For now, I'll create a custom implementation using existing functionality if possible
         // Since there's no specific undelete method, we'll need to handle this differently
@@ -565,10 +565,10 @@ public:
     }
 
     // Diagnostic operations
-    bool storage_usage(const std::string& user) {
+    bool storage_usage(const std::string& user, const std::string& tenant = "default") {
         StorageUsageRequest request;
-        *request.mutable_auth() = create_auth_context(user);
-        request.set_tenant("default"); // Using default tenant
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        request.set_tenant(tenant);
 
         StorageUsageResponse response;
         grpc::ClientContext context;
@@ -597,25 +597,25 @@ public:
         }
     }
 
-    bool trigger_sync(const std::string& user) {
+    bool trigger_sync(const std::string& user, const std::string& tenant = "default") {
         std::cout << "✓ Triggered synchronization" << std::endl;
         return true; // Just print a message for now
     }
 
-    bool purge_old_versions(const std::string& uid, int days_old, const std::string& user) {
+    bool purge_old_versions(const std::string& uid, int days_old, const std::string& user, const std::string& tenant = "default") {
         std::cout << "✗ Purge old versions operation not supported in this build" << std::endl;
         return false;
     }
 
     // Upload operation - combines touch and put
-    bool upload(const std::string& parent_uid, const std::string& name, const std::string& file_path, const std::string& user) {
+    bool upload(const std::string& parent_uid, const std::string& name, const std::string& file_path, const std::string& user, const std::string& tenant = "default") {
         std::cout << "Uploading file '" << file_path << "' as '" << name << "' to parent '" << parent_uid << "'" << std::endl;
 
         // First, touch to create the file and get a UID
         TouchRequest touch_request;
         touch_request.set_parent_uid(parent_uid);
         touch_request.set_name(name);
-        *touch_request.mutable_auth() = create_auth_context(user);
+        *touch_request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         TouchResponse touch_response;
         grpc::ClientContext touch_context;
@@ -641,14 +641,14 @@ public:
                                   std::istreambuf_iterator<char>());
         file.close();
 
-        return put_file(file_uid, data, user);
+        return put_file(file_uid, data, user, tenant);
     }
 
     // Enhanced download operation - can optionally select a version (though version specific download not supported in this build)
-    bool download(const std::string& uid, const std::string& output_path, const std::string& user, int version_number = -1) {
+    bool download(const std::string& uid, const std::string& output_path, const std::string& user, const std::string& tenant = "default", int version_number = -1) {
         GetFileRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         GetFileResponse response;
         grpc::ClientContext context;
@@ -679,12 +679,12 @@ public:
     }
 
     // ACL operations
-    bool grant_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user) {
+    bool grant_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default") {
         GrantPermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         GrantPermissionResponse response;
         grpc::ClientContext context;
@@ -700,12 +700,12 @@ public:
         }
     }
 
-    bool revoke_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user) {
+    bool revoke_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default") {
         RevokePermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         RevokePermissionResponse response;
         grpc::ClientContext context;
@@ -721,11 +721,11 @@ public:
         }
     }
 
-    bool check_permission(const std::string& resource_uid, const std::string& user, Permission required_permission) {
+    bool check_permission(const std::string& resource_uid, const std::string& user, Permission required_permission, const std::string& tenant = "default") {
         CheckPermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_required_permission(required_permission);
-        *request.mutable_auth() = create_auth_context(user);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
 
         CheckPermissionResponse response;
         grpc::ClientContext context;
@@ -977,13 +977,13 @@ int main(int argc, char** argv) {
         client.touch(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "rm" && argc - arg_offset == 2) {  // command + 1 arg
-        client.remove_file(argv[arg_offset + 1], user);
+        client.remove_file(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "del" && argc - arg_offset == 2) {  // command + 1 arg
-        client.delete_file(argv[arg_offset + 1], user);
+        client.delete_file(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "undelete" && argc - arg_offset == 2) {  // command + 1 arg
-        client.undelete_file(argv[arg_offset + 1], user);
+        client.undelete_file(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "stat" && argc - arg_offset == 2) {  // command + 1 arg
         client.stat(argv[arg_offset + 1], user, tenant);
@@ -997,13 +997,13 @@ int main(int argc, char** argv) {
         if (file.is_open()) {
             std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
                                       std::istreambuf_iterator<char>());
-            client.put_file(argv[arg_offset + 1], data, user);
+            client.put_file(argv[arg_offset + 1], data, user, tenant);
         } else {
             std::cout << "✗ Could not open file: " << argv[arg_offset + 2] << std::endl;
         }
     }
     else if (command == "get" && argc - arg_offset == 3) {  // command + 2 args
-        auto data = client.get_file(argv[arg_offset + 1], user);
+        auto data = client.get_file(argv[arg_offset + 1], user, tenant);
         if (!data.empty()) {
             std::ofstream file(argv[arg_offset + 2], std::ios::binary);
             if (file.is_open()) {
@@ -1015,36 +1015,36 @@ int main(int argc, char** argv) {
         }
     }
     else if (command == "upload" && argc - arg_offset == 4) {  // command + 3 args
-        client.upload(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user);
+        client.upload(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user, tenant);
     }
     else if (command == "download" && argc - arg_offset == 3) {  // command + 2 args
-        client.download(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.download(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "download" && argc - arg_offset == 4) {  // command + 3 args
         try {
             int version = std::stoi(argv[arg_offset + 3]);
-            client.download(argv[arg_offset + 1], argv[arg_offset + 2], user, version);
+            client.download(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant, version);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid version number: " << argv[arg_offset + 3] << std::endl;
             return 1;
         }
     }
     else if (command == "rename" && argc - arg_offset == 3) {  // command + 2 args
-        client.rename(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.rename(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "move" && argc - arg_offset == 3) {  // command + 2 args
-        client.move(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.move(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "copy" && argc - arg_offset == 3) {  // command + 2 args
-        client.copy(argv[arg_offset + 1], argv[arg_offset + 2], user);
+        client.copy(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "versions" && argc - arg_offset == 2) {  // command + 1 arg
-        client.list_versions(argv[arg_offset + 1], user);
+        client.list_versions(argv[arg_offset + 1], user, tenant);
     }
     else if (command == "getversion" && argc - arg_offset == 3) {  // command + 2 args
         try {
             int version = std::stoi(argv[arg_offset + 2]);
-            client.get_version(argv[arg_offset + 1], version, user);
+            client.get_version(argv[arg_offset + 1], version, user, tenant);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid version number: " << argv[arg_offset + 2] << std::endl;
             return 1;
@@ -1053,7 +1053,7 @@ int main(int argc, char** argv) {
     else if (command == "restore" && argc - arg_offset == 3) {  // command + 2 args
         try {
             int version = std::stoi(argv[arg_offset + 2]);
-            client.restore_to_version(argv[arg_offset + 1], version, user);
+            client.restore_to_version(argv[arg_offset + 1], version, user, tenant);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid version number: " << argv[arg_offset + 2] << std::endl;
             return 1;
@@ -1085,7 +1085,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user);
+        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant);
     }
     else if (command == "revoke" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
@@ -1101,7 +1101,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.revoke_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user);
+        client.revoke_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant);
     }
     else if (command == "check" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
@@ -1117,18 +1117,18 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        client.check_permission(argv[arg_offset + 1], user, perm);
+        client.check_permission(argv[arg_offset + 1], user, perm, tenant);
     }
     else if (command == "usage" && argc - arg_offset == 1) {  // command only
-        client.storage_usage(user);
+        client.storage_usage(user, tenant);
     }
     else if (command == "sync" && argc - arg_offset == 1) {  // command only
-        client.trigger_sync(user);
+        client.trigger_sync(user, tenant);
     }
     else if (command == "purge" && argc - arg_offset == 3) {  // command + 2 args
         try {
             int days = std::stoi(argv[arg_offset + 2]);
-            client.purge_old_versions(argv[arg_offset + 1], days, user);
+            client.purge_old_versions(argv[arg_offset + 1], days, user, tenant);
         } catch (const std::exception& e) {
             std::cout << "✗ Invalid days value: " << argv[arg_offset + 2] << std::endl;
             return 1;

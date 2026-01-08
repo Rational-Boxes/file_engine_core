@@ -109,22 +109,14 @@ Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
 
 TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id) {
     try {
-        // Create database instance for the tenant
-        auto db = std::make_unique<Database>(
-            config_.db_host,
-            config_.db_port,
-            config_.db_name,
-            config_.db_user,
-            config_.db_password
-        );
-
-        // Initialize the database connection
-        if (!db->connect()) {
+        // Use the shared database instance to avoid creating duplicate connection pools
+        // All tenants share the same database connection pool for efficiency
+        if (!shared_database_) {
             return nullptr;
         }
 
         // Ensure tenant schema and tables exist - this will create them if they don't exist
-        auto schema_result = db->create_tenant_schema(tenant_id);
+        auto schema_result = shared_database_->create_tenant_schema(tenant_id);
         if (!schema_result.success) {
             // Log the error but continue - some operations might still work
         }
@@ -154,10 +146,18 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
 
         // Create the tenant context
         auto context = std::make_unique<TenantContext>();
-        context->db = std::move(db);
+        context->db = shared_database_;  // Use shared database instance
         context->storage = std::move(storage);
         context->object_store = std::move(object_store);
         context->storage_tracker = storage_tracker_;
+
+        // Create the tenant directory in storage if it doesn't exist
+        if (!tenant_id.empty() && tenant_id != "default") {
+            auto tenant_dir_result = context->storage->create_tenant_directory(tenant_id);
+            if (!tenant_dir_result.success) {
+                // Log warning but continue - directory may already exist
+            }
+        }
 
         return context.release();  // Transfer ownership to caller who will place in map
     } catch (const std::exception& ex) {

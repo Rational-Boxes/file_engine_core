@@ -1775,7 +1775,7 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
 
         // Add default ACLs for the root directory
         // Grant full permissions to system user
-        std::string insert_root_acl_sql = "INSERT INTO acls (resource_uid, principal, principal_type, permissions) "
+        std::string insert_root_acl_sql = "INSERT INTO \"" + escaped_schema + "\".acls (resource_uid, principal, principal_type, permissions) "
             "VALUES ('', 'system', 0, 755) "
             "ON CONFLICT (resource_uid, principal, principal_type) "
             "DO UPDATE SET permissions = 755, updated_at = CURRENT_TIMESTAMP;";
@@ -1789,7 +1789,7 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         PQclear(res);
 
         // Grant full permissions to root user
-        std::string insert_root_user_acl_sql = "INSERT INTO acls (resource_uid, principal, principal_type, permissions) "
+        std::string insert_root_user_acl_sql = "INSERT INTO \"" + escaped_schema + "\".acls (resource_uid, principal, principal_type, permissions) "
             "VALUES ('', 'root', 0, 755) "
             "ON CONFLICT (resource_uid, principal, principal_type) "
             "DO UPDATE SET permissions = 755, updated_at = CURRENT_TIMESTAMP;";
@@ -1803,7 +1803,7 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         PQclear(res);
 
         // Grant read permissions to 'other' category for root directory
-        std::string insert_root_other_acl_sql = "INSERT INTO acls (resource_uid, principal, principal_type, permissions) "
+        std::string insert_root_other_acl_sql = "INSERT INTO \"" + escaped_schema + "\".acls (resource_uid, principal, principal_type, permissions) "
             "VALUES ('', 'other', 2, 444) "
             "ON CONFLICT (resource_uid, principal, principal_type) "
             "DO UPDATE SET permissions = 444, updated_at = CURRENT_TIMESTAMP;";
@@ -1816,6 +1816,20 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         }
         PQclear(res);
     }
+
+    // Register the tenant in the global tenants table for multi-tenant sync
+    std::string tenant_id_to_register = tenant.empty() ? "default" : tenant;
+    std::string register_tenant_sql = "INSERT INTO tenants (tenant_id, schema_name, created_at, updated_at) "
+        "VALUES (" + escape_string(tenant_id_to_register, pg_conn) + ", " +
+        escape_string(escaped_schema, pg_conn) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "ON CONFLICT (tenant_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;";
+
+    res = PQexec(pg_conn, register_tenant_sql.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        // Log warning but don't fail - tenant registration is not critical for basic operation
+        // std::cerr << "Warning: Failed to register tenant in global registry: " << PQerrorMessage(pg_conn) << std::endl;
+    }
+    PQclear(res);
 
     connection_pool_->release(conn);
 
@@ -1868,9 +1882,93 @@ Result<bool> Database::tenant_schema_exists(const std::string& tenant) {
 }
 
 Result<void> Database::cleanup_tenant_data(const std::string& tenant) {
-    // In a real implementation, this would clean up tenant-specific data
-    // For now, just return success
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    // Begin transaction for atomic cleanup
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to begin transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(begin_res);
+
+    // Drop the tenant schema (CASCADE will remove all tables in it)
+    std::string drop_schema_sql = "DROP SCHEMA IF EXISTS " + schema + " CASCADE;";
+    PGresult* drop_res = PQexec(pg_conn, drop_schema_sql.c_str());
+    if (PQresultStatus(drop_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to drop tenant schema: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(drop_res);
+        PQexec(pg_conn, "ROLLBACK;");
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(drop_res);
+
+    // Remove tenant from global tenants registry
+    std::string tenant_id_to_remove = tenant.empty() ? "default" : tenant;
+    std::string delete_tenant_sql = "DELETE FROM tenants WHERE tenant_id = $1;";
+    const char* param_values[1] = {tenant_id_to_remove.c_str()};
+
+    PGresult* delete_res = PQexecParams(pg_conn, delete_tenant_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
+    if (PQresultStatus(delete_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to remove tenant from registry: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(delete_res);
+        PQexec(pg_conn, "ROLLBACK;");
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(delete_res);
+
+    // Commit transaction
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to commit transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        PQexec(pg_conn, "ROLLBACK;");
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
     return Result<void>::ok();
+}
+
+Result<std::vector<std::string>> Database::list_tenants() {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<std::string>>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    const char* query_sql = "SELECT tenant_id FROM tenants ORDER BY tenant_id;";
+    PGresult* res = PQexec(pg_conn, query_sql);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to list tenants: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<std::string>>::err(error);
+    }
+
+    std::vector<std::string> tenant_ids;
+    int nrows = PQntuples(res);
+    for (int i = 0; i < nrows; ++i) {
+        tenant_ids.push_back(PQgetvalue(res, i, 0));
+    }
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<std::string>>::ok(tenant_ids);
 }
 
 // Add the database connection monitoring methods
@@ -1996,24 +2094,25 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
 
     PGconn* pg_conn = conn->get_connection();
 
-    // Create ACL table if it doesn't exist
-    const char* create_acl_table_sql = R"SQL(
-        CREATE TABLE IF NOT EXISTS acls (
-            id BIGSERIAL PRIMARY KEY,
-            resource_uid VARCHAR(64) NOT NULL,
-            principal VARCHAR(255) NOT NULL,
-            principal_type INTEGER NOT NULL,
-            permissions INTEGER NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(resource_uid, principal, principal_type)
-        );
+    // Get tenant-specific schema prefix
+    std::string schema = get_schema_prefix(tenant);
 
-        CREATE INDEX IF NOT EXISTS idx_acls_resource_uid ON acls(resource_uid);
-        CREATE INDEX IF NOT EXISTS idx_acls_principal ON acls(principal);
-    )SQL";
+    // Create ACL table in tenant schema if it doesn't exist
+    std::string create_acl_table_sql =
+        "CREATE TABLE IF NOT EXISTS " + schema + ".acls ("
+        "    id BIGSERIAL PRIMARY KEY,"
+        "    resource_uid VARCHAR(64) NOT NULL,"
+        "    principal VARCHAR(255) NOT NULL,"
+        "    principal_type INTEGER NOT NULL,"
+        "    permissions INTEGER NOT NULL,"
+        "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "    UNIQUE(resource_uid, principal, principal_type)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_acls_resource_uid ON " + schema + ".acls(resource_uid);"
+        "CREATE INDEX IF NOT EXISTS idx_acls_principal ON " + schema + ".acls(principal);";
 
-    PGresult* create_res = PQexec(pg_conn, create_acl_table_sql);
+    PGresult* create_res = PQexec(pg_conn, create_acl_table_sql.c_str());
     if (PQresultStatus(create_res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to create ACL table: " + std::string(PQerrorMessage(pg_conn));
         PQclear(create_res);
@@ -2022,12 +2121,11 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     }
     PQclear(create_res);
 
-    const char* insert_sql = R"SQL(
-        INSERT INTO acls (resource_uid, principal, principal_type, permissions)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (resource_uid, principal, principal_type)
-        DO UPDATE SET permissions = $4, updated_at = CURRENT_TIMESTAMP;
-    )SQL";
+    std::string insert_sql =
+        "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions) "
+        "VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (resource_uid, principal, principal_type) "
+        "DO UPDATE SET permissions = $4, updated_at = CURRENT_TIMESTAMP;";
 
     const char* param_values[4] = {
         resource_uid.c_str(),
@@ -2036,7 +2134,7 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
         std::to_string(permissions).c_str()
     };
 
-    PGresult* res = PQexecParams(pg_conn, insert_sql, 4, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 4, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to add ACL: " + std::string(PQerrorMessage(pg_conn));
@@ -2059,14 +2157,17 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* delete_sql = "DELETE FROM acls WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
+    // Get tenant-specific schema prefix
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string delete_sql = "DELETE FROM " + schema + ".acls WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
     const char* param_values[3] = {
         resource_uid.c_str(),
         principal.c_str(),
         std::to_string(type).c_str()
     };
 
-    PGresult* res = PQexecParams(pg_conn, delete_sql, 3, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, delete_sql.c_str(), 3, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to remove ACL: " + std::string(PQerrorMessage(pg_conn));
@@ -2089,10 +2190,13 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_acls_for_resource(const s
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM acls WHERE resource_uid = $1;";
+    // Get tenant-specific schema prefix
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM " + schema + ".acls WHERE resource_uid = $1;";
     const char* param_values[1] = {resource_uid.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 1, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to get ACLs for resource: " + std::string(PQerrorMessage(pg_conn));
@@ -2128,10 +2232,13 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
 
     PGconn* pg_conn = conn->get_connection();
 
-    const char* query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM acls WHERE resource_uid = $1 AND principal = $2;";
+    // Get tenant-specific schema prefix
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM " + schema + ".acls WHERE resource_uid = $1 AND principal = $2;";
     const char* param_values[2] = {resource_uid.c_str(), principal.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql, 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to get user ACLs: " + std::string(PQerrorMessage(pg_conn));

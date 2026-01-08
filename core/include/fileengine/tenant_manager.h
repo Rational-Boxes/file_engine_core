@@ -29,7 +29,7 @@ struct TenantConfig {
 };
 
 struct TenantContext {
-    std::unique_ptr<IDatabase> db;
+    std::shared_ptr<IDatabase> db;  // Shared across all tenants to reuse connection pool
     std::unique_ptr<IStorage> storage;
     std::unique_ptr<IObjectStore> object_store;
     class StorageTracker* storage_tracker;  // Pointer to shared storage tracker

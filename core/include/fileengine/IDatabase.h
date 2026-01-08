@@ -81,6 +81,7 @@ public:
     virtual Result<void> create_tenant_schema(const std::string& tenant) = 0;
     virtual Result<bool> tenant_schema_exists(const std::string& tenant) = 0;
     virtual Result<void> cleanup_tenant_data(const std::string& tenant) = 0;
+    virtual Result<std::vector<std::string>> list_tenants() = 0;
 
     // ACL operations
     struct AclEntry {
