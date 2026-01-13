@@ -2265,4 +2265,62 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
     return Result<std::vector<IDatabase::AclEntry>>::ok(acls);
 }
 
+// Role management implementations
+Result<void> Database::create_role(const std::string& role, const std::string& tenant) {
+    // In this corrected implementation, roles are not stored in the database
+    // They are passed with each request as part of the authentication context
+    // So this function is essentially a no-op for validation purposes
+    if (role.empty()) {
+        return Result<void>::err("Role name cannot be empty");
+    }
+    return Result<void>::ok();
+}
+
+Result<void> Database::delete_role(const std::string& role, const std::string& tenant) {
+    // In this corrected implementation, roles are not stored in the database
+    // So this function is essentially a no-op for validation purposes
+    if (role.empty()) {
+        return Result<void>::err("Role name cannot be empty");
+    }
+    return Result<void>::ok();
+}
+
+Result<void> Database::assign_user_to_role(const std::string& user, const std::string& role, const std::string& tenant) {
+    // In this corrected implementation, user-role assignments are not stored in the database
+    // The mapping is handled externally and passed with each request
+    // So this function is essentially a no-op for validation purposes
+    if (user.empty() || role.empty()) {
+        return Result<void>::err("User and role names cannot be empty");
+    }
+    return Result<void>::ok();
+}
+
+Result<void> Database::remove_user_from_role(const std::string& user, const std::string& role, const std::string& tenant) {
+    // In this corrected implementation, user-role assignments are not stored in the database
+    // So this function is essentially a no-op for validation purposes
+    if (user.empty() || role.empty()) {
+        return Result<void>::err("User and role names cannot be empty");
+    }
+    return Result<void>::ok();
+}
+
+Result<std::vector<std::string>> Database::get_roles_for_user(const std::string& user, const std::string& tenant) {
+    // In this corrected implementation, roles are passed with each request
+    // The database doesn't store user-role mappings
+    // So this function returns an empty vector - the roles must come from the request
+    return Result<std::vector<std::string>>::ok(std::vector<std::string>());
+}
+
+Result<std::vector<std::string>> Database::get_users_for_role(const std::string& role, const std::string& tenant) {
+    // In this corrected implementation, user-role assignments are not stored in the database
+    // So this function returns an empty vector
+    return Result<std::vector<std::string>>::ok(std::vector<std::string>());
+}
+
+Result<std::vector<std::string>> Database::get_all_roles(const std::string& tenant) {
+    // In this corrected implementation, roles are not stored in the database
+    // So this function returns an empty vector - roles are passed with requests
+    return Result<std::vector<std::string>>::ok(std::vector<std::string>());
+}
+
 } // namespace fileengine

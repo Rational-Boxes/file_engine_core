@@ -102,6 +102,19 @@ public:
                                                 const std::string& principal,
                                                 const std::string& tenant = "") override;
 
+    // Role management operations
+    Result<void> create_role(const std::string& role, const std::string& tenant = "") override;
+    Result<void> delete_role(const std::string& role, const std::string& tenant = "") override;
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant = "") override;
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant = "") override;
+    Result<std::vector<std::string>> get_roles_for_user(const std::string& user,
+                                                        const std::string& tenant = "") override;
+    Result<std::vector<std::string>> get_users_for_role(const std::string& role,
+                                                        const std::string& tenant = "") override;
+    Result<std::vector<std::string>> get_all_roles(const std::string& tenant = "") override;
+
     // Connection info access for administrative operations
     std::string get_connection_info() const;
 

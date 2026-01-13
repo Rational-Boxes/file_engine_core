@@ -46,6 +46,15 @@ service FileService {
     rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
     rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
 
+    // Role management operations
+    rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
+    rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
+    rpc AssignUserToRole(AssignUserToRoleRequest) returns (AssignUserToRoleResponse);
+    rpc RemoveUserFromRole(RemoveUserFromRoleRequest) returns (RemoveUserFromRoleResponse);
+    rpc GetRolesForUser(GetRolesForUserRequest) returns (GetRolesForUserResponse);
+    rpc GetUsersForRole(GetUsersForRoleRequest) returns (GetUsersForRoleResponse);
+    rpc GetAllRoles(GetAllRolesRequest) returns (GetAllRolesResponse);
+
     // Streaming operations for large files
     rpc StreamFileUpload(stream PutFileRequest) returns (PutFileResponse);
     rpc StreamFileDownload(GetFileRequest) returns (stream GetFileResponse);
@@ -410,6 +419,81 @@ message CheckPermissionResponse {
     bool success = 1;
     string error = 2;
     bool has_permission = 3;            // Whether the user has the required permission
+}
+
+// Role management operations
+message CreateRoleRequest {
+    string role = 1;                    // Role name to create
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message CreateRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message DeleteRoleRequest {
+    string role = 1;                    // Role name to delete
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message DeleteRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message AssignUserToRoleRequest {
+    string user = 1;                    // User name to assign
+    string role = 2;                    // Role name to assign to
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message AssignUserToRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RemoveUserFromRoleRequest {
+    string user = 1;                    // User name to remove
+    string role = 2;                    // Role name to remove from
+    AuthenticationContext auth = 3;     // Authentication information
+}
+
+message RemoveUserFromRoleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetRolesForUserRequest {
+    string user = 1;                    // User name to get roles for
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message GetRolesForUserResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string roles = 3;          // List of roles for the user
+}
+
+message GetUsersForRoleRequest {
+    string role = 1;                    // Role name to get users for
+    AuthenticationContext auth = 2;     // Authentication information
+}
+
+message GetUsersForRoleResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string users = 3;          // List of users in the role
+}
+
+message GetAllRolesRequest {
+    AuthenticationContext auth = 1;     // Authentication information
+}
+
+message GetAllRolesResponse {
+    bool success = 1;
+    string error = 2;
+    repeated string roles = 3;          // List of all roles
 }
 
 // Administrative operations

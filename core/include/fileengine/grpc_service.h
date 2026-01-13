@@ -12,6 +12,7 @@
 #include "fileengine/filesystem.h"
 #include "fileengine/tenant_manager.h"
 #include "fileengine/acl_manager.h"
+#include "fileengine/role_manager.h"
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/storage_tracker.h"
 
@@ -135,6 +136,35 @@ public:
     grpc::Status CheckPermission(grpc::ServerContext* context,
                                 const fileengine_rpc::CheckPermissionRequest* request,
                                 fileengine_rpc::CheckPermissionResponse* response) override;
+
+    // Role management operations
+    grpc::Status CreateRole(grpc::ServerContext* context,
+                           const fileengine_rpc::CreateRoleRequest* request,
+                           fileengine_rpc::CreateRoleResponse* response) override;
+
+    grpc::Status DeleteRole(grpc::ServerContext* context,
+                           const fileengine_rpc::DeleteRoleRequest* request,
+                           fileengine_rpc::DeleteRoleResponse* response) override;
+
+    grpc::Status AssignUserToRole(grpc::ServerContext* context,
+                                 const fileengine_rpc::AssignUserToRoleRequest* request,
+                                 fileengine_rpc::AssignUserToRoleResponse* response) override;
+
+    grpc::Status RemoveUserFromRole(grpc::ServerContext* context,
+                                   const fileengine_rpc::RemoveUserFromRoleRequest* request,
+                                   fileengine_rpc::RemoveUserFromRoleResponse* response) override;
+
+    grpc::Status GetRolesForUser(grpc::ServerContext* context,
+                                const fileengine_rpc::GetRolesForUserRequest* request,
+                                fileengine_rpc::GetRolesForUserResponse* response) override;
+
+    grpc::Status GetUsersForRole(grpc::ServerContext* context,
+                                const fileengine_rpc::GetUsersForRoleRequest* request,
+                                fileengine_rpc::GetUsersForRoleResponse* response) override;
+
+    grpc::Status GetAllRoles(grpc::ServerContext* context,
+                            const fileengine_rpc::GetAllRolesRequest* request,
+                            fileengine_rpc::GetAllRolesResponse* response) override;
 
     // Streaming operations for large files
     grpc::Status StreamFileUpload(grpc::ServerContext* context,

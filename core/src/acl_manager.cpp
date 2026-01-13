@@ -157,39 +157,55 @@ Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resour
     return Result<std::vector<ACLRule>>::ok(user_acls);
 }
 
-int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rules, 
-                                               const std::string& user, 
+int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rules,
+                                               const std::string& user,
                                                const std::vector<std::string>& roles) {
     int effective_perms = 0;
-    
-    // Priority: user permissions > group permissions > other permissions
+
+    // Priority: user permissions > role permissions > group permissions > other permissions
     bool user_found = false;
+    bool role_found = false;
     bool other_found = false;
-    
+
+    // Check user-specific permissions first
     for (const auto& rule : rules) {
         if (rule.principal == user && rule.type == PrincipalType::USER) {
             effective_perms |= rule.permissions;
             user_found = true;
-        } else if (rule.type == PrincipalType::OTHER) {
-            // Store other permissions but apply them only if user doesn't have specific permissions
-            if (!user_found) {
+        }
+    }
+
+    // If no user-specific permissions, check role-based permissions
+    if (!user_found) {
+        for (const auto& role : roles) {
+            for (const auto& rule : rules) {
+                if (rule.principal == role && rule.type == PrincipalType::ROLE) {
+                    effective_perms |= rule.permissions;
+                    role_found = true;
+                }
+            }
+        }
+    }
+
+    // Check group permissions (if not already covered by user or role)
+    if (!user_found && !role_found) {
+        for (const auto& rule : rules) {
+            if (rule.type == PrincipalType::GROUP) {
+                effective_perms |= rule.permissions;
+            }
+        }
+    }
+
+    // Check other permissions
+    for (const auto& rule : rules) {
+        if (rule.type == PrincipalType::OTHER) {
+            if (!user_found && !role_found) {
                 effective_perms |= rule.permissions;
             }
             other_found = true;
         }
-        // In a real implementation, we'd also handle groups
     }
-    
-    // If no user-specific permissions found but other permissions exist, use them
-    if (!user_found && other_found) {
-        effective_perms = 0;  // Reset and recalculate
-        for (const auto& rule : rules) {
-            if (rule.type == PrincipalType::OTHER) {
-                effective_perms |= rule.permissions;
-            }
-        }
-    }
-    
+
     return effective_perms;
 }
 

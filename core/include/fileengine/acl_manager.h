@@ -39,6 +39,7 @@ inline int operator|(Permission left, int right) {
 
 enum class PrincipalType {
     USER,
+    ROLE,      // For role-based permissions
     GROUP,
     OTHER
 };

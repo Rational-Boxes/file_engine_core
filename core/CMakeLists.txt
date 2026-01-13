@@ -101,6 +101,7 @@ add_library(fileengine_core SHARED
     src/tenant_manager.cpp
     src/cache_manager.cpp
     src/acl_manager.cpp
+    src/role_manager.cpp       # Add role manager source file
     src/utils.cpp
     src/config_loader.cpp
     src/grpc_service.cpp  # Add gRPC service implementation

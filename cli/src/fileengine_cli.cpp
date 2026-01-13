@@ -65,6 +65,21 @@ using fileengine_rpc::PurgeOldVersionsRequest;
 using fileengine_rpc::PurgeOldVersionsResponse;
 using fileengine_rpc::TriggerSyncRequest;
 using fileengine_rpc::TriggerSyncResponse;
+// Role management types
+using fileengine_rpc::CreateRoleRequest;
+using fileengine_rpc::CreateRoleResponse;
+using fileengine_rpc::DeleteRoleRequest;
+using fileengine_rpc::DeleteRoleResponse;
+using fileengine_rpc::AssignUserToRoleRequest;
+using fileengine_rpc::AssignUserToRoleResponse;
+using fileengine_rpc::RemoveUserFromRoleRequest;
+using fileengine_rpc::RemoveUserFromRoleResponse;
+using fileengine_rpc::GetRolesForUserRequest;
+using fileengine_rpc::GetRolesForUserResponse;
+using fileengine_rpc::GetUsersForRoleRequest;
+using fileengine_rpc::GetUsersForRoleResponse;
+using fileengine_rpc::GetAllRolesRequest;
+using fileengine_rpc::GetAllRolesResponse;
 
 namespace fileengine {
 
@@ -757,6 +772,166 @@ public:
             return false;
         }
     }
+
+    // Role management operations
+    bool create_role(const std::string& role, const std::string& user, const std::string& tenant = "default") {
+        CreateRoleRequest request;
+        request.set_role(role);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+
+        CreateRoleResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->CreateRole(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Validated role '" << role << "' in tenant '" << tenant << "'" << std::endl;
+            std::cout << "Note: In this implementation, roles are not stored in the database but passed with each request." << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to validate role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool delete_role(const std::string& role, const std::string& user, const std::string& tenant = "default") {
+        DeleteRoleRequest request;
+        request.set_role(role);
+        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+
+        DeleteRoleResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->DeleteRole(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Validated deletion of role '" << role << "' in tenant '" << tenant << "'" << std::endl;
+            std::cout << "Note: In this implementation, roles are not stored in the database but passed with each request." << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to validate deletion of role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool assign_user_to_role(const std::string& user, const std::string& role, const std::string& requesting_user, const std::string& tenant = "default") {
+        AssignUserToRoleRequest request;
+        request.set_user(user);
+        request.set_role(role);
+        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+
+        AssignUserToRoleResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->AssignUserToRole(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Validated assignment of user '" << user << "' to role '" << role << "' in tenant '" << tenant << "'" << std::endl;
+            std::cout << "Note: In this implementation, user-role assignments are not stored in the database but handled externally." << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to validate assignment of user '" << user << "' to role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool remove_user_from_role(const std::string& user, const std::string& role, const std::string& requesting_user, const std::string& tenant = "default") {
+        RemoveUserFromRoleRequest request;
+        request.set_user(user);
+        request.set_role(role);
+        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+
+        RemoveUserFromRoleResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->RemoveUserFromRole(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Validated removal of user '" << user << "' from role '" << role << "' in tenant '" << tenant << "'" << std::endl;
+            std::cout << "Note: In this implementation, user-role assignments are not stored in the database but handled externally." << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to validate removal of user '" << user << "' from role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool list_roles_for_user(const std::string& user, const std::string& requesting_user, const std::string& tenant = "default") {
+        GetRolesForUserRequest request;
+        request.set_user(user);
+        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+
+        GetRolesForUserResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->GetRolesForUser(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "Roles for user '" << user << "' in tenant '" << tenant << "':" << std::endl;
+            if (response.roles_size() > 0) {
+                for (const auto& role : response.roles()) {
+                    std::cout << "  - " << role << std::endl;
+                }
+            } else {
+                std::cout << "  No roles found (roles should be provided with each request)" << std::endl;
+            }
+            return true;
+        } else {
+            std::cout << "✗ Failed to get roles for user '" << user << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool list_users_for_role(const std::string& role, const std::string& requesting_user, const std::string& tenant = "default") {
+        GetUsersForRoleRequest request;
+        request.set_role(role);
+        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+
+        GetUsersForRoleResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->GetUsersForRole(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "Users in role '" << role << "' in tenant '" << tenant << "':" << std::endl;
+            if (response.users_size() > 0) {
+                for (const auto& user : response.users()) {
+                    std::cout << "  - " << user << std::endl;
+                }
+            } else {
+                std::cout << "  No users found (user-role mappings are handled externally)" << std::endl;
+            }
+            return true;
+        } else {
+            std::cout << "✗ Failed to get users for role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool list_all_roles(const std::string& requesting_user, const std::string& tenant = "default") {
+        GetAllRolesRequest request;
+        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+
+        GetAllRolesResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->GetAllRoles(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "All roles in tenant '" << tenant << "':" << std::endl;
+            if (response.roles_size() > 0) {
+                for (const auto& role : response.roles()) {
+                    std::cout << "  - " << role << std::endl;
+                }
+            } else {
+                std::cout << "  No roles found (roles are provided with each request)" << std::endl;
+            }
+            return true;
+        } else {
+            std::cout << "✗ Failed to get all roles in tenant '" << tenant << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
 };
 
 // Configuration loading function
@@ -935,6 +1110,16 @@ int main(int argc, char** argv) {
         std::cout << "  grant <resource_uid> <user> <perm>    - Grant permission (r/w/x)" << std::endl;
         std::cout << "  revoke <resource_uid> <user> <perm>   - Revoke permission (r/w/x)" << std::endl;
         std::cout << "  check <resource_uid> <user> <perm>    - Check permission (r/w/x)" << std::endl;
+        std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Role management operations:" << std::endl;
+        std::cout << "  create_role <role>                    - Create a new role" << std::endl;
+        std::cout << "  delete_role <role>                    - Delete a role" << std::endl;
+        std::cout << "  assign_role <user> <role>             - Assign user to a role" << std::endl;
+        std::cout << "  remove_role <user> <role>             - Remove user from a role" << std::endl;
+        std::cout << "  list_roles <user>                     - List roles for a user" << std::endl;
+        std::cout << "  list_users <role>                     - List users in a role" << std::endl;
+        std::cout << "  list_all_roles                        - List all roles" << std::endl;
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Diagnostic operations:" << std::endl;
@@ -1118,6 +1303,28 @@ int main(int argc, char** argv) {
         }
 
         client.check_permission(argv[arg_offset + 1], user, perm, tenant);
+    }
+    // Role management commands
+    else if (command == "create_role" && argc - arg_offset == 2) {  // command + 1 arg
+        client.create_role(argv[arg_offset + 1], user, tenant);
+    }
+    else if (command == "delete_role" && argc - arg_offset == 2) {  // command + 1 arg
+        client.delete_role(argv[arg_offset + 1], user, tenant);
+    }
+    else if (command == "assign_role" && argc - arg_offset == 3) {  // command + 2 args
+        client.assign_user_to_role(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
+    }
+    else if (command == "remove_role" && argc - arg_offset == 3) {  // command + 2 args
+        client.remove_user_from_role(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
+    }
+    else if (command == "list_roles" && argc - arg_offset == 2) {  // command + 1 arg
+        client.list_roles_for_user(argv[arg_offset + 1], user, tenant);
+    }
+    else if (command == "list_users" && argc - arg_offset == 2) {  // command + 1 arg
+        client.list_users_for_role(argv[arg_offset + 1], user, tenant);
+    }
+    else if (command == "list_all_roles" && argc - arg_offset == 1) {  // command only
+        client.list_all_roles(user, tenant);
     }
     else if (command == "usage" && argc - arg_offset == 1) {  // command only
         client.storage_usage(user, tenant);

@@ -100,6 +100,19 @@ public:
     virtual Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
                                                         const std::string& principal,
                                                         const std::string& tenant = "") = 0;
+
+    // Role management operations
+    virtual Result<void> create_role(const std::string& role, const std::string& tenant = "") = 0;
+    virtual Result<void> delete_role(const std::string& role, const std::string& tenant = "") = 0;
+    virtual Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                             const std::string& tenant = "") = 0;
+    virtual Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                               const std::string& tenant = "") = 0;
+    virtual Result<std::vector<std::string>> get_roles_for_user(const std::string& user,
+                                                                const std::string& tenant = "") = 0;
+    virtual Result<std::vector<std::string>> get_users_for_role(const std::string& role,
+                                                                const std::string& tenant = "") = 0;
+    virtual Result<std::vector<std::string>> get_all_roles(const std::string& tenant = "") = 0;
 };
 
 } // namespace fileengine
