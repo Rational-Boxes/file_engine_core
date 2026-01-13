@@ -86,10 +86,11 @@ namespace fileengine {
 class FileEngineClient {
 private:
     std::unique_ptr<fileengine_rpc::FileService::Stub> stub_;
+    std::vector<std::string> roles_;  // Roles passed from command line
 
 public:
-    FileEngineClient(std::shared_ptr<grpc::Channel> channel)
-        : stub_(fileengine_rpc::FileService::NewStub(channel)) {}
+    FileEngineClient(std::shared_ptr<grpc::Channel> channel, const std::vector<std::string>& initial_roles = {})
+        : stub_(fileengine_rpc::FileService::NewStub(channel)), roles_(initial_roles) {}
 
     // Helper function to create auth context with user, roles, and tenant
     AuthenticationContext create_auth_context(const std::string& user, const std::vector<std::string>& roles = {}, const std::string& tenant = "default", const std::vector<std::string>& claims = {}) {
@@ -699,7 +700,7 @@ public:
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GrantPermissionResponse response;
         grpc::ClientContext context;
@@ -720,7 +721,7 @@ public:
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         RevokePermissionResponse response;
         grpc::ClientContext context;
@@ -740,7 +741,7 @@ public:
         CheckPermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_required_permission(required_permission);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         CheckPermissionResponse response;
         grpc::ClientContext context;
@@ -760,7 +761,7 @@ public:
                     perm_str = "EXECUTE";
                     break;
             }
-            
+
             if (response.has_permission()) {
                 std::cout << "✓ User '" << user << "' has " << perm_str << " permission on resource '" << resource_uid << "'" << std::endl;
             } else {
@@ -777,7 +778,7 @@ public:
     bool create_role(const std::string& role, const std::string& user, const std::string& tenant = "default") {
         CreateRoleRequest request;
         request.set_role(role);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         CreateRoleResponse response;
         grpc::ClientContext context;
@@ -797,7 +798,7 @@ public:
     bool delete_role(const std::string& role, const std::string& user, const std::string& tenant = "default") {
         DeleteRoleRequest request;
         request.set_role(role);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         DeleteRoleResponse response;
         grpc::ClientContext context;
@@ -818,7 +819,7 @@ public:
         AssignUserToRoleRequest request;
         request.set_user(user);
         request.set_role(role);
-        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(requesting_user, roles_, tenant);
 
         AssignUserToRoleResponse response;
         grpc::ClientContext context;
@@ -839,7 +840,7 @@ public:
         RemoveUserFromRoleRequest request;
         request.set_user(user);
         request.set_role(role);
-        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(requesting_user, roles_, tenant);
 
         RemoveUserFromRoleResponse response;
         grpc::ClientContext context;
@@ -859,7 +860,7 @@ public:
     bool list_roles_for_user(const std::string& user, const std::string& requesting_user, const std::string& tenant = "default") {
         GetRolesForUserRequest request;
         request.set_user(user);
-        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(requesting_user, roles_, tenant);
 
         GetRolesForUserResponse response;
         grpc::ClientContext context;
@@ -885,7 +886,7 @@ public:
     bool list_users_for_role(const std::string& role, const std::string& requesting_user, const std::string& tenant = "default") {
         GetUsersForRoleRequest request;
         request.set_role(role);
-        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(requesting_user, roles_, tenant);
 
         GetUsersForRoleResponse response;
         grpc::ClientContext context;
@@ -910,7 +911,7 @@ public:
 
     bool list_all_roles(const std::string& requesting_user, const std::string& tenant = "default") {
         GetAllRolesRequest request;
-        *request.mutable_auth() = create_auth_context(requesting_user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(requesting_user, roles_, tenant);
 
         GetAllRolesResponse response;
         grpc::ClientContext context;
@@ -1138,7 +1139,7 @@ int main(int argc, char** argv) {
     }
 
     auto channel = grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
-    fileengine::FileEngineClient client(channel);
+    fileengine::FileEngineClient client(channel, roles);
 
     std::string command = argv[arg_offset];
 
