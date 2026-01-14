@@ -227,6 +227,12 @@ private:
             return true;
         }
 
+        // Special rule: The filesystem root (empty UID) is always readable by all users
+        // This allows users to list the root directory contents regardless of specific ACLs
+        if (resource_uid.empty() && (required_permissions & static_cast<int>(Permission::READ))) {
+            return true;
+        }
+
         // Check if acl_manager_ is available
         if (!acl_manager_) {
             // If ACL manager is not available, default to allowing access for basic functionality

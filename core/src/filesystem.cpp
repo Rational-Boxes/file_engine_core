@@ -1331,7 +1331,7 @@ TenantContext* FileSystem::get_tenant_context(const std::string& tenant) {
     return context;
 }
 
-Result<bool> FileSystem::validate_user_permissions(const std::string& resource_uid, 
+Result<bool> FileSystem::validate_user_permissions(const std::string& resource_uid,
                                                   const std::string& user,
                                                   const std::vector<std::string>& roles,
                                                   int required_permissions,
@@ -1340,8 +1340,17 @@ Result<bool> FileSystem::validate_user_permissions(const std::string& resource_u
         // If no ACL manager, default to allowing access for basic implementation
         return Result<bool>::ok(true);
     }
-    
-    auto result = acl_manager_->check_permission(resource_uid, user, roles, 
+
+    // Special rule: The filesystem root (empty UID) is always readable by all users
+    // This allows users to list the root directory contents regardless of specific ACLs
+    if (resource_uid.empty() && (required_permissions & static_cast<int>(Permission::READ))) {
+        SERVER_LOG_DEBUG("FileSystem::validate_user_permissions",
+                         ServerLogger::getInstance().detailed_log_prefix() +
+                         "Allowing READ access to filesystem root for user: " + user);
+        return Result<bool>::ok(true);
+    }
+
+    auto result = acl_manager_->check_permission(resource_uid, user, roles,
                                                  required_permissions, tenant);
     return result;
 }
