@@ -3,6 +3,7 @@
 #include "fileengine/server_logger.h"
 #include "fileengine/crypto_utils.h"
 #include <algorithm>
+#include <optional>
 
 namespace fileengine {
 
@@ -23,6 +24,11 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
                                       const std::vector<std::string>& roles,
                                       int permissions,
                                       const std::string& tenant) {
+    // Request-scoped cache: the parent ACL is read once by the WRITE check
+    // and again by compute_initial_acl_grants — share the read.
+    std::optional<AclManager::CacheScope> cache_scope;
+    if (acl_manager_) cache_scope.emplace(*acl_manager_);
+
     // Detailed debug logging for entry
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Entering mkdir operation - parent_uid: " + parent_uid +
@@ -65,19 +71,19 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Generated new UID: " + new_uid + " for directory path: " + path);
 
-    // Insert directory in database
+    // Atomic creation: file row + default/inherited ACLs in one transaction
+    // so a crash mid-creation can't leave a directory without ACLs.
+    auto grants = compute_initial_acl_grants(parent_uid, user, tenant);
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-              "Inserting directory in database with UID: " + new_uid);
-    auto db_result = context->db->insert_file(new_uid, name, path, parent_uid,
-                                              FileType::DIRECTORY, user, permissions, tenant);
+              "Inserting directory atomically with UID: " + new_uid);
+    auto db_result = context->db->create_file_with_acls(new_uid, name, path, parent_uid,
+                                                       FileType::DIRECTORY, user, permissions,
+                                                       grants, tenant);
     if (!db_result.success) {
         SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Failed to create directory in database: " + db_result.error);
         return Result<std::string>::err("Failed to create directory in database: " + db_result.error);
     }
-
-    // Default ACLs + inheritance from parent (see apply_acls_for_new_resource).
-    apply_acls_for_new_resource(parent_uid, new_uid, user, tenant);
 
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Successfully created directory with UID: " + new_uid);
@@ -218,6 +224,9 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
                                       const std::string& user,
                                       const std::vector<std::string>& roles,
                                       const std::string& tenant) {
+    std::optional<AclManager::CacheScope> cache_scope;
+    if (acl_manager_) cache_scope.emplace(*acl_manager_);
+
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<std::string>::err("Database not available for tenant: " + tenant);
@@ -239,15 +248,14 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
     std::string new_uid = Utils::generate_uuid();
     std::string path = parent_uid.empty() ? "/" + name : parent_uid + "/" + name;
     
-    // Insert file in database
-    auto db_result = context->db->insert_file(new_uid, name, path, parent_uid, 
-                                              FileType::REGULAR_FILE, user, 0644, tenant);
+    // Atomic creation: file row + default/inherited ACLs in one transaction.
+    auto grants = compute_initial_acl_grants(parent_uid, user, tenant);
+    auto db_result = context->db->create_file_with_acls(new_uid, name, path, parent_uid,
+                                                       FileType::REGULAR_FILE, user, 0644,
+                                                       grants, tenant);
     if (!db_result.success) {
         return Result<std::string>::err("Failed to create file in database: " + db_result.error);
     }
-    
-    // Default ACLs + inheritance from parent (see apply_acls_for_new_resource).
-    apply_acls_for_new_resource(parent_uid, new_uid, user, tenant);
 
     return Result<std::string>::ok(new_uid);
 }
@@ -655,6 +663,9 @@ Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst
                               const std::string& user,
                               const std::vector<std::string>& roles,
                               const std::string& tenant) {
+    std::optional<AclManager::CacheScope> cache_scope;
+    if (acl_manager_) cache_scope.emplace(*acl_manager_);
+
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<void>::err("Database not available for tenant: " + tenant);
@@ -701,6 +712,11 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                               const std::string& user,
                               const std::vector<std::string>& roles,
                               const std::string& tenant) {
+    // copy is the heaviest beneficiary of the cache — recursive directory
+    // copies re-validate the same ancestors as they walk the tree.
+    std::optional<AclManager::CacheScope> cache_scope;
+    if (acl_manager_) cache_scope.emplace(*acl_manager_);
+
     auto context = get_tenant_context(tenant);
     if (!context || !context->db || !context->storage) {
         return Result<void>::err("Database or storage not available for tenant: " + tenant);
@@ -742,15 +758,14 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
 
     // If it's a directory, we need to recursively copy all contents
     if (src_info.type == FileType::DIRECTORY) {
-        // Create the new directory in the database
-        auto db_result = context->db->insert_file(new_uid, src_info.name, new_path, dst_uid,
-                                                  FileType::DIRECTORY, user, src_info.permissions, tenant);
+        // Atomic creation: directory row + default/inherited ACLs from dst.
+        auto grants = compute_initial_acl_grants(dst_uid, user, tenant);
+        auto db_result = context->db->create_file_with_acls(new_uid, src_info.name, new_path, dst_uid,
+                                                           FileType::DIRECTORY, user, src_info.permissions,
+                                                           grants, tenant);
         if (!db_result.success) {
             return Result<void>::err("Failed to create directory in database: " + db_result.error);
         }
-
-        // Default ACLs + inheritance from destination parent.
-        apply_acls_for_new_resource(dst_uid, new_uid, user, tenant);
 
         // List all entries in the source directory
         auto list_result = listdir(src_uid, user, roles, tenant);
@@ -794,9 +809,11 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             context->storage_tracker->record_file_creation(store_result.value, storage_result.value.size(), tenant);
         }
 
-        // Create the new file entry in the database
-        auto db_result = context->db->insert_file(new_uid, src_info.name, new_path, dst_uid,
-                                                  FileType::REGULAR_FILE, user, src_info.permissions, tenant);
+        // Atomic creation: file row + default/inherited ACLs in one transaction.
+        auto grants = compute_initial_acl_grants(dst_uid, user, tenant);
+        auto db_result = context->db->create_file_with_acls(new_uid, src_info.name, new_path, dst_uid,
+                                                           FileType::REGULAR_FILE, user, src_info.permissions,
+                                                           grants, tenant);
         if (!db_result.success) {
             return Result<void>::err("Failed to create file in database: " + db_result.error);
         }
@@ -819,9 +836,6 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
         if (!update_time_result.success) {
             // Log error but don't fail the operation
         }
-
-        // Default ACLs + inheritance from destination parent.
-        apply_acls_for_new_resource(dst_uid, new_uid, user, tenant);
 
         // If we have an object store, schedule a backup for the copied file
         if (context->object_store) {
@@ -1297,6 +1311,61 @@ void FileSystem::apply_acls_for_new_resource(const std::string& parent_uid,
                             + ": " + inherit_result.error);
         }
     }
+}
+
+std::vector<IDatabase::AclGrant> FileSystem::compute_initial_acl_grants(
+        const std::string& parent_uid,
+        const std::string& creator,
+        const std::string& tenant) {
+    std::vector<IDatabase::AclGrant> grants;
+    if (!acl_manager_) {
+        return grants;
+    }
+
+    // Creator's default USER bits. Mirrors apply_default_acls semantics.
+    IDatabase::AclGrant creator_grant;
+    creator_grant.principal = creator;
+    creator_grant.type = static_cast<int>(PrincipalType::USER);
+    creator_grant.permissions =
+        static_cast<int>(Permission::READ)
+        | static_cast<int>(Permission::WRITE)
+        | static_cast<int>(Permission::EXECUTE)
+        | static_cast<int>(Permission::MANAGE_ACL)
+        | static_cast<int>(Permission::ACL_INHERIT);
+    creator_grant.performed_by = creator;
+    creator_grant.effect = static_cast<int>(AclEffect::ALLOW);
+    grants.push_back(creator_grant);
+
+    // Optional world-readable default.
+    if (acl_manager_->default_world_readable()) {
+        IDatabase::AclGrant other_grant;
+        other_grant.principal = "other";
+        other_grant.type = static_cast<int>(PrincipalType::OTHER);
+        other_grant.permissions = static_cast<int>(Permission::READ);
+        other_grant.performed_by = creator;
+        other_grant.effect = static_cast<int>(AclEffect::ALLOW);
+        grants.push_back(other_grant);
+    }
+
+    // Inheritable parent rules.
+    if (!parent_uid.empty()) {
+        auto parent_acls = acl_manager_->get_acls_for_resource(parent_uid, tenant);
+        if (parent_acls.success) {
+            const int inherit_bit = static_cast<int>(Permission::ACL_INHERIT);
+            for (const auto& rule : parent_acls.value) {
+                if ((rule.permissions & inherit_bit) == 0) continue;
+                IDatabase::AclGrant g;
+                g.principal = rule.principal;
+                g.type = static_cast<int>(rule.type);
+                g.permissions = rule.permissions;
+                g.performed_by = creator;
+                g.effect = static_cast<int>(rule.effect);
+                grants.push_back(g);
+            }
+        }
+    }
+
+    return grants;
 }
 
 Result<std::vector<uint8_t>> FileSystem::fetch_from_object_store_if_missing(const std::string& uid,

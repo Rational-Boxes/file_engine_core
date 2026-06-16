@@ -1094,9 +1094,14 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
             break;
     }
 
+    AclEffect rule_effect = (request->effect() == fileengine_rpc::AclEffect::DENY)
+                                ? AclEffect::DENY : AclEffect::ALLOW;
+
     auto result = acl_manager_->grant_permission(resource_uid, principal,
                                                  PrincipalType::USER,  // Simplified for this example
-                                                 converted_permissions, tenant);
+                                                 converted_permissions, tenant,
+                                                 /*performed_by=*/user,
+                                                 rule_effect);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -1164,9 +1169,14 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
             break;
     }
 
+    AclEffect rule_effect = (request->effect() == fileengine_rpc::AclEffect::DENY)
+                                ? AclEffect::DENY : AclEffect::ALLOW;
+
     auto result = acl_manager_->revoke_permission(resource_uid, principal,
                                                   PrincipalType::USER,  // Simplified for this example
-                                                  converted_permissions, tenant);
+                                                  converted_permissions, tenant,
+                                                  /*performed_by=*/user,
+                                                  rule_effect);
 
     response->set_success(result.success);
     if (!result.success) {

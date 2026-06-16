@@ -26,6 +26,15 @@ public:
                                    int permissions, const std::string& tenant = "") override {
         return Result<std::string>::ok(uid);
     }
+    Result<std::string> create_file_with_acls(const std::string& uid,
+                                               const std::string&, const std::string&,
+                                               const std::string&,
+                                               FileType, const std::string&,
+                                               int,
+                                               const std::vector<AclGrant>&,
+                                               const std::string& = "") override {
+        return Result<std::string>::ok(uid);
+    }
     Result<void> update_file_modified(const std::string& uid, const std::string& tenant = "") override {
         return Result<void>::ok();
     }
@@ -157,7 +166,8 @@ public:
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
                          const std::string& tenant = "",
-                         const std::string& /*performed_by*/ = "") override {
+                         const std::string& /*performed_by*/ = "",
+                         int /*effect*/ = 0) override {
         AclEntry entry;
         entry.resource_uid = resource_uid;
         entry.principal = principal;
@@ -172,7 +182,8 @@ public:
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
                             const std::string& tenant = "",
-                            const std::string& /*performed_by*/ = "") override {
+                            const std::string& /*performed_by*/ = "",
+                            int /*effect*/ = 0) override {
         auto& resource_acls = acls_[resource_uid];
         for (auto& entry : resource_acls) {
             if (entry.principal == principal && entry.type == type) {

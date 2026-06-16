@@ -1,6 +1,8 @@
 #include "fileengine/acl_manager.h"
 #include "fileengine/IDatabase.h"
 #include <algorithm>
+#include <map>
+#include <optional>
 #include <sstream>
 
 // ACLs are stored separately from file metadata to maintain security boundaries
@@ -8,7 +10,59 @@
 
 namespace fileengine {
 
+namespace {
+// Request-scoped lookup cache. Thread-local so a single AclManager can serve
+// concurrent gRPC handlers — each thread sees only its own cache. Wrapped in
+// an optional so the cache only exists inside an explicit CacheScope and
+// outside scopes get_acls_for_resource hits the DB as before.
+thread_local std::optional<std::map<std::string, std::vector<ACLRule>>> tls_acl_cache;
+}
+
 AclManager::AclManager(std::shared_ptr<IDatabase> db) : db_(db) {
+}
+
+// Reentrance counter so nested CacheScope objects don't clobber each other.
+// The outermost scope owns the cache; nested ones are no-ops. This lets a
+// gRPC handler open a scope and the FileSystem methods it calls open scopes
+// of their own without losing the handler-level cached reads.
+namespace {
+thread_local int tls_cache_scope_depth = 0;
+}
+
+void AclManager::enter_cache_scope() {
+    if (tls_cache_scope_depth == 0) {
+        tls_acl_cache.emplace();
+    }
+    ++tls_cache_scope_depth;
+}
+
+void AclManager::exit_cache_scope() {
+    --tls_cache_scope_depth;
+    if (tls_cache_scope_depth == 0) {
+        tls_acl_cache.reset();
+    }
+}
+
+bool AclManager::try_get_cached_acls(const std::string& cache_key,
+                                     std::vector<ACLRule>& out) const {
+    if (!tls_acl_cache.has_value()) return false;
+    auto it = tls_acl_cache->find(cache_key);
+    if (it == tls_acl_cache->end()) return false;
+    out = it->second;
+    return true;
+}
+
+void AclManager::put_cached_acls(const std::string& cache_key,
+                                 const std::vector<ACLRule>& acls) const {
+    if (tls_acl_cache.has_value()) {
+        (*tls_acl_cache)[cache_key] = acls;
+    }
+}
+
+void AclManager::invalidate_cache_entry(const std::string& resource_uid,
+                                        const std::string& tenant) const {
+    if (!tls_acl_cache.has_value()) return;
+    tls_acl_cache->erase(tenant + "::" + resource_uid);
 }
 
 Result<void> AclManager::grant_permission(const std::string& resource_uid,
@@ -16,9 +70,14 @@ Result<void> AclManager::grant_permission(const std::string& resource_uid,
                                           PrincipalType type,
                                           int permissions,
                                           const std::string& tenant,
-                                          const std::string& performed_by) {
-    return db_->add_acl(resource_uid, principal, static_cast<int>(type), permissions,
-                        tenant, performed_by);
+                                          const std::string& performed_by,
+                                          AclEffect effect) {
+    auto result = db_->add_acl(resource_uid, principal, static_cast<int>(type), permissions,
+                               tenant, performed_by, static_cast<int>(effect));
+    // Invalidate any cached read of this resource's ACLs so subsequent checks
+    // in the same scope see the new grant.
+    invalidate_cache_entry(resource_uid, tenant);
+    return result;
 }
 
 Result<void> AclManager::revoke_permission(const std::string& resource_uid,
@@ -26,11 +85,14 @@ Result<void> AclManager::revoke_permission(const std::string& resource_uid,
                                            PrincipalType type,
                                            int permissions,
                                            const std::string& tenant,
-                                           const std::string& performed_by) {
+                                           const std::string& performed_by,
+                                           AclEffect effect) {
     // Bit-mask revoke: only the requested bits are cleared. If the principal's
     // remaining bitmask is zero the row is deleted by the DB layer.
-    return db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions,
-                           tenant, performed_by);
+    auto result = db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions,
+                                  tenant, performed_by, static_cast<int>(effect));
+    invalidate_cache_entry(resource_uid, tenant);
+    return result;
 }
 
 Result<bool> AclManager::check_permission(const std::string& resource_uid,
@@ -70,25 +132,31 @@ bool AclManager::is_system_admin(const std::string& user,
 
 Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string& resource_uid,
                                                                const std::string& tenant) {
-    std::vector<ACLRule> acls;
+    // Request-scoped cache hit (only active inside a CacheScope).
+    std::string cache_key = tenant + "::" + resource_uid;
+    std::vector<ACLRule> cached;
+    if (try_get_cached_acls(cache_key, cached)) {
+        return Result<std::vector<ACLRule>>::ok(cached);
+    }
 
-    // Query dedicated ACL tables
     auto acl_result = db_->get_acls_for_resource(resource_uid, tenant);
     if (!acl_result.success) {
         return Result<std::vector<ACLRule>>::err(acl_result.error);
     }
 
-    // Transform the database format to internal ACLRule format
+    std::vector<ACLRule> acls;
     for (const auto& db_acl : acl_result.value) {
         ACLRule rule;
         rule.resource_uid = resource_uid;
         rule.principal = db_acl.principal;
         rule.type = static_cast<PrincipalType>(db_acl.type);
         rule.permissions = db_acl.permissions;
+        rule.effect = static_cast<AclEffect>(db_acl.effect);
 
         acls.push_back(rule);
     }
 
+    put_cached_acls(cache_key, acls);
     return Result<std::vector<ACLRule>>::ok(acls);
 }
 
@@ -219,6 +287,7 @@ Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resour
         rule.principal = db_acl.principal;
         rule.type = static_cast<PrincipalType>(db_acl.type);
         rule.permissions = db_acl.permissions;
+        rule.effect = static_cast<AclEffect>(db_acl.effect);
 
         user_acls.push_back(rule);
     }
@@ -229,41 +298,41 @@ Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resour
 int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rules,
                                                const std::string& user,
                                                const std::vector<std::string>& roles) {
-    // Union model: every matching grant contributes its bits, regardless of
-    // principal type. A per-user grant of READ does NOT suppress role-provided
-    // WRITE on the same resource. This matches POSIX-ACL / NFSv4-style additive
-    // grants and avoids the surprising "user-rule masks role-rule" footgun
-    // documented in design_documents/acl_rbac_review_and_plan.md.
-    int effective_perms = 0;
+    // Union model: every matching ALLOW grant contributes its bits, regardless
+    // of principal type. DENY grants are unioned into a separate mask and
+    // subtracted at the end so any matching deny wins (POSIX-NFSv4 style).
+    // See plan §6.1.
+    int allow_mask = 0;
+    int deny_mask = 0;
 
-    for (const auto& rule : rules) {
+    auto matches_principal = [&](const ACLRule& rule) -> bool {
         switch (rule.type) {
             case PrincipalType::USER:
-                if (rule.principal == user) {
-                    effective_perms |= rule.permissions;
-                }
-                break;
+                return rule.principal == user;
             case PrincipalType::ROLE:
                 for (const auto& role : roles) {
-                    if (rule.principal == role) {
-                        effective_perms |= rule.permissions;
-                        break;
-                    }
+                    if (rule.principal == role) return true;
                 }
-                break;
+                return false;
             case PrincipalType::GROUP:
-                // GROUP rules apply to anyone — group membership is not yet
-                // modeled (see plan §2.3). Treat as a global grant to mirror
-                // the prior behavior until groups are persisted.
-                effective_perms |= rule.permissions;
-                break;
+                // GROUP membership is not yet modeled (plan §2.3); treat as global.
+                return true;
             case PrincipalType::OTHER:
-                effective_perms |= rule.permissions;
-                break;
+                return true;
+        }
+        return false;
+    };
+
+    for (const auto& rule : rules) {
+        if (!matches_principal(rule)) continue;
+        if (rule.effect == AclEffect::DENY) {
+            deny_mask |= rule.permissions;
+        } else {
+            allow_mask |= rule.permissions;
         }
     }
 
-    return effective_perms;
+    return allow_mask & ~deny_mask;
 }
 
 } // namespace fileengine

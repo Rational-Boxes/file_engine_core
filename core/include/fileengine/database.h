@@ -40,6 +40,16 @@ public:
                                     const std::string& path, const std::string& parent_uid,
                                     FileType type, const std::string& owner,
                                     int permissions, const std::string& tenant) override;
+
+    Result<std::string> create_file_with_acls(const std::string& uid,
+                                               const std::string& name,
+                                               const std::string& path,
+                                               const std::string& parent_uid,
+                                               FileType type,
+                                               const std::string& owner,
+                                               int permissions,
+                                               const std::vector<AclGrant>& acl_grants,
+                                               const std::string& tenant = "") override;
     Result<void> update_file_modified(const std::string& uid, const std::string& tenant) override;
     Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) override;
     Result<bool> delete_file(const std::string& uid, const std::string& tenant) override;
@@ -95,11 +105,13 @@ public:
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
                          const std::string& tenant = "",
-                         const std::string& performed_by = "") override;
+                         const std::string& performed_by = "",
+                         int effect = 0) override;
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
                             const std::string& tenant = "",
-                            const std::string& performed_by = "") override;
+                            const std::string& performed_by = "",
+                            int effect = 0) override;
     Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                         const std::string& tenant = "") override;
     Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,

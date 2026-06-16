@@ -60,6 +60,24 @@ public:
                                    int, const std::string&) override {
         return Result<std::string>::ok(uid);
     }
+    Result<std::string> create_file_with_acls(const std::string& uid,
+                                               const std::string&,
+                                               const std::string&,
+                                               const std::string&,
+                                               FileType,
+                                               const std::string&,
+                                               int,
+                                               const std::vector<AclGrant>& grants,
+                                               const std::string& tenant = "") override {
+        // Mock simulates atomicity by sequencing add_acl calls; tests that
+        // care about transactional semantics should run against real Postgres.
+        for (const auto& g : grants) {
+            add_acl(uid, g.principal, g.type, g.permissions, tenant, g.performed_by, g.effect);
+        }
+        last_atomic_create_grants_ = grants;
+        ++atomic_create_count_;
+        return Result<std::string>::ok(uid);
+    }
     Result<void> update_file_modified(const std::string&, const std::string&) override { return Result<void>::ok(); }
     Result<void> update_file_current_version(const std::string&, const std::string&, const std::string&) override { return Result<void>::ok(); }
     Result<bool> delete_file(const std::string&, const std::string&) override { return Result<bool>::ok(true); }
@@ -105,29 +123,44 @@ public:
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
                          const std::string& tenant = "",
-                         const std::string& performed_by = "") override {
-        AclEntry entry;
-        entry.resource_uid = resource_uid;
-        entry.principal = principal;
-        entry.type = type;
-        entry.permissions = permissions;
-
+                         const std::string& performed_by = "",
+                         int effect = 0) override {
         std::string key = tenant + "::" + resource_uid;
-        acls_[key].push_back(entry);
-        audit_log_.push_back({resource_uid, principal, type, "grant", permissions, performed_by, tenant});
+        auto& resource_acls = acls_[key];
+        // Upsert by (principal, type, effect) — ALLOW and DENY coexist.
+        bool updated = false;
+        for (auto& entry : resource_acls) {
+            if (entry.principal == principal && entry.type == type && entry.effect == effect) {
+                entry.permissions = permissions;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            AclEntry entry;
+            entry.resource_uid = resource_uid;
+            entry.principal = principal;
+            entry.type = type;
+            entry.permissions = permissions;
+            entry.effect = effect;
+            resource_acls.push_back(entry);
+        }
+        std::string action = (effect == 1) ? "grant_deny" : "grant";
+        audit_log_.push_back({resource_uid, principal, type, action, permissions, performed_by, tenant});
         return Result<void>::ok();
     }
 
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
                             const std::string& tenant = "",
-                            const std::string& performed_by = "") override {
+                            const std::string& performed_by = "",
+                            int effect = 0) override {
         std::string key = tenant + "::" + resource_uid;
         auto& resource_acls = acls_[key];
         int permissions_after = 0;
         bool found = false;
         for (auto& entry : resource_acls) {
-            if (entry.principal == principal && entry.type == type) {
+            if (entry.principal == principal && entry.type == type && entry.effect == effect) {
                 entry.permissions &= ~permissions;
                 permissions_after = entry.permissions;
                 found = true;
@@ -137,17 +170,19 @@ public:
             std::remove_if(resource_acls.begin(), resource_acls.end(),
                           [&](const AclEntry& entry) {
                               return entry.principal == principal && entry.type == type
-                                     && entry.permissions == 0;
+                                     && entry.effect == effect && entry.permissions == 0;
                           }),
             resource_acls.end());
         if (found) {
-            audit_log_.push_back({resource_uid, principal, type, "revoke", permissions_after, performed_by, tenant});
+            std::string action = (effect == 1) ? "revoke_deny" : "revoke";
+            audit_log_.push_back({resource_uid, principal, type, action, permissions_after, performed_by, tenant});
         }
         return Result<void>::ok();
     }
 
     Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                         const std::string& tenant = "") override {
+        ++get_acls_call_count_;
         std::string key = tenant + "::" + resource_uid;
         auto it = acls_.find(key);
         if (it != acls_.end()) {
@@ -243,18 +278,30 @@ public:
         std::string resource_uid;
         std::string principal;
         int type;
-        std::string action;       // "grant" | "revoke"
+        std::string action;       // "grant" | "revoke" | "grant_deny" | "revoke_deny"
         int permissions;          // for grants: granted bitmask; for revokes: bitmask after revoke
         std::string performed_by;
         std::string tenant;
     };
     const std::vector<AuditEvent>& audit_log() const { return audit_log_; }
 
+    // Phase 6 §6.2: visibility into the atomic-create path.
+    int atomic_create_count() const { return atomic_create_count_; }
+    const std::vector<AclGrant>& last_atomic_create_grants() const { return last_atomic_create_grants_; }
+
+    // Phase 6 §6.3: how many times the DB layer's get_acls_for_resource was
+    // called. Used to verify the request-scoped cache really does coalesce.
+    int get_acls_call_count() const { return get_acls_call_count_; }
+    void reset_get_acls_call_count() { get_acls_call_count_ = 0; }
+
 private:
     std::map<std::string, std::vector<AclEntry>> acls_;
     std::map<std::string, std::set<std::string>> roles_;
     std::map<std::string, std::set<std::pair<std::string, std::string>>> user_roles_;
     std::vector<AuditEvent> audit_log_;
+    int atomic_create_count_ = 0;
+    std::vector<AclGrant> last_atomic_create_grants_;
+    int get_acls_call_count_ = 0;
 };
 
 // Helper constants
@@ -796,23 +843,25 @@ void test_check_permission_with_superset() {
 // 6. GRANT AND REVOKE BEHAVIOR
 // =============================================================================
 
-void test_grant_creates_separate_entries() {
+void test_grant_upserts_per_principal_effect() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "res-grant-001";
 
-    // Each grant creates a separate ACL entry
+    // Successive grants for the same (principal, type, effect) upsert into a
+    // single row — second one REPLACES the first. The DB enforces this with
+    // ON CONFLICT DO UPDATE; the mock matches.
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE);
 
     auto acls = acl.get_acls_for_resource(res);
     TEST_ASSERT(acls.success, "get_acls should succeed");
-    TEST_ASSERT(acls.value.size() == 2, "should have 2 separate ACL entries");
+    TEST_ASSERT(acls.value.size() == 1, "ALLOW row is upserted, not duplicated");
 
-    // Effective permissions should be the OR of both
+    // Effective perms reflect ONLY the most recent grant.
     auto result = acl.get_effective_permissions(res, "alice", {});
-    TEST_ASSERT(has_perm(result.value, PERM_READ), "alice should have READ");
-    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "alice should have WRITE");
+    TEST_ASSERT(!has_perm(result.value, PERM_READ), "READ was replaced by the WRITE grant");
+    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "alice should have the latest grant: WRITE");
 }
 
 void test_revoke_clears_only_requested_bits() {
@@ -1102,6 +1151,222 @@ void test_audit_log_records_creator_for_default_acls() {
                 "default ACL should record the creator as the actor");
     TEST_ASSERT(log[0].principal == "creator_user",
                 "default ACL principal is the creator's USER row");
+}
+
+// =============================================================================
+// 13. DENY RULES (Phase 6 §6.1)
+// =============================================================================
+
+void test_deny_rule_subtracts_from_allow() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "deny-test-001";
+
+    // alice has READ|WRITE via ALLOW, but a DENY removes WRITE.
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::ALLOW);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    auto perms = acl.get_effective_permissions(res, "alice", {});
+    TEST_ASSERT(perms.success, "get_effective_permissions should succeed");
+    TEST_ASSERT(has_perm(perms.value, PERM_READ),
+                "alice should still have READ — only WRITE was denied");
+    TEST_ASSERT(!has_perm(perms.value, PERM_WRITE),
+                "alice should NOT have WRITE — deny wins over allow");
+}
+
+void test_deny_role_grant_for_specific_user() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "shared-doc";
+
+    // "everyone in role editor" gets READ|WRITE — alice is the exception.
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    // bob (an editor) gets full role permissions.
+    auto bob = acl.get_effective_permissions(res, "bob", {"editor"});
+    TEST_ASSERT(bob.success, "bob check should succeed");
+    TEST_ASSERT(has_perm(bob.value, PERM_READ), "bob should have READ via role");
+    TEST_ASSERT(has_perm(bob.value, PERM_WRITE), "bob should have WRITE via role");
+
+    // alice (also an editor) gets READ but not WRITE.
+    auto alice = acl.get_effective_permissions(res, "alice", {"editor"});
+    TEST_ASSERT(alice.success, "alice check should succeed");
+    TEST_ASSERT(has_perm(alice.value, PERM_READ), "alice should have READ via role");
+    TEST_ASSERT(!has_perm(alice.value, PERM_WRITE),
+                "alice should NOT have WRITE — user-level deny wins over role allow");
+}
+
+void test_deny_on_bit_never_granted_is_noop() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "no-leak-resource";
+
+    // DENY READ on a resource where alice has no ALLOW at all.
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    auto perms = acl.get_effective_permissions(res, "alice", {});
+    TEST_ASSERT(perms.success && perms.value == 0,
+                "deny without any allow yields zero permissions (no negative leak)");
+}
+
+void test_deny_and_allow_coexist_as_separate_rows() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "two-row-resource";
+
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::ALLOW);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    auto acls = acl.get_acls_for_resource(res);
+    TEST_ASSERT(acls.success && acls.value.size() == 2,
+                "ALLOW and DENY for same principal coexist as separate rows");
+    bool saw_allow = false, saw_deny = false;
+    for (const auto& r : acls.value) {
+        if (r.effect == AclEffect::ALLOW) saw_allow = true;
+        if (r.effect == AclEffect::DENY) saw_deny = true;
+    }
+    TEST_ASSERT(saw_allow && saw_deny, "both effect rows should be present");
+}
+
+void test_deny_revoke_targets_the_deny_row() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "revoke-target-test";
+
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::ALLOW);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    // Revoking from the DENY row removes the block — alice gets WRITE back.
+    acl.revoke_permission(res, "alice", PrincipalType::USER, -1,
+                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    auto perms = acl.get_effective_permissions(res, "alice", {});
+    TEST_ASSERT(has_perm(perms.value, PERM_READ), "READ remains from allow");
+    TEST_ASSERT(has_perm(perms.value, PERM_WRITE),
+                "WRITE is restored after the deny row is revoked");
+}
+
+// =============================================================================
+// 14. ATOMIC RESOURCE CREATION (Phase 6 §6.2)
+// =============================================================================
+
+void test_create_file_with_acls_applies_all_grants() {
+    auto db = std::make_shared<MockDatabase>();
+
+    std::vector<IDatabase::AclGrant> grants;
+    {
+        IDatabase::AclGrant g;
+        g.principal = "creator"; g.type = static_cast<int>(PrincipalType::USER);
+        g.permissions = PERM_READ | PERM_WRITE | PERM_MANAGE_ACL;
+        g.performed_by = "creator"; g.effect = 0;
+        grants.push_back(g);
+    }
+    {
+        IDatabase::AclGrant g;
+        g.principal = "editor"; g.type = static_cast<int>(PrincipalType::ROLE);
+        g.permissions = PERM_READ | PERM_ACL_INHERIT;
+        g.performed_by = "creator"; g.effect = 0;
+        grants.push_back(g);
+    }
+
+    auto result = db->create_file_with_acls("file-uid", "name", "/name", "",
+                                            FileType::REGULAR_FILE, "creator", 0644,
+                                            grants, "");
+    TEST_ASSERT(result.success, "create_file_with_acls should succeed");
+    TEST_ASSERT(result.value == "file-uid", "should return the file uid");
+    TEST_ASSERT(db->atomic_create_count() == 1, "atomic create path should be invoked once");
+
+    // All grants must be persisted (mock simulates the transaction by applying
+    // each add_acl in order).
+    auto acls = db->get_acls_for_resource("file-uid", "");
+    TEST_ASSERT(acls.success && acls.value.size() == 2,
+                "both grants should be visible after atomic creation");
+}
+
+// =============================================================================
+// 15. REQUEST-SCOPED PERMISSION CACHE (Phase 6 §6.3)
+// =============================================================================
+
+void test_cache_coalesces_repeat_reads_within_scope() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "cached-resource";
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
+
+    db->reset_get_acls_call_count();
+    {
+        AclManager::CacheScope scope(acl);
+        // Three repeat checks for the same resource.
+        acl.check_permission(res, "alice", {}, PERM_READ);
+        acl.check_permission(res, "alice", {}, PERM_WRITE);
+        acl.get_effective_permissions(res, "alice", {});
+    }
+    TEST_ASSERT(db->get_acls_call_count() == 1,
+                "within a CacheScope the DB should be read exactly once for the same resource");
+}
+
+void test_cache_disabled_outside_scope() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "uncached-resource";
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+
+    db->reset_get_acls_call_count();
+    acl.check_permission(res, "alice", {}, PERM_READ);
+    acl.check_permission(res, "alice", {}, PERM_READ);
+    TEST_ASSERT(db->get_acls_call_count() == 2,
+                "without a CacheScope every check should re-hit the DB");
+}
+
+void test_cache_invalidated_on_grant_within_scope() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "mutated-resource";
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+
+    db->reset_get_acls_call_count();
+    {
+        AclManager::CacheScope scope(acl);
+        acl.check_permission(res, "alice", {}, PERM_READ); // DB read 1, cached
+        // A mid-scope grant invalidates the cached entry so a subsequent
+        // check sees the new permission.
+        acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
+        auto perms = acl.get_effective_permissions(res, "alice", {});
+        TEST_ASSERT(has_perm(perms.value, PERM_WRITE),
+                    "post-grant check should see WRITE, not the stale cached value");
+    }
+    TEST_ASSERT(db->get_acls_call_count() >= 2,
+                "DB should be hit again after the invalidation");
+}
+
+void test_nested_cache_scopes_share_outer_cache() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "nested-scope-resource";
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+
+    db->reset_get_acls_call_count();
+    {
+        AclManager::CacheScope outer(acl);
+        acl.check_permission(res, "alice", {}, PERM_READ); // DB read, cached
+        {
+            // Nested scope must NOT reset the outer cache.
+            AclManager::CacheScope inner(acl);
+            acl.check_permission(res, "alice", {}, PERM_READ); // cached hit
+        }
+        acl.check_permission(res, "alice", {}, PERM_READ); // still cached
+    }
+    TEST_ASSERT(db->get_acls_call_count() == 1,
+                "nested CacheScope should not clobber the outer cache");
 }
 
 // Regression: the gRPC enforcement layer historically passed POSIX-octal
@@ -1510,7 +1775,7 @@ int main() {
     run_test("check_permission with superset", test_check_permission_with_superset);
 
     std::cout << "\n--- 6. Grant and Revoke Behavior ---\n";
-    run_test("grant creates separate entries", test_grant_creates_separate_entries);
+    run_test("grant upserts per (principal, type, effect)", test_grant_upserts_per_principal_effect);
     run_test("revoke clears only the requested bits", test_revoke_clears_only_requested_bits);
     run_test("revoke -1 deletes the row entirely", test_revoke_all_bits_deletes_row);
     run_test("revoke only affects matching type", test_revoke_only_affects_matching_type);
@@ -1531,6 +1796,16 @@ int main() {
     run_test("system_admin bypass requires both flag and role", test_system_admin_bypass_requires_flag_and_role);
     run_test("audit log records actor for grant and revoke", test_audit_log_records_actor_for_grant_and_revoke);
     run_test("audit log records creator for default ACLs", test_audit_log_records_creator_for_default_acls);
+    run_test("deny rule subtracts from allow", test_deny_rule_subtracts_from_allow);
+    run_test("deny role grant for a specific user", test_deny_role_grant_for_specific_user);
+    run_test("deny on bit never granted is a no-op", test_deny_on_bit_never_granted_is_noop);
+    run_test("deny and allow coexist as separate rows", test_deny_and_allow_coexist_as_separate_rows);
+    run_test("revoke targets the deny row when effect=DENY", test_deny_revoke_targets_the_deny_row);
+    run_test("create_file_with_acls applies all grants", test_create_file_with_acls_applies_all_grants);
+    run_test("cache coalesces repeat reads within scope", test_cache_coalesces_repeat_reads_within_scope);
+    run_test("cache disabled outside scope", test_cache_disabled_outside_scope);
+    run_test("cache invalidated on grant within scope", test_cache_invalidated_on_grant_within_scope);
+    run_test("nested cache scopes share outer cache", test_nested_cache_scopes_share_outer_cache);
     run_test("regression: gRPC bitmask octal vs hex", test_grpc_bitmask_regression_octal_vs_hex);
 
     std::cout << "\n--- 9. Tenant Isolation ---\n";

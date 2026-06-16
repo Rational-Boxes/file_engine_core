@@ -205,6 +205,15 @@ private:
                                      const std::string& user,
                                      const std::string& tenant);
 
+    // Build the list of ACL grants that should accompany resource creation
+    // (creator's default USER bits + every inheritable rule on the parent +
+    // an optional OTHER->READ rule when default_world_readable is on). Used
+    // by mkdir/touch/copy to feed Database::create_file_with_acls so the
+    // file row and its ACLs commit atomically (plan §6.2).
+    std::vector<IDatabase::AclGrant> compute_initial_acl_grants(const std::string& parent_uid,
+                                                                const std::string& creator,
+                                                                const std::string& tenant);
+
 private:
     // Async object store backup functionality
     struct BackupTask {

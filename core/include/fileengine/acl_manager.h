@@ -46,11 +46,20 @@ enum class PrincipalType {
     OTHER
 };
 
+// ALLOW (default) contributes bits; DENY subtracts them at evaluation time so
+// a matching DENY always wins. The integer values are wire-stable — they map
+// directly to the DB `effect` column and the proto AclEffect enum.
+enum class AclEffect {
+    ALLOW = 0,
+    DENY  = 1
+};
+
 struct ACLRule {
     std::string principal;      // User or group name
     PrincipalType type;         // User, group, or other
     int permissions;            // Bitmask of permissions
     std::string resource_uid;   // Resource this ACL applies to
+    AclEffect effect = AclEffect::ALLOW;
 };
 
 class IDatabase;
@@ -79,24 +88,46 @@ public:
     bool is_system_admin(const std::string& user,
                          const std::vector<std::string>& request_roles,
                          const std::string& tenant = "");
+
+    // Request-scoped ACL lookup cache. Within the lifetime of a CacheScope,
+    // repeat get_acls_for_resource lookups for the same (resource, tenant)
+    // tuple on the same thread are served from memory instead of re-hitting
+    // Postgres. Any grant/revoke through this AclManager invalidates the
+    // affected entry, so the cache is consistent for the lifetime of one
+    // gRPC handler. See plan §6.3.
+    class CacheScope {
+    public:
+        explicit CacheScope(AclManager& m) : mgr_(&m) { mgr_->enter_cache_scope(); }
+        ~CacheScope() { mgr_->exit_cache_scope(); }
+        CacheScope(const CacheScope&) = delete;
+        CacheScope& operator=(const CacheScope&) = delete;
+        CacheScope(CacheScope&&) = delete;
+        CacheScope& operator=(CacheScope&&) = delete;
+    private:
+        AclManager* mgr_;
+    };
     
     // Grant permission to a user/group on a resource. performed_by is the
     // last arg so legacy positional callers that pass `tenant` as the 5th
-    // argument still bind to the right slot.
+    // argument still bind to the right slot. effect defaults to ALLOW; pass
+    // DENY to add bits to the deny set instead (a matching DENY always wins).
     Result<void> grant_permission(const std::string& resource_uid,
                                   const std::string& principal,
                                   PrincipalType type,
                                   int permissions,
                                   const std::string& tenant = "",
-                                  const std::string& performed_by = "");
+                                  const std::string& performed_by = "",
+                                  AclEffect effect = AclEffect::ALLOW);
 
-    // Revoke permission from a user/group on a resource.
+    // Revoke permission from a user/group on a resource. The effect arg
+    // selects which row (ALLOW or DENY) the bits come out of.
     Result<void> revoke_permission(const std::string& resource_uid,
                                    const std::string& principal,
                                    PrincipalType type,
                                    int permissions,
                                    const std::string& tenant = "",
-                                   const std::string& performed_by = "");
+                                   const std::string& performed_by = "",
+                                   AclEffect effect = AclEffect::ALLOW);
     
     // Check if a user has specific permissions on a resource
     Result<bool> check_permission(const std::string& resource_uid, 
@@ -155,6 +186,18 @@ private:
     std::vector<std::string> resolve_effective_roles(const std::string& user,
                                                      const std::vector<std::string>& request_roles,
                                                      const std::string& tenant);
+
+    // CacheScope hooks. Implementation uses a thread-local optional map so a
+    // single AclManager instance can serve multiple concurrent requests, each
+    // with its own private cache.
+    void enter_cache_scope();
+    void exit_cache_scope();
+    bool try_get_cached_acls(const std::string& cache_key,
+                             std::vector<ACLRule>& out) const;
+    void put_cached_acls(const std::string& cache_key,
+                         const std::vector<ACLRule>& acls) const;
+    void invalidate_cache_entry(const std::string& resource_uid,
+                                const std::string& tenant) const;
 };
 
 } // namespace fileengine
