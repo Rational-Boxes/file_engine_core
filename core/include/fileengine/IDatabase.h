@@ -89,17 +89,71 @@ public:
         std::string principal;
         int type;
         int permissions;
+        int effect = 0; // 0 = ALLOW, 1 = DENY (matches AclEffect)
     };
 
+    // A pending ACL grant tied to a not-yet-created resource. Used by
+    // create_file_with_acls to wrap the file row + all default/inherited
+    // ACLs in a single transaction.
+    struct AclGrant {
+        std::string principal;
+        int type;
+        int permissions;
+        std::string performed_by;
+        int effect = 0; // 0 = ALLOW, 1 = DENY
+    };
+
+    // Atomic resource creation: insert the file row and apply all ACL grants
+    // in a single Postgres transaction. Either everything commits or nothing
+    // does — a crash mid-creation can never leave a file without ACLs.
+    // See plan §6.2.
+    virtual Result<std::string> create_file_with_acls(const std::string& uid,
+                                                       const std::string& name,
+                                                       const std::string& path,
+                                                       const std::string& parent_uid,
+                                                       FileType type,
+                                                       const std::string& owner,
+                                                       int permissions,
+                                                       const std::vector<AclGrant>& acl_grants,
+                                                       const std::string& tenant = "") = 0;
+
+    // performed_by records who triggered the change in granted_by and the
+    // acl_audit table. effect (default 0 = ALLOW) selects which logical row
+    // for the (resource, principal, type) tuple is updated — ALLOW and DENY
+    // are stored separately so they can coexist for the same principal.
     virtual Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
-                                 int type, int permissions, const std::string& tenant = "") = 0;
+                                 int type, int permissions,
+                                 const std::string& tenant = "",
+                                 const std::string& performed_by = "",
+                                 int effect = 0) = 0;
+    // Clear the bits in `permissions` from the matching ACL row. If the
+    // resulting permission bitmask is zero the row is deleted. Pass -1 (all
+    // bits set) to fully revoke the principal's row in one call. effect
+    // (default 0 = ALLOW) selects which logical row to revoke from.
     virtual Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                                    int type, const std::string& tenant = "") = 0;
+                                    int type, int permissions,
+                                    const std::string& tenant = "",
+                                    const std::string& performed_by = "",
+                                    int effect = 0) = 0;
     virtual Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                                  const std::string& tenant = "") = 0;
     virtual Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
                                                         const std::string& principal,
+                                                        int type,
                                                         const std::string& tenant = "") = 0;
+
+    // Role management operations
+    virtual Result<void> create_role(const std::string& role, const std::string& tenant = "") = 0;
+    virtual Result<void> delete_role(const std::string& role, const std::string& tenant = "") = 0;
+    virtual Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                             const std::string& tenant = "") = 0;
+    virtual Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                               const std::string& tenant = "") = 0;
+    virtual Result<std::vector<std::string>> get_roles_for_user(const std::string& user,
+                                                                const std::string& tenant = "") = 0;
+    virtual Result<std::vector<std::string>> get_users_for_role(const std::string& role,
+                                                                const std::string& tenant = "") = 0;
+    virtual Result<std::vector<std::string>> get_all_roles(const std::string& tenant = "") = 0;
 };
 
 } // namespace fileengine

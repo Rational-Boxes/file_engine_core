@@ -12,6 +12,7 @@
 #include "fileengine/filesystem.h"
 #include "fileengine/tenant_manager.h"
 #include "fileengine/acl_manager.h"
+#include "fileengine/role_manager.h"
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/storage_tracker.h"
 
@@ -136,6 +137,35 @@ public:
                                 const fileengine_rpc::CheckPermissionRequest* request,
                                 fileengine_rpc::CheckPermissionResponse* response) override;
 
+    // Role management operations
+    grpc::Status CreateRole(grpc::ServerContext* context,
+                           const fileengine_rpc::CreateRoleRequest* request,
+                           fileengine_rpc::CreateRoleResponse* response) override;
+
+    grpc::Status DeleteRole(grpc::ServerContext* context,
+                           const fileengine_rpc::DeleteRoleRequest* request,
+                           fileengine_rpc::DeleteRoleResponse* response) override;
+
+    grpc::Status AssignUserToRole(grpc::ServerContext* context,
+                                 const fileengine_rpc::AssignUserToRoleRequest* request,
+                                 fileengine_rpc::AssignUserToRoleResponse* response) override;
+
+    grpc::Status RemoveUserFromRole(grpc::ServerContext* context,
+                                   const fileengine_rpc::RemoveUserFromRoleRequest* request,
+                                   fileengine_rpc::RemoveUserFromRoleResponse* response) override;
+
+    grpc::Status GetRolesForUser(grpc::ServerContext* context,
+                                const fileengine_rpc::GetRolesForUserRequest* request,
+                                fileengine_rpc::GetRolesForUserResponse* response) override;
+
+    grpc::Status GetUsersForRole(grpc::ServerContext* context,
+                                const fileengine_rpc::GetUsersForRoleRequest* request,
+                                fileengine_rpc::GetUsersForRoleResponse* response) override;
+
+    grpc::Status GetAllRoles(grpc::ServerContext* context,
+                            const fileengine_rpc::GetAllRolesRequest* request,
+                            fileengine_rpc::GetAllRolesResponse* response) override;
+
     // Streaming operations for large files
     grpc::Status StreamFileUpload(grpc::ServerContext* context,
                                  grpc::ServerReader<fileengine_rpc::PutFileRequest>* reader,
@@ -183,30 +213,27 @@ private:
         return roles;
     }
 
-    // Helper function to validate permissions
+    // Helper function to validate permissions. System-admin bypass is handled
+    // inside AclManager::check_permission so this helper has a single path.
     inline bool validate_user_permissions(const std::string& resource_uid,
                                       const fileengine_rpc::AuthenticationContext& auth_ctx,
                                       int required_permissions) {
         std::string user = get_user_from_auth_context(auth_ctx);
         std::string tenant = get_tenant_from_auth_context(auth_ctx);
 
-        // Check if root user is enabled and user is root
-        // This would typically be checked against the config, but for now we'll do a basic check
-        if (user == "root") {
-            // Root user bypasses permission system
+        // Special rule: the filesystem root (empty UID) is always readable.
+        // This is enforced here (not in AclManager) so root listing works
+        // before any ACL exists on it. See plan §4.2.
+        if (resource_uid.empty() && (required_permissions & static_cast<int>(Permission::READ))) {
             return true;
         }
 
-        // Check if acl_manager_ is available
         if (!acl_manager_) {
-            // If ACL manager is not available, default to allowing access for basic functionality
-            // This is a fallback for cases where ACL management is not properly initialized
+            // Fallback for unusual init paths (test harnesses, etc.).
             return true;
         }
 
-        // Convert roles from gRPC context to internal representation
         std::vector<std::string> roles = get_roles_from_auth_context(auth_ctx);
-
         auto result = acl_manager_->check_permission(resource_uid, user, roles, required_permissions, tenant);
         return result.success && result.value;
     }

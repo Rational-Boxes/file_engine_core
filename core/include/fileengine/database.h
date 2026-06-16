@@ -40,6 +40,16 @@ public:
                                     const std::string& path, const std::string& parent_uid,
                                     FileType type, const std::string& owner,
                                     int permissions, const std::string& tenant) override;
+
+    Result<std::string> create_file_with_acls(const std::string& uid,
+                                               const std::string& name,
+                                               const std::string& path,
+                                               const std::string& parent_uid,
+                                               FileType type,
+                                               const std::string& owner,
+                                               int permissions,
+                                               const std::vector<AclGrant>& acl_grants,
+                                               const std::string& tenant = "") override;
     Result<void> update_file_modified(const std::string& uid, const std::string& tenant) override;
     Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) override;
     Result<bool> delete_file(const std::string& uid, const std::string& tenant) override;
@@ -93,14 +103,34 @@ public:
 
     // ACL operations
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
-                         int type, int permissions, const std::string& tenant = "") override;
+                         int type, int permissions,
+                         const std::string& tenant = "",
+                         const std::string& performed_by = "",
+                         int effect = 0) override;
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                            int type, const std::string& tenant = "") override;
+                            int type, int permissions,
+                            const std::string& tenant = "",
+                            const std::string& performed_by = "",
+                            int effect = 0) override;
     Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                         const std::string& tenant = "") override;
     Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
                                                 const std::string& principal,
+                                                int type,
                                                 const std::string& tenant = "") override;
+
+    // Role management operations
+    Result<void> create_role(const std::string& role, const std::string& tenant = "") override;
+    Result<void> delete_role(const std::string& role, const std::string& tenant = "") override;
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant = "") override;
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant = "") override;
+    Result<std::vector<std::string>> get_roles_for_user(const std::string& user,
+                                                        const std::string& tenant = "") override;
+    Result<std::vector<std::string>> get_users_for_role(const std::string& role,
+                                                        const std::string& tenant = "") override;
+    Result<std::vector<std::string>> get_all_roles(const std::string& tenant = "") override;
 
     // Connection info access for administrative operations
     std::string get_connection_info() const;
