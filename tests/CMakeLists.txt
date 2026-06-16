@@ -80,6 +80,33 @@ target_include_directories(test_comprehensive_acl_roles PRIVATE
     ${GRPCPP_INCLUDE_DIRS}
 )
 
+# Comprehensive ACL and RBAC test
+add_executable(test_acl_rbac_comprehensive test_acl_rbac_comprehensive.cpp)
+
+target_link_libraries(test_acl_rbac_comprehensive
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+if(AWSSDK_FOUND)
+    target_link_libraries(test_acl_rbac_comprehensive ${AWSSDK_LINK_LIBRARIES})
+endif()
+
+target_include_directories(test_acl_rbac_comprehensive PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
 # Include the existing S3 integration test
 add_executable(test_s3_integration test_s3_integration.cpp)
 

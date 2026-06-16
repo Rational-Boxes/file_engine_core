@@ -95,11 +95,12 @@ public:
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions, const std::string& tenant = "") override;
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                            int type, const std::string& tenant = "") override;
+                            int type, int permissions, const std::string& tenant = "") override;
     Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                         const std::string& tenant = "") override;
     Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
                                                 const std::string& principal,
+                                                int type,
                                                 const std::string& tenant = "") override;
 
     // Role management operations

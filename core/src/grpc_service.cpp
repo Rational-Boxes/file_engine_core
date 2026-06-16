@@ -52,6 +52,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
               "MakeDirectory - getting tenant from auth context");
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory - tenant: '" + tenant + "', user: '" + user + "'");
 
@@ -62,7 +63,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
     // Check permissions on parent directory
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory - checking permissions for parent_uid: '" + parent_uid + "', empty check: " + (parent_uid.empty() ? "true" : "false"));
-    if (!parent_uid.empty() && !validate_user_permissions(parent_uid, auth_context, 0200)) { // WRITE permission
+    if (!parent_uid.empty() && !validate_user_permissions(parent_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to create directory in this location");
         SERVER_LOG_ERROR("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -77,7 +78,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
     // Call the filesystem to create the directory
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory - calling filesystem mkdir with parent_uid: '" + parent_uid + "', name: '" + name + "', tenant: '" + tenant + "', user: '" + user + "'");
-    auto result = filesystem_->mkdir(parent_uid, name, user, request->permissions(), tenant);
+    auto result = filesystem_->mkdir(parent_uid, name, user, roles, request->permissions(), tenant);
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory - filesystem mkdir completed, success: " + (result.success ? "true" : "false"));
 
@@ -113,16 +114,17 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions before removing
-    if (!validate_user_permissions(dir_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(dir_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to remove directory");
         SERVER_LOG_ERROR("GRPCService", "RemoveDirectory failed: User " + user + " does not have permission to remove directory " + dir_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->rmdir(dir_uid, user, tenant);
+    auto result = filesystem_->rmdir(dir_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -144,16 +146,17 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check read permissions on the directory
-    if (!validate_user_permissions(dir_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(dir_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to list directory");
         SERVER_LOG_ERROR("GRPCService", "ListDirectory failed: User " + user + " does not have permission to list directory " + dir_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->listdir(dir_uid, user, tenant);
+    auto result = filesystem_->listdir(dir_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -203,16 +206,17 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check read permissions on the directory
-    if (!validate_user_permissions(dir_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(dir_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to list directory with deleted items");
         SERVER_LOG_ERROR("GRPCService", "ListDirectoryWithDeleted failed: User " + user + " does not have permission to list directory " + dir_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->listdir_with_deleted(dir_uid, user, tenant);
+    auto result = filesystem_->listdir_with_deleted(dir_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -282,6 +286,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch - tenant: '" + tenant + "', user: '" + user + "'");
 
@@ -292,7 +297,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
     // Check permissions on parent directory
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch - checking permissions for parent_uid: '" + parent_uid + "', empty check: " + (parent_uid.empty() ? "true" : "false"));
-    if (!parent_uid.empty() && !validate_user_permissions(parent_uid, auth_context, 0200)) { // WRITE permission
+    if (!parent_uid.empty() && !validate_user_permissions(parent_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to create file in this directory");
         SERVER_LOG_ERROR("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
@@ -307,7 +312,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
     // Call the filesystem to create the file
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch - calling filesystem touch with parent_uid: '" + parent_uid + "', name: '" + name + "', tenant: '" + tenant + "', user: '" + user + "'");
-    auto result = filesystem_->touch(parent_uid, name, user, tenant);
+    auto result = filesystem_->touch(parent_uid, name, user, roles, tenant);
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch - filesystem touch completed, success: " + (result.success ? "true" : "false"));
 
@@ -350,16 +355,17 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions on the file
-    if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to remove file");
         SERVER_LOG_ERROR("GRPCService", "RemoveFile failed: User " + user + " does not have permission to remove file " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->remove(file_uid, user, tenant);
+    auto result = filesystem_->remove(file_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -381,10 +387,11 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // For now, we'll just check if the user has permission to write in the directory
     // In a real implementation, there would be a special undelete permission check
-    if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to undelete file");
         SERVER_LOG_ERROR("GRPCService", "UndeleteFile failed: User " + user + " does not have permission to undelete file " + file_uid);
@@ -429,6 +436,7 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
               "PutFile - tenant: '" + tenant + "', user: '" + user + "'");
 
@@ -439,7 +447,7 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
     // Check permissions - user needs write access to the file
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
               "PutFile - checking permissions for file_uid: '" + file_uid + "'");
-    if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to write to file");
         SERVER_LOG_ERROR("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
@@ -458,7 +466,7 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
 
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
               "PutFile - calling filesystem put with file_uid: '" + file_uid + "', tenant: '" + tenant + "', user: '" + user + "'");
-    auto result = filesystem_->put(file_uid, data_vec, user, tenant);
+    auto result = filesystem_->put(file_uid, data_vec, user, roles, tenant);
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
               "PutFile - filesystem put completed, success: " + (result.success ? "true" : "false"));
 
@@ -491,16 +499,17 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to the file
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to read file");
         SERVER_LOG_ERROR("GRPCService", "GetFile failed: User " + user + " does not have permission to read file " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->get(file_uid, user, tenant);
+    auto result = filesystem_->get(file_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -525,16 +534,17 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to stat the file
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to access file information");
         SERVER_LOG_ERROR("GRPCService", "Stat failed: User " + user + " does not have permission to access file information for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->stat(file_uid, user, tenant);
+    auto result = filesystem_->stat(file_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -619,16 +629,17 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs write access to rename the file
-    if (!validate_user_permissions(uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to rename file");
         SERVER_LOG_ERROR("GRPCService", "Rename failed: User " + user + " does not have permission to rename file " + uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->rename(uid, new_name, user, tenant);
+    auto result = filesystem_->rename(uid, new_name, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -651,23 +662,24 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions on source and destination
-    if (!validate_user_permissions(source_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(source_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to move source file");
         SERVER_LOG_ERROR("GRPCService", "Move failed: User " + user + " does not have permission to move source file " + source_uid);
         return grpc::Status::OK;
     }
 
-    if (!validate_user_permissions(dest_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(dest_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to move to destination directory");
         SERVER_LOG_ERROR("GRPCService", "Move failed: User " + user + " does not have permission to move to destination directory " + dest_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->move(source_uid, dest_uid, user, tenant);
+    auto result = filesystem_->move(source_uid, dest_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -690,23 +702,24 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions on source and destination
-    if (!validate_user_permissions(source_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(source_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to read source file");
         SERVER_LOG_ERROR("GRPCService", "Copy failed: User " + user + " does not have permission to read source file " + source_uid);
         return grpc::Status::OK;
     }
 
-    if (!validate_user_permissions(dest_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(dest_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to write to destination directory");
         SERVER_LOG_ERROR("GRPCService", "Copy failed: User " + user + " does not have permission to write to destination directory " + dest_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->copy(source_uid, dest_uid, user, tenant);
+    auto result = filesystem_->copy(source_uid, dest_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -729,16 +742,17 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to list file versions
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to list file versions");
         SERVER_LOG_ERROR("GRPCService", "ListVersions failed: User " + user + " does not have permission to list file versions for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->list_versions(file_uid, user, tenant);
+    auto result = filesystem_->list_versions(file_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -764,16 +778,17 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to access file version
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to access file version");
         SERVER_LOG_ERROR("GRPCService", "GetVersion failed: User " + user + " does not have permission to access file version for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->get_version(file_uid, version_timestamp, user, tenant);
+    auto result = filesystem_->get_version(file_uid, version_timestamp, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -797,17 +812,18 @@ grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs write access to restore to version
     // In some systems, this might be a special permission, but typically requires write access
-    if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to restore to version");
         SERVER_LOG_ERROR("GRPCService", "RestoreToVersion failed: User " + user + " does not have permission to restore to version for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->restore_to_version(file_uid, version_timestamp, user, tenant);
+    auto result = filesystem_->restore_to_version(file_uid, version_timestamp, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -834,16 +850,17 @@ grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs write access to set metadata
-    if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to set metadata");
         SERVER_LOG_ERROR("GRPCService", "SetMetadata failed: User " + user + " does not have permission to set metadata for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->set_metadata(file_uid, key, value, user, tenant);
+    auto result = filesystem_->set_metadata(file_uid, key, value, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -866,16 +883,17 @@ grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to get metadata
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to get metadata");
         SERVER_LOG_ERROR("GRPCService", "GetMetadata failed: User " + user + " does not have permission to get metadata for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->get_metadata(file_uid, key, user, tenant);
+    auto result = filesystem_->get_metadata(file_uid, key, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -898,16 +916,17 @@ grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to get metadata
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to get metadata");
         SERVER_LOG_ERROR("GRPCService", "GetAllMetadata failed: User " + user + " does not have permission to get metadata for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->get_all_metadata(file_uid, user, tenant);
+    auto result = filesystem_->get_all_metadata(file_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
@@ -933,16 +952,17 @@ grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs write access to delete metadata
-    if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to delete metadata");
         SERVER_LOG_ERROR("GRPCService", "DeleteMetadata failed: User " + user + " does not have permission to delete metadata for " + file_uid);
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->delete_metadata(file_uid, key, user, tenant);
+    auto result = filesystem_->delete_metadata(file_uid, key, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {
@@ -966,9 +986,10 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to get metadata
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to get metadata for version");
         SERVER_LOG_ERROR("GRPCService", "GetMetadataForVersion failed: User " + user + " does not have permission to get metadata for version for " + file_uid);
@@ -994,9 +1015,10 @@ grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* cont
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to get metadata
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         response->set_success(false);
         response->set_error("User does not have permission to get metadata for version");
         SERVER_LOG_ERROR("GRPCService", "GetAllMetadataForVersion failed: User " + user + " does not have permission to get metadata for version for " + file_uid);
@@ -1024,10 +1046,11 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Only admins or users with grant permission can grant permissions
     // Check if it's a root user first
-    if (user != "root" && !validate_user_permissions(resource_uid, auth_context, 0200)) { // WRITE permission
+    if (user != "root" && !validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to grant permissions");
         SERVER_LOG_ERROR("GRPCService", "GrantPermission failed: User " + user + " does not have permission to grant permissions on " + resource_uid);
@@ -1095,9 +1118,10 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Only admins or users with appropriate permissions can revoke permissions
-    if (user != "root" && !validate_user_permissions(resource_uid, auth_context, 0200)) { // WRITE permission
+    if (user != "root" && !validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to revoke permissions");
         SERVER_LOG_ERROR("GRPCService", "RevokePermission failed: User " + user + " does not have permission to revoke permissions on " + resource_uid);
@@ -1163,8 +1187,6 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
-
-    // Convert roles from gRPC context to internal representation
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     int required_permissions_int;
@@ -1251,16 +1273,17 @@ grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
     if (!file_uid.empty()) {
         std::string tenant = get_tenant_from_auth_context(auth_context);
         std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
         // Check permissions - user needs write access to the file
-        if (!validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+        if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
             response->set_success(false);
             response->set_error("User does not have permission to write to file");
             SERVER_LOG_ERROR("GRPCService", "StreamFileUpload failed: User " + user + " does not have permission to write to file " + file_uid);
             return grpc::Status::OK;
         }
 
-        auto result = filesystem_->put(file_uid, full_data, user, tenant);
+        auto result = filesystem_->put(file_uid, full_data, user, roles, tenant);
 
         response->set_success(result.success);
         if (!result.success) {
@@ -1287,9 +1310,10 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to the file
-    if (!validate_user_permissions(file_uid, auth_context, 0400)) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
         fileengine_rpc::GetFileResponse response;
         response.set_success(false);
         response.set_error("User does not have permission to read file");
@@ -1298,7 +1322,7 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->get(file_uid, user, tenant);
+    auto result = filesystem_->get(file_uid, user, roles, tenant);
 
     if (result.success) {
         // Simulate streaming by sending chunks
@@ -1390,9 +1414,10 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs write access to the file
-    if (user != "root" && !validate_user_permissions(file_uid, auth_context, 0200)) { // WRITE permission
+    if (user != "root" && !validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
         response->set_success(false);
         response->set_error("User does not have permission to purge old versions");
         SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed: User " + user + " does not have permission to purge old versions for " + file_uid);
@@ -1433,6 +1458,7 @@ grpc::Status GRPCFileService::CreateRole(grpc::ServerContext* context,
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check if user has admin privileges to create roles
     // For now, we'll allow any authenticated user to create roles
@@ -1469,6 +1495,7 @@ grpc::Status GRPCFileService::DeleteRole(grpc::ServerContext* context,
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Get the database from the tenant manager
     auto tenant_context = tenant_manager_->get_tenant_context(tenant);
@@ -1501,6 +1528,7 @@ grpc::Status GRPCFileService::AssignUserToRole(grpc::ServerContext* context,
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Get the database from the tenant manager
     auto tenant_context = tenant_manager_->get_tenant_context(tenant);
@@ -1533,6 +1561,7 @@ grpc::Status GRPCFileService::RemoveUserFromRole(grpc::ServerContext* context,
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Get the database from the tenant manager
     auto tenant_context = tenant_manager_->get_tenant_context(tenant);
@@ -1564,17 +1593,29 @@ grpc::Status GRPCFileService::GetRolesForUser(grpc::ServerContext* context,
 
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
-    std::string user = get_user_from_auth_context(auth_context);
 
-    // In the corrected implementation, roles are passed with each request
-    // The database doesn't store user-role mappings
-    // This method is kept for API compatibility but returns an empty vector
-    // The roles must come from the request context
+    auto tenant_context = tenant_manager_->get_tenant_context(tenant);
+    if (!tenant_context || !tenant_context->db) {
+        response->set_success(false);
+        response->set_error("Tenant context not found or database unavailable");
+        SERVER_LOG_ERROR("GRPCService", "GetRolesForUser failed: Tenant context not found for tenant: " + tenant);
+        return grpc::Status::OK;
+    }
+
+    auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
+    auto result = role_manager->get_roles_for_user(request->user(), tenant);
+
+    if (!result.success) {
+        response->set_success(false);
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetRolesForUser failed for user " + request->user() + ": " + result.error);
+        return grpc::Status::OK;
+    }
+
     response->set_success(true);
-    SERVER_LOG_INFO("GRPCService", "GetRolesForUser returning empty vector - roles must be passed with request");
-    // Note: In a real implementation, you'd get the roles from an external identity provider
-    // For now, we return an empty list as the roles should be in the request's auth context
-
+    for (const auto& r : result.value) {
+        response->add_roles(r);
+    }
     return grpc::Status::OK;
 }
 
@@ -1585,15 +1626,29 @@ grpc::Status GRPCFileService::GetUsersForRole(grpc::ServerContext* context,
 
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
-    std::string user = get_user_from_auth_context(auth_context);
 
-    // In the corrected implementation, user-role assignments are not stored in the database
-    // This method is kept for API compatibility but returns an empty vector
+    auto tenant_context = tenant_manager_->get_tenant_context(tenant);
+    if (!tenant_context || !tenant_context->db) {
+        response->set_success(false);
+        response->set_error("Tenant context not found or database unavailable");
+        SERVER_LOG_ERROR("GRPCService", "GetUsersForRole failed: Tenant context not found for tenant: " + tenant);
+        return grpc::Status::OK;
+    }
+
+    auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
+    auto result = role_manager->get_users_for_role(request->role(), tenant);
+
+    if (!result.success) {
+        response->set_success(false);
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetUsersForRole failed for role " + request->role() + ": " + result.error);
+        return grpc::Status::OK;
+    }
+
     response->set_success(true);
-    SERVER_LOG_INFO("GRPCService", "GetUsersForRole returning empty vector - user-role mappings not stored in database");
-    // Note: In a real implementation, you'd get the users from an external identity provider
-    // For now, we return an empty list
-
+    for (const auto& u : result.value) {
+        response->add_users(u);
+    }
     return grpc::Status::OK;
 }
 
@@ -1604,15 +1659,29 @@ grpc::Status GRPCFileService::GetAllRoles(grpc::ServerContext* context,
 
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
-    std::string user = get_user_from_auth_context(auth_context);
 
-    // In the corrected implementation, roles are not stored in the database
-    // This method is kept for API compatibility but returns an empty vector
+    auto tenant_context = tenant_manager_->get_tenant_context(tenant);
+    if (!tenant_context || !tenant_context->db) {
+        response->set_success(false);
+        response->set_error("Tenant context not found or database unavailable");
+        SERVER_LOG_ERROR("GRPCService", "GetAllRoles failed: Tenant context not found for tenant: " + tenant);
+        return grpc::Status::OK;
+    }
+
+    auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
+    auto result = role_manager->get_all_roles(tenant);
+
+    if (!result.success) {
+        response->set_success(false);
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetAllRoles failed: " + result.error);
+        return grpc::Status::OK;
+    }
+
     response->set_success(true);
-    SERVER_LOG_INFO("GRPCService", "GetAllRoles returning empty vector - roles not stored in database");
-    // Note: In a real implementation, you'd get the roles from an external identity provider
-    // For now, we return an empty list
-
+    for (const auto& r : result.value) {
+        response->add_roles(r);
+    }
     return grpc::Status::OK;
 }
 

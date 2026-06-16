@@ -169,12 +169,18 @@ public:
     }
     
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                            int type, const std::string& tenant = "") override {
+                            int type, int permissions, const std::string& tenant = "") override {
         auto& resource_acls = acls_[resource_uid];
+        for (auto& entry : resource_acls) {
+            if (entry.principal == principal && entry.type == type) {
+                entry.permissions &= ~permissions;
+            }
+        }
         resource_acls.erase(
             std::remove_if(resource_acls.begin(), resource_acls.end(),
                           [&](const AclEntry& entry) {
-                              return entry.principal == principal && entry.type == type;
+                              return entry.principal == principal && entry.type == type
+                                     && entry.permissions == 0;
                           }),
             resource_acls.end());
         return Result<void>::ok();
@@ -191,12 +197,13 @@ public:
     
     Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
                                                 const std::string& principal,
+                                                int type,
                                                 const std::string& tenant = "") override {
         auto it = acls_.find(resource_uid);
         if (it != acls_.end()) {
             std::vector<AclEntry> user_acls;
             for (const auto& entry : it->second) {
-                if (entry.principal == principal) {
+                if (entry.principal == principal && entry.type == type) {
                     user_acls.push_back(entry);
                 }
             }

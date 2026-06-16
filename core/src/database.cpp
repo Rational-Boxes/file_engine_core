@@ -1728,6 +1728,94 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
     res = PQexec(pg_conn, create_idx_metadata_key.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
 
+    // ACL + RBAC tables. Created here (not lazily in add_acl) so a freshly
+    // initialized tenant can be queried for ACLs / roles before any write.
+    std::string create_acls_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".acls ("
+        "    id BIGSERIAL PRIMARY KEY,"
+        "    resource_uid VARCHAR(64) NOT NULL,"
+        "    principal VARCHAR(255) NOT NULL,"
+        "    principal_type INTEGER NOT NULL,"
+        "    permissions INTEGER NOT NULL,"
+        "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "    UNIQUE(resource_uid, principal, principal_type)"
+        ");";
+    res = PQexec(pg_conn, create_acls_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant acls table: " + error);
+    }
+    PQclear(res);
+
+    // The UNIQUE constraint covers (resource_uid, principal, principal_type) for
+    // per-resource lookups. Add a (principal, principal_type) index so
+    // "all ACLs for principal X" queries don't scan the whole table.
+    std::string create_idx_acls_principal =
+        "CREATE INDEX IF NOT EXISTS idx_acls_principal_type_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".acls(principal, principal_type);";
+    res = PQexec(pg_conn, create_idx_acls_principal.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    // Drop the legacy single-column principal index (created by the old lazy
+    // path in add_acl) if it exists — the new composite index supersedes it.
+    std::string drop_legacy_idx =
+        "DROP INDEX IF EXISTS \"" + escaped_schema + "\".idx_acls_principal;";
+    res = PQexec(pg_conn, drop_legacy_idx.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+    // The legacy idx_acls_resource_uid (also created by old lazy path) is
+    // redundant with the UNIQUE constraint's index; drop it too.
+    std::string drop_legacy_idx_resource =
+        "DROP INDEX IF EXISTS \"" + escaped_schema + "\".idx_acls_resource_uid;";
+    res = PQexec(pg_conn, drop_legacy_idx_resource.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    std::string create_roles_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".roles ("
+        "    id BIGSERIAL PRIMARY KEY,"
+        "    role_name VARCHAR(255) UNIQUE NOT NULL,"
+        "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");";
+    res = PQexec(pg_conn, create_roles_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant roles table: " + error);
+    }
+    PQclear(res);
+
+    std::string create_user_roles_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".user_roles ("
+        "    id BIGSERIAL PRIMARY KEY,"
+        "    user_name VARCHAR(255) NOT NULL,"
+        "    role_name VARCHAR(255) NOT NULL,"
+        "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "    UNIQUE(user_name, role_name)"
+        ");";
+    res = PQexec(pg_conn, create_user_roles_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant user_roles table: " + error);
+    }
+    PQclear(res);
+
+    std::string create_idx_user_roles_user =
+        "CREATE INDEX IF NOT EXISTS idx_user_roles_user_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".user_roles(user_name);";
+    res = PQexec(pg_conn, create_idx_user_roles_user.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    std::string create_idx_user_roles_role =
+        "CREATE INDEX IF NOT EXISTS idx_user_roles_role_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".user_roles(role_name);";
+    res = PQexec(pg_conn, create_idx_user_roles_role.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
     // Create the filesystem root directory record with default permissions
     // The root directory is identified by blank UUID string (empty string) as per specification
     std::string root_uid = "";  // Root directory UID is blank (empty string) as per spec
@@ -2095,32 +2183,9 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
 
     PGconn* pg_conn = conn->get_connection();
 
-    // Get tenant-specific schema prefix
+    // Get tenant-specific schema prefix. The acls table is created at tenant
+    // init time (see create_tenant_schema) — do not create it lazily here.
     std::string schema = get_schema_prefix(tenant);
-
-    // Create ACL table in tenant schema if it doesn't exist
-    std::string create_acl_table_sql =
-        "CREATE TABLE IF NOT EXISTS " + schema + ".acls ("
-        "    id BIGSERIAL PRIMARY KEY,"
-        "    resource_uid VARCHAR(64) NOT NULL,"
-        "    principal VARCHAR(255) NOT NULL,"
-        "    principal_type INTEGER NOT NULL,"
-        "    permissions INTEGER NOT NULL,"
-        "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        "    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        "    UNIQUE(resource_uid, principal, principal_type)"
-        ");"
-        "CREATE INDEX IF NOT EXISTS idx_acls_resource_uid ON " + schema + ".acls(resource_uid);"
-        "CREATE INDEX IF NOT EXISTS idx_acls_principal ON " + schema + ".acls(principal);";
-
-    PGresult* create_res = PQexec(pg_conn, create_acl_table_sql.c_str());
-    if (PQresultStatus(create_res) != PGRES_COMMAND_OK) {
-        std::string error = "Failed to create ACL table: " + std::string(PQerrorMessage(pg_conn));
-        PQclear(create_res);
-        connection_pool_->release(conn);
-        return Result<void>::err(error);
-    }
-    PQclear(create_res);
 
     std::string insert_sql =
         "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions) "
@@ -2150,25 +2215,39 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
 }
 
 Result<void> Database::remove_acl(const std::string& resource_uid, const std::string& principal,
-                                  int type, const std::string& tenant) {
+                                  int type, int permissions, const std::string& tenant) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
 
     PGconn* pg_conn = conn->get_connection();
-
-    // Get tenant-specific schema prefix
     std::string schema = get_schema_prefix(tenant);
 
-    std::string delete_sql = "DELETE FROM " + schema + ".acls WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
-    const char* param_values[3] = {
+    // Clear the bits in `permissions` from the row's existing bitmask, then
+    // delete the row if it would be left with no bits. Using a CTE keeps both
+    // statements in a single round-trip and a single transaction.
+    std::string sql =
+        "WITH updated AS ("
+        "  UPDATE " + schema + ".acls "
+        "  SET permissions = permissions & ~$4, updated_at = CURRENT_TIMESTAMP "
+        "  WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 "
+        "  RETURNING resource_uid, principal, principal_type, permissions"
+        ") "
+        "DELETE FROM " + schema + ".acls "
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 "
+        "  AND permissions = 0;";
+
+    std::string type_str = std::to_string(type);
+    std::string perms_str = std::to_string(permissions);
+    const char* param_values[4] = {
         resource_uid.c_str(),
         principal.c_str(),
-        std::to_string(type).c_str()
+        type_str.c_str(),
+        perms_str.c_str()
     };
 
-    PGresult* res = PQexecParams(pg_conn, delete_sql.c_str(), 3, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 4, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to remove ACL: " + std::string(PQerrorMessage(pg_conn));
@@ -2225,6 +2304,7 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_acls_for_resource(const s
 
 Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::string& resource_uid,
                                                                  const std::string& principal,
+                                                                 int type,
                                                                  const std::string& tenant) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
@@ -2236,10 +2316,13 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
     // Get tenant-specific schema prefix
     std::string schema = get_schema_prefix(tenant);
 
-    std::string query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM " + schema + ".acls WHERE resource_uid = $1 AND principal = $2;";
-    const char* param_values[2] = {resource_uid.c_str(), principal.c_str()};
+    // Filter by principal_type so user/role/group names in the same namespace
+    // are not conflated (e.g. a user "alice" and a role "alice").
+    std::string query_sql = "SELECT resource_uid, principal, principal_type, permissions FROM " + schema + ".acls WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
+    std::string type_str = std::to_string(type);
+    const char* param_values[3] = {resource_uid.c_str(), principal.c_str(), type_str.c_str()};
 
-    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 3, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to get user ACLs: " + std::string(PQerrorMessage(pg_conn));
@@ -2266,61 +2349,207 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
 }
 
 // Role management implementations
+// roles and user_roles tables are created at tenant init time by
+// create_tenant_schema. Local role definitions persisted here are UNIONed
+// with request-supplied roles from AuthenticationContext at permission-check
+// time (see AclManager::check_permission).
 Result<void> Database::create_role(const std::string& role, const std::string& tenant) {
-    // In this corrected implementation, roles are not stored in the database
-    // They are passed with each request as part of the authentication context
-    // So this function is essentially a no-op for validation purposes
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
     }
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string sql = "INSERT INTO " + schema + ".roles (role_name) VALUES ($1) "
+                      "ON CONFLICT (role_name) DO NOTHING;";
+    const char* params[1] = { role.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to create role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
     return Result<void>::ok();
 }
 
 Result<void> Database::delete_role(const std::string& role, const std::string& tenant) {
-    // In this corrected implementation, roles are not stored in the database
-    // So this function is essentially a no-op for validation purposes
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
     }
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    // Deleting a role removes its user_roles mappings; ACL grants that named
+    // this role become orphaned (they remain in the acls table but match no
+    // assigned user). The caller can clean those up via revoke_permission.
+    std::string sql_user_roles = "DELETE FROM " + schema + ".user_roles WHERE role_name = $1;";
+    std::string sql_roles = "DELETE FROM " + schema + ".roles WHERE role_name = $1;";
+    const char* params[1] = { role.c_str() };
+
+    PGresult* res = PQexecParams(pg_conn, sql_user_roles.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to clear role assignments: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(res);
+
+    res = PQexecParams(pg_conn, sql_roles.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to delete role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
     return Result<void>::ok();
 }
 
 Result<void> Database::assign_user_to_role(const std::string& user, const std::string& role, const std::string& tenant) {
-    // In this corrected implementation, user-role assignments are not stored in the database
-    // The mapping is handled externally and passed with each request
-    // So this function is essentially a no-op for validation purposes
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
     }
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string sql = "INSERT INTO " + schema + ".user_roles (user_name, role_name) VALUES ($1, $2) "
+                      "ON CONFLICT (user_name, role_name) DO NOTHING;";
+    const char* params[2] = { user.c_str(), role.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to assign user to role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
     return Result<void>::ok();
 }
 
 Result<void> Database::remove_user_from_role(const std::string& user, const std::string& role, const std::string& tenant) {
-    // In this corrected implementation, user-role assignments are not stored in the database
-    // So this function is essentially a no-op for validation purposes
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
     }
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string sql = "DELETE FROM " + schema + ".user_roles WHERE user_name = $1 AND role_name = $2;";
+    const char* params[2] = { user.c_str(), role.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to remove user from role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
     return Result<void>::ok();
 }
 
 Result<std::vector<std::string>> Database::get_roles_for_user(const std::string& user, const std::string& tenant) {
-    // In this corrected implementation, roles are passed with each request
-    // The database doesn't store user-role mappings
-    // So this function returns an empty vector - the roles must come from the request
-    return Result<std::vector<std::string>>::ok(std::vector<std::string>());
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<std::string>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string sql = "SELECT role_name FROM " + schema + ".user_roles WHERE user_name = $1;";
+    const char* params[1] = { user.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to get roles for user: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<std::string>>::err(error);
+    }
+    std::vector<std::string> roles;
+    int rows = PQntuples(res);
+    roles.reserve(rows);
+    for (int i = 0; i < rows; ++i) {
+        roles.emplace_back(PQgetvalue(res, i, 0));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<std::string>>::ok(roles);
 }
 
 Result<std::vector<std::string>> Database::get_users_for_role(const std::string& role, const std::string& tenant) {
-    // In this corrected implementation, user-role assignments are not stored in the database
-    // So this function returns an empty vector
-    return Result<std::vector<std::string>>::ok(std::vector<std::string>());
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<std::string>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string sql = "SELECT user_name FROM " + schema + ".user_roles WHERE role_name = $1;";
+    const char* params[1] = { role.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to get users for role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<std::string>>::err(error);
+    }
+    std::vector<std::string> users;
+    int rows = PQntuples(res);
+    users.reserve(rows);
+    for (int i = 0; i < rows; ++i) {
+        users.emplace_back(PQgetvalue(res, i, 0));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<std::string>>::ok(users);
 }
 
 Result<std::vector<std::string>> Database::get_all_roles(const std::string& tenant) {
-    // In this corrected implementation, roles are not stored in the database
-    // So this function returns an empty vector - roles are passed with requests
-    return Result<std::vector<std::string>>::ok(std::vector<std::string>());
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<std::string>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    std::string sql = "SELECT role_name FROM " + schema + ".roles ORDER BY role_name;";
+    PGresult* res = PQexec(pg_conn, sql.c_str());
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to get all roles: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<std::string>>::err(error);
+    }
+    std::vector<std::string> roles;
+    int rows = PQntuples(res);
+    roles.reserve(rows);
+    for (int i = 0; i < rows; ++i) {
+        roles.emplace_back(PQgetvalue(res, i, 0));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<std::string>>::ok(roles);
 }
 
 } // namespace fileengine

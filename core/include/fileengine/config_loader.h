@@ -42,6 +42,10 @@ struct Config {
 
     // Security configuration
     bool root_user_enabled = false;
+    // When true, apply_default_acls grants OTHER->READ on every new resource,
+    // making files/directories world-readable by default. Off by default so
+    // freshly created resources are private to the creator.
+    bool default_world_readable = false;
 
     // Sync configuration
     bool sync_enabled = true;

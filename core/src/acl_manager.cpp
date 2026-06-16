@@ -1,5 +1,6 @@
 #include "fileengine/acl_manager.h"
 #include "fileengine/IDatabase.h"
+#include <algorithm>
 #include <sstream>
 
 // ACLs are stored separately from file metadata to maintain security boundaries
@@ -27,29 +28,25 @@ Result<void> AclManager::revoke_permission(const std::string& resource_uid,
                                            PrincipalType type,
                                            int permissions,
                                            const std::string& tenant) {
-    // Remove the ACL entry using dedicated ACL methods
-    auto result = db_->remove_acl(resource_uid, principal, static_cast<int>(type), tenant);
-
-    return result;
+    // Bit-mask revoke: only the requested bits are cleared. If the principal's
+    // remaining bitmask is zero the row is deleted by the DB layer.
+    return db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions, tenant);
 }
 
-Result<bool> AclManager::check_permission(const std::string& resource_uid, 
-                                          const std::string& user, 
+Result<bool> AclManager::check_permission(const std::string& resource_uid,
+                                          const std::string& user,
                                           const std::vector<std::string>& roles,
-                                          int required_permissions, 
+                                          int required_permissions,
                                           const std::string& tenant) {
-    // Get all ACLs for the resource
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
         return Result<bool>::err(acls_result.error);
     }
-    
-    // Calculate effective permissions for the user
-    int effective_perms = calculate_effective_permissions(acls_result.value, user, roles);
-    
-    // Check if the effective permissions include the required permissions
+
+    auto effective_roles = resolve_effective_roles(user, roles, tenant);
+    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles);
+
     bool has_permission = (effective_perms & required_permissions) == required_permissions;
-    
     return Result<bool>::ok(has_permission);
 }
 
@@ -77,37 +74,60 @@ Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string
     return Result<std::vector<ACLRule>>::ok(acls);
 }
 
-Result<int> AclManager::get_effective_permissions(const std::string& resource_uid, 
-                                                 const std::string& user, 
+Result<int> AclManager::get_effective_permissions(const std::string& resource_uid,
+                                                 const std::string& user,
                                                  const std::vector<std::string>& roles,
                                                  const std::string& tenant) {
-    // Get all ACLs for the resource
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
         return Result<int>::err(acls_result.error);
     }
-    
-    // Calculate effective permissions
-    int effective_perms = calculate_effective_permissions(acls_result.value, user, roles);
-    
+
+    auto effective_roles = resolve_effective_roles(user, roles, tenant);
+    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles);
+
     return Result<int>::ok(effective_perms);
 }
 
-Result<void> AclManager::apply_default_acls(const std::string& resource_uid, 
-                                           const std::string& creator, 
+std::vector<std::string> AclManager::resolve_effective_roles(const std::string& user,
+                                                             const std::vector<std::string>& request_roles,
+                                                             const std::string& tenant) {
+    // Start with the request-supplied roles (federated IdP path).
+    std::vector<std::string> roles = request_roles;
+
+    // Union in DB-stored roles for the user (local management path). A DB
+    // failure here is non-fatal — we degrade to request roles rather than
+    // denying every permission check, but we don't silently swallow either:
+    // the db_ method will have logged the underlying error already.
+    auto db_roles = db_->get_roles_for_user(user, tenant);
+    if (db_roles.success) {
+        for (const auto& r : db_roles.value) {
+            if (std::find(roles.begin(), roles.end(), r) == roles.end()) {
+                roles.push_back(r);
+            }
+        }
+    }
+
+    return roles;
+}
+
+Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
+                                           const std::string& creator,
                                            const std::string& tenant) {
-    // Apply default permissions: creator gets full access, others get read-only
+    // Creator always gets full access on the resource they created.
     auto grant_result = grant_permission(resource_uid, creator, PrincipalType::USER,
                                         static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE) | static_cast<int>(Permission::EXECUTE), tenant);
     if (!grant_result.success) {
         return grant_result;
     }
-    
-    // Grant read permission to 'other' category
-    auto other_result = grant_permission(resource_uid, "other", PrincipalType::OTHER,
-                                        static_cast<int>(Permission::READ), tenant);
-    
-    return other_result;
+
+    // World-readable OTHER->READ is opt-in. Default is private-by-default.
+    if (default_world_readable_) {
+        return grant_permission(resource_uid, "other", PrincipalType::OTHER,
+                                static_cast<int>(Permission::READ), tenant);
+    }
+
+    return Result<void>::ok();
 }
 
 Result<void> AclManager::inherit_acls(const std::string& parent_uid, 
@@ -135,8 +155,11 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
 Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resource_uid,
                                                        const std::string& user,
                                                        const std::string& tenant) {
-    // Query dedicated ACL tables directly for user-specific ACLs
-    auto user_acl_result = db_->get_user_acls(resource_uid, user, tenant);
+    // Query dedicated ACL tables directly for user-specific ACLs.
+    // The AclManager API treats `user` as a USER principal, so scope the DB
+    // lookup to USER-typed rows to avoid conflating role/group names.
+    auto user_acl_result = db_->get_user_acls(resource_uid, user,
+                                              static_cast<int>(PrincipalType::USER), tenant);
     if (!user_acl_result.success) {
         return Result<std::vector<ACLRule>>::err(user_acl_result.error);
     }
@@ -160,49 +183,37 @@ Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resour
 int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rules,
                                                const std::string& user,
                                                const std::vector<std::string>& roles) {
+    // Union model: every matching grant contributes its bits, regardless of
+    // principal type. A per-user grant of READ does NOT suppress role-provided
+    // WRITE on the same resource. This matches POSIX-ACL / NFSv4-style additive
+    // grants and avoids the surprising "user-rule masks role-rule" footgun
+    // documented in design_documents/acl_rbac_review_and_plan.md.
     int effective_perms = 0;
 
-    // Priority: user permissions > role permissions > group permissions > other permissions
-    bool user_found = false;
-    bool role_found = false;
-    bool other_found = false;
-
-    // Check user-specific permissions first
     for (const auto& rule : rules) {
-        if (rule.principal == user && rule.type == PrincipalType::USER) {
-            effective_perms |= rule.permissions;
-            user_found = true;
-        }
-    }
-
-    // If no user-specific permissions, check role-based permissions
-    if (!user_found) {
-        for (const auto& role : roles) {
-            for (const auto& rule : rules) {
-                if (rule.principal == role && rule.type == PrincipalType::ROLE) {
+        switch (rule.type) {
+            case PrincipalType::USER:
+                if (rule.principal == user) {
                     effective_perms |= rule.permissions;
-                    role_found = true;
                 }
-            }
-        }
-    }
-
-    // Check group permissions (if not already covered by user or role)
-    if (!user_found && !role_found) {
-        for (const auto& rule : rules) {
-            if (rule.type == PrincipalType::GROUP) {
+                break;
+            case PrincipalType::ROLE:
+                for (const auto& role : roles) {
+                    if (rule.principal == role) {
+                        effective_perms |= rule.permissions;
+                        break;
+                    }
+                }
+                break;
+            case PrincipalType::GROUP:
+                // GROUP rules apply to anyone — group membership is not yet
+                // modeled (see plan §2.3). Treat as a global grant to mirror
+                // the prior behavior until groups are persisted.
                 effective_perms |= rule.permissions;
-            }
-        }
-    }
-
-    // Check other permissions
-    for (const auto& rule : rules) {
-        if (rule.type == PrincipalType::OTHER) {
-            if (!user_found && !role_found) {
+                break;
+            case PrincipalType::OTHER:
                 effective_perms |= rule.permissions;
-            }
-            other_found = true;
+                break;
         }
     }
 

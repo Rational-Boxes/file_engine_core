@@ -56,6 +56,11 @@ class IDatabase;
 class AclManager {
 public:
     AclManager(std::shared_ptr<IDatabase> db);
+
+    // Toggle whether apply_default_acls grants OTHER->READ on new resources.
+    // Defaults to false (private-by-default).
+    void set_default_world_readable(bool enabled) { default_world_readable_ = enabled; }
+    bool default_world_readable() const { return default_world_readable_; }
     
     // Grant permission to a user/group on a resource
     Result<void> grant_permission(const std::string& resource_uid, 
@@ -100,6 +105,7 @@ public:
     
 private:
     std::shared_ptr<IDatabase> db_;
+    bool default_world_readable_ = false;
     
     // Internal helper to get user permissions from the database
     Result<std::vector<ACLRule>> get_user_acls(const std::string& resource_uid, 
@@ -107,9 +113,16 @@ private:
                                                const std::string& tenant);
     
     // Internal helper to calculate effective permissions
-    int calculate_effective_permissions(const std::vector<ACLRule>& rules, 
-                                      const std::string& user, 
+    int calculate_effective_permissions(const std::vector<ACLRule>& rules,
+                                      const std::string& user,
                                       const std::vector<std::string>& roles);
+
+    // Union request-supplied roles with DB-stored roles for the user (deduped).
+    // Request roles support federated IdP setups; DB roles support local
+    // server-side role management.
+    std::vector<std::string> resolve_effective_roles(const std::string& user,
+                                                     const std::vector<std::string>& request_roles,
+                                                     const std::string& tenant);
 };
 
 } // namespace fileengine

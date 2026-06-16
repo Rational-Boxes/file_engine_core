@@ -19,7 +19,9 @@ FileSystem::~FileSystem() {
 }
 
 Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::string& name,
-                                      const std::string& user, int permissions,
+                                      const std::string& user,
+                                      const std::vector<std::string>& roles,
+                                      int permissions,
                                       const std::string& tenant) {
     // Detailed debug logging for entry
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
@@ -47,7 +49,7 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
             return Result<std::string>::err("Only root can create in root directory");
         }
     } else {
-        auto perm_result = validate_user_permissions(parent_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+        auto perm_result = validate_user_permissions(parent_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
         if (!perm_result.success || !perm_result.value) {
             SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                       "User " + user + " does not have permission to create directory in " + parent_uid);
@@ -97,6 +99,7 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
 }
 
 Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& user,
+                               const std::vector<std::string>& roles,
                                const std::string& tenant) {
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Entering rmdir operation - dir_uid: " + dir_uid +
@@ -112,7 +115,7 @@ Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& us
     // Check permissions - the user needs write permission on the directory
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Checking permissions for user: " + user + " on directory: " + dir_uid);
-    auto perm_result = validate_user_permissions(dir_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(dir_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "User " + user + " does not have permission to remove directory " + dir_uid);
@@ -124,7 +127,7 @@ Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& us
     // First, check if directory is empty
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Checking if directory " + dir_uid + " is empty");
-    auto list_result = listdir(dir_uid, user, tenant);
+    auto list_result = listdir(dir_uid, user, roles, tenant);
     if (list_result.success && !list_result.value.empty()) {
         SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Directory " + dir_uid + " is not empty, contains " +
@@ -149,8 +152,9 @@ Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& us
     return Result<void>::ok();
 }
 
-Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_uid, 
-                                                        const std::string& user, 
+Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_uid,
+                                                        const std::string& user,
+                                                        const std::vector<std::string>& roles,
                                                         const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -158,7 +162,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
     }
     
     // Check permissions - the user needs read permission on the directory
-    auto perm_result = validate_user_permissions(dir_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(dir_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<DirectoryEntry>>::err("User does not have permission to list directory");
     }
@@ -186,8 +190,9 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
-Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::string& dir_uid, 
-                                                                     const std::string& user, 
+Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::string& dir_uid,
+                                                                     const std::string& user,
+                                                                     const std::vector<std::string>& roles,
                                                                      const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -195,7 +200,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
     }
     
     // Check permissions - the user needs read permission on the directory
-    auto perm_result = validate_user_permissions(dir_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(dir_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<DirectoryEntry>>::err("User does not have permission to list directory");
     }
@@ -223,8 +228,10 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
-Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::string& name, 
-                                      const std::string& user, const std::string& tenant) {
+Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::string& name,
+                                      const std::string& user,
+                                      const std::vector<std::string>& roles,
+                                      const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<std::string>::err("Database not available for tenant: " + tenant);
@@ -237,7 +244,7 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
             return Result<std::string>::err("Only root can create in root directory");
         }
     } else {
-        auto perm_result = validate_user_permissions(parent_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+        auto perm_result = validate_user_permissions(parent_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
         if (!perm_result.success || !perm_result.value) {
             return Result<std::string>::err("User does not have permission to create file");
         }
@@ -264,7 +271,8 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
     return Result<std::string>::ok(new_uid);
 }
 
-Result<void> FileSystem::remove(const std::string& file_uid, const std::string& user, 
+Result<void> FileSystem::remove(const std::string& file_uid, const std::string& user,
+                                const std::vector<std::string>& roles,
                                 const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -272,7 +280,7 @@ Result<void> FileSystem::remove(const std::string& file_uid, const std::string& 
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to remove file");
     }
@@ -286,7 +294,8 @@ Result<void> FileSystem::remove(const std::string& file_uid, const std::string& 
     return Result<void>::ok();
 }
 
-Result<void> FileSystem::undelete(const std::string& file_uid, const std::string& user, 
+Result<void> FileSystem::undelete(const std::string& file_uid, const std::string& user,
+                                  const std::vector<std::string>& roles,
                                   const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -294,7 +303,7 @@ Result<void> FileSystem::undelete(const std::string& file_uid, const std::string
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to undelete file");
     }
@@ -308,15 +317,17 @@ Result<void> FileSystem::undelete(const std::string& file_uid, const std::string
     return Result<void>::ok();
 }
 
-Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint8_t>& data, 
-                             const std::string& user, const std::string& tenant) {
+Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint8_t>& data,
+                             const std::string& user,
+                             const std::vector<std::string>& roles,
+                             const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db || !context->storage) {
         return Result<void>::err("Database or storage not available for tenant: " + tenant);
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to write file");
     }
@@ -451,6 +462,7 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
 
 Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
                                               const std::string& user,
+                                              const std::vector<std::string>& roles,
                                               const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -458,7 +470,7 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
     }
 
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<uint8_t>>::err("User does not have permission to read file");
     }
@@ -472,7 +484,7 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
     std::string current_version = file_info_result.value->version;
     if (current_version.empty()) {
         // If no version is set, get the latest version
-        auto versions_result = list_versions(file_uid, user, tenant);
+        auto versions_result = list_versions(file_uid, user, roles, tenant);
         if (!versions_result.success || versions_result.value.empty()) {
             return Result<std::vector<uint8_t>>::err("No versions available for file");
         }
@@ -622,7 +634,8 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
     return Result<std::vector<uint8_t>>::err("File content not found in storage or object store");
 }
 
-Result<FileInfo> FileSystem::stat(const std::string& file_uid, const std::string& user, 
+Result<FileInfo> FileSystem::stat(const std::string& file_uid, const std::string& user,
+                                  const std::vector<std::string>& roles,
                                   const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -630,7 +643,7 @@ Result<FileInfo> FileSystem::stat(const std::string& file_uid, const std::string
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<FileInfo>::err("User does not have permission to access file info");
     }
@@ -658,20 +671,22 @@ Result<bool> FileSystem::exists(const std::string& file_uid, const std::string& 
 }
 
 Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst_uid,
-                              const std::string& user, const std::string& tenant) {
+                              const std::string& user,
+                              const std::vector<std::string>& roles,
+                              const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<void>::err("Database not available for tenant: " + tenant);
     }
 
     // Check permissions - the user needs write permission on both source and destination
-    auto src_perm_result = validate_user_permissions(src_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto src_perm_result = validate_user_permissions(src_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!src_perm_result.success || !src_perm_result.value) {
         return Result<void>::err("User does not have permission to move source file");
     }
 
     // For move operation, dst_uid represents the new parent directory
-    auto dst_perm_result = validate_user_permissions(dst_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto dst_perm_result = validate_user_permissions(dst_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!dst_perm_result.success || !dst_perm_result.value) {
         return Result<void>::err("User does not have permission to move to destination directory");
     }
@@ -702,20 +717,22 @@ Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst
 }
 
 Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst_uid,
-                              const std::string& user, const std::string& tenant) {
+                              const std::string& user,
+                              const std::vector<std::string>& roles,
+                              const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db || !context->storage) {
         return Result<void>::err("Database or storage not available for tenant: " + tenant);
     }
 
     // Check permissions - the user needs read permission on source and write permission on destination
-    auto src_perm_result = validate_user_permissions(src_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto src_perm_result = validate_user_permissions(src_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!src_perm_result.success || !src_perm_result.value) {
         return Result<void>::err("User does not have permission to read source file");
     }
 
     // For copy operation, dst_uid represents the new parent directory
-    auto dst_perm_result = validate_user_permissions(dst_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto dst_perm_result = validate_user_permissions(dst_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!dst_perm_result.success || !dst_perm_result.value) {
         return Result<void>::err("User does not have permission to write to destination directory");
     }
@@ -760,11 +777,11 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
         }
 
         // List all entries in the source directory
-        auto list_result = listdir(src_uid, user, tenant);
+        auto list_result = listdir(src_uid, user, roles, tenant);
         if (list_result.success) {
             // Recursively copy each entry in the source directory
             for (const auto& entry : list_result.value) {
-                Result<void> copy_result = copy(entry.uid, new_uid, user, tenant);
+                Result<void> copy_result = copy(entry.uid, new_uid, user, roles, tenant);
                 if (!copy_result.success) {
                     return Result<void>::err("Failed to copy directory contents: " + copy_result.error);
                 }
@@ -775,7 +792,7 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
     } else {
         // It's a regular file - copy the file content and metadata
         // Get the current version of the source file
-        auto versions_result = list_versions(src_uid, user, tenant);
+        auto versions_result = list_versions(src_uid, user, roles, tenant);
         if (!versions_result.success || versions_result.value.empty()) {
             return Result<void>::err("No versions available for source file");
         }
@@ -848,15 +865,17 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
     }
 }
 
-Result<void> FileSystem::rename(const std::string& uid, const std::string& new_name, 
-                                const std::string& user, const std::string& tenant) {
+Result<void> FileSystem::rename(const std::string& uid, const std::string& new_name,
+                                const std::string& user,
+                                const std::vector<std::string>& roles,
+                                const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<void>::err("Database not available for tenant: " + tenant);
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to rename file");
     }
@@ -869,8 +888,9 @@ Result<void> FileSystem::rename(const std::string& uid, const std::string& new_n
     return Result<void>::ok();
 }
 
-Result<std::vector<std::string>> FileSystem::list_versions(const std::string& file_uid, 
-                                                           const std::string& user, 
+Result<std::vector<std::string>> FileSystem::list_versions(const std::string& file_uid,
+                                                           const std::string& user,
+                                                           const std::vector<std::string>& roles,
                                                            const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -878,7 +898,7 @@ Result<std::vector<std::string>> FileSystem::list_versions(const std::string& fi
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<std::string>>::err("User does not have permission to list versions");
     }
@@ -891,9 +911,10 @@ Result<std::vector<std::string>> FileSystem::list_versions(const std::string& fi
     return Result<std::vector<std::string>>::ok(db_result.value);
 }
 
-Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid, 
-                                                     const std::string& version_timestamp, 
-                                                     const std::string& user, 
+Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid,
+                                                     const std::string& version_timestamp,
+                                                     const std::string& user,
+                                                     const std::vector<std::string>& roles,
                                                      const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -901,7 +922,7 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<uint8_t>>::err("User does not have permission to access version");
     }
@@ -971,6 +992,7 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
 Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
                                            const std::string& version_timestamp,
                                            const std::string& user,
+                                           const std::vector<std::string>& roles,
                                            const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -979,7 +1001,7 @@ Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
 
     // Check if user has special permission to restore to version
     // Typically requires WRITE permission or special version management permission
-    auto perm_result = validate_user_permissions(file_uid, user, std::vector<std::string>(), static_cast<int>(fileengine::Permission::WRITE), tenant); // WRITE permission
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(fileengine::Permission::WRITE), tenant); // WRITE permission
     if (!perm_result.success || !perm_result.value) {
         return Result<bool>::err("User does not have permission to restore to version");
     }
@@ -1082,8 +1104,9 @@ Result<double> FileSystem::get_cache_usage_percentage(const std::string& tenant)
     return Result<double>::err("Cache manager not available");
 }
 
-Result<void> FileSystem::set_metadata(const std::string& file_uid, const std::string& key, 
-                                      const std::string& value, const std::string& user, 
+Result<void> FileSystem::set_metadata(const std::string& file_uid, const std::string& key,
+                                      const std::string& value, const std::string& user,
+                                      const std::vector<std::string>& roles,
                                       const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -1091,7 +1114,7 @@ Result<void> FileSystem::set_metadata(const std::string& file_uid, const std::st
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to set metadata");
     }
@@ -1101,15 +1124,17 @@ Result<void> FileSystem::set_metadata(const std::string& file_uid, const std::st
     return db_result;
 }
 
-Result<std::string> FileSystem::get_metadata(const std::string& file_uid, const std::string& key, 
-                                             const std::string& user, const std::string& tenant) {
+Result<std::string> FileSystem::get_metadata(const std::string& file_uid, const std::string& key,
+                                             const std::string& user,
+                                             const std::vector<std::string>& roles,
+                                             const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<std::string>::err("Database not available for tenant: " + tenant);
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::string>::err("User does not have permission to get metadata");
     }
@@ -1123,8 +1148,9 @@ Result<std::string> FileSystem::get_metadata(const std::string& file_uid, const 
     return Result<std::string>::ok(db_result.value.value());
 }
 
-Result<std::map<std::string, std::string>> FileSystem::get_all_metadata(const std::string& file_uid, 
-                                                                        const std::string& user, 
+Result<std::map<std::string, std::string>> FileSystem::get_all_metadata(const std::string& file_uid,
+                                                                        const std::string& user,
+                                                                        const std::vector<std::string>& roles,
                                                                         const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -1132,7 +1158,7 @@ Result<std::map<std::string, std::string>> FileSystem::get_all_metadata(const st
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::map<std::string, std::string>>::err("User does not have permission to get metadata");
     }
@@ -1142,15 +1168,17 @@ Result<std::map<std::string, std::string>> FileSystem::get_all_metadata(const st
     return db_result;
 }
 
-Result<void> FileSystem::delete_metadata(const std::string& file_uid, const std::string& key, 
-                                         const std::string& user, const std::string& tenant) {
+Result<void> FileSystem::delete_metadata(const std::string& file_uid, const std::string& key,
+                                         const std::string& user,
+                                         const std::vector<std::string>& roles,
+                                         const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<void>::err("Database not available for tenant: " + tenant);
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to delete metadata");
     }
@@ -1160,10 +1188,11 @@ Result<void> FileSystem::delete_metadata(const std::string& file_uid, const std:
     return db_result;
 }
 
-Result<std::string> FileSystem::get_metadata_for_version(const std::string& file_uid, 
-                                                         const std::string& version_timestamp, 
-                                                         const std::string& key, 
-                                                         const std::string& user, 
+Result<std::string> FileSystem::get_metadata_for_version(const std::string& file_uid,
+                                                         const std::string& version_timestamp,
+                                                         const std::string& key,
+                                                         const std::string& user,
+                                                         const std::vector<std::string>& roles,
                                                          const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -1171,7 +1200,7 @@ Result<std::string> FileSystem::get_metadata_for_version(const std::string& file
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::string>::err("User does not have permission to get metadata");
     }
@@ -1184,9 +1213,10 @@ Result<std::string> FileSystem::get_metadata_for_version(const std::string& file
     return Result<std::string>::ok(db_result.value.value());
 }
 
-Result<std::map<std::string, std::string>> FileSystem::get_all_metadata_for_version(const std::string& file_uid, 
-                                                                                    const std::string& version_timestamp, 
-                                                                                    const std::string& user, 
+Result<std::map<std::string, std::string>> FileSystem::get_all_metadata_for_version(const std::string& file_uid,
+                                                                                    const std::string& version_timestamp,
+                                                                                    const std::string& user,
+                                                                                    const std::vector<std::string>& roles,
                                                                                     const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
@@ -1194,7 +1224,7 @@ Result<std::map<std::string, std::string>> FileSystem::get_all_metadata_for_vers
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, {}, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::map<std::string, std::string>>::err("User does not have permission to get metadata");
     }
@@ -1203,17 +1233,18 @@ Result<std::map<std::string, std::string>> FileSystem::get_all_metadata_for_vers
     return db_result;
 }
 
-Result<void> FileSystem::grant_permission(const std::string& resource_uid, 
-                                          const std::string& principal, 
-                                          int permissions, 
-                                          const std::string& user, 
+Result<void> FileSystem::grant_permission(const std::string& resource_uid,
+                                          const std::string& principal,
+                                          int permissions,
+                                          const std::string& user,
+                                          const std::vector<std::string>& roles,
                                           const std::string& tenant) {
     if (!acl_manager_) {
         return Result<void>::err("ACL manager not available");
     }
     
     // Only allow users with appropriate permissions to grant permissions
-    auto perm_result = validate_user_permissions(resource_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(resource_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to grant permissions");
     }
@@ -1223,17 +1254,18 @@ Result<void> FileSystem::grant_permission(const std::string& resource_uid,
     return result;
 }
 
-Result<void> FileSystem::revoke_permission(const std::string& resource_uid, 
-                                           const std::string& principal, 
-                                           int permissions, 
-                                           const std::string& user, 
+Result<void> FileSystem::revoke_permission(const std::string& resource_uid,
+                                           const std::string& principal,
+                                           int permissions,
+                                           const std::string& user,
+                                           const std::vector<std::string>& roles,
                                            const std::string& tenant) {
     if (!acl_manager_) {
         return Result<void>::err("ACL manager not available");
     }
     
     // Only allow users with appropriate permissions to revoke permissions
-    auto perm_result = validate_user_permissions(resource_uid, user, {}, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(resource_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to revoke permissions");
     }
