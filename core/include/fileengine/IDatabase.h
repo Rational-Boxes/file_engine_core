@@ -91,13 +91,22 @@ public:
         int permissions;
     };
 
+    // performed_by records who triggered the change in granted_by and the
+    // acl_audit table. Empty string is allowed (e.g. for internal callers).
+    // performed_by is the LAST argument so legacy positional calls that pass
+    // tenant as the 5th arg still bind to `tenant`.
     virtual Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
-                                 int type, int permissions, const std::string& tenant = "") = 0;
+                                 int type, int permissions,
+                                 const std::string& tenant = "",
+                                 const std::string& performed_by = "") = 0;
     // Clear the bits in `permissions` from the matching ACL row. If the
     // resulting permission bitmask is zero the row is deleted. Pass -1 (all
-    // bits set) to fully revoke the principal's row in one call.
+    // bits set) to fully revoke the principal's row in one call. performed_by
+    // is recorded in the acl_audit table.
     virtual Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                                    int type, int permissions, const std::string& tenant = "") = 0;
+                                    int type, int permissions,
+                                    const std::string& tenant = "",
+                                    const std::string& performed_by = "") = 0;
     virtual Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                                  const std::string& tenant = "") = 0;
     virtual Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,

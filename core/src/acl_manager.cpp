@@ -15,22 +15,22 @@ Result<void> AclManager::grant_permission(const std::string& resource_uid,
                                           const std::string& principal,
                                           PrincipalType type,
                                           int permissions,
-                                          const std::string& tenant) {
-    // Use the database's dedicated ACL methods
-    // This ensures ACLs are stored separately from file metadata
-    auto result = db_->add_acl(resource_uid, principal, static_cast<int>(type), permissions, tenant);
-
-    return result;
+                                          const std::string& tenant,
+                                          const std::string& performed_by) {
+    return db_->add_acl(resource_uid, principal, static_cast<int>(type), permissions,
+                        tenant, performed_by);
 }
 
 Result<void> AclManager::revoke_permission(const std::string& resource_uid,
                                            const std::string& principal,
                                            PrincipalType type,
                                            int permissions,
-                                           const std::string& tenant) {
+                                           const std::string& tenant,
+                                           const std::string& performed_by) {
     // Bit-mask revoke: only the requested bits are cleared. If the principal's
     // remaining bitmask is zero the row is deleted by the DB layer.
-    return db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions, tenant);
+    return db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions,
+                           tenant, performed_by);
 }
 
 Result<bool> AclManager::check_permission(const std::string& resource_uid,
@@ -38,16 +38,34 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
                                           const std::vector<std::string>& roles,
                                           int required_permissions,
                                           const std::string& tenant) {
+    auto effective_roles = resolve_effective_roles(user, roles, tenant);
+
+    // System-admin bypass: requires the role AND the server-side enable flag.
+    if (system_admin_enabled_ &&
+        std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
+            != effective_roles.end()) {
+        return Result<bool>::ok(true);
+    }
+
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
         return Result<bool>::err(acls_result.error);
     }
 
-    auto effective_roles = resolve_effective_roles(user, roles, tenant);
     int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles);
-
     bool has_permission = (effective_perms & required_permissions) == required_permissions;
     return Result<bool>::ok(has_permission);
+}
+
+bool AclManager::is_system_admin(const std::string& user,
+                                 const std::vector<std::string>& request_roles,
+                                 const std::string& tenant) {
+    if (!system_admin_enabled_) {
+        return false;
+    }
+    auto effective_roles = resolve_effective_roles(user, request_roles, tenant);
+    return std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
+           != effective_roles.end();
 }
 
 Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string& resource_uid,
@@ -114,9 +132,17 @@ std::vector<std::string> AclManager::resolve_effective_roles(const std::string& 
 Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
                                            const std::string& creator,
                                            const std::string& tenant) {
-    // Creator always gets full access on the resource they created.
+    // Creator always gets full access on the resource they created, including
+    // MANAGE_ACL so they can grant/revoke permissions for other principals.
+    // ACL_INHERIT is set so the creator's rule cascades to children if this
+    // resource is later treated as a parent.
     auto grant_result = grant_permission(resource_uid, creator, PrincipalType::USER,
-                                        static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE) | static_cast<int>(Permission::EXECUTE), tenant);
+                                        static_cast<int>(Permission::READ)
+                                        | static_cast<int>(Permission::WRITE)
+                                        | static_cast<int>(Permission::EXECUTE)
+                                        | static_cast<int>(Permission::MANAGE_ACL)
+                                        | static_cast<int>(Permission::ACL_INHERIT),
+                                        tenant, creator);
     if (!grant_result.success) {
         return grant_result;
     }
@@ -124,32 +150,52 @@ Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
     // World-readable OTHER->READ is opt-in. Default is private-by-default.
     if (default_world_readable_) {
         return grant_permission(resource_uid, "other", PrincipalType::OTHER,
-                                static_cast<int>(Permission::READ), tenant);
+                                static_cast<int>(Permission::READ),
+                                tenant, creator);
     }
 
     return Result<void>::ok();
 }
 
-Result<void> AclManager::inherit_acls(const std::string& parent_uid, 
-                                     const std::string& child_uid, 
-                                     const std::string& tenant) {
-    // Get ACLs from parent
+Result<void> AclManager::inherit_acls(const std::string& parent_uid,
+                                     const std::string& child_uid,
+                                     const std::string& tenant,
+                                     const std::string& performed_by) {
     auto parent_acls_result = get_acls_for_resource(parent_uid, tenant);
     if (!parent_acls_result.success) {
         return Result<void>::err(parent_acls_result.error);
     }
-    
-    // Copy ACLs to child
+
+    const int inherit_bit = static_cast<int>(Permission::ACL_INHERIT);
+
+    // Copy only rules marked with ACL_INHERIT. The bit is preserved on the
+    // child so inheritance cascades to grandchildren; callers can break the
+    // chain at any level by revoking the bit. Fail-loud: any per-rule failure
+    // aborts so the caller sees a partial-state error.
     for (const auto& rule : parent_acls_result.value) {
-        auto result = grant_permission(child_uid, rule.principal, rule.type, 
-                                     rule.permissions, tenant);
-        if (!result.success) {
-            // Log error but continue copying other ACLs
+        if ((rule.permissions & inherit_bit) == 0) {
             continue;
         }
+        auto result = grant_permission(child_uid, rule.principal, rule.type,
+                                       rule.permissions, tenant, performed_by);
+        if (!result.success) {
+            return Result<void>::err("inherit_acls: failed to copy rule for "
+                                     + rule.principal + ": " + result.error);
+        }
     }
-    
+
     return Result<void>::ok();
+}
+
+bool AclManager::parent_has_inheritable_acls(const std::string& parent_uid,
+                                             const std::string& tenant) {
+    auto parent_acls = get_acls_for_resource(parent_uid, tenant);
+    if (!parent_acls.success) return false;
+    const int inherit_bit = static_cast<int>(Permission::ACL_INHERIT);
+    for (const auto& rule : parent_acls.value) {
+        if (rule.permissions & inherit_bit) return true;
+    }
+    return false;
 }
 
 Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resource_uid,

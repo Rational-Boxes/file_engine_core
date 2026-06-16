@@ -38,15 +38,16 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Validating permissions for user: " + user + " on parent: " + parent_uid);
 
-    // Check permissions - the user needs write permission on the parent directory
+    // Check permissions - the user needs write permission on the parent directory.
+    // Creating directly under the filesystem root is restricted to system admins
+    // (controlled by config.root_user_enabled — see AclManager).
     if (parent_uid.empty()) {
-        // Root directory creation - only for system admin
         SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-                  "Attempting root directory creation - only allowed for root user");
-        if (user != "root") {
+                  "Attempting root directory creation - only allowed for system_admin role");
+        if (!acl_manager_ || !acl_manager_->is_system_admin(user, roles, tenant)) {
             SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-                      "Non-root user attempting to create in root directory");
-            return Result<std::string>::err("Only root can create in root directory");
+                      "Non-admin user attempting to create in root directory");
+            return Result<std::string>::err("Only system_admin can create in root directory");
         }
     } else {
         auto perm_result = validate_user_permissions(parent_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
@@ -75,23 +76,8 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
         return Result<std::string>::err("Failed to create directory in database: " + db_result.error);
     }
 
-    // Apply default ACLs
-    if (acl_manager_) {
-        SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-                  "Applying default ACLs for new directory: " + new_uid);
-        auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
-        if (!acl_result.success) {
-            // Log error but don't fail the operation
-            SERVER_LOG_WARN("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-                     "Failed to apply default ACLs: " + acl_result.error);
-        } else {
-            SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-                      "Successfully applied default ACLs for: " + new_uid);
-        }
-    } else {
-        SERVER_LOG_WARN("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
-                 "ACL manager not available for tenant: " + tenant);
-    }
+    // Default ACLs + inheritance from parent (see apply_acls_for_new_resource).
+    apply_acls_for_new_resource(parent_uid, new_uid, user, tenant);
 
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Successfully created directory with UID: " + new_uid);
@@ -237,11 +223,11 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
         return Result<std::string>::err("Database not available for tenant: " + tenant);
     }
     
-    // Check permissions - the user needs write permission on the parent directory
+    // Check permissions - the user needs write permission on the parent directory.
+    // Creating directly under the filesystem root is restricted to system admins.
     if (parent_uid.empty()) {
-        // Root directory creation - only for system admin
-        if (user != "root") {
-            return Result<std::string>::err("Only root can create in root directory");
+        if (!acl_manager_ || !acl_manager_->is_system_admin(user, roles, tenant)) {
+            return Result<std::string>::err("Only system_admin can create in root directory");
         }
     } else {
         auto perm_result = validate_user_permissions(parent_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
@@ -260,14 +246,9 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
         return Result<std::string>::err("Failed to create file in database: " + db_result.error);
     }
     
-    // Apply default ACLs
-    if (acl_manager_) {
-        auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
-        if (!acl_result.success) {
-            // Log error but don't fail the operation
-        }
-    }
-    
+    // Default ACLs + inheritance from parent (see apply_acls_for_new_resource).
+    apply_acls_for_new_resource(parent_uid, new_uid, user, tenant);
+
     return Result<std::string>::ok(new_uid);
 }
 
@@ -768,13 +749,8 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             return Result<void>::err("Failed to create directory in database: " + db_result.error);
         }
 
-        // Apply default ACLs to the new directory
-        if (acl_manager_) {
-            auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
-            if (!acl_result.success) {
-                // Log error but don't fail the operation
-            }
-        }
+        // Default ACLs + inheritance from destination parent.
+        apply_acls_for_new_resource(dst_uid, new_uid, user, tenant);
 
         // List all entries in the source directory
         auto list_result = listdir(src_uid, user, roles, tenant);
@@ -844,13 +820,8 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             // Log error but don't fail the operation
         }
 
-        // Apply default ACLs to the new file
-        if (acl_manager_) {
-            auto acl_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
-            if (!acl_result.success) {
-                // Log error but don't fail the operation
-            }
-        }
+        // Default ACLs + inheritance from destination parent.
+        apply_acls_for_new_resource(dst_uid, new_uid, user, tenant);
 
         // If we have an object store, schedule a backup for the copied file
         if (context->object_store) {
@@ -1243,14 +1214,14 @@ Result<void> FileSystem::grant_permission(const std::string& resource_uid,
         return Result<void>::err("ACL manager not available");
     }
     
-    // Only allow users with appropriate permissions to grant permissions
-    auto perm_result = validate_user_permissions(resource_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
+    // Grant requires MANAGE_ACL on the resource — see plan §4.3 / Phase 5.
+    auto perm_result = validate_user_permissions(resource_uid, user, roles, static_cast<int>(Permission::MANAGE_ACL), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to grant permissions");
     }
-    
-    auto result = acl_manager_->grant_permission(resource_uid, principal, PrincipalType::USER, 
-                                                 permissions, tenant);
+
+    auto result = acl_manager_->grant_permission(resource_uid, principal, PrincipalType::USER,
+                                                 permissions, tenant, user);
     return result;
 }
 
@@ -1263,15 +1234,15 @@ Result<void> FileSystem::revoke_permission(const std::string& resource_uid,
     if (!acl_manager_) {
         return Result<void>::err("ACL manager not available");
     }
-    
-    // Only allow users with appropriate permissions to revoke permissions
-    auto perm_result = validate_user_permissions(resource_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
+
+    // Revoke requires MANAGE_ACL on the resource — see plan §4.3 / Phase 5.
+    auto perm_result = validate_user_permissions(resource_uid, user, roles, static_cast<int>(Permission::MANAGE_ACL), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to revoke permissions");
     }
     
-    auto result = acl_manager_->revoke_permission(resource_uid, principal, PrincipalType::USER, 
-                                                  permissions, tenant);
+    auto result = acl_manager_->revoke_permission(resource_uid, principal, PrincipalType::USER,
+                                                  permissions, tenant, user);
     return result;
 }
 
@@ -1297,6 +1268,34 @@ void FileSystem::shutdown() {
     // Cleanup operations
     if (cache_manager_) {
         cache_manager_->cleanup_cache();
+    }
+}
+
+void FileSystem::apply_acls_for_new_resource(const std::string& parent_uid,
+                                             const std::string& new_uid,
+                                             const std::string& user,
+                                             const std::string& tenant) {
+    if (!acl_manager_) {
+        return;
+    }
+    // Creator always gets default USER bits (READ|WRITE|EXECUTE|MANAGE_ACL|
+    // ACL_INHERIT) so they can manage what they just created — regardless of
+    // what cascades down from the parent.
+    auto default_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
+    if (!default_result.success) {
+        SERVER_LOG_WARN("FileSystem::apply_acls_for_new_resource",
+                        "Failed to apply default ACLs for " + new_uid + ": " + default_result.error);
+    }
+
+    // Inherit parent rules marked ACL_INHERIT on top. Empty parent_uid (the
+    // filesystem root) skips inheritance.
+    if (!parent_uid.empty() && acl_manager_->parent_has_inheritable_acls(parent_uid, tenant)) {
+        auto inherit_result = acl_manager_->inherit_acls(parent_uid, new_uid, tenant, user);
+        if (!inherit_result.success) {
+            SERVER_LOG_WARN("FileSystem::apply_acls_for_new_resource",
+                            "Inheritance failed for " + new_uid + " from parent " + parent_uid
+                            + ": " + inherit_result.error);
+        }
     }
 }
 

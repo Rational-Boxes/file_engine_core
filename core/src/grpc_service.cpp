@@ -1048,12 +1048,14 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     std::string user = get_user_from_auth_context(auth_context);
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
-    // Only admins or users with grant permission can grant permissions
-    // Check if it's a root user first
-    if (user != "root" && !validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    // Granting/revoking permissions requires the MANAGE_ACL bit on the
+    // resource, NOT plain WRITE — otherwise any user with write access could
+    // escalate themselves or others. system_admin role bypass is applied
+    // inside AclManager::check_permission.
+    if (!validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::MANAGE_ACL))) {
         response->set_success(false);
         response->set_error("User does not have permission to grant permissions");
-        SERVER_LOG_ERROR("GRPCService", "GrantPermission failed: User " + user + " does not have permission to grant permissions on " + resource_uid);
+        SERVER_LOG_ERROR("GRPCService", "GrantPermission failed: User " + user + " does not have MANAGE_ACL on " + resource_uid);
         return grpc::Status::OK;
     }
 
@@ -1120,11 +1122,11 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     std::string user = get_user_from_auth_context(auth_context);
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
-    // Only admins or users with appropriate permissions can revoke permissions
-    if (user != "root" && !validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    // Revoking permissions requires MANAGE_ACL — see GrantPermission above.
+    if (!validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::MANAGE_ACL))) {
         response->set_success(false);
         response->set_error("User does not have permission to revoke permissions");
-        SERVER_LOG_ERROR("GRPCService", "RevokePermission failed: User " + user + " does not have permission to revoke permissions on " + resource_uid);
+        SERVER_LOG_ERROR("GRPCService", "RevokePermission failed: User " + user + " does not have MANAGE_ACL on " + resource_uid);
         return grpc::Status::OK;
     }
 
@@ -1416,8 +1418,9 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
     std::string user = get_user_from_auth_context(auth_context);
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
-    // Check permissions - user needs write access to the file
-    if (user != "root" && !validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    // Check permissions - user needs write access to the file.
+    // system_admin bypass is applied inside AclManager::check_permission.
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) {
         response->set_success(false);
         response->set_error("User does not have permission to purge old versions");
         SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed: User " + user + " does not have permission to purge old versions for " + file_uid);

@@ -103,7 +103,9 @@ public:
     // =========================================================================
 
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
-                         int type, int permissions, const std::string& tenant = "") override {
+                         int type, int permissions,
+                         const std::string& tenant = "",
+                         const std::string& performed_by = "") override {
         AclEntry entry;
         entry.resource_uid = resource_uid;
         entry.principal = principal;
@@ -112,16 +114,23 @@ public:
 
         std::string key = tenant + "::" + resource_uid;
         acls_[key].push_back(entry);
+        audit_log_.push_back({resource_uid, principal, type, "grant", permissions, performed_by, tenant});
         return Result<void>::ok();
     }
 
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                            int type, int permissions, const std::string& tenant = "") override {
+                            int type, int permissions,
+                            const std::string& tenant = "",
+                            const std::string& performed_by = "") override {
         std::string key = tenant + "::" + resource_uid;
         auto& resource_acls = acls_[key];
+        int permissions_after = 0;
+        bool found = false;
         for (auto& entry : resource_acls) {
             if (entry.principal == principal && entry.type == type) {
                 entry.permissions &= ~permissions;
+                permissions_after = entry.permissions;
+                found = true;
             }
         }
         resource_acls.erase(
@@ -131,6 +140,9 @@ public:
                                      && entry.permissions == 0;
                           }),
             resource_acls.end());
+        if (found) {
+            audit_log_.push_back({resource_uid, principal, type, "revoke", permissions_after, performed_by, tenant});
+        }
         return Result<void>::ok();
     }
 
@@ -227,13 +239,27 @@ public:
         return (it != acls_.end()) ? it->second.size() : 0;
     }
 
+    struct AuditEvent {
+        std::string resource_uid;
+        std::string principal;
+        int type;
+        std::string action;       // "grant" | "revoke"
+        int permissions;          // for grants: granted bitmask; for revokes: bitmask after revoke
+        std::string performed_by;
+        std::string tenant;
+    };
+    const std::vector<AuditEvent>& audit_log() const { return audit_log_; }
+
 private:
     std::map<std::string, std::vector<AclEntry>> acls_;
     std::map<std::string, std::set<std::string>> roles_;
     std::map<std::string, std::set<std::pair<std::string, std::string>>> user_roles_;
+    std::vector<AuditEvent> audit_log_;
 };
 
 // Helper constants
+static const int PERM_ACL_INHERIT = static_cast<int>(Permission::ACL_INHERIT);
+static const int PERM_MANAGE_ACL = static_cast<int>(Permission::MANAGE_ACL);
 static const int PERM_READ = static_cast<int>(Permission::READ);
 static const int PERM_WRITE = static_cast<int>(Permission::WRITE);
 static const int PERM_DELETE = static_cast<int>(Permission::DELETE);
@@ -243,7 +269,7 @@ static const int PERM_VIEW_VERSIONS = static_cast<int>(Permission::VIEW_VERSIONS
 static const int PERM_RETRIEVE_BACK_VERSION = static_cast<int>(Permission::RETRIEVE_BACK_VERSION);
 static const int PERM_RESTORE_TO_VERSION = static_cast<int>(Permission::RESTORE_TO_VERSION);
 static const int PERM_EXECUTE = static_cast<int>(Permission::EXECUTE);
-static const int PERM_ALL = PERM_READ | PERM_WRITE | PERM_DELETE | PERM_LIST_DELETED |
+static const int PERM_ALL = PERM_MANAGE_ACL | PERM_READ | PERM_WRITE | PERM_DELETE | PERM_LIST_DELETED |
                             PERM_UNDELETE | PERM_VIEW_VERSIONS | PERM_RETRIEVE_BACK_VERSION |
                             PERM_RESTORE_TO_VERSION | PERM_EXECUTE;
 
@@ -852,27 +878,48 @@ void test_revoke_nonexistent_permission() {
 // 7. ACL INHERITANCE
 // =============================================================================
 
-void test_inherit_acls_copies_parent_to_child() {
+void test_inherit_acls_copies_inheritable_rules_only() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string parent = "dir-parent";
     std::string child = "dir-child";
 
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
-    acl.grant_permission(parent, "editor", PrincipalType::ROLE, PERM_READ);
-    acl.grant_permission(parent, "other", PrincipalType::OTHER, PERM_READ);
+    // Two rules marked inheritable, one not.
+    const int inherit = PERM_ACL_INHERIT;
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE | inherit);
+    acl.grant_permission(parent, "editor", PrincipalType::ROLE, PERM_READ | inherit);
+    acl.grant_permission(parent, "other", PrincipalType::OTHER, PERM_READ); // no inherit bit
 
     auto result = acl.inherit_acls(parent, child);
     TEST_ASSERT(result.success, "inherit_acls should succeed");
 
-    // Child should have same ACLs as parent
     auto child_acls = acl.get_acls_for_resource(child);
-    TEST_ASSERT(child_acls.value.size() == 3, "child should have 3 ACL entries from parent");
+    TEST_ASSERT(child_acls.value.size() == 2,
+                "child should only inherit the two rules marked ACL_INHERIT");
 
-    // Verify alice has READ|WRITE on child
+    // alice still has READ|WRITE on the child (the inherit bit is copied too
+    // so inheritance cascades to grandchildren).
     auto child_perms = acl.get_effective_permissions(child, "alice", {});
     TEST_ASSERT(has_perm(child_perms.value, PERM_READ), "alice should have READ on child");
     TEST_ASSERT(has_perm(child_perms.value, PERM_WRITE), "alice should have WRITE on child");
+}
+
+void test_inherit_acls_skips_non_inheritable_rules() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string parent = "dir-non-inherit-parent";
+    std::string child = "dir-non-inherit-child";
+
+    // None of the parent rules carry ACL_INHERIT.
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(parent, "bob", PrincipalType::USER, PERM_WRITE);
+
+    auto result = acl.inherit_acls(parent, child);
+    TEST_ASSERT(result.success, "inherit_acls should succeed even with nothing to copy");
+
+    auto child_acls = acl.get_acls_for_resource(child);
+    TEST_ASSERT(child_acls.value.empty(),
+                "no rules should be inherited when none carry ACL_INHERIT");
 }
 
 void test_inherit_acls_is_one_time_copy() {
@@ -881,13 +928,13 @@ void test_inherit_acls_is_one_time_copy() {
     std::string parent = "dir-parent-2";
     std::string child = "dir-child-2";
 
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_ACL_INHERIT);
     acl.inherit_acls(parent, child);
 
-    // Add more permissions to parent AFTER inheritance
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_WRITE);
+    // Add more permissions to parent AFTER inheritance.
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_WRITE | PERM_ACL_INHERIT);
 
-    // Child should NOT get the new permission
+    // Child should NOT get the new permission.
     auto child_perms = acl.get_effective_permissions(child, "alice", {});
     TEST_ASSERT(has_perm(child_perms.value, PERM_READ), "child should have READ (inherited)");
     TEST_ASSERT(!has_perm(child_perms.value, PERM_WRITE), "child should NOT have WRITE (added after inherit)");
@@ -962,6 +1009,99 @@ void test_default_acls_creator_has_full_user_bits() {
     auto perms = acl.get_effective_permissions(res, "creator_user", {});
     TEST_ASSERT(has_perm(perms.value, PERM_WRITE), "creator should have WRITE from USER ACL");
     TEST_ASSERT(has_perm(perms.value, PERM_EXECUTE), "creator should have EXECUTE from USER ACL");
+    TEST_ASSERT(has_perm(perms.value, PERM_MANAGE_ACL),
+                "creator should have MANAGE_ACL so they can grant/revoke on their resource");
+}
+
+void test_manage_acl_required_separately_from_write() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "managed-resource";
+
+    // bob has WRITE but no MANAGE_ACL.
+    acl.grant_permission(res, "bob", PrincipalType::USER, PERM_READ | PERM_WRITE);
+
+    // check_permission(MANAGE_ACL) should return false even though bob has WRITE.
+    auto can_manage = acl.check_permission(res, "bob", {}, PERM_MANAGE_ACL);
+    TEST_ASSERT(can_manage.success, "check_permission should succeed");
+    TEST_ASSERT(!can_manage.value,
+                "WRITE alone must not satisfy a MANAGE_ACL check (no escalation gap)");
+
+    // The creator has MANAGE_ACL via apply_default_acls.
+    acl.apply_default_acls(res, "owner");
+    auto owner_can_manage = acl.check_permission(res, "owner", {}, PERM_MANAGE_ACL);
+    TEST_ASSERT(owner_can_manage.success && owner_can_manage.value,
+                "creator should satisfy a MANAGE_ACL check");
+}
+
+void test_system_admin_bypass_requires_flag_and_role() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "locked-resource";
+
+    // Resource has no ACLs at all — normal users get zero permissions.
+    auto baseline = acl.check_permission(res, "alice", {}, PERM_READ);
+    TEST_ASSERT(baseline.success && !baseline.value,
+                "alice without ACL should not have READ on locked resource");
+
+    // Holding system_admin while the flag is OFF must NOT bypass.
+    TEST_ASSERT(!acl.system_admin_enabled(), "flag should default to off");
+    auto without_flag = acl.check_permission(res, "alice", {kSystemAdminRole}, PERM_READ);
+    TEST_ASSERT(without_flag.success && !without_flag.value,
+                "system_admin role must NOT bypass while the server flag is off");
+    TEST_ASSERT(!acl.is_system_admin("alice", {kSystemAdminRole}),
+                "is_system_admin must be false when the flag is off");
+
+    // Enable the flag — now the role bypasses.
+    acl.set_system_admin_enabled(true);
+    auto with_flag = acl.check_permission(res, "alice", {kSystemAdminRole}, PERM_READ);
+    TEST_ASSERT(with_flag.success && with_flag.value,
+                "system_admin role should bypass ACLs when flag is on");
+    TEST_ASSERT(acl.is_system_admin("alice", {kSystemAdminRole}),
+                "is_system_admin should reflect the role check");
+
+    // The flag alone (without the role) must not grant anything.
+    auto flag_only = acl.check_permission(res, "alice", {}, PERM_READ);
+    TEST_ASSERT(flag_only.success && !flag_only.value,
+                "flag without role must not grant access");
+}
+
+void test_audit_log_records_actor_for_grant_and_revoke() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "audited-resource";
+
+    // Direct AclManager API: actor is the trailing performed_by argument.
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"admin");
+    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"auditor");
+
+    const auto& log = db->audit_log();
+    TEST_ASSERT(log.size() == 2, "audit log should have one row per grant + one per revoke");
+
+    TEST_ASSERT(log[0].action == "grant", "first event should be grant");
+    TEST_ASSERT(log[0].performed_by == "admin", "grant should record admin as actor");
+    TEST_ASSERT(log[0].resource_uid == res, "grant should reference the resource");
+
+    TEST_ASSERT(log[1].action == "revoke", "second event should be revoke");
+    TEST_ASSERT(log[1].performed_by == "auditor", "revoke should record auditor as actor");
+}
+
+void test_audit_log_records_creator_for_default_acls() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "fresh-resource";
+
+    acl.apply_default_acls(res, "creator_user");
+
+    const auto& log = db->audit_log();
+    TEST_ASSERT(!log.empty(), "apply_default_acls should emit at least one audit row");
+    TEST_ASSERT(log[0].action == "grant", "default ACL is recorded as a grant");
+    TEST_ASSERT(log[0].performed_by == "creator_user",
+                "default ACL should record the creator as the actor");
+    TEST_ASSERT(log[0].principal == "creator_user",
+                "default ACL principal is the creator's USER row");
 }
 
 // Regression: the gRPC enforcement layer historically passed POSIX-octal
@@ -1377,7 +1517,8 @@ int main() {
     run_test("revoke nonexistent permission is no-op", test_revoke_nonexistent_permission);
 
     std::cout << "\n--- 7. ACL Inheritance ---\n";
-    run_test("inherit copies parent ACLs to child", test_inherit_acls_copies_parent_to_child);
+    run_test("inherit copies only ACL_INHERIT-marked rules", test_inherit_acls_copies_inheritable_rules_only);
+    run_test("inherit skips rules without ACL_INHERIT", test_inherit_acls_skips_non_inheritable_rules);
     run_test("inheritance is one-time copy", test_inherit_acls_is_one_time_copy);
     run_test("inherit from empty parent", test_inherit_from_empty_parent);
 
@@ -1386,6 +1527,10 @@ int main() {
     run_test("default ACLs: other gets READ when world-readable enabled", test_default_acls_other_gets_read_when_world_readable);
     run_test("default ACLs: private-by-default (world-readable OFF)", test_default_acls_private_by_default);
     run_test("default ACLs: creator has full user bits", test_default_acls_creator_has_full_user_bits);
+    run_test("MANAGE_ACL is required separately from WRITE", test_manage_acl_required_separately_from_write);
+    run_test("system_admin bypass requires both flag and role", test_system_admin_bypass_requires_flag_and_role);
+    run_test("audit log records actor for grant and revoke", test_audit_log_records_actor_for_grant_and_revoke);
+    run_test("audit log records creator for default ACLs", test_audit_log_records_creator_for_default_acls);
     run_test("regression: gRPC bitmask octal vs hex", test_grpc_bitmask_regression_octal_vs_hex);
 
     std::cout << "\n--- 9. Tenant Isolation ---\n";

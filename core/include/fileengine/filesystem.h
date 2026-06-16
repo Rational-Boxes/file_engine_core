@@ -196,6 +196,15 @@ private:
                                           int required_permissions,
                                           const std::string& tenant);
 
+    // For a newly created resource: copy ACL_INHERIT-marked rules from parent
+    // if it has any, otherwise fall back to default ACLs. The creator always
+    // also gets full USER bits via apply_default_acls so they can manage
+    // what they just made — inheritance is additive.
+    void apply_acls_for_new_resource(const std::string& parent_uid,
+                                     const std::string& new_uid,
+                                     const std::string& user,
+                                     const std::string& tenant);
+
 private:
     // Async object store backup functionality
     struct BackupTask {

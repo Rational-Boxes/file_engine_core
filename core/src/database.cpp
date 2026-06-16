@@ -1737,6 +1737,7 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "    principal VARCHAR(255) NOT NULL,"
         "    principal_type INTEGER NOT NULL,"
         "    permissions INTEGER NOT NULL,"
+        "    granted_by VARCHAR(255),"
         "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "    UNIQUE(resource_uid, principal, principal_type)"
@@ -1749,6 +1750,45 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         return Result<void>::err("Failed to create tenant acls table: " + error);
     }
     PQclear(res);
+
+    // Migration: legacy tenants created before Phase 5 won't have granted_by.
+    // ADD COLUMN IF NOT EXISTS is idempotent and cheap.
+    std::string add_granted_by =
+        "ALTER TABLE \"" + escaped_schema + "\".acls "
+        "ADD COLUMN IF NOT EXISTS granted_by VARCHAR(255);";
+    res = PQexec(pg_conn, add_granted_by.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+    else { PQclear(res); }
+
+    // Audit table records every grant and revoke. permissions_before and
+    // permissions_after are the masks on the acls row immediately before and
+    // after the operation (after = 0 means the row was deleted).
+    std::string create_acl_audit_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".acl_audit ("
+        "    id BIGSERIAL PRIMARY KEY,"
+        "    resource_uid VARCHAR(64) NOT NULL,"
+        "    principal VARCHAR(255) NOT NULL,"
+        "    principal_type INTEGER NOT NULL,"
+        "    action VARCHAR(16) NOT NULL,"   // 'grant' | 'revoke'
+        "    permissions_before INTEGER,"
+        "    permissions_after INTEGER,"
+        "    performed_by VARCHAR(255),"
+        "    performed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");";
+    res = PQexec(pg_conn, create_acl_audit_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant acl_audit table: " + error);
+    }
+    PQclear(res);
+
+    std::string create_idx_acl_audit_resource =
+        "CREATE INDEX IF NOT EXISTS idx_acl_audit_resource_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".acl_audit(resource_uid, performed_at);";
+    res = PQexec(pg_conn, create_idx_acl_audit_resource.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
 
     // The UNIQUE constraint covers (resource_uid, principal, principal_type) for
     // per-resource lookups. Add a (principal, principal_type) index so
@@ -2175,47 +2215,87 @@ std::string Database::get_schema_prefix(const std::string& tenant) const {
 
 // ACL operations implementations
 Result<void> Database::add_acl(const std::string& resource_uid, const std::string& principal,
-                               int type, int permissions, const std::string& tenant) {
+                               int type, int permissions,
+                               const std::string& tenant,
+                               const std::string& performed_by) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
 
     PGconn* pg_conn = conn->get_connection();
-
-    // Get tenant-specific schema prefix. The acls table is created at tenant
-    // init time (see create_tenant_schema) — do not create it lazily here.
+    // The acls table is created at tenant init time (see create_tenant_schema).
     std::string schema = get_schema_prefix(tenant);
 
-    std::string insert_sql =
-        "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions) "
-        "VALUES ($1, $2, $3, $4) "
-        "ON CONFLICT (resource_uid, principal, principal_type) "
-        "DO UPDATE SET permissions = $4, updated_at = CURRENT_TIMESTAMP;";
+    std::string type_str = std::to_string(type);
+    std::string perms_str = std::to_string(permissions);
 
-    const char* param_values[4] = {
+    // Capture the prior permissions bitmask (if any) so we can write an
+    // accurate audit row. NULL/empty performed_by is allowed.
+    std::string select_before_sql =
+        "SELECT permissions FROM " + schema + ".acls "
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
+    const char* before_params[3] = { resource_uid.c_str(), principal.c_str(), type_str.c_str() };
+    int permissions_before = 0;
+    bool had_row = false;
+    PGresult* before_res = PQexecParams(pg_conn, select_before_sql.c_str(), 3,
+                                        nullptr, before_params, nullptr, nullptr, 0);
+    if (PQresultStatus(before_res) == PGRES_TUPLES_OK && PQntuples(before_res) > 0) {
+        permissions_before = atoi(PQgetvalue(before_res, 0, 0));
+        had_row = true;
+    }
+    PQclear(before_res);
+
+    std::string insert_sql =
+        "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions, granted_by) "
+        "VALUES ($1, $2, $3, $4, NULLIF($5, '')) "
+        "ON CONFLICT (resource_uid, principal, principal_type) "
+        "DO UPDATE SET permissions = $4, granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
+
+    const char* param_values[5] = {
         resource_uid.c_str(),
         principal.c_str(),
-        std::to_string(type).c_str(),
-        std::to_string(permissions).c_str()
+        type_str.c_str(),
+        perms_str.c_str(),
+        performed_by.c_str()
     };
 
-    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 4, nullptr, param_values, nullptr, nullptr, 0);
-
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 5, nullptr, param_values, nullptr, nullptr, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to add ACL: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
         connection_pool_->release(conn);
         return Result<void>::err(error);
     }
-
     PQclear(res);
+
+    // Audit row. Failures here are non-fatal — never fail an ACL change just
+    // because the audit log couldn't be written; the caller has bigger problems.
+    std::string audit_sql =
+        "INSERT INTO " + schema + ".acl_audit "
+        "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
+        "VALUES ($1, $2, $3, 'grant', $4, $5, NULLIF($6, ''));";
+    std::string before_str = had_row ? std::to_string(permissions_before) : std::string("0");
+    const char* audit_params[6] = {
+        resource_uid.c_str(),
+        principal.c_str(),
+        type_str.c_str(),
+        before_str.c_str(),
+        perms_str.c_str(),
+        performed_by.c_str()
+    };
+    PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
+    if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) { PQclear(audit_res); }
+    else { PQclear(audit_res); }
+
     connection_pool_->release(conn);
     return Result<void>::ok();
 }
 
 Result<void> Database::remove_acl(const std::string& resource_uid, const std::string& principal,
-                                  int type, int permissions, const std::string& tenant) {
+                                  int type, int permissions,
+                                  const std::string& tenant,
+                                  const std::string& performed_by) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
@@ -2224,9 +2304,27 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
     PGconn* pg_conn = conn->get_connection();
     std::string schema = get_schema_prefix(tenant);
 
+    std::string type_str = std::to_string(type);
+    std::string perms_str = std::to_string(permissions);
+
+    // Capture the prior permissions bitmask for the audit row.
+    std::string select_before_sql =
+        "SELECT permissions FROM " + schema + ".acls "
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3;";
+    const char* before_params[3] = { resource_uid.c_str(), principal.c_str(), type_str.c_str() };
+    int permissions_before = 0;
+    bool had_row = false;
+    PGresult* before_res = PQexecParams(pg_conn, select_before_sql.c_str(), 3,
+                                        nullptr, before_params, nullptr, nullptr, 0);
+    if (PQresultStatus(before_res) == PGRES_TUPLES_OK && PQntuples(before_res) > 0) {
+        permissions_before = atoi(PQgetvalue(before_res, 0, 0));
+        had_row = true;
+    }
+    PQclear(before_res);
+
     // Clear the bits in `permissions` from the row's existing bitmask, then
-    // delete the row if it would be left with no bits. Using a CTE keeps both
-    // statements in a single round-trip and a single transaction.
+    // delete the row if it would be left with no bits. Single CTE = single
+    // transaction.
     std::string sql =
         "WITH updated AS ("
         "  UPDATE " + schema + ".acls "
@@ -2238,25 +2336,43 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
         "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 "
         "  AND permissions = 0;";
 
-    std::string type_str = std::to_string(type);
-    std::string perms_str = std::to_string(permissions);
     const char* param_values[4] = {
         resource_uid.c_str(),
         principal.c_str(),
         type_str.c_str(),
         perms_str.c_str()
     };
-
     PGresult* res = PQexecParams(pg_conn, sql.c_str(), 4, nullptr, param_values, nullptr, nullptr, 0);
-
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to remove ACL: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
         connection_pool_->release(conn);
         return Result<void>::err(error);
     }
-
     PQclear(res);
+
+    // Only audit if there was a row to act on.
+    if (had_row) {
+        int permissions_after = permissions_before & ~permissions;
+        std::string after_str = std::to_string(permissions_after);
+        std::string before_str = std::to_string(permissions_before);
+        std::string audit_sql =
+            "INSERT INTO " + schema + ".acl_audit "
+            "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
+            "VALUES ($1, $2, $3, 'revoke', $4, $5, NULLIF($6, ''));";
+        const char* audit_params[6] = {
+            resource_uid.c_str(),
+            principal.c_str(),
+            type_str.c_str(),
+            before_str.c_str(),
+            after_str.c_str(),
+            performed_by.c_str()
+        };
+        PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
+        if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) { PQclear(audit_res); }
+        else { PQclear(audit_res); }
+    }
+
     connection_pool_->release(conn);
     return Result<void>::ok();
 }

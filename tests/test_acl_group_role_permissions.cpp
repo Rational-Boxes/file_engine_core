@@ -156,7 +156,9 @@ public:
     
     // ACL operations - these are the important ones for our test
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
-                         int type, int permissions, const std::string& tenant = "") override {
+                         int type, int permissions,
+                         const std::string& tenant = "",
+                         const std::string& /*performed_by*/ = "") override {
         AclEntry entry;
         entry.resource_uid = resource_uid;
         entry.principal = principal;
@@ -169,7 +171,9 @@ public:
     }
     
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
-                            int type, int permissions, const std::string& tenant = "") override {
+                            int type, int permissions,
+                            const std::string& tenant = "",
+                            const std::string& /*performed_by*/ = "") override {
         auto& resource_acls = acls_[resource_uid];
         for (auto& entry : resource_acls) {
             if (entry.principal == principal && entry.type == type) {
