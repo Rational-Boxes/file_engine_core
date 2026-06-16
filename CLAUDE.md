@@ -103,14 +103,15 @@ cmake .. && make -j$(nproc)
 ./basic_tests   # or other test binaries
 ```
 
-Key test suites:
-- `test_comprehensive_acl_roles.cpp` — Full ACL + role coverage (~26K lines)
-- `test_role_based_access_scenarios.cpp` — RBAC scenarios (~25K lines)
-- `test_acl_group_role_permissions.cpp` — Group/role permissions (~19K lines)
-- `filesystem_tests.cpp`, `database_tests.cpp`, `storage_tests.cpp`, `cache_tests.cpp`, etc.
+Key test suites (in `tests/`):
+- `test_acl_rbac_comprehensive.cpp` — Newest comprehensive ACL+RBAC suite (~1255 lines, currently untracked)
+- `test_comprehensive_acl_roles.cpp` — Full ACL + role coverage (~534 lines)
+- `test_role_based_access_scenarios.cpp` — RBAC scenarios (~469 lines)
+- `test_acl_group_role_permissions.cpp` — Group/role permissions (~375 lines)
+- Core unit suites: `filesystem_tests.cpp`, `database_tests.cpp`, `storage_tests.cpp`, `cache_tests.cpp`, `acl_tests.cpp`, `tenant_tests.cpp`, `query_builder_tests.cpp`, `file_culler_tests.cpp`, `storage_tracker_tests.cpp`, `object_store_sync_tests.cpp`, `s3_tests.cpp`, `test_s3_integration.cpp`, `basic_tests.cpp`, `unit_tests.cpp`
 - Shell scripts: `test_acl_roles.sh`, `test_permissions.sh`
 
-Ad-hoc test files in project root (test_*.cpp) are standalone integration tests compiled separately.
+Numerous ad-hoc `test_*.cpp` files at the project root are standalone integration tests (e.g., `test_grpc.cpp`, `test_s3_sync.cpp`, `test_tenant_manager.cpp`, `test_direct_filesystem*.cpp`) compiled separately from the main test suite.
 
 ## Deployment
 
@@ -134,7 +135,8 @@ Ad-hoc test files in project root (test_*.cpp) are standalone integration tests 
 - PUT operations return immediately after local storage; S3 backup is async via background worker thread
 
 ## Current Development State
-- **Active branch:** `ACL-improvments` (3 commits ahead of main)
-- **Recent work:** Role-based ACL permission implementation and comprehensive test coverage
+- **Active branch:** `ACL-improvments` (4 commits ahead of main)
+- **Recent work:** Role-based ACL permission implementation and comprehensive test coverage. A new `test_acl_rbac_comprehensive.cpp` suite plus updates to `test_comprehensive_acl_roles.cpp` and `tests/CMakeLists.txt` are currently uncommitted.
 - **Main implementation** is in `/core/` with well-defined interfaces and dependency injection
-- **backup_working_implementation/** is a legacy reference — active development is in `/core/`
+- **backup_working_implementation/** referenced in older docs no longer exists in the tree — active development is in `/core/`
+- **Other AI-context files** present at the root: `GEMINI.md`, `QWEN.md`, `README.md`, `DOCUMENTATION.md`, `SPECIFICATIONS.md`, `database_architecture.md`
