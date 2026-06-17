@@ -480,8 +480,19 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
         current_version = versions_result.value[0]; // Latest version
     }
 
-    // Determine expected locations for the file
-    std::string local_storage_path = context->storage->get_storage_path(file_uid, current_version, tenant);
+    // Look up the actual stored path from the versions table. The schema's
+    // storage_path column is the source of truth — important for restored
+    // versions where (uid, new_timestamp) doesn't map to a real file but the
+    // row points at an older version's file.
+    std::string local_storage_path;
+    auto path_result = context->db->get_version_storage_path(file_uid, current_version, tenant);
+    if (path_result.success && path_result.value.has_value()) {
+        local_storage_path = path_result.value.value();
+    } else {
+        // Fallback: derive from (uid, version_timestamp). Covers callers
+        // that wrote bytes before a versions row existed.
+        local_storage_path = context->storage->get_storage_path(file_uid, current_version, tenant);
+    }
     std::string s3_storage_path = context->object_store ?
         context->object_store->get_storage_path(file_uid, current_version, tenant) : "N/A";
 

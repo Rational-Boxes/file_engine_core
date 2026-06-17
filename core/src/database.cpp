@@ -9,6 +9,8 @@
 #include <iostream>
 #include <memory>
 #include <chrono>
+#include <cstdio>
+#include <ctime>
 
 namespace fileengine {
 
@@ -1273,16 +1275,80 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
 }
 
 Result<bool> Database::restore_to_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& user, const std::string& tenant) {
-    // Since we don't have a current_version column in the schema, this operation is not supported
-    // The version functionality would need to be implemented differently in the current schema
+    // "Current version" is whichever versions row has the max version_timestamp
+    // for this file_uid. To restore, insert a new versions row with a fresh
+    // timestamp pointing at the requested version's storage_path. The
+    // existing payload is reused (no re-encrypt / re-compress) and the new
+    // row's timestamp wins on read.
+    (void)user; // accepted for API parity; the FS layer already enforced WRITE permission
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection for restore operation");
     }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
 
-    // Just return an error as versioning isn't supported with the current schema
+    // 1. Look up the source version's storage_path + size.
+    std::string select_sql = "SELECT storage_path, size FROM \"" + schema + "\".versions "
+                             "WHERE file_uid = $1 AND version_timestamp = $2 LIMIT 1;";
+    const char* select_params[2] = { file_uid.c_str(), version_timestamp.c_str() };
+    PGresult* sel = PQexecParams(pg_conn, select_sql.c_str(), 2, nullptr, select_params, nullptr, nullptr, 0);
+    if (PQresultStatus(sel) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to look up version: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(sel);
+        connection_pool_->release(conn);
+        return Result<bool>::err(error);
+    }
+    if (PQntuples(sel) == 0) {
+        PQclear(sel);
+        connection_pool_->release(conn);
+        return Result<bool>::err("Version " + version_timestamp + " not found for file " + file_uid);
+    }
+    std::string source_path = PQgetvalue(sel, 0, 0);
+    std::string size_str = PQgetvalue(sel, 0, 1);
+    PQclear(sel);
+
+    // 2. Generate a new version_timestamp and insert a new row pointing at
+    //    the same storage_path. The Utils helper format is used elsewhere;
+    //    inline a compatible one here to avoid a new dependency.
+    // UTC, matching Utils::get_timestamp_string used by the rest of the codebase.
+    // Mixing local-time and UTC would break the "current = max(timestamp)" ordering.
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()) % 1000;
+    std::tm tm_buf{};
+    gmtime_r(&t, &tm_buf);
+    char ts_buf[40];
+    std::snprintf(ts_buf, sizeof(ts_buf), "%04d%02d%02d_%02d%02d%02d.%03lld",
+                  tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                  tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                  static_cast<long long>(ms.count()));
+    std::string new_ts = ts_buf;
+
+    std::string insert_sql = "INSERT INTO \"" + schema + "\".versions "
+                             "(file_uid, version_timestamp, size, storage_path) "
+                             "VALUES ($1, $2, $3, $4);";
+    const char* insert_params[4] = {
+        file_uid.c_str(), new_ts.c_str(), size_str.c_str(), source_path.c_str()
+    };
+    PGresult* ins = PQexecParams(pg_conn, insert_sql.c_str(), 4, nullptr, insert_params, nullptr, nullptr, 0);
+    if (PQresultStatus(ins) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to insert restored version: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(ins);
+        connection_pool_->release(conn);
+        return Result<bool>::err(error);
+    }
+    PQclear(ins);
+
+    // 3. Bump files.modified-at-equivalent so observers see a "change".
+    std::string update_sql = "UPDATE \"" + schema + "\".files SET size = $2 WHERE uid = $1;";
+    const char* update_params[2] = { file_uid.c_str(), size_str.c_str() };
+    PGresult* upd = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, update_params, nullptr, nullptr, 0);
+    if (upd) PQclear(upd);  // non-fatal
+
     connection_pool_->release(conn);
-    return Result<bool>::err("Restore to version not supported with current schema. Versioning needs to be implemented differently.");
+    return Result<bool>::ok(true);
 }
 
 // Add all missing methods here

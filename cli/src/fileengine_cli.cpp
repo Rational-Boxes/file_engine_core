@@ -42,6 +42,8 @@ using fileengine_rpc::ListVersionsRequest;
 using fileengine_rpc::ListVersionsResponse;
 using fileengine_rpc::GetVersionRequest;
 using fileengine_rpc::GetVersionResponse;
+using fileengine_rpc::RestoreToVersionRequest;
+using fileengine_rpc::RestoreToVersionResponse;
 using fileengine_rpc::SetMetadataRequest;
 using fileengine_rpc::SetMetadataResponse;
 using fileengine_rpc::GetMetadataRequest;
@@ -491,17 +493,73 @@ public:
 
     // Versioning operations
     bool list_versions(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
-        std::cout << "✗ List versions operation not supported in this build" << std::endl;
+        ListVersionsRequest request;
+        request.set_uid(uid);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        ListVersionsResponse response;
+        grpc::ClientContext context;
+        grpc::Status status = stub_->ListVersions(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "Versions for '" << uid << "':" << std::endl;
+            if (response.versions_size() == 0) {
+                std::cout << "  (no versions yet)" << std::endl;
+            }
+            for (const auto& v : response.versions()) {
+                std::cout << "  - " << v << std::endl;
+            }
+            return true;
+        }
+        std::cout << "✗ Failed to list versions: " << response.error() << std::endl;
         return false;
     }
 
-    bool get_version(const std::string& uid, int version_number, const std::string& user, const std::string& tenant = "default") {
-        std::cout << "✗ Get version operation not supported in this build" << std::endl;
-        return false;
+    bool get_version(const std::string& uid, const std::string& version_timestamp,
+                     const std::string& output_path, const std::string& user,
+                     const std::string& tenant = "default") {
+        GetVersionRequest request;
+        request.set_uid(uid);
+        request.set_version_timestamp(version_timestamp);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        GetVersionResponse response;
+        grpc::ClientContext context;
+        grpc::Status status = stub_->GetVersion(&context, request, &response);
+
+        if (!(status.ok() && response.success())) {
+            std::cout << "✗ Failed to get version: " << response.error() << std::endl;
+            return false;
+        }
+
+        std::ofstream out(output_path, std::ios::binary);
+        if (!out) {
+            std::cout << "✗ Failed to open output file: " << output_path << std::endl;
+            return false;
+        }
+        out.write(response.data().data(), response.data().size());
+        out.close();
+        std::cout << "✓ Wrote version " << version_timestamp << " (" << response.data().size()
+                  << " bytes) to " << output_path << std::endl;
+        return true;
     }
 
-    bool restore_to_version(const std::string& uid, int version_number, const std::string& user, const std::string& tenant = "default") {
-        std::cout << "✗ Restore to version operation not supported in this build" << std::endl;
+    bool restore_to_version(const std::string& uid, const std::string& version_timestamp,
+                            const std::string& user, const std::string& tenant = "default") {
+        RestoreToVersionRequest request;
+        request.set_uid(uid);
+        request.set_version_timestamp(version_timestamp);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        RestoreToVersionResponse response;
+        grpc::ClientContext context;
+        grpc::Status status = stub_->RestoreToVersion(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Restored '" << uid << "' to version " << response.restored_version() << std::endl;
+            return true;
+        }
+        std::cout << "✗ Failed to restore: " << response.error() << std::endl;
         return false;
     }
 
@@ -1140,9 +1198,9 @@ int main(int argc, char** argv) {
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Versioning operations:" << std::endl;
-        std::cout << "  versions <uid>                        - List all versions for a resource" << std::endl;
-        std::cout << "  getversion <uid> <version>            - Get specific version of resource" << std::endl;
-        std::cout << "  restore <uid> <version>               - Restore resource to specific version" << std::endl;
+        std::cout << "  versions <uid>                            - List all version timestamps for a resource" << std::endl;
+        std::cout << "  getversion <uid> <timestamp> <out_path>   - Read a specific version into out_path" << std::endl;
+        std::cout << "  restore <uid> <timestamp>                 - Restore resource to a specific version" << std::endl;
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Metadata operations:" << std::endl;
@@ -1276,23 +1334,11 @@ int main(int argc, char** argv) {
     else if (command == "versions" && argc - arg_offset == 2) {  // command + 1 arg
         client.list_versions(argv[arg_offset + 1], user, tenant);
     }
-    else if (command == "getversion" && argc - arg_offset == 3) {  // command + 2 args
-        try {
-            int version = std::stoi(argv[arg_offset + 2]);
-            client.get_version(argv[arg_offset + 1], version, user, tenant);
-        } catch (const std::exception& e) {
-            std::cout << "✗ Invalid version number: " << argv[arg_offset + 2] << std::endl;
-            return 1;
-        }
+    else if (command == "getversion" && argc - arg_offset == 4) {  // command + 3 args: uid, timestamp, output_path
+        client.get_version(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user, tenant);
     }
-    else if (command == "restore" && argc - arg_offset == 3) {  // command + 2 args
-        try {
-            int version = std::stoi(argv[arg_offset + 2]);
-            client.restore_to_version(argv[arg_offset + 1], version, user, tenant);
-        } catch (const std::exception& e) {
-            std::cout << "✗ Invalid version number: " << argv[arg_offset + 2] << std::endl;
-            return 1;
-        }
+    else if (command == "restore" && argc - arg_offset == 3) {  // command + 2 args: uid, timestamp
+        client.restore_to_version(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "setmeta" && argc - arg_offset == 4) {  // command + 3 args
         client.set_metadata(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user, tenant);
