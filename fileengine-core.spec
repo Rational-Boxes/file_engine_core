@@ -13,10 +13,14 @@ URL:            https://github.com/fileengine/fileengine-core
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
-BuildRequires:  cmake, gcc-c++, make
+BuildRequires:  cmake, gcc-c++, make, pkgconfig
 BuildRequires:  postgresql-devel, openssl-devel, zlib-devel
 BuildRequires:  grpc-devel, protobuf-devel, protobuf-compiler
-BuildRequires:  aws-sdk-cpp-devel, libcurl-devel, libuuid-devel
+# On modern Fedora the AWS SDK is split per service; the s3 client lives in
+# aws-sdk-cpp-storage-devel and the core in aws-sdk-cpp-core-devel.
+BuildRequires:  aws-sdk-cpp-core-devel
+BuildRequires:  aws-sdk-cpp-storage-devel
+BuildRequires:  libcurl-devel, libuuid-devel
 BuildRequires:  systemd-rpm-macros
 
 %description
@@ -137,13 +141,12 @@ The fileengine_cli command-line tool. Connects to a FileEngine gRPC server
 %setup -q -n %{_source_name}-%{version}
 
 %build
+# Plain cmake invocation (avoid the cmake distro macro): the upstream
+# CMakeLists is structured around an in-tree build/ subdir; Fedora's
+# distro macro redirects into redhat-linux-build/ which leaves build/
+# empty for the install phase below.
 mkdir -p build
 cd build
-%cmake3 .. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=%{_prefix} \
-    -DCMAKE_INSTALL_LIBDIR=%{_lib} \
-    -DCMAKE_SKIP_INSTALL_RPATH=ON 2>/dev/null || \
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=%{_prefix} \

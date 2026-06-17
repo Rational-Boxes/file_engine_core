@@ -8,10 +8,13 @@ PACKAGE_NAME := fileengine-core
 BUILD_DIR := build
 INSTALL_PREFIX := /opt/file_engine_core
 
-# Create distribution tarball
+# Create distribution tarball. The --prefix matches the dir name the RPM
+# spec's %setup -n expects and that dpkg-buildpackage unpacks into.
 dist:
 	@echo "Creating distribution tarball..."
-	@git archive --format=tar.gz --output=$(PACKAGE_NAME)-$(VERSION).tar.gz HEAD
+	@git archive --format=tar.gz \
+	    --prefix=$(PACKAGE_NAME)-$(VERSION)/ \
+	    --output=$(PACKAGE_NAME)-$(VERSION).tar.gz HEAD
 
 # Build Arch Linux package
 arch-package: dist

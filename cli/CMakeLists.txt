@@ -54,6 +54,7 @@ target_link_libraries(fileengine_cli
 )
 
 # Installation target for CLI
+include(GNUInstallDirs)
 install(TARGETS fileengine_cli
-    RUNTIME DESTINATION bin
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
