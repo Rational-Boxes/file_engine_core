@@ -315,25 +315,27 @@ configured for Jaeger renders an end-to-end trace.
 
 ---
 
-## 10. Open questions
+## 10. Decisions (resolved)
 
-- **Bind address for `:8081`.** Default to all-interfaces or
-  localhost-only? Defaulting to localhost is the safer choice (no
-  surprise exposure); operators bind it wider in `core.conf`.
-- **Authentication on `/metrics`.** None by default + localhost-only,
-  or static bearer + all-interfaces? My lean: localhost-only by
-  default, bearer-supported for cross-host scrape.
-- **Cardinality of the `tenant` label.** Currently we have ~5
-  tenants; in production this could be hundreds. Worth a config
-  knob to disable the tenant label if cardinality gets out of hand.
-- **TLS on the REST port.** OpenSSL is linked. We could reuse the
-  gRPC TLS cert, or accept that scrape happens inside a trusted
-  network. Defer.
+- **Bind address for `:8081`.** Default `0.0.0.0`. Production
+  assumption is that the network perimeter (firewall / VPC security
+  groups) restricts the port to trusted scrapers and operators —
+  there is no second authentication layer to add for `/metrics`.
+- **Authentication on `/metrics`.** None. Same firewall-trust
+  rationale as above.
+- **Cardinality of the `tenant` label.** Emit by default but
+  config-gated: `FILEENGINE_METRICS_TENANT_LABEL=true|false`. Flip
+  to `false` to collapse tenant series for high-tenant-count
+  deployments.
+- **TLS on the REST port.** Not implemented. Always assumed to be
+  inside a trusted network.
 - **Where do build-info / git-sha come from at runtime?** CMake
   baking a generated header (`build_info.h`) via `configure_file()`
-  is the standard pattern.
-- **systemd `Type=notify`.** Cheap to add, lets systemd's own
-  readiness reporting flow naturally. Suggest yes in Phase A.
+  — the standard pattern.
+- **systemd integration.** Yes, full `Type=notify` integration:
+  `sd_notify("READY=1")` once the listener is up, watchdog ping
+  loop, status messages. The unit file already exists; switch
+  `Type=simple` → `Type=notify` and add `WatchdogSec=`.
 
 ---
 
@@ -348,18 +350,22 @@ configured for Jaeger renders an end-to-end trace.
 
 ---
 
-## 12. Suggested defaults that don't paint us into a corner
+## 12. Locked-in defaults
 
-- HTTP listener: cpp-httplib, OFF by default in `core.conf`, but the
-  RPM/DEB install enables it (`FILEENGINE_HTTP_METRICS_ENABLED=true`,
-  `FILEENGINE_HTTP_METRICS_ADDR=127.0.0.1`,
-  `FILEENGINE_HTTP_METRICS_PORT=8081`).
-- Metrics: prometheus-cpp, one global registry, `/metrics` always
-  served when the listener is up.
+- HTTP listener: cpp-httplib, ON by default
+  (`FILEENGINE_HTTP_METRICS_ENABLED=true`,
+  `FILEENGINE_HTTP_METRICS_ADDR=0.0.0.0`,
+  `FILEENGINE_HTTP_METRICS_PORT=8081`). Firewall is the trust boundary.
+- Metrics: prometheus-cpp, one global registry. Per-tenant labels on
+  by default (`FILEENGINE_METRICS_TENANT_LABEL=true`); flip to
+  `false` for high-tenant-count deployments.
 - Tracing: OFF by default. Enable when an OTel Collector endpoint is
   configured (`FILEENGINE_OTLP_ENDPOINT=...`).
 - Logging: text by default; flip to JSON with
   `FILEENGINE_LOG_FORMAT=json`.
+- systemd: `Type=notify` with watchdog. `sd_notify("READY=1")` from
+  the server once both the gRPC listener and the REST listener are
+  bound.
 
 ---
 
