@@ -1942,48 +1942,14 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         }
         PQclear(res);
 
-        // Add default ACLs for the root directory
-        // Grant full permissions to system user
-        std::string insert_root_acl_sql = "INSERT INTO \"" + escaped_schema + "\".acls (resource_uid, principal, principal_type, permissions) "
-            "VALUES ('', 'system', 0, 755) "
-            "ON CONFLICT (resource_uid, principal, principal_type) "
-            "DO UPDATE SET permissions = 755, updated_at = CURRENT_TIMESTAMP;";
-        res = PQexec(pg_conn, insert_root_acl_sql.c_str());
-        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
-            std::string error = "Failed to create root directory ACL: " + std::string(PQerrorMessage(pg_conn));
-            PQclear(res);
-            connection_pool_->release(conn);
-            return Result<void>::err(error);
-        }
-        PQclear(res);
-
-        // Grant full permissions to root user
-        std::string insert_root_user_acl_sql = "INSERT INTO \"" + escaped_schema + "\".acls (resource_uid, principal, principal_type, permissions) "
-            "VALUES ('', 'root', 0, 755) "
-            "ON CONFLICT (resource_uid, principal, principal_type) "
-            "DO UPDATE SET permissions = 755, updated_at = CURRENT_TIMESTAMP;";
-        res = PQexec(pg_conn, insert_root_user_acl_sql.c_str());
-        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
-            std::string error = "Failed to create root directory ACL for 'root' user: " + std::string(PQerrorMessage(pg_conn));
-            PQclear(res);
-            connection_pool_->release(conn);
-            return Result<void>::err(error);
-        }
-        PQclear(res);
-
-        // Grant read permissions to 'other' category for root directory
-        std::string insert_root_other_acl_sql = "INSERT INTO \"" + escaped_schema + "\".acls (resource_uid, principal, principal_type, permissions) "
-            "VALUES ('', 'other', 2, 444) "
-            "ON CONFLICT (resource_uid, principal, principal_type) "
-            "DO UPDATE SET permissions = 444, updated_at = CURRENT_TIMESTAMP;";
-        res = PQexec(pg_conn, insert_root_other_acl_sql.c_str());
-        if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
-            std::string error = "Failed to create root directory ACL for 'other': " + std::string(PQerrorMessage(pg_conn));
-            PQclear(res);
-            connection_pool_->release(conn);
-            return Result<void>::err(error);
-        }
-        PQclear(res);
+        // No bootstrap ACL rows for the empty-uid root resource. The
+        // filesystem-root auto-read special case in grpc_service.h grants
+        // READ access there regardless of ACLs, and mkdir at root is gated
+        // by the system_admin role check in FileSystem::mkdir. The legacy
+        // 'system'/'root'/'other' inserts that used to live here used a
+        // 3-column ON CONFLICT that became invalid in Phase 6 (the named
+        // constraint is on 4 columns including effect), and they aborted
+        // create_tenant_schema before the public.tenants registration ran.
     }
 
     // Register the tenant in the global tenants table for multi-tenant sync
@@ -1995,8 +1961,11 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
 
     res = PQexec(pg_conn, register_tenant_sql.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        // Log warning but don't fail - tenant registration is not critical for basic operation
-        // std::cerr << "Warning: Failed to register tenant in global registry: " << PQerrorMessage(pg_conn) << std::endl;
+        // Non-fatal: the tenant's own schema works whether or not it lands
+        // in the global registry. But log loudly so this doesn't hide again.
+        SERVER_LOG_WARN("Database::create_tenant_schema",
+                        "Failed to register tenant '" + tenant_id_to_register +
+                        "' in public.tenants: " + std::string(PQerrorMessage(pg_conn)));
     }
     PQclear(res);
 
