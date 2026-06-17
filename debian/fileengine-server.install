@@ -1,0 +1,4 @@
+usr/bin/fileengine_server
+etc/fileengine/core.conf
+etc/logrotate.d/fileengine
+lib/systemd/system/fileengine.service

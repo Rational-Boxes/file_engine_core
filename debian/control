@@ -9,7 +9,7 @@ Build-Depends: debhelper-compat (= 13),
                libssl-dev,
                zlib1g-dev,
                libcurl4-openssl-dev,
-               libuuid1,
+               uuid-dev,
                libgrpc++-dev,
                libprotobuf-dev,
                protobuf-compiler,
@@ -18,25 +18,49 @@ Build-Depends: debhelper-compat (= 13),
 Standards-Version: 4.6.0
 Homepage: https://github.com/fileengine/fileengine-core
 
-Package: fileengine-core
+Package: fileengine-libs
+Architecture: amd64
+Section: libs
+Multi-Arch: same
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Description: FileEngine shared library
+ The libfileengine_core.so shared library used by the FileEngine server
+ and client binaries. Install on any machine that runs either of them.
+
+Package: fileengine-server
 Architecture: amd64
 Depends: ${shlibs:Depends},
          ${misc:Depends},
+         fileengine-libs (= ${binary:Version}),
+         adduser,
          postgresql-client,
          openssl,
-         libcurl4,
-         libuuid1
-Description: A distributed virtual filesystem with horizontal scaling and hybrid cloud/on-premises deployment support
- FileEngine Core is a simplified, focused implementation of a distributed
- virtual filesystem with horizontal scaling and hybrid cloud/on-premises
- deployment support. It provides features like:
+         libcurl4
+Description: FileEngine gRPC server daemon
+ The fileengine_server gRPC daemon. Multi-tenant virtual filesystem with
+ PostgreSQL persistence, S3/MinIO object-store integration, ACL/RBAC
+ enforcement, and at-rest compression+encryption.
  .
- * UUID-based file identification for distributed handling
- * Automatic versioning with microsecond precision timestamps
- * POSIX-compliant ACLs for granular access control
- * Intelligent file culling with configurable thresholds
- * Hybrid cloud/on-premises deployment support
- * S3/MinIO integration with automatic synchronization
- * Detailed storage tracking per host and tenant
- .
- This package provides the core FileEngine server and client tools.
+ Ships a systemd unit (fileengine.service), a default config at
+ /etc/fileengine/core.conf, and a logrotate rule. Creates a system
+ 'fileengine' user/group and the storage and log directories on install.
+
+Package: fileengine-server-dev
+Architecture: amd64
+Section: libdevel
+Depends: ${misc:Depends},
+         fileengine-libs (= ${binary:Version})
+Description: FileEngine development headers
+ C++ headers and a libfileengine_core.so dev symlink for linking other
+ fileengine components against the shared library. Install on dev hosts.
+
+Package: fileengine-cli
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         fileengine-libs (= ${binary:Version})
+Description: FileEngine command-line client
+ The fileengine_cli command-line tool. Connects to a FileEngine gRPC
+ server (local or remote) for directory/file/permission/version/metadata
+ operations.

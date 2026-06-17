@@ -1,19 +1,30 @@
 #!/usr/bin/make -f
 
 %:
-	dh $@ --with=cmake
+	dh $@ --buildsystem=cmake
 
 override_dh_auto_configure:
 	dh_auto_configure -- \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_INSTALL_PREFIX=/usr \
-		-DCMAKE_INSTALL_LIBDIR=lib
+		-DCMAKE_INSTALL_LIBDIR=lib/$(DEB_HOST_MULTIARCH) \
+		-DCMAKE_SKIP_INSTALL_RPATH=ON
 
 override_dh_auto_install:
 	dh_auto_install --destdir=debian/tmp
-
-override_dh_installinit:
-	dh_installinit --name=fileengine
+	# The top-level CMakeLists creates /usr/local symlinks and writes the
+	# unit file to /etc/systemd/system — both inappropriate for a Debian
+	# package. Strip them out; .install lists the canonical locations.
+	rm -rf debian/tmp/usr/local
+	rm -rf debian/tmp/etc/systemd
+	# Install the systemd unit under lib/systemd/system (canonical vendor location).
+	install -d debian/tmp/lib/systemd/system
+	install -m 644 fileengine.service debian/tmp/lib/systemd/system/fileengine.service
+	# Default server config + logrotate rule.
+	install -d debian/tmp/etc/fileengine
+	install -m 644 core.conf debian/tmp/etc/fileengine/core.conf
+	install -d debian/tmp/etc/logrotate.d
+	install -m 644 fileengine.logrotate debian/tmp/etc/logrotate.d/fileengine
 
 override_dh_installsystemd:
-	dh_installsystemd --name=fileengine
+	dh_installsystemd -p fileengine-server --name=fileengine

@@ -1,3 +1,15 @@
+fileengine-core (1.0.0-2) unstable; urgency=low
+
+  * Split into four binary packages: fileengine-libs, fileengine-server,
+    fileengine-server-dev, fileengine-cli.
+  * libfileengine_core.so moves to fileengine-libs so CLI and server can
+    install independently; both depend on it via fileengine-libs.
+  * fileengine-server now owns the systemd unit, default config, logrotate
+    rule, and the fileengine system user/group.
+  * fileengine-cli is now a minimal package — just the binary.
+
+ -- FileEngine Team <maintainer@fileengine.example.com>  Wed, 17 Jun 2026 22:00:00 +0000
+
 fileengine-core (1.0.0-1) unstable; urgency=low
 
   * Initial release of FileEngine Core

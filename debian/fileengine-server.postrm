@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            systemctl disable fileengine.service >/dev/null 2>&1 || true
+            systemctl daemon-reload || true
+        fi
+    ;;
+    purge)
+        # Keep /var/lib/fileengine on remove — it has the storage payload.
+        # purge sweeps everything user-side, including the service user.
+        rm -rf /var/log/fileengine || true
+        rm -f /etc/logrotate.d/fileengine || true
+        if getent passwd fileengine >/dev/null; then
+            deluser --system fileengine 2>/dev/null || true
+        fi
+        if getent group fileengine >/dev/null; then
+            delgroup --system fileengine 2>/dev/null || true
+        fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

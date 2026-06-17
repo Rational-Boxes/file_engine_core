@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Runtime directories owned by the service user.
+        install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine
+        install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine/storage
+        install -d -o fileengine -g fileengine -m 750 /var/log/fileengine
+
+        # systemd integration (dh_installsystemd would also do this; keeping
+        # it explicit so the package works even on hosts without dh).
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemctl enable fileengine.service >/dev/null || true
+        fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

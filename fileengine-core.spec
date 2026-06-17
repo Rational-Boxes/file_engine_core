@@ -1,10 +1,14 @@
+# Top-level (source) package metadata. The source tarball name is unchanged
+# from earlier (fileengine-core-<ver>.tar.gz) so existing build scripts that
+# pass --define name=fileengine-core still work.
+%define _source_name fileengine-core
+%define _libname     libfileengine_core.so
+
 Name:           fileengine-core
 Version:        1.0.0
 Release:        1%{?dist}
-Summary:        A distributed virtual filesystem with horizontal scaling and hybrid cloud/on-premises deployment support
-
+Summary:        Distributed virtual filesystem — meta package
 License:        MIT
-Group:          System Environment/Daemons
 URL:            https://github.com/fileengine/fileengine-core
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -13,81 +17,175 @@ BuildRequires:  cmake, gcc-c++, make
 BuildRequires:  postgresql-devel, openssl-devel, zlib-devel
 BuildRequires:  grpc-devel, protobuf-devel, protobuf-compiler
 BuildRequires:  aws-sdk-cpp-devel, libcurl-devel, libuuid-devel
-
-Requires:       postgresql, openssl, libcurl, libuuid
+BuildRequires:  systemd-rpm-macros
 
 %description
-FileEngine Core is a simplified, focused implementation of a distributed
-virtual filesystem with horizontal scaling and hybrid cloud/on-premises
-deployment support. It provides features like:
+FileEngine Core is a C++17 distributed virtual filesystem with multi-tenant
+file management, POSIX ACLs, S3/MinIO object store integration, and a gRPC API.
 
-* UUID-based file identification for distributed handling
-* Automatic versioning with microsecond precision timestamps
-* POSIX-compliant ACLs for granular access control
-* Intelligent file culling with configurable thresholds
-* Hybrid cloud/on-premises deployment support
-* S3/MinIO integration with automatic synchronization
-* Detailed storage tracking per host and tenant
+This source package produces four binary packages:
 
+* fileengine-libs         — shared library (libfileengine_core.so)
+* fileengine-server       — gRPC server daemon + systemd unit + config
+* fileengine-server-devel — headers + .so symlink for building integrations
+* fileengine-cli          — command-line client
+
+The empty fileengine-core meta-package depends on -libs and -server for the
+common "install everything for a server box" case; install -cli separately on
+client machines.
+
+Requires:       fileengine-libs = %{version}-%{release}
+Requires:       fileengine-server = %{version}-%{release}
+
+# ---------------------------------------------------------------------------
+# Shared library
+# ---------------------------------------------------------------------------
+%package -n fileengine-libs
+Summary:        FileEngine shared library
+Requires:       postgresql, openssl, libcurl, libuuid
+%description -n fileengine-libs
+The libfileengine_core.so shared library used by the FileEngine server and
+client binaries. Install on any machine that runs either of them.
+
+%post -n fileengine-libs -p /sbin/ldconfig
+%postun -n fileengine-libs -p /sbin/ldconfig
+
+%files -n fileengine-libs
+%defattr(-,root,root,-)
+%attr(644,root,root) %{_libdir}/%{_libname}
+
+# ---------------------------------------------------------------------------
+# Server daemon
+# ---------------------------------------------------------------------------
+%package -n fileengine-server
+Summary:        FileEngine gRPC server daemon
+Requires:       fileengine-libs = %{version}-%{release}
+Requires(pre):  shadow-utils
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+%description -n fileengine-server
+The fileengine_server gRPC daemon. Multi-tenant virtual filesystem with
+PostgreSQL persistence, S3/MinIO object-store integration, ACL/RBAC
+enforcement, and at-rest compression+encryption.
+
+Ships a systemd unit (fileengine.service), a default config at
+/etc/fileengine/core.conf, and a logrotate rule. Creates a system 'fileengine'
+user/group and the storage and log directories on install.
+
+%pre -n fileengine-server
+# Create fileengine user/group before file install so ownership lands right.
+getent group fileengine >/dev/null || groupadd -r fileengine
+getent passwd fileengine >/dev/null || \
+    useradd -r -g fileengine -d /var/lib/fileengine -s /sbin/nologin \
+            -c "FileEngine Service" fileengine
+exit 0
+
+%post -n fileengine-server
+# Storage + log directories owned by the service user.
+install -d -o fileengine -g fileengine -m 750 /var/lib/fileengine/storage
+install -d -o fileengine -g fileengine -m 750 /var/log/fileengine
+%systemd_post fileengine.service
+
+%preun -n fileengine-server
+%systemd_preun fileengine.service
+
+%postun -n fileengine-server
+%systemd_postun_with_restart fileengine.service
+
+%files -n fileengine-server
+%defattr(-,root,root,-)
+%attr(755,root,root) %{_bindir}/fileengine_server
+%config(noreplace) /etc/fileengine/core.conf
+%config(noreplace) /etc/logrotate.d/fileengine
+%{_unitdir}/fileengine.service
+%dir %attr(750,fileengine,fileengine) /var/lib/fileengine
+%dir %attr(750,fileengine,fileengine) /var/log/fileengine
+
+# ---------------------------------------------------------------------------
+# Development headers (build integrations against the shared library)
+# ---------------------------------------------------------------------------
+%package -n fileengine-server-devel
+Summary:        Development headers for building against fileengine-libs
+Requires:       fileengine-libs = %{version}-%{release}
+%description -n fileengine-server-devel
+C++ headers and a libfileengine_core.so dev symlink for linking other
+fileengine components against the shared library. Install on dev hosts.
+
+%files -n fileengine-server-devel
+%defattr(-,root,root,-)
+%{_includedir}/fileengine/
+
+# ---------------------------------------------------------------------------
+# CLI client
+# ---------------------------------------------------------------------------
+%package -n fileengine-cli
+Summary:        Command-line client for the FileEngine server
+Requires:       fileengine-libs = %{version}-%{release}
+%description -n fileengine-cli
+The fileengine_cli command-line tool. Connects to a FileEngine gRPC server
+(local or remote) for directory/file/permission/version/metadata operations.
+
+%files -n fileengine-cli
+%defattr(-,root,root,-)
+%attr(755,root,root) %{_bindir}/fileengine_cli
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
 %prep
-%setup -q
+%setup -q -n %{_source_name}-%{version}
 
 %build
 mkdir -p build
 cd build
+%cmake3 .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=%{_prefix} \
+    -DCMAKE_INSTALL_LIBDIR=%{_lib} \
+    -DCMAKE_SKIP_INSTALL_RPATH=ON 2>/dev/null || \
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=%{_prefix} \
-    -DCMAKE_INSTALL_LIBDIR=lib
+    -DCMAKE_INSTALL_LIBDIR=%{_lib} \
+    -DCMAKE_SKIP_INSTALL_RPATH=ON
 make %{?_smp_mflags}
 
 %install
-rm -rf $RPM_BUILD_ROOT
-mkdir -p $RPM_BUILD_ROOT
+rm -rf %{buildroot}
 cd build
-make DESTDIR=$RPM_BUILD_ROOT install
+make DESTDIR=%{buildroot} install
 
-# Install systemd service file
-mkdir -p $RPM_BUILD_ROOT%{_unitdir}
-install -m 644 ../fileengine.service $RPM_BUILD_ROOT%{_unitdir}/fileengine.service
+# Drop the CMake-driven /usr/local symlinks and /etc/systemd/system unit;
+# the spec installs to %{_unitdir} explicitly below.
+rm -rf %{buildroot}/usr/local
+rm -rf %{buildroot}/etc/systemd
 
-# Install default configuration
-mkdir -p $RPM_BUILD_ROOT/etc/fileengine
-install -m 644 ../core.conf $RPM_BUILD_ROOT/etc/fileengine/core.conf
+# Sytemd unit (canonical RPM location).
+install -d %{buildroot}%{_unitdir}
+install -m 644 ../fileengine.service %{buildroot}%{_unitdir}/fileengine.service
 
-# Install logrotate configuration
-mkdir -p $RPM_BUILD_ROOT/etc/logrotate.d
-install -m 644 ../fileengine.logrotate $RPM_BUILD_ROOT/etc/logrotate.d/fileengine
+# Default server config.
+install -d %{buildroot}/etc/fileengine
+install -m 644 ../core.conf %{buildroot}/etc/fileengine/core.conf
 
-%post
-# Create fileengine user if it doesn't exist
-getent group fileengine >/dev/null || groupadd -r fileengine
-getent passwd fileengine >/dev/null || useradd -r -g fileengine -d /var/lib/fileengine -s /sbin/nologin -c "FileEngine Core Service" fileengine
-# Create necessary directories
-mkdir -p /var/lib/fileengine/storage
-mkdir -p /var/log/fileengine
-chown -R fileengine:fileengine /var/lib/fileengine
-chown -R fileengine:fileengine /var/log/fileengine
-# Enable and start the service
-%systemd_post fileengine.service
+# Logrotate.
+install -d %{buildroot}/etc/logrotate.d
+install -m 644 ../fileengine.logrotate %{buildroot}/etc/logrotate.d/fileengine
 
-%preun
-%systemd_preun fileengine.service
+# Pre-create runtime dirs so the %dir directives have something to own.
+install -d %{buildroot}/var/lib/fileengine
+install -d %{buildroot}/var/log/fileengine
 
-%postun
-%systemd_postun_with_restart fileengine.service
-
-%files
-%attr(755,root,root) %{_bindir}/fileengine_server
-%attr(755,root,root) %{_bindir}/fileengine_cli
-%attr(644,root,root) %{_libdir}/libfileengine_core.so
-%attr(644,root,root) %{_datadir}/fileengine/
-%config(noreplace) /etc/fileengine/core.conf
-%config(noreplace) /etc/logrotate.d/fileengine
-%{_unitdir}/fileengine.service
-%dir /var/lib/fileengine
-%dir /var/log/fileengine
+%clean
+rm -rf %{buildroot}
 
 %changelog
+* Wed Jun 17 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
+- Split monolithic fileengine-core RPM into four sub-packages:
+  fileengine-libs, fileengine-server, fileengine-server-devel, fileengine-cli.
+- Library now triggers ldconfig in %post; server runs as system user
+  'fileengine'; per-package %files lists keep contents disjoint.
+
 * Wed Jan 07 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
 - Initial package

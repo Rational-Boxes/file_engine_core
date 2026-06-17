@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+# Create the fileengine system user/group before files are unpacked so the
+# %dir attrs land with the right ownership. Idempotent.
+case "$1" in
+    install|upgrade)
+        if ! getent group fileengine >/dev/null; then
+            addgroup --system fileengine
+        fi
+        if ! getent passwd fileengine >/dev/null; then
+            adduser --system --ingroup fileengine \
+                    --home /var/lib/fileengine \
+                    --shell /usr/sbin/nologin \
+                    --gecos "FileEngine Service" fileengine
+        fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0
