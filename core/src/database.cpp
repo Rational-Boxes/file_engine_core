@@ -2331,7 +2331,8 @@ Result<std::string> Database::create_file_with_acls(const std::string& uid,
         "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions, granted_by, effect) "
         "VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6) "
         "ON CONFLICT ON CONSTRAINT acls_principal_effect "
-        "DO UPDATE SET permissions = $4, granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
+        "DO UPDATE SET permissions = " + schema + ".acls.permissions | ($4::int), "
+        "              granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
 
     std::string audit_sql =
         "INSERT INTO " + schema + ".acl_audit "
@@ -2410,7 +2411,7 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     // row so the audit log can record before/after deltas.
     std::string select_before_sql =
         "SELECT permissions FROM " + schema + ".acls "
-        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 AND effect = $4;";
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = ($3::int) AND effect = ($4::int);";
     const char* before_params[4] = {
         resource_uid.c_str(), principal.c_str(), type_str.c_str(), effect_str.c_str() };
     int permissions_before = 0;
@@ -2427,7 +2428,8 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
         "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions, granted_by, effect) "
         "VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6) "
         "ON CONFLICT ON CONSTRAINT acls_principal_effect "
-        "DO UPDATE SET permissions = $4, granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
+        "DO UPDATE SET permissions = " + schema + ".acls.permissions | ($4::int), "
+        "              granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
 
     const char* param_values[6] = {
         resource_uid.c_str(),
@@ -2455,14 +2457,17 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
         "INSERT INTO " + schema + ".acl_audit "
         "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
         "VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''));";
-    std::string before_str = had_row ? std::to_string(permissions_before) : std::string("0");
+    int before_value = had_row ? permissions_before : 0;
+    int after_value = before_value | permissions;  // grants OR the bits in
+    std::string before_str = std::to_string(before_value);
+    std::string after_str = std::to_string(after_value);
     const char* audit_params[7] = {
         resource_uid.c_str(),
         principal.c_str(),
         type_str.c_str(),
         action_label.c_str(),
         before_str.c_str(),
-        perms_str.c_str(),
+        after_str.c_str(),
         performed_by.c_str()
     };
     PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 7, nullptr, audit_params, nullptr, nullptr, 0);
@@ -2493,7 +2498,7 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
     // Capture the prior permissions bitmask for the audit row.
     std::string select_before_sql =
         "SELECT permissions FROM " + schema + ".acls "
-        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 AND effect = $4;";
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = ($3::int) AND effect = ($4::int);";
     const char* before_params[4] = {
         resource_uid.c_str(), principal.c_str(), type_str.c_str(), effect_str.c_str() };
     int permissions_before = 0;
@@ -2509,32 +2514,76 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
     // Clear the bits in `permissions` from the row's existing bitmask, then
     // delete the row if it would be left with no bits. Single CTE = single
     // transaction.
-    std::string sql =
-        "WITH updated AS ("
-        "  UPDATE " + schema + ".acls "
-        "  SET permissions = permissions & ~$4, updated_at = CURRENT_TIMESTAMP "
-        "  WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 AND effect = $5 "
-        "  RETURNING resource_uid, principal, principal_type, permissions"
-        ") "
+    // Two-statement transaction: UPDATE (clear bits) then DELETE the row if
+    // it has no bits left. CTE-based variants of this had subtle issues with
+    // RETURNING visibility, so do it explicitly. Explicit ::int casts because
+    // libpq sends bind params as text and `~` can't pick an overload otherwise.
+    std::string update_sql =
+        "UPDATE " + schema + ".acls "
+        "SET permissions = permissions & ~($4::int), updated_at = CURRENT_TIMESTAMP "
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = ($3::int) AND effect = ($5::int);";
+    // DELETE uses 4 params (no perms mask) — referencing an unused $4 makes
+    // Postgres fail with "could not determine data type of parameter $4".
+    std::string delete_sql =
         "DELETE FROM " + schema + ".acls "
-        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = $3 AND effect = $5 "
+        "WHERE resource_uid = $1 AND principal = $2 AND principal_type = ($3::int) AND effect = ($4::int) "
         "  AND permissions = 0;";
 
-    const char* param_values[5] = {
+    const char* update_params[5] = {
         resource_uid.c_str(),
         principal.c_str(),
         type_str.c_str(),
         perms_str.c_str(),
         effect_str.c_str()
     };
-    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 5, nullptr, param_values, nullptr, nullptr, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        std::string error = "Failed to remove ACL: " + std::string(PQerrorMessage(pg_conn));
-        PQclear(res);
+    const char* delete_params[4] = {
+        resource_uid.c_str(),
+        principal.c_str(),
+        type_str.c_str(),
+        effect_str.c_str()
+    };
+
+    // Wrap UPDATE + conditional DELETE in a transaction so an observer never
+    // sees the intermediate "permissions = 0" state.
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN remove_acl transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
         connection_pool_->release(conn);
         return Result<void>::err(error);
     }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
+    PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 5, nullptr, update_params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to update ACL bits in remove_acl: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        return rollback_and_fail(error);
+    }
     PQclear(res);
+
+    res = PQexecParams(pg_conn, delete_sql.c_str(), 4, nullptr, delete_params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to delete zeroed ACL row in remove_acl: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        return rollback_and_fail(error);
+    }
+    PQclear(res);
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT remove_acl: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
 
     // Only audit if there was a row to act on.
     if (had_row) {

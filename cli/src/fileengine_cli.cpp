@@ -83,6 +83,45 @@ using fileengine_rpc::GetAllRolesResponse;
 
 namespace fileengine {
 
+// Parse a single-letter permission code into the proto Permission enum.
+// Returns false on unknown letters; caller is responsible for the error
+// message. Letters were chosen to be mnemonic and pairwise-unique:
+//   r READ, w WRITE, x EXECUTE
+//   d DELETE, l LIST_DELETED, u UNDELETE
+//   v VIEW_VERSIONS, b RETRIEVE_BACK_VERSION (b = "back"), s RESTORE_TO_VERSION
+//   m MANAGE_ACL, i ACL_INHERIT
+inline bool parse_perm_letter(const std::string& letter, Permission& out) {
+    if (letter == "r") { out = Permission::READ; return true; }
+    if (letter == "w") { out = Permission::WRITE; return true; }
+    if (letter == "x") { out = Permission::EXECUTE; return true; }
+    if (letter == "d") { out = Permission::DELETE; return true; }
+    if (letter == "l") { out = Permission::LIST_DELETED; return true; }
+    if (letter == "u") { out = Permission::UNDELETE; return true; }
+    if (letter == "v") { out = Permission::VIEW_VERSIONS; return true; }
+    if (letter == "b") { out = Permission::RETRIEVE_BACK_VERSION; return true; }
+    if (letter == "s") { out = Permission::RESTORE_TO_VERSION; return true; }
+    if (letter == "m") { out = Permission::MANAGE_ACL; return true; }
+    if (letter == "i") { out = Permission::ACL_INHERIT; return true; }
+    return false;
+}
+
+inline const char* perm_name(Permission p) {
+    switch (p) {
+        case Permission::READ: return "READ";
+        case Permission::WRITE: return "WRITE";
+        case Permission::EXECUTE: return "EXECUTE";
+        case Permission::DELETE: return "DELETE";
+        case Permission::LIST_DELETED: return "LIST_DELETED";
+        case Permission::UNDELETE: return "UNDELETE";
+        case Permission::VIEW_VERSIONS: return "VIEW_VERSIONS";
+        case Permission::RETRIEVE_BACK_VERSION: return "RETRIEVE_BACK_VERSION";
+        case Permission::RESTORE_TO_VERSION: return "RESTORE_TO_VERSION";
+        case Permission::MANAGE_ACL: return "MANAGE_ACL";
+        case Permission::ACL_INHERIT: return "ACL_INHERIT";
+        default: return "UNKNOWN";
+    }
+}
+
 class FileEngineClient {
 private:
     std::unique_ptr<fileengine_rpc::FileService::Stub> stub_;
@@ -116,7 +155,7 @@ public:
         request.set_name(name);
         fileengine::Logger::detail("Mkdir", "Set parent UID: ", parent_uid, ", name: ", name);
 
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
         request.set_permissions(0755);
         fileengine::Logger::detail("Mkdir", "Set permissions: 0755");
 
@@ -150,7 +189,7 @@ public:
         request.set_uid(uid);
         fileengine::Logger::detail("ListDir", "Set directory UID: ", uid);
 
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         ListDirectoryResponse response;
         grpc::ClientContext context;
@@ -192,7 +231,7 @@ public:
     bool remove_directory(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         RemoveDirectoryRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         RemoveDirectoryResponse response;
         grpc::ClientContext context;
@@ -217,7 +256,7 @@ public:
         request.set_name(name);
         fileengine::Logger::detail("Touch", "Set parent UID: ", parent_uid, ", name: ", name);
 
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         TouchResponse response;
         grpc::ClientContext context;
@@ -240,7 +279,7 @@ public:
     bool remove_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         RemoveFileRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         RemoveFileResponse response;
         grpc::ClientContext context;
@@ -263,7 +302,7 @@ public:
         request.set_uid(uid);
         fileengine::Logger::detail("GetFile", "Set file UID: ", uid);
 
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GetFileResponse response;
         grpc::ClientContext context;
@@ -294,7 +333,7 @@ public:
         request.set_data(data_str);
         fileengine::Logger::detail("PutFile", "Set file UID: ", uid, ", data size: ", data_str.size());
 
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         PutFileResponse response;
         grpc::ClientContext context;
@@ -318,7 +357,7 @@ public:
     bool stat(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         StatRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         StatResponse response;
         grpc::ClientContext context;
@@ -366,7 +405,7 @@ public:
     bool exists(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         ExistsRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         ExistsResponse response;
         grpc::ClientContext context;
@@ -391,7 +430,7 @@ public:
         RenameRequest request;
         request.set_uid(uid);
         request.set_new_name(new_name);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         RenameResponse response;
         grpc::ClientContext context;
@@ -412,7 +451,7 @@ public:
         MoveRequest request;
         request.set_source_uid(uid);
         request.set_destination_parent_uid(new_parent_uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         MoveResponse response;
         grpc::ClientContext context;
@@ -433,7 +472,7 @@ public:
         CopyRequest request;
         request.set_source_uid(source_uid);
         request.set_destination_parent_uid(destination_parent_uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         CopyResponse response;
         grpc::ClientContext context;
@@ -469,7 +508,7 @@ public:
     bool delete_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         RemoveFileRequest request;  // Using the same request as remove_file but could have a soft-delete version
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         RemoveFileResponse response;
         grpc::ClientContext context;
@@ -502,7 +541,7 @@ public:
         request.set_uid(uid);
         request.set_key(key);
         request.set_value(value);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         SetMetadataResponse response;
         grpc::ClientContext context;
@@ -522,7 +561,7 @@ public:
         GetMetadataRequest request;
         request.set_uid(uid);
         request.set_key(key);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GetMetadataResponse response;
         grpc::ClientContext context;
@@ -541,7 +580,7 @@ public:
     bool get_all_metadata(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
         GetAllMetadataRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GetAllMetadataResponse response;
         grpc::ClientContext context;
@@ -564,7 +603,7 @@ public:
         DeleteMetadataRequest request;
         request.set_uid(uid);
         request.set_key(key);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         DeleteMetadataResponse response;
         grpc::ClientContext context;
@@ -583,7 +622,7 @@ public:
     // Diagnostic operations
     bool storage_usage(const std::string& user, const std::string& tenant = "default") {
         StorageUsageRequest request;
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
         request.set_tenant(tenant);
 
         StorageUsageResponse response;
@@ -631,7 +670,7 @@ public:
         TouchRequest touch_request;
         touch_request.set_parent_uid(parent_uid);
         touch_request.set_name(name);
-        *touch_request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *touch_request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         TouchResponse touch_response;
         grpc::ClientContext touch_context;
@@ -664,7 +703,7 @@ public:
     bool download(const std::string& uid, const std::string& output_path, const std::string& user, const std::string& tenant = "default", int version_number = -1) {
         GetFileRequest request;
         request.set_uid(uid);
-        *request.mutable_auth() = create_auth_context(user, {}, tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GetFileResponse response;
         grpc::ClientContext context;
@@ -695,11 +734,12 @@ public:
     }
 
     // ACL operations
-    bool grant_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default") {
+    bool grant_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default", fileengine_rpc::AclEffect effect = fileengine_rpc::AclEffect::ALLOW) {
         GrantPermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
+        request.set_effect(effect);
         *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GrantPermissionResponse response;
@@ -707,8 +747,10 @@ public:
 
         grpc::Status status = stub_->GrantPermission(&context, request, &response);
 
+        const char* effect_str = (effect == fileengine_rpc::AclEffect::DENY) ? "DENY" : "ALLOW";
         if (status.ok() && response.success()) {
-            std::cout << "✓ Granted permission to '" << principal << "' on resource '" << resource_uid << "'" << std::endl;
+            std::cout << "✓ Granted " << effect_str << " " << perm_name(permission)
+                      << " to '" << principal << "' on resource '" << resource_uid << "'" << std::endl;
             return true;
         } else {
             std::cout << "✗ Failed to grant permission: " << response.error() << std::endl;
@@ -716,11 +758,12 @@ public:
         }
     }
 
-    bool revoke_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default") {
+    bool revoke_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default", fileengine_rpc::AclEffect effect = fileengine_rpc::AclEffect::ALLOW) {
         RevokePermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
+        request.set_effect(effect);
         *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         RevokePermissionResponse response;
@@ -728,8 +771,10 @@ public:
 
         grpc::Status status = stub_->RevokePermission(&context, request, &response);
 
+        const char* effect_str = (effect == fileengine_rpc::AclEffect::DENY) ? "DENY" : "ALLOW";
         if (status.ok() && response.success()) {
-            std::cout << "✓ Revoked permission from '" << principal << "' on resource '" << resource_uid << "'" << std::endl;
+            std::cout << "✓ Revoked " << effect_str << " " << perm_name(permission)
+                      << " from '" << principal << "' on resource '" << resource_uid << "'" << std::endl;
             return true;
         } else {
             std::cout << "✗ Failed to revoke permission: " << response.error() << std::endl;
@@ -749,19 +794,7 @@ public:
         grpc::Status status = stub_->CheckPermission(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::string perm_str = "UNKNOWN";
-            switch(required_permission) {
-                case Permission::READ:
-                    perm_str = "READ";
-                    break;
-                case Permission::WRITE:
-                    perm_str = "WRITE";
-                    break;
-                case Permission::EXECUTE:
-                    perm_str = "EXECUTE";
-                    break;
-            }
-
+            const char* perm_str = perm_name(required_permission);
             if (response.has_permission()) {
                 std::cout << "✓ User '" << user << "' has " << perm_str << " permission on resource '" << resource_uid << "'" << std::endl;
             } else {
@@ -786,11 +819,10 @@ public:
         grpc::Status status = stub_->CreateRole(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "✓ Validated role '" << role << "' in tenant '" << tenant << "'" << std::endl;
-            std::cout << "Note: In this implementation, roles are not stored in the database but passed with each request." << std::endl;
+            std::cout << "✓ Created role '" << role << "' in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to validate role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to create role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -806,11 +838,10 @@ public:
         grpc::Status status = stub_->DeleteRole(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "✓ Validated deletion of role '" << role << "' in tenant '" << tenant << "'" << std::endl;
-            std::cout << "Note: In this implementation, roles are not stored in the database but passed with each request." << std::endl;
+            std::cout << "✓ Deleted role '" << role << "' in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to validate deletion of role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to delete role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -827,11 +858,10 @@ public:
         grpc::Status status = stub_->AssignUserToRole(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "✓ Validated assignment of user '" << user << "' to role '" << role << "' in tenant '" << tenant << "'" << std::endl;
-            std::cout << "Note: In this implementation, user-role assignments are not stored in the database but handled externally." << std::endl;
+            std::cout << "✓ Assigned user '" << user << "' to role '" << role << "' in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to validate assignment of user '" << user << "' to role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to assign user '" << user << "' to role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -848,11 +878,10 @@ public:
         grpc::Status status = stub_->RemoveUserFromRole(&context, request, &response);
 
         if (status.ok() && response.success()) {
-            std::cout << "✓ Validated removal of user '" << user << "' from role '" << role << "' in tenant '" << tenant << "'" << std::endl;
-            std::cout << "Note: In this implementation, user-role assignments are not stored in the database but handled externally." << std::endl;
+            std::cout << "✓ Removed user '" << user << "' from role '" << role << "' in tenant '" << tenant << "'" << std::endl;
             return true;
         } else {
-            std::cout << "✗ Failed to validate removal of user '" << user << "' from role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+            std::cout << "✗ Failed to remove user '" << user << "' from role '" << role << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
     }
@@ -874,7 +903,7 @@ public:
                     std::cout << "  - " << role << std::endl;
                 }
             } else {
-                std::cout << "  No roles found (roles should be provided with each request)" << std::endl;
+                std::cout << "  (no roles assigned to this user)" << std::endl;
             }
             return true;
         } else {
@@ -900,7 +929,7 @@ public:
                     std::cout << "  - " << user << std::endl;
                 }
             } else {
-                std::cout << "  No users found (user-role mappings are handled externally)" << std::endl;
+                std::cout << "  (no users assigned to this role)" << std::endl;
             }
             return true;
         } else {
@@ -984,6 +1013,9 @@ int main(int argc, char** argv) {
     std::vector<std::string> claims = {};
     std::string server_address = "localhost:50051";
     fileengine::LogLevel log_level = fileengine::LogLevel::NORMAL;
+    // Phase 6: ACL effect for grant/revoke. Default to ALLOW; users opt into
+    // DENY rules with --effect deny (or -e deny).
+    fileengine_rpc::AclEffect effect = fileengine_rpc::AclEffect::ALLOW;
 
     // First, let's handle global options before the command, including config file
     int arg_offset = 1;
@@ -1024,6 +1056,18 @@ int main(int argc, char** argv) {
         } else if (opt == "--server") {
             if (arg_offset + 1 < argc) {
                 server_address = argv[++arg_offset];
+            }
+        } else if (opt == "-e" || opt == "--effect") {
+            if (arg_offset + 1 < argc) {
+                std::string val = argv[++arg_offset];
+                if (val == "deny" || val == "DENY") {
+                    effect = fileengine_rpc::AclEffect::DENY;
+                } else if (val == "allow" || val == "ALLOW") {
+                    effect = fileengine_rpc::AclEffect::ALLOW;
+                } else {
+                    std::cout << "Invalid --effect value: " << val << " (use allow or deny)" << std::endl;
+                    return 1;
+                }
             }
         } else if (opt == "-v" || opt == "--verbose") {
             log_level = fileengine::LogLevel::VERBOSE;
@@ -1066,6 +1110,7 @@ int main(int argc, char** argv) {
         std::cout << "  -t, --tenant TENANT       - Tenant for operations (default: default)" << std::endl;
         std::cout << "  -r, --roles ROLE1,ROLE2   - Roles for the user (comma separated)" << std::endl;
         std::cout << "  -c, --claims CLAIM1,CLAIM2 - Claims for the user (comma separated)" << std::endl;
+        std::cout << "  -e, --effect allow|deny   - For grant/revoke: target the ALLOW (default) or DENY ACL row" << std::endl;
         std::cout << "  --server ADDRESS          - Server address (default: localhost:50051)" << std::endl;
         std::cout << "  -v, --verbose             - Enable verbose logging" << std::endl;
         std::cout << "  -vv, --very-verbose       - Enable very verbose logging" << std::endl;
@@ -1108,9 +1153,13 @@ int main(int argc, char** argv) {
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Permission operations:" << std::endl;
-        std::cout << "  grant <resource_uid> <user> <perm>    - Grant permission (r/w/x)" << std::endl;
-        std::cout << "  revoke <resource_uid> <user> <perm>   - Revoke permission (r/w/x)" << std::endl;
-        std::cout << "  check <resource_uid> <user> <perm>    - Check permission (r/w/x)" << std::endl;
+        std::cout << "  grant <resource_uid> <principal> <perm>  - Grant permission (use -e deny for a DENY rule)" << std::endl;
+        std::cout << "  revoke <resource_uid> <principal> <perm> - Revoke permission (use -e deny to revoke a DENY rule)" << std::endl;
+        std::cout << "  check <resource_uid> <user> <perm>       - Check whether user has the permission" << std::endl;
+        std::cout << "  Permission letters:" << std::endl;
+        std::cout << "    r=READ  w=WRITE  x=EXECUTE  d=DELETE  l=LIST_DELETED  u=UNDELETE" << std::endl;
+        std::cout << "    v=VIEW_VERSIONS  b=RETRIEVE_BACK_VERSION  s=RESTORE_TO_VERSION" << std::endl;
+        std::cout << "    m=MANAGE_ACL  i=ACL_INHERIT" << std::endl;
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Role management operations:" << std::endl;
@@ -1259,50 +1308,26 @@ int main(int argc, char** argv) {
     }
     else if (command == "grant" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
-        std::string perm_arg = argv[arg_offset + 3];
-        if (perm_arg == "r") {
-            perm = fileengine_rpc::Permission::READ;
-        } else if (perm_arg == "w") {
-            perm = fileengine_rpc::Permission::WRITE;
-        } else if (perm_arg == "x") {
-            perm = fileengine_rpc::Permission::EXECUTE;
-        } else {
-            std::cout << "✗ Invalid permission. Use r, w, or x." << std::endl;
+        if (!fileengine::parse_perm_letter(argv[arg_offset + 3], perm)) {
+            std::cout << "✗ Invalid permission letter. Use one of: r w x d l u v b s m i" << std::endl;
             return 1;
         }
-
-        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant);
+        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant, effect);
     }
     else if (command == "revoke" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
-        std::string perm_arg = argv[arg_offset + 3];
-        if (perm_arg == "r") {
-            perm = fileengine_rpc::Permission::READ;
-        } else if (perm_arg == "w") {
-            perm = fileengine_rpc::Permission::WRITE;
-        } else if (perm_arg == "x") {
-            perm = fileengine_rpc::Permission::EXECUTE;
-        } else {
-            std::cout << "✗ Invalid permission. Use r, w, or x." << std::endl;
+        if (!fileengine::parse_perm_letter(argv[arg_offset + 3], perm)) {
+            std::cout << "✗ Invalid permission letter. Use one of: r w x d l u v b s m i" << std::endl;
             return 1;
         }
-
-        client.revoke_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant);
+        client.revoke_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant, effect);
     }
     else if (command == "check" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
-        std::string perm_arg = argv[arg_offset + 3];
-        if (perm_arg == "r") {
-            perm = fileengine_rpc::Permission::READ;
-        } else if (perm_arg == "w") {
-            perm = fileengine_rpc::Permission::WRITE;
-        } else if (perm_arg == "x") {
-            perm = fileengine_rpc::Permission::EXECUTE;
-        } else {
-            std::cout << "✗ Invalid permission. Use r, w, or x." << std::endl;
+        if (!fileengine::parse_perm_letter(argv[arg_offset + 3], perm)) {
+            std::cout << "✗ Invalid permission letter. Use one of: r w x d l u v b s m i" << std::endl;
             return 1;
         }
-
         client.check_permission(argv[arg_offset + 1], user, perm, tenant);
     }
     // Role management commands

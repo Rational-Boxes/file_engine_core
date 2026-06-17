@@ -99,7 +99,9 @@ enum Permission {
     VIEW_VERSIONS = 5;     // View versions permission
     RETRIEVE_BACK_VERSION = 6;  // Retrieve back version permission
     RESTORE_TO_VERSION = 7;     // Restore to version permission
-    EXECUTE = 8;            // Execute permission
+    EXECUTE = 8;           // Execute permission
+    MANAGE_ACL = 9;        // Grant/revoke permissions on this resource (Phase 5)
+    ACL_INHERIT = 10;      // Marks a rule for parent->child propagation (Phase 5)
 }
 
 // Directory operations

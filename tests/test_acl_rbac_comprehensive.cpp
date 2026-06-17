@@ -127,11 +127,13 @@ public:
                          int effect = 0) override {
         std::string key = tenant + "::" + resource_uid;
         auto& resource_acls = acls_[key];
-        // Upsert by (principal, type, effect) — ALLOW and DENY coexist.
+        // Upsert by (principal, type, effect). ALLOW and DENY coexist as
+        // separate rows. Successive grants OR the bits — matches the real
+        // DB's `SET permissions = acls.permissions | $4`.
         bool updated = false;
         for (auto& entry : resource_acls) {
             if (entry.principal == principal && entry.type == type && entry.effect == effect) {
-                entry.permissions = permissions;
+                entry.permissions |= permissions;
                 updated = true;
                 break;
             }
@@ -843,14 +845,15 @@ void test_check_permission_with_superset() {
 // 6. GRANT AND REVOKE BEHAVIOR
 // =============================================================================
 
-void test_grant_upserts_per_principal_effect() {
+void test_grant_accumulates_per_principal_effect() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "res-grant-001";
 
-    // Successive grants for the same (principal, type, effect) upsert into a
-    // single row — second one REPLACES the first. The DB enforces this with
-    // ON CONFLICT DO UPDATE; the mock matches.
+    // Successive grants for the same (principal, type, effect) OR the new
+    // bits into the existing row, so callers can grant bits incrementally
+    // without overwriting earlier grants. The DB enforces this with
+    //   ON CONFLICT DO UPDATE SET permissions = acls.permissions | $4
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE);
 
@@ -858,10 +861,9 @@ void test_grant_upserts_per_principal_effect() {
     TEST_ASSERT(acls.success, "get_acls should succeed");
     TEST_ASSERT(acls.value.size() == 1, "ALLOW row is upserted, not duplicated");
 
-    // Effective perms reflect ONLY the most recent grant.
     auto result = acl.get_effective_permissions(res, "alice", {});
-    TEST_ASSERT(!has_perm(result.value, PERM_READ), "READ was replaced by the WRITE grant");
-    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "alice should have the latest grant: WRITE");
+    TEST_ASSERT(has_perm(result.value, PERM_READ), "alice retains READ from the first grant");
+    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "alice gains WRITE from the second grant");
 }
 
 void test_revoke_clears_only_requested_bits() {
@@ -1083,7 +1085,7 @@ void test_manage_acl_required_separately_from_write() {
                 "creator should satisfy a MANAGE_ACL check");
 }
 
-void test_system_admin_bypass_requires_flag_and_role() {
+void test_system_admin_role_bypasses_acls() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "locked-resource";
@@ -1093,26 +1095,24 @@ void test_system_admin_bypass_requires_flag_and_role() {
     TEST_ASSERT(baseline.success && !baseline.value,
                 "alice without ACL should not have READ on locked resource");
 
-    // Holding system_admin while the flag is OFF must NOT bypass.
-    TEST_ASSERT(!acl.system_admin_enabled(), "flag should default to off");
-    auto without_flag = acl.check_permission(res, "alice", {kSystemAdminRole}, PERM_READ);
-    TEST_ASSERT(without_flag.success && !without_flag.value,
-                "system_admin role must NOT bypass while the server flag is off");
-    TEST_ASSERT(!acl.is_system_admin("alice", {kSystemAdminRole}),
-                "is_system_admin must be false when the flag is off");
-
-    // Enable the flag — now the role bypasses.
-    acl.set_system_admin_enabled(true);
-    auto with_flag = acl.check_permission(res, "alice", {kSystemAdminRole}, PERM_READ);
-    TEST_ASSERT(with_flag.success && with_flag.value,
-                "system_admin role should bypass ACLs when flag is on");
+    // Holding system_admin in the request roles immediately grants access —
+    // there is no enable flag. Upstream is trusted to only attach this role
+    // to legitimately privileged requests.
+    auto via_request = acl.check_permission(res, "alice", {kSystemAdminRole}, PERM_READ);
+    TEST_ASSERT(via_request.success && via_request.value,
+                "system_admin role in request roles should bypass ACLs");
     TEST_ASSERT(acl.is_system_admin("alice", {kSystemAdminRole}),
                 "is_system_admin should reflect the role check");
 
-    // The flag alone (without the role) must not grant anything.
-    auto flag_only = acl.check_permission(res, "alice", {}, PERM_READ);
-    TEST_ASSERT(flag_only.success && !flag_only.value,
-                "flag without role must not grant access");
+    // A user assigned system_admin in the DB also bypasses (request and DB
+    // roles are unioned via resolve_effective_roles).
+    acl.is_system_admin("bob", {kSystemAdminRole}); // no-op, just consistency
+    RoleManager rm(db);
+    rm.create_role(kSystemAdminRole);
+    rm.assign_user_to_role("bob", kSystemAdminRole);
+    auto via_db = acl.check_permission(res, "bob", {}, PERM_READ);
+    TEST_ASSERT(via_db.success && via_db.value,
+                "system_admin role via DB-stored assignment should also bypass");
 }
 
 void test_audit_log_records_actor_for_grant_and_revoke() {
@@ -1775,7 +1775,7 @@ int main() {
     run_test("check_permission with superset", test_check_permission_with_superset);
 
     std::cout << "\n--- 6. Grant and Revoke Behavior ---\n";
-    run_test("grant upserts per (principal, type, effect)", test_grant_upserts_per_principal_effect);
+    run_test("grant accumulates bits per (principal, type, effect)", test_grant_accumulates_per_principal_effect);
     run_test("revoke clears only the requested bits", test_revoke_clears_only_requested_bits);
     run_test("revoke -1 deletes the row entirely", test_revoke_all_bits_deletes_row);
     run_test("revoke only affects matching type", test_revoke_only_affects_matching_type);
@@ -1793,7 +1793,7 @@ int main() {
     run_test("default ACLs: private-by-default (world-readable OFF)", test_default_acls_private_by_default);
     run_test("default ACLs: creator has full user bits", test_default_acls_creator_has_full_user_bits);
     run_test("MANAGE_ACL is required separately from WRITE", test_manage_acl_required_separately_from_write);
-    run_test("system_admin bypass requires both flag and role", test_system_admin_bypass_requires_flag_and_role);
+    run_test("system_admin role bypasses ACLs (request and DB paths)", test_system_admin_role_bypasses_acls);
     run_test("audit log records actor for grant and revoke", test_audit_log_records_actor_for_grant_and_revoke);
     run_test("audit log records creator for default ACLs", test_audit_log_records_creator_for_default_acls);
     run_test("deny rule subtracts from allow", test_deny_rule_subtracts_from_allow);

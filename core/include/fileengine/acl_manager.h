@@ -64,9 +64,10 @@ struct ACLRule {
 
 class IDatabase;
 
-// Reserved role name. A user holding this role bypasses all ACL checks, but
-// ONLY when set_system_admin_enabled(true) has been called (the server wires
-// this from config.root_user_enabled — default off).
+// Reserved role name. A user whose effective roles (request_roles ∪ DB-stored
+// roles) contain this string bypasses all ACL checks. There is no enable
+// flag — the trust model is that upstream authentication only attaches the
+// system_admin role to legitimately privileged requests.
 inline constexpr const char* kSystemAdminRole = "system_admin";
 
 class AclManager {
@@ -78,13 +79,8 @@ public:
     void set_default_world_readable(bool enabled) { default_world_readable_ = enabled; }
     bool default_world_readable() const { return default_world_readable_; }
 
-    // Toggle whether holding the system_admin role bypasses ACL checks.
-    // Defaults to false — the bypass must be explicitly enabled in config.
-    void set_system_admin_enabled(bool enabled) { system_admin_enabled_ = enabled; }
-    bool system_admin_enabled() const { return system_admin_enabled_; }
-
-    // Returns true iff system_admin_enabled is on AND the user (via request
-    // roles or DB-stored roles) holds kSystemAdminRole.
+    // Returns true iff the user (via request roles or DB-stored roles) holds
+    // kSystemAdminRole.
     bool is_system_admin(const std::string& user,
                          const std::vector<std::string>& request_roles,
                          const std::string& tenant = "");
@@ -168,7 +164,6 @@ public:
 private:
     std::shared_ptr<IDatabase> db_;
     bool default_world_readable_ = false;
-    bool system_admin_enabled_ = false;
     
     // Internal helper to get user permissions from the database
     Result<std::vector<ACLRule>> get_user_acls(const std::string& resource_uid, 

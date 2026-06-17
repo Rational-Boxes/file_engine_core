@@ -145,9 +145,8 @@ int main(int argc, char** argv) {
     // Initialize ACL manager
     auto acl_manager = std::make_shared<fileengine::AclManager>(database);
     acl_manager->set_default_world_readable(config.default_world_readable);
-    // root_user_enabled controls the system_admin role bypass — when off, even
-    // a user holding the system_admin role goes through normal ACL checks.
-    acl_manager->set_system_admin_enabled(config.root_user_enabled);
+    // The system_admin bypass is role-driven (no config flag) — upstream is
+    // trusted to only attach kSystemAdminRole to legitimately admin requests.
 
     // Initialize cache manager
     auto cache_manager = std::make_unique<fileengine::CacheManager>(storage.get(), s3_storage.get(), config.cache_threshold);

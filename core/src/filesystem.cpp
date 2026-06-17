@@ -45,8 +45,8 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
               "Validating permissions for user: " + user + " on parent: " + parent_uid);
 
     // Check permissions - the user needs write permission on the parent directory.
-    // Creating directly under the filesystem root is restricted to system admins
-    // (controlled by config.root_user_enabled — see AclManager).
+    // Creating directly under the filesystem root is restricted to callers
+    // holding the system_admin role in their effective roles.
     if (parent_uid.empty()) {
         SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Attempting root directory creation - only allowed for system_admin role");

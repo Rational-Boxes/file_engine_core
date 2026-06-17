@@ -102,9 +102,10 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
                                           const std::string& tenant) {
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
 
-    // System-admin bypass: requires the role AND the server-side enable flag.
-    if (system_admin_enabled_ &&
-        std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
+    // System-admin bypass: holding kSystemAdminRole grants all permissions.
+    // No server-side enable flag — upstream is trusted to only attach this
+    // role to legitimately admin requests (see plan §4 / kSystemAdminRole doc).
+    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
             != effective_roles.end()) {
         return Result<bool>::ok(true);
     }
@@ -122,9 +123,6 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
 bool AclManager::is_system_admin(const std::string& user,
                                  const std::vector<std::string>& request_roles,
                                  const std::string& tenant) {
-    if (!system_admin_enabled_) {
-        return false;
-    }
     auto effective_roles = resolve_effective_roles(user, request_roles, tenant);
     return std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
            != effective_roles.end();

@@ -1089,6 +1089,12 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::EXECUTE:
             converted_permissions = static_cast<int>(fileengine::Permission::EXECUTE);
             break;
+        case fileengine_rpc::Permission::MANAGE_ACL:
+            converted_permissions = static_cast<int>(fileengine::Permission::MANAGE_ACL);
+            break;
+        case fileengine_rpc::Permission::ACL_INHERIT:
+            converted_permissions = static_cast<int>(fileengine::Permission::ACL_INHERIT);
+            break;
         default:
             converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1164,6 +1170,12 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::EXECUTE:
             converted_permissions = static_cast<int>(fileengine::Permission::EXECUTE);
             break;
+        case fileengine_rpc::Permission::MANAGE_ACL:
+            converted_permissions = static_cast<int>(fileengine::Permission::MANAGE_ACL);
+            break;
+        case fileengine_rpc::Permission::ACL_INHERIT:
+            converted_permissions = static_cast<int>(fileengine::Permission::ACL_INHERIT);
+            break;
         default:
             converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1229,6 +1241,12 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
             break;
         case fileengine_rpc::Permission::EXECUTE:
             required_permissions_int = static_cast<int>(fileengine::Permission::EXECUTE);
+            break;
+        case fileengine_rpc::Permission::MANAGE_ACL:
+            required_permissions_int = static_cast<int>(fileengine::Permission::MANAGE_ACL);
+            break;
+        case fileengine_rpc::Permission::ACL_INHERIT:
+            required_permissions_int = static_cast<int>(fileengine::Permission::ACL_INHERIT);
             break;
         default:
             required_permissions_int = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
