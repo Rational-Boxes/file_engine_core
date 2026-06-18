@@ -224,7 +224,7 @@ SDK to the tracing phase (§7).
 
 ---
 
-## 7. Tracing — OpenTelemetry
+## 7. Tracing — OpenTelemetry (optional build)
 
 Once `/metrics` is in place, the next ROI win is distributed traces.
 
@@ -236,8 +236,29 @@ Once `/metrics` is in place, the next ROI win is distributed traces.
 - Export via OTLP (gRPC or HTTP/protobuf) to the OTel Collector,
   which fans out to Jaeger / Tempo / Honeycomb / Datadog APM / etc.
 
-Cost: linking `opentelemetry-cpp` (a few MB), starting the collector
-sidecar. Pay it when the team needs trace data, not now.
+**Build-time optional.** `opentelemetry-cpp` isn't in mainline Fedora
+or Debian repos and is non-trivial to vendor, so it's a CMake option,
+not a hard build dep:
+
+```cmake
+option(FILEENGINE_ENABLE_OTEL "Build with OpenTelemetry tracing support" OFF)
+
+if(FILEENGINE_ENABLE_OTEL)
+    find_package(opentelemetry-cpp REQUIRED COMPONENTS api sdk exporters_otlp_grpc)
+    target_compile_definitions(fileengine_core PUBLIC FILEENGINE_OTEL=1)
+    target_link_libraries(fileengine_core PUBLIC opentelemetry-cpp::api ...)
+endif()
+```
+
+Source code wraps every span call in `#ifdef FILEENGINE_OTEL` (or
+via a thin tracing facade that compiles to no-ops when the flag is
+off). When the flag is off the binary has zero OTel link-time
+footprint — the same RPM ships everywhere, with packagers flipping
+the option in distros that have the SDK packaged.
+
+Cost when enabled: linking `opentelemetry-cpp` (a few MB), running
+an OTel Collector sidecar. Pay it when the team needs trace data,
+not now.
 
 ---
 
@@ -290,17 +311,25 @@ What each well-known stack consumes, and what we need to expose:
 **Exit criteria:** `prometheus --config.file=prometheus.yml` against
 the server's `/metrics` produces every panel on the bundled dashboard.
 
-### Phase C — Tracing (3–5 days)
+### Phase C — Tracing (3–5 days, opt-in build)
 
-- Add `opentelemetry-cpp` (link OTel + the OTLP gRPC exporter).
-- gRPC server interceptor that opens a span per request, attributes:
-  `rpc.method`, `tenant`, `user`, `auth.system_admin`.
+- Gate behind `-DFILEENGINE_ENABLE_OTEL=ON`. Default OFF so the
+  stock RPM/DEB built on a vanilla Fedora/Debian doesn't need
+  `opentelemetry-cpp` to be present.
+- When enabled: gRPC server interceptor that opens a span per
+  request, attributes: `rpc.method`, `tenant`, `user`,
+  `auth.system_admin`.
 - Wrap `Database` and `S3Storage` calls with child spans so a
   PutFile trace shows the breakdown between metadata write, ACL
   apply, encryption, local store, and (async) S3 upload.
+- Source uses a thin tracing facade (`tracing.h`) that compiles to
+  no-op inline functions when `FILEENGINE_OTEL` isn't defined, so
+  call sites don't need `#ifdef` clutter.
 
-**Exit criteria:** A `PutFile` call against an OTel Collector
-configured for Jaeger renders an end-to-end trace.
+**Exit criteria (when built with the flag on):** A `PutFile` call
+against an OTel Collector configured for Jaeger renders an end-to-end
+trace. **Exit criteria (with the flag off):** the binary builds and
+runs identically to a Phase B build, with no OTel symbols linked.
 
 ### Phase D — Structured logging (0.5 day)
 
@@ -359,8 +388,12 @@ configured for Jaeger renders an end-to-end trace.
 - Metrics: prometheus-cpp, one global registry. Per-tenant labels on
   by default (`FILEENGINE_METRICS_TENANT_LABEL=true`); flip to
   `false` for high-tenant-count deployments.
-- Tracing: OFF by default. Enable when an OTel Collector endpoint is
-  configured (`FILEENGINE_OTLP_ENDPOINT=...`).
+- Tracing: **opt-in at build time** via
+  `-DFILEENGINE_ENABLE_OTEL=ON`. Default OFF so the standard package
+  builds on stock distros without `opentelemetry-cpp` available. When
+  the flag is on, the runtime behaviour is also OFF by default and
+  enables when an OTel Collector endpoint is configured
+  (`FILEENGINE_OTLP_ENDPOINT=...`).
 - Logging: text by default; flip to JSON with
   `FILEENGINE_LOG_FORMAT=json`.
 - systemd: `Type=notify` with watchdog. `sd_notify("READY=1")` from
