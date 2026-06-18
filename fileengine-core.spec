@@ -22,6 +22,10 @@ BuildRequires:  aws-sdk-cpp-core-devel
 BuildRequires:  aws-sdk-cpp-storage-devel
 BuildRequires:  libcurl-devel, libuuid-devel
 BuildRequires:  systemd-rpm-macros
+# Monitoring (Phase A): libsystemd for sd_notify; cpp-httplib + nlohmann/json
+# are vendored under third_party/, no system packages needed for those.
+BuildRequires:  systemd-devel
+BuildRequires:  pkgconfig(libsystemd)
 
 %description
 FileEngine Core is a C++17 distributed virtual filesystem with multi-tenant
