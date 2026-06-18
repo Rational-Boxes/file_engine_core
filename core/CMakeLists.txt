@@ -3,6 +3,50 @@ project(file_engine_core_core VERSION 1.0.0)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ----- Build-time options ----------------------------------------------------
+option(FILEENGINE_ENABLE_OTEL "Build with OpenTelemetry tracing support" OFF)
+option(FILEENGINE_ENABLE_REST "Build with the REST monitoring listener" ON)
+
+# ----- systemd integration (sd_notify) ---------------------------------------
+# libsystemd is small and ubiquitous; if pkg-config can't find it (e.g.
+# cross-compile, alpine) we degrade gracefully with stub macros in server.cpp.
+pkg_check_modules(SYSTEMD libsystemd)
+if(SYSTEMD_FOUND)
+    message(STATUS "libsystemd found — sd_notify integration enabled")
+endif()
+
+# ----- Build-info header (configure_file substitution) -----------------------
+set(FILEENGINE_VERSION "${PROJECT_VERSION}")
+
+# git SHA at configure time; falls back to "unknown" when not in a repo.
+find_program(GIT_EXECUTABLE git)
+set(FILEENGINE_GIT_SHA "unknown")
+if(GIT_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR} rev-parse --short HEAD
+        OUTPUT_VARIABLE _git_sha
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_git_sha)
+        set(FILEENGINE_GIT_SHA "${_git_sha}")
+    endif()
+endif()
+
+string(TIMESTAMP FILEENGINE_BUILD_TIMESTAMP "%Y-%m-%dT%H:%M:%SZ" UTC)
+
+if(FILEENGINE_ENABLE_OTEL)
+    set(FILEENGINE_OTEL_BOOL "true")
+else()
+    set(FILEENGINE_OTEL_BOOL "false")
+endif()
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/build_info.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/fileengine/build_info.h
+    @ONLY
+)
+
 # Find packages
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -112,6 +156,7 @@ add_library(fileengine_core SHARED
     src/query_builder.cpp      # Add query builder source file
     src/server_logger.cpp      # Add server logger source file
     src/crypto_utils.cpp       # Add crypto utilities source file
+    src/rest_server.cpp        # Monitoring HTTP listener (Phase A)
 )
 
 # Include directories
@@ -122,6 +167,7 @@ target_include_directories(fileengine_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated/fileengine # Include the generated fileengine directory
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/third_party  # cpp-httplib + nlohmann/json (vendored)
 )
 
 # Link libraries
@@ -161,6 +207,12 @@ target_link_libraries(fileengine_server
     grpc++_reflection  # Add reflection library
     pthread
 )
+
+if(SYSTEMD_FOUND)
+    target_compile_definitions(fileengine_server PRIVATE FILEENGINE_HAS_SYSTEMD=1)
+    target_include_directories(fileengine_server PRIVATE ${SYSTEMD_INCLUDE_DIRS})
+    target_link_libraries(fileengine_server ${SYSTEMD_LIBRARIES})
+endif()
 
 add_dependencies(fileengine_core generated_files)
 add_dependencies(fileengine_server generated_files)

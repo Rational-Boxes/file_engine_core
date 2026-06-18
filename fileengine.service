@@ -4,13 +4,19 @@ After=network.target postgresql.service
 Wants=postgresql.service
 
 [Service]
-Type=simple
+# Type=notify: the server sends sd_notify("READY=1") once both the gRPC
+# listener and the REST listener are bound. systemd will hold ordering
+# (After=/Before= for downstream units) until that happens.
+Type=notify
+NotifyAccess=main
 User=fileengine
 Group=fileengine
 ExecStart=/usr/bin/fileengine_server
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=3
+# Generous startup timeout — initial DB-pool warm-up + S3 init can be slow.
+TimeoutStartSec=60
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=fileengine
