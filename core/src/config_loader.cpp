@@ -138,6 +138,16 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     it = env_vars.find("FILEENGINE_DEFAULT_WORLD_READABLE");
     if (it != env_vars.end()) config.default_world_readable = (it->second == "true" || it->second == "1");
 
+    // Monitoring REST listener
+    it = env_vars.find("FILEENGINE_HTTP_METRICS_ENABLED");
+    if (it != env_vars.end()) config.http_metrics_enabled = (it->second == "true" || it->second == "1");
+    it = env_vars.find("FILEENGINE_HTTP_METRICS_ADDR");
+    if (it != env_vars.end()) config.http_metrics_addr = it->second;
+    it = env_vars.find("FILEENGINE_HTTP_METRICS_PORT");
+    if (it != env_vars.end()) config.http_metrics_port = std::stoi(it->second);
+    it = env_vars.find("FILEENGINE_METRICS_TENANT_LABEL");
+    if (it != env_vars.end()) config.metrics_tenant_label = (it->second == "true" || it->second == "1");
+
     // Sync configuration
     it = env_vars.find("FILEENGINE_S3_SYNC_SUPPORT");
     if (it != env_vars.end()) config.sync_enabled = (it->second == "true" || it->second == "minio" || it->second == "s3");
@@ -232,6 +242,16 @@ Config ConfigLoader::load_from_env() {
 
     env_value = get_env_var("FILEENGINE_DEFAULT_WORLD_READABLE", "");
     if (!env_value.empty()) config.default_world_readable = (env_value == "true" || env_value == "1");
+
+    // Monitoring REST listener
+    env_value = get_env_var("FILEENGINE_HTTP_METRICS_ENABLED", "");
+    if (!env_value.empty()) config.http_metrics_enabled = (env_value == "true" || env_value == "1");
+    env_value = get_env_var("FILEENGINE_HTTP_METRICS_ADDR", "");
+    if (!env_value.empty()) config.http_metrics_addr = env_value;
+    env_value = get_env_var("FILEENGINE_HTTP_METRICS_PORT", "");
+    if (!env_value.empty()) config.http_metrics_port = std::stoi(env_value);
+    env_value = get_env_var("FILEENGINE_METRICS_TENANT_LABEL", "");
+    if (!env_value.empty()) config.metrics_tenant_label = (env_value == "true" || env_value == "1");
 
     // Sync configuration
     env_value = get_env_var("FILEENGINE_S3_SYNC_SUPPORT", "");
@@ -422,6 +442,16 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     it = default_file_vars.find("FILEENGINE_DEFAULT_WORLD_READABLE");
     if (it != default_file_vars.end()) config.default_world_readable = (it->second == "true" || it->second == "1");
 
+    // Monitoring REST listener
+    it = default_file_vars.find("FILEENGINE_HTTP_METRICS_ENABLED");
+    if (it != default_file_vars.end()) config.http_metrics_enabled = (it->second == "true" || it->second == "1");
+    it = default_file_vars.find("FILEENGINE_HTTP_METRICS_ADDR");
+    if (it != default_file_vars.end()) config.http_metrics_addr = it->second;
+    it = default_file_vars.find("FILEENGINE_HTTP_METRICS_PORT");
+    if (it != default_file_vars.end()) config.http_metrics_port = std::stoi(it->second);
+    it = default_file_vars.find("FILEENGINE_METRICS_TENANT_LABEL");
+    if (it != default_file_vars.end()) config.metrics_tenant_label = (it->second == "true" || it->second == "1");
+
     // Sync configuration
     it = default_file_vars.find("FILEENGINE_S3_SYNC_SUPPORT");
     if (it != default_file_vars.end()) config.sync_enabled = (it->second == "true" || it->second == "minio" || it->second == "s3");
@@ -539,6 +569,16 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
 
     it = cmdline_file_vars.find("FILEENGINE_DEFAULT_WORLD_READABLE");
     if (it != cmdline_file_vars.end()) config.default_world_readable = (it->second == "true" || it->second == "1");
+
+    // Monitoring REST listener
+    it = cmdline_file_vars.find("FILEENGINE_HTTP_METRICS_ENABLED");
+    if (it != cmdline_file_vars.end()) config.http_metrics_enabled = (it->second == "true" || it->second == "1");
+    it = cmdline_file_vars.find("FILEENGINE_HTTP_METRICS_ADDR");
+    if (it != cmdline_file_vars.end()) config.http_metrics_addr = it->second;
+    it = cmdline_file_vars.find("FILEENGINE_HTTP_METRICS_PORT");
+    if (it != cmdline_file_vars.end()) config.http_metrics_port = std::stoi(it->second);
+    it = cmdline_file_vars.find("FILEENGINE_METRICS_TENANT_LABEL");
+    if (it != cmdline_file_vars.end()) config.metrics_tenant_label = (it->second == "true" || it->second == "1");
 
     // Sync configuration
     it = cmdline_file_vars.find("FILEENGINE_S3_SYNC_SUPPORT");

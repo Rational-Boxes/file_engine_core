@@ -23,6 +23,14 @@
 #include "fileengine/storage_tracker.h"
 #include "fileengine/file_culler.h"
 #include "fileengine/server_logger.h"
+#include "fileengine/rest_server.h"
+
+#ifdef FILEENGINE_HAS_SYSTEMD
+#include <systemd/sd-daemon.h>
+#else
+// No-op shims so the call sites compile without #ifdef sprinkles.
+static inline int sd_notify(int, const char*) { return 0; }
+#endif
 
 // Generated gRPC files are included here
 #include "fileservice.grpc.pb.h"
@@ -232,6 +240,30 @@ int main(int argc, char** argv) {
 
     std::cout << "gRPC Server listening on " << server_address << " with " << num_threads << " threads" << std::endl;
 
+    // --- Monitoring REST listener (Phase A) ---------------------------------
+    std::unique_ptr<fileengine::RestServer> rest_listener;
+    if (config.http_metrics_enabled) {
+        rest_listener = std::make_unique<fileengine::RestServer>(
+            database, cache_manager.get(), file_culler.get());
+        if (!rest_listener->start(config.http_metrics_addr,
+                                  config.http_metrics_port)) {
+            std::cerr << "WARNING: REST monitoring listener failed to bind "
+                      << config.http_metrics_addr << ":"
+                      << config.http_metrics_port
+                      << " — continuing without it." << std::endl;
+            rest_listener.reset();
+        } else {
+            std::cout << "Monitoring REST listening on "
+                      << config.http_metrics_addr << ":"
+                      << config.http_metrics_port << std::endl;
+        }
+    }
+
+    // --- systemd readiness ---------------------------------------------------
+    // sd_notify is a no-op when NOTIFY_SOCKET isn't set (i.e. running outside
+    // systemd), so this is safe to call unconditionally.
+    sd_notify(0, "READY=1\nSTATUS=Serving gRPC + REST\n");
+
     // Set up signal handling for graceful shutdown
     std::signal(SIGINT, fileengine::signal_handler);
     std::signal(SIGTERM, fileengine::signal_handler);
@@ -241,8 +273,10 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    sd_notify(0, "STOPPING=1\nSTATUS=Shutting down\n");
     std::cout << "\nShutting down gRPC server..." << std::endl;
     server->Shutdown();
+    if (rest_listener) rest_listener->stop();
 
     // Stop services in reverse order
     file_culler->stop_automatic_culling();

@@ -40,6 +40,14 @@ struct Config {
     int server_port = 50051;
     int thread_pool_size = 10;
 
+    // Monitoring REST listener (Phase A — health, readiness, /v1/status,
+    // /v1/version, /metrics in Phase B). The trust boundary is the network
+    // perimeter; no in-process auth or TLS on this port.
+    bool        http_metrics_enabled = true;
+    std::string http_metrics_addr = "0.0.0.0";
+    int         http_metrics_port = 8081;
+    bool        metrics_tenant_label = true;  // emit tenant label on metrics
+
     // Security configuration
     bool root_user_enabled = false;
     // When true, apply_default_acls grants OTHER->READ on every new resource,
