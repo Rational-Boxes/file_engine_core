@@ -76,6 +76,7 @@ public:
                                     int64_t size, const std::string& storage_path, const std::string& tenant) override;
     Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) override;
     Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant) override;
+    Result<bool> delete_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") override;
 
     // Version restoration operations
     Result<bool> restore_to_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& user, const std::string& tenant = "") override;

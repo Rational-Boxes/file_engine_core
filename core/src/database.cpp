@@ -1274,6 +1274,33 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
     }
 }
 
+Result<bool> Database::delete_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<bool>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string sql = "DELETE FROM \"" + schema_name + "\".versions WHERE file_uid = $1 AND version_timestamp = $2;";
+    const char* param_values[2] = {file_uid.c_str(), version_timestamp.c_str()};
+
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+        int rows_affected = std::stoi(PQcmdTuples(res));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<bool>::ok(rows_affected > 0);
+    } else {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<bool>::err("Failed to delete version: " + error);
+    }
+}
+
 Result<bool> Database::restore_to_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& user, const std::string& tenant) {
     // "Current version" is whichever versions row has the max version_timestamp
     // for this file_uid. To restore, insert a new versions row with a fresh

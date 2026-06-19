@@ -10,6 +10,16 @@
 
 namespace fileengine {
 
+namespace {
+// The filesystem root may be referenced either as the empty string or as the
+// all-zeros UUID. Internally the storage/database layers use the empty string,
+// so canonicalize the all-zeros form at the gRPC boundary.
+inline std::string canonical_uid(const std::string& uid) {
+    static const std::string kZeroUuid = "00000000-0000-0000-0000-000000000000";
+    return uid == kZeroUuid ? std::string() : uid;
+}
+} // namespace
+
 GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                                  std::shared_ptr<TenantManager> tenant_manager,
                                  std::shared_ptr<AclManager> acl_manager,
@@ -41,7 +51,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
     }
 
     // Get the authentication context
-    std::string parent_uid = request->parent_uid();
+    std::string parent_uid = canonical_uid(request->parent_uid());
     std::string name = request->name();
     auto auth_context = request->auth();
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -109,7 +119,7 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
                                               const fileengine_rpc::RemoveDirectoryRequest* request,
                                               fileengine_rpc::RemoveDirectoryResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "RemoveDirectory called for uid: " + request->uid());
-    std::string dir_uid = request->uid();
+    std::string dir_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -141,7 +151,7 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
                                             const fileengine_rpc::ListDirectoryRequest* request,
                                             fileengine_rpc::ListDirectoryResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "ListDirectory called for uid: " + request->uid());
-    std::string dir_uid = request->uid();
+    std::string dir_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -201,7 +211,7 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
                                                        fileengine_rpc::ListDirectoryWithDeletedResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "ListDirectoryWithDeleted called for uid: " + request->uid());
     // For now, implement the same as ListDirectory but indicate this functionality would return deleted items too
-    std::string dir_uid = request->uid();
+    std::string dir_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -278,7 +288,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    std::string parent_uid = request->parent_uid();
+    std::string parent_uid = canonical_uid(request->parent_uid());
     std::string name = request->name();
     auto auth_context = request->auth();
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
@@ -350,7 +360,7 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -382,7 +392,7 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
                                           const fileengine_rpc::UndeleteFileRequest* request,
                                           fileengine_rpc::UndeleteFileResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "UndeleteFile called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -398,11 +408,15 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    // In a real implementation, this would undelete the file
-    // For now, we'll return an error to indicate it's not supported
-    response->set_success(false);
-    response->set_error("Undelete functionality not implemented in this version");
-    SERVER_LOG_ERROR("GRPCService", "UndeleteFile failed: Not implemented");
+    auto result = filesystem_->undelete(file_uid, user, roles, tenant);
+
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "UndeleteFile failed for uid: " + file_uid + " with error: " + result.error);
+    } else {
+        SERVER_LOG_INFO("GRPCService", "UndeleteFile successful for uid: " + file_uid);
+    }
 
     return grpc::Status::OK;
 }
@@ -428,7 +442,7 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto file_data = request->data();
     auto auth_context = request->auth();
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
@@ -493,7 +507,7 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
                                      const fileengine_rpc::GetFileRequest* request,
                                      fileengine_rpc::GetFileResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetFile called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
 
@@ -529,7 +543,7 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
                                   const fileengine_rpc::StatRequest* request,
                                   fileengine_rpc::StatResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "Stat called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -591,7 +605,7 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
                                     const fileengine_rpc::ExistsRequest* request,
                                     fileengine_rpc::ExistsResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "Exists called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -623,7 +637,7 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    std::string uid = request->uid();
+    std::string uid = canonical_uid(request->uid());
     std::string new_name = request->new_name();
     auto auth_context = request->auth();
 
@@ -656,8 +670,8 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
                                   const fileengine_rpc::MoveRequest* request,
                                   fileengine_rpc::MoveResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "Move called for source_uid: " + request->source_uid() + " to " + request->destination_parent_uid());
-    std::string source_uid = request->source_uid();
-    std::string dest_uid = request->destination_parent_uid();
+    std::string source_uid = canonical_uid(request->source_uid());
+    std::string dest_uid = canonical_uid(request->destination_parent_uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -696,8 +710,8 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
                                   const fileengine_rpc::CopyRequest* request,
                                   fileengine_rpc::CopyResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "Copy called for source_uid: " + request->source_uid() + " to " + request->destination_parent_uid());
-    std::string source_uid = request->source_uid();
-    std::string dest_uid = request->destination_parent_uid();
+    std::string source_uid = canonical_uid(request->source_uid());
+    std::string dest_uid = canonical_uid(request->destination_parent_uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -737,7 +751,7 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
                                           const fileengine_rpc::ListVersionsRequest* request,
                                           fileengine_rpc::ListVersionsResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "ListVersions called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -772,7 +786,7 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
                                         const fileengine_rpc::GetVersionRequest* request,
                                         fileengine_rpc::GetVersionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
 
@@ -806,7 +820,7 @@ grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
                                               const fileengine_rpc::RestoreToVersionRequest* request,
                                               fileengine_rpc::RestoreToVersionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "RestoreToVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
 
@@ -843,7 +857,7 @@ grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
                                          const fileengine_rpc::SetMetadataRequest* request,
                                          fileengine_rpc::SetMetadataResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "SetMetadata called for uid: " + request->uid() + " with key " + request->key());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string key = request->key();
     std::string value = request->value();
     auto auth_context = request->auth();
@@ -877,7 +891,7 @@ grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
                                          const fileengine_rpc::GetMetadataRequest* request,
                                          fileengine_rpc::GetMetadataResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetMetadata called for uid: " + request->uid() + " with key " + request->key());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string key = request->key();
     auto auth_context = request->auth();
 
@@ -911,7 +925,7 @@ grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
                                             const fileengine_rpc::GetAllMetadataRequest* request,
                                             fileengine_rpc::GetAllMetadataResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetAllMetadata called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -946,7 +960,7 @@ grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
                                             const fileengine_rpc::DeleteMetadataRequest* request,
                                             fileengine_rpc::DeleteMetadataResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "DeleteMetadata called for uid: " + request->uid() + " with key " + request->key());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string key = request->key();
     auto auth_context = request->auth();
 
@@ -979,7 +993,7 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
                                                    const fileengine_rpc::GetMetadataForVersionRequest* request,
                                                    fileengine_rpc::GetMetadataForVersionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetMetadataForVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
     std::string key = request->key();
     auto auth_context = request->auth();
@@ -996,11 +1010,16 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
         return grpc::Status::OK;
     }
 
-    // In a real implementation, this would get metadata for a specific version
-    // For now, we'll return an error to indicate it's not supported
-    response->set_success(false);
-    response->set_error("Get metadata for version functionality not implemented in this version");
-    SERVER_LOG_ERROR("GRPCService", "GetMetadataForVersion failed: Not implemented");
+    auto result = filesystem_->get_metadata_for_version(file_uid, version_timestamp, key, user, roles, tenant);
+
+    response->set_success(result.success);
+    if (result.success) {
+        response->set_value(result.value);
+        SERVER_LOG_INFO("GRPCService", "GetMetadataForVersion successful for uid: " + file_uid);
+    } else {
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetMetadataForVersion failed for uid: " + file_uid + " with error: " + result.error);
+    }
 
     return grpc::Status::OK;
 }
@@ -1009,7 +1028,7 @@ grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* cont
                                                       const fileengine_rpc::GetAllMetadataForVersionRequest* request,
                                                       fileengine_rpc::GetAllMetadataForVersionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GetAllMetadataForVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
     auto auth_context = request->auth();
 
@@ -1025,11 +1044,18 @@ grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* cont
         return grpc::Status::OK;
     }
 
-    // In a real implementation, this would get all metadata for a specific version
-    // For now, we'll return an error to indicate it's not supported
-    response->set_success(false);
-    response->set_error("Get all metadata for version functionality not implemented in this version");
-    SERVER_LOG_ERROR("GRPCService", "GetAllMetadataForVersion failed: Not implemented");
+    auto result = filesystem_->get_all_metadata_for_version(file_uid, version_timestamp, user, roles, tenant);
+
+    response->set_success(result.success);
+    if (result.success) {
+        for (const auto& [k, v] : result.value) {
+            (*response->mutable_metadata())[k] = v;
+        }
+        SERVER_LOG_INFO("GRPCService", "GetAllMetadataForVersion successful for uid: " + file_uid);
+    } else {
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetAllMetadataForVersion failed for uid: " + file_uid + " with error: " + result.error);
+    }
 
     return grpc::Status::OK;
 }
@@ -1039,8 +1065,16 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
                                              const fileengine_rpc::GrantPermissionRequest* request,
                                              fileengine_rpc::GrantPermissionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "GrantPermission called for resource_uid: " + request->resource_uid() + " for principal " + request->principal());
-    std::string resource_uid = request->resource_uid();
+    std::string resource_uid = canonical_uid(request->resource_uid());
     std::string principal = request->principal();
+    // A "role:" prefix designates a role principal; the stored principal is the
+    // bare role name so permission checks (which compare ROLE rules against the
+    // caller's effective role names) can match it. Everything else is a user.
+    PrincipalType principal_type = PrincipalType::USER;
+    if (principal.rfind("role:", 0) == 0) {
+        principal_type = PrincipalType::ROLE;
+        principal = principal.substr(5);
+    }
     fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
 
@@ -1104,7 +1138,7 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
     auto result = acl_manager_->grant_permission(resource_uid, principal,
-                                                 PrincipalType::USER,  // Simplified for this example
+                                                 principal_type,
                                                  converted_permissions, tenant,
                                                  /*performed_by=*/user,
                                                  rule_effect);
@@ -1124,8 +1158,14 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
                                               const fileengine_rpc::RevokePermissionRequest* request,
                                               fileengine_rpc::RevokePermissionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "RevokePermission called for resource_uid: " + request->resource_uid() + " for principal " + request->principal());
-    std::string resource_uid = request->resource_uid();
+    std::string resource_uid = canonical_uid(request->resource_uid());
     std::string principal = request->principal();
+    // Mirror GrantPermission: "role:" prefix targets a role principal.
+    PrincipalType principal_type = PrincipalType::USER;
+    if (principal.rfind("role:", 0) == 0) {
+        principal_type = PrincipalType::ROLE;
+        principal = principal.substr(5);
+    }
     fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
 
@@ -1185,7 +1225,7 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
     auto result = acl_manager_->revoke_permission(resource_uid, principal,
-                                                  PrincipalType::USER,  // Simplified for this example
+                                                  principal_type,
                                                   converted_permissions, tenant,
                                                   /*performed_by=*/user,
                                                   rule_effect);
@@ -1205,7 +1245,7 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
                                              const fileengine_rpc::CheckPermissionRequest* request,
                                              fileengine_rpc::CheckPermissionResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "CheckPermission called for resource_uid: " + request->resource_uid() + " for user " + request->auth().user());
-    std::string resource_uid = request->resource_uid();
+    std::string resource_uid = canonical_uid(request->resource_uid());
     fileengine_rpc::Permission required_permission = request->required_permission();
     auto auth_context = request->auth();
 
@@ -1335,7 +1375,7 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
                                                 const fileengine_rpc::GetFileRequest* request,
                                                 grpc::ServerWriter<fileengine_rpc::GetFileResponse>* writer) {
     SERVER_LOG_DEBUG("GRPCService", "StreamFileDownload called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -1438,7 +1478,7 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
                                               const fileengine_rpc::PurgeOldVersionsRequest* request,
                                               fileengine_rpc::PurgeOldVersionsResponse* response) {
     SERVER_LOG_DEBUG("GRPCService", "PurgeOldVersions called for uid: " + request->uid());
-    std::string file_uid = request->uid();
+    std::string file_uid = canonical_uid(request->uid());
     int keep_count = request->keep_count();
     auto auth_context = request->auth();
 
@@ -1455,11 +1495,15 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    // In a real implementation, this would remove old versions
-    // For now, we'll return an error to indicate it's not supported
-    response->set_success(false);
-    response->set_error("Purge old versions functionality not implemented in this version");
-    SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed: Not implemented");
+    auto result = filesystem_->purge_old_versions(file_uid, keep_count, tenant);
+
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed for uid: " + file_uid + " with error: " + result.error);
+    } else {
+        SERVER_LOG_INFO("GRPCService", "PurgeOldVersions successful for uid: " + file_uid + " (keep_count=" + std::to_string(keep_count) + ")");
+    }
 
     return grpc::Status::OK;
 }

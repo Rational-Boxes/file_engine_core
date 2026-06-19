@@ -56,6 +56,11 @@ public:
                                             int64_t size, const std::string& storage_path, const std::string& tenant = "") = 0;
     virtual Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
     virtual Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant = "") = 0;
+    // Remove a single version row for a file. Non-pure so existing mocks need
+    // no update; the concrete Database overrides it.
+    virtual Result<bool> delete_version(const std::string& /*file_uid*/, const std::string& /*version_timestamp*/, const std::string& /*tenant*/ = "") {
+        return Result<bool>::err("delete_version not implemented");
+    }
 
     // Version restoration operations
     virtual Result<bool> restore_to_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& user, const std::string& tenant = "") = 0;

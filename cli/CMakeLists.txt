@@ -24,7 +24,7 @@ endif()
 # Ensure the proto files are generated first
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
 set(PROTO_FILE ${PROTO_DIR}/fileservice.proto)
-set(PROTO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/../core/build/generated)
+set(PROTO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/../core/generated)
 
 # Add the CLI executable
 add_executable(fileengine_cli
@@ -36,7 +36,7 @@ target_include_directories(fileengine_cli PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/include/fileengine
     ${CMAKE_CURRENT_SOURCE_DIR}/include  # Include CLI-specific headers
-    ${CMAKE_CURRENT_BINARY_DIR}/../core/build/generated/fileengine  # Include generated proto files from core build
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine  # Include generated proto files from core build
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
 )
