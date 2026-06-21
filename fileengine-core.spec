@@ -14,6 +14,8 @@ Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
 BuildRequires:  cmake, gcc-c++, make, pkgconfig
+# Static libstdc++ archive for the self-contained fileengine-cli-static build.
+BuildRequires:  libstdc++-static
 BuildRequires:  postgresql-devel, openssl-devel, zlib-devel
 BuildRequires:  grpc-devel, protobuf-devel, protobuf-compiler
 # On modern Fedora the AWS SDK is split per service; the s3 client lives in
@@ -31,16 +33,18 @@ BuildRequires:  pkgconfig(libsystemd)
 FileEngine Core is a C++17 distributed virtual filesystem with multi-tenant
 file management, POSIX ACLs, S3/MinIO object store integration, and a gRPC API.
 
-This source package produces four binary packages:
+This source package produces five binary packages:
 
 * fileengine-libs         — shared library (libfileengine_core.so)
 * fileengine-server       — gRPC server daemon + systemd unit + config
 * fileengine-server-devel — headers + .so symlink for building integrations
-* fileengine-cli          — command-line client
+* fileengine-cli          — command-line client (dynamic; needs fileengine-libs)
+* fileengine-cli-static   — self-contained client (no fileengine-libs / libstdc++)
 
 The empty fileengine-core meta-package depends on -libs and -server for the
-common "install everything for a server box" case; install -cli separately on
-client machines.
+common "install everything for a server box" case. On a host that already runs
+the full stack install fileengine-cli; on a client-only machine install
+fileengine-cli-static for a leaner footprint.
 
 Requires:       fileengine-libs = %{version}-%{release}
 Requires:       fileengine-server = %{version}-%{release}
@@ -139,6 +143,27 @@ The fileengine_cli command-line tool. Connects to a FileEngine gRPC server
 %attr(755,root,root) %{_bindir}/fileengine_cli
 
 # ---------------------------------------------------------------------------
+# CLI client — self-contained (statically-linked) build
+# ---------------------------------------------------------------------------
+%package -n fileengine-cli-static
+Summary:        Self-contained command-line client for the FileEngine server
+%description -n fileengine-cli-static
+A self-contained build of the FileEngine command-line client
+(fileengine_cli_static). It does NOT depend on fileengine-libs or a matching
+libstdc++ — both are linked in — so it can be dropped onto a client machine to
+talk to a remote FileEngine server without installing the rest of the stack.
+
+The heavy third-party libraries (gRPC, protobuf, OpenSSL, libpq) are still
+linked dynamically and pulled in via the usual shared-library dependencies.
+
+Install fileengine-cli instead on hosts that already run the full FileEngine
+stack; install this package for a leaner, client-only footprint.
+
+%files -n fileengine-cli-static
+%defattr(-,root,root,-)
+%attr(755,root,root) %{_bindir}/fileengine_cli_static
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 %prep
@@ -155,7 +180,8 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=%{_prefix} \
     -DCMAKE_INSTALL_LIBDIR=%{_lib} \
-    -DCMAKE_SKIP_INSTALL_RPATH=ON
+    -DCMAKE_SKIP_INSTALL_RPATH=ON \
+    -DBUILD_STATIC_CLI=ON
 make %{?_smp_mflags}
 
 %install
@@ -188,6 +214,12 @@ install -d %{buildroot}/var/log/fileengine
 rm -rf %{buildroot}
 
 %changelog
+* Thu Jun 19 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
+- Add fileengine-cli-static: a self-contained statically-linked CLI package
+  (no fileengine-libs / libstdc++ dependency) for client-only machines,
+  alongside the existing dynamic fileengine-cli. Build now passes
+  -DBUILD_STATIC_CLI=ON and BuildRequires libstdc++-static.
+
 * Wed Jun 17 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
 - Split monolithic fileengine-core RPM into four sub-packages:
   fileengine-libs, fileengine-server, fileengine-server-devel, fileengine-cli.

@@ -99,6 +99,10 @@ The system is configured through environment variables or configuration files:
 - Caching thresholds and policies
 - Encryption and compression settings
 
+For the complete, stand-alone configuration reference — every setting, its
+default, the load order/precedence of config sources, and setup recipes for
+PostgreSQL and S3/MinIO — see [CONFIGURATION.md](CONFIGURATION.md).
+
 ## Performance Optimizations
 
 - Directory desaturation to prevent filesystem bottlenecks in high-file-count scenarios
@@ -144,7 +148,7 @@ User accounts and roles are stored in an LDAP service as specified in the fronte
 4. Start the service
 5. Use the CLI or Protocol Buffers interface for operations
 
-For detailed setup and configuration instructions, see the setup guide in the repository.
+For detailed setup and configuration instructions, see [CONFIGURATION.md](CONFIGURATION.md).
 ---
 
 # Multitenancy Review - January 2026

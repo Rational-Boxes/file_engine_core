@@ -7,6 +7,38 @@
 
 namespace fileengine {
 
+namespace {
+// Convert a system_clock time_point to whole UNIX epoch seconds, matching the
+// int64 timestamp fields in the proto DirectoryEntry/FileInfo messages.
+int64_t to_epoch_seconds(const std::chrono::system_clock::time_point& tp) {
+    return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+}
+
+// Returns true if `candidate` is `ancestor` itself or nested somewhere inside
+// it, by walking the parent chain up to the root (empty parent_uid).
+//
+// Used to reject copying/moving a directory into its own subtree. Without this
+// guard a recursive directory copy into a descendant never terminates — each
+// level creates a fresh child inside the destination, which then appears in the
+// next listing — exhausting the stack and crashing the server (SIGSEGV). For
+// move it would splice an unreachable cycle into the tree. kMaxDepth bounds the
+// walk so a pre-existing cycle can't hang the request.
+bool is_within_subtree(const std::shared_ptr<IDatabase>& db,
+                       const std::string& candidate,
+                       const std::string& ancestor,
+                       const std::string& tenant) {
+    constexpr int kMaxDepth = 4096;
+    std::string current = candidate;
+    for (int depth = 0; depth < kMaxDepth && !current.empty(); ++depth) {
+        if (current == ancestor) return true;
+        auto info = db->get_file_by_uid(current, tenant);
+        if (!info.success || !info.value.has_value()) break;
+        current = info.value->parent_uid;
+    }
+    return false;
+}
+} // namespace
+
 FileSystem::FileSystem(std::shared_ptr<TenantManager> tenant_manager)
     : tenant_manager_(tenant_manager) {
     // Initialize file culler (cache management) - will be set by the server with proper dependencies
@@ -173,12 +205,14 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
         entry.name = file_info.name;
         entry.type = file_info.type;
         entry.size = file_info.size;
-        // Set timestamps appropriately
-        entry.version_count = 0; // Would be populated from version info in a complete implementation
-        
+        // These int64 fields are otherwise read uninitialized by the gRPC layer.
+        entry.created_at = to_epoch_seconds(file_info.created_at);
+        entry.modified_at = to_epoch_seconds(file_info.modified_at);
+        entry.version_count = file_info.version_count;
+
         entries.push_back(entry);
     }
-    
+
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
@@ -211,12 +245,14 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
         entry.name = file_info.name;
         entry.type = file_info.type;
         entry.size = file_info.size;
-        // Set timestamps appropriately
-        entry.version_count = 0; // Would be populated from version info in a complete implementation
-        
+        // These int64 fields are otherwise read uninitialized by the gRPC layer.
+        entry.created_at = to_epoch_seconds(file_info.created_at);
+        entry.modified_at = to_epoch_seconds(file_info.modified_at);
+        entry.version_count = file_info.version_count;
+
         entries.push_back(entry);
     }
-    
+
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
@@ -710,6 +746,13 @@ Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst
         return Result<void>::err("Destination is not a directory");
     }
 
+    // Reject moving a directory into itself or its own subtree, which would
+    // splice an unreachable cycle into the tree and break later traversals.
+    if (src_info_result.value->type == FileType::DIRECTORY &&
+        is_within_subtree(context->db, dst_uid, src_uid, tenant)) {
+        return Result<void>::err("Cannot move a directory into itself or its own subtree");
+    }
+
     // Update the parent_uid in the database to move the file/directory
     auto db_result = context->db->update_file_parent(src_uid, dst_uid, tenant);
     if (!db_result.success) {
@@ -761,6 +804,14 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
 
     if (dst_info_result.value->type != FileType::DIRECTORY) {
         return Result<void>::err("Destination is not a directory");
+    }
+
+    // Reject copying a directory into itself or its own subtree. This would
+    // recurse without bound (each created child reappears in the next listing)
+    // and crash the server, so guard before doing any work.
+    if (src_info.type == FileType::DIRECTORY &&
+        is_within_subtree(context->db, dst_uid, src_uid, tenant)) {
+        return Result<void>::err("Cannot copy a directory into itself or its own subtree");
     }
 
     // Generate a new UID for the copied file
@@ -1082,9 +1133,41 @@ Result<void> FileSystem::backup_to_object_store_with_version(const std::string& 
 
 Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int keep_count,
                                             const std::string& tenant) {
-    // This is a simplified implementation - in reality, this would involve
-    // deleting old versions from both local storage and object store
-    return Result<void>::err("Purge old versions not fully implemented");
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<void>::err("Database not available for tenant: " + tenant);
+    }
+
+    // Always retain at least the current (newest) version so the file stays
+    // readable, regardless of the requested keep_count.
+    int keep = keep_count > 1 ? keep_count : 1;
+
+    // list_versions returns newest-first.
+    auto versions_result = context->db->list_versions(file_uid, tenant);
+    if (!versions_result.success) {
+        return Result<void>::err("Failed to list versions: " + versions_result.error);
+    }
+    const auto& versions = versions_result.value;
+    if (static_cast<int>(versions.size()) <= keep) {
+        return Result<void>::ok();  // nothing old enough to purge
+    }
+
+    // Drop everything older than the newest `keep` versions. The local storage
+    // payload is removed best-effort; object-store copies are immutable by
+    // design and are intentionally left untouched.
+    for (size_t i = keep; i < versions.size(); ++i) {
+        const std::string& vts = versions[i];
+        if (context->storage) {
+            std::string path = context->storage->get_storage_path(file_uid, vts, tenant);
+            context->storage->delete_file(path, tenant);  // best-effort
+        }
+        auto del = context->db->delete_version(file_uid, vts, tenant);
+        if (!del.success) {
+            return Result<void>::err("Failed to purge version " + vts + ": " + del.error);
+        }
+    }
+
+    return Result<void>::ok();
 }
 
 void FileSystem::update_cache_threshold(double threshold, const std::string& tenant) {

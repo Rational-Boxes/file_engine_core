@@ -7,8 +7,8 @@
 #include <map>
 #include <grpcpp/grpcpp.h>
 
-// Include generated gRPC files
-#include "../../build/core/generated/fileengine/fileservice.grpc.pb.h"
+// Include generated gRPC files (resolved via target_include_directories)
+#include "fileservice.grpc.pb.h"
 
 // Include logging functionality
 #include "../include/logger.h"
@@ -187,47 +187,57 @@ public:
     bool list_directory(const std::string& uid, const std::string& user, bool show_deleted = false, const std::string& tenant = "default") {
         fileengine::Logger::debug("ListDir", "Attempting to list directory with UID: ", uid, " for user: ", user, ", show_deleted: ", show_deleted ? "true" : "false", ", tenant: ", tenant);
 
-        ListDirectoryRequest request;
-        request.set_uid(uid);
-        fileengine::Logger::detail("ListDir", "Set directory UID: ", uid);
-
-        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
-
-        ListDirectoryResponse response;
-        grpc::ClientContext context;
-        fileengine::Logger::trace("ListDir", "Created request and context, making gRPC call");
-
-        grpc::Status status = stub_->ListDirectory(&context, request, &response);
-        fileengine::Logger::trace("ListDir", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
-
-        if (status.ok() && response.success()) {
+        // Shared rendering for either response type (both expose .entries()).
+        auto render = [&](const auto& response) -> bool {
             fileengine::Logger::debug("ListDir", "Directory listing successful, found ", response.entries_size(), " entries");
             if (show_deleted) {
                 std::cout << "Contents of directory (UID: " << uid << ", showing deleted files) in tenant '" << tenant << "':" << std::endl;
             } else {
                 std::cout << "Contents of directory (UID: " << uid << ") in tenant '" << tenant << "':" << std::endl;
             }
-
             for (const auto& entry : response.entries()) {
                 std::string type_str = "FILE";
-                if (entry.type() == FileType::REGULAR_FILE) {
-                    type_str = "FILE";
-                } else if (entry.type() == FileType::DIRECTORY) {
+                if (entry.type() == FileType::DIRECTORY) {
                     type_str = "DIR";
                 } else if (entry.type() == FileType::SYMLINK) {
                     type_str = "LINK";
                 }
-
                 fileengine::Logger::detail("ListDir", "Entry - Name: ", entry.name(), ", UID: ", entry.uid(), ", Type: ", type_str);
-
                 std::cout << "  [" << type_str << "] " << entry.name() << " (UID: " << entry.uid() << ")" << std::endl;
             }
             return true;
-        } else {
-            fileengine::Logger::debug("ListDir", "Failed to list directory '", uid, "', error: ", response.error());
+        };
+
+        grpc::ClientContext context;
+        fileengine::Logger::trace("ListDir", "Created request and context, making gRPC call");
+
+        // show_deleted must hit the dedicated RPC; plain ListDirectory filters
+        // out soft-deleted entries server-side.
+        if (show_deleted) {
+            fileengine_rpc::ListDirectoryWithDeletedRequest request;
+            request.set_uid(uid);
+            *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+            fileengine_rpc::ListDirectoryWithDeletedResponse response;
+            grpc::Status status = stub_->ListDirectoryWithDeleted(&context, request, &response);
+            if (status.ok() && response.success()) {
+                return render(response);
+            }
             std::cout << "✗ Failed to list directory '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
             return false;
         }
+
+        ListDirectoryRequest request;
+        request.set_uid(uid);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+        ListDirectoryResponse response;
+        grpc::Status status = stub_->ListDirectory(&context, request, &response);
+        fileengine::Logger::trace("ListDir", "gRPC call completed with status: ", status.ok() ? "OK" : "ERROR");
+        if (status.ok() && response.success()) {
+            return render(response);
+        }
+        fileengine::Logger::debug("ListDir", "Failed to list directory '", uid, "', error: ", response.error());
+        std::cout << "✗ Failed to list directory '" << uid << "' in tenant '" << tenant << "': " << response.error() << std::endl;
+        return false;
     }
 
     bool remove_directory(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
@@ -583,14 +593,22 @@ public:
     }
 
     bool undelete_file(const std::string& uid, const std::string& user, const std::string& tenant = "default") {
-        // Assuming there's an UndeleteFile RPC; if not available, would need to implement differently
-        // For now, I'll create a custom implementation using existing functionality if possible
-        // Since there's no specific undelete method, we'll need to handle this differently
-        // Let's assume the service supports undeletion through a dedicated method
-        // Creating stub to satisfy interface - in real implementation would use actual RPC
+        fileengine_rpc::UndeleteFileRequest request;
+        request.set_uid(uid);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
-        std::cout << "✗ Undelete operation not fully implemented in this version. Would undelete resource '" << uid << "'" << std::endl;
-        return false;
+        fileengine_rpc::UndeleteFileResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->UndeleteFile(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Undeleted resource '" << uid << "' in tenant '" << tenant << "'" << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to undelete resource '" << uid << "': " << response.error() << std::endl;
+            return false;
+        }
     }
 
     // Metadata operations
@@ -657,6 +675,56 @@ public:
         }
     }
 
+    bool get_metadata_for_version(const std::string& uid, const std::string& version_timestamp,
+                                  const std::string& key, const std::string& user, const std::string& tenant = "default") {
+        fileengine_rpc::GetMetadataForVersionRequest request;
+        request.set_uid(uid);
+        request.set_version_timestamp(version_timestamp);
+        request.set_key(key);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        fileengine_rpc::GetMetadataForVersionResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->GetMetadataForVersion(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "Metadata '" << key << "' for '" << uid << "' @ version " << version_timestamp
+                      << " in tenant '" << tenant << "': " << response.value() << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to get metadata '" << key << "' for '" << uid << "' @ version "
+                      << version_timestamp << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
+    bool get_all_metadata_for_version(const std::string& uid, const std::string& version_timestamp,
+                                      const std::string& user, const std::string& tenant = "default") {
+        fileengine_rpc::GetAllMetadataForVersionRequest request;
+        request.set_uid(uid);
+        request.set_version_timestamp(version_timestamp);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        fileengine_rpc::GetAllMetadataForVersionResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->GetAllMetadataForVersion(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "All metadata for '" << uid << "' @ version " << version_timestamp
+                      << " in tenant '" << tenant << "':" << std::endl;
+            for (const auto& pair : response.metadata()) {
+                std::cout << "  " << pair.first << " = " << pair.second << std::endl;
+            }
+            return true;
+        } else {
+            std::cout << "✗ Failed to get all metadata for '" << uid << "' @ version "
+                      << version_timestamp << "': " << response.error() << std::endl;
+            return false;
+        }
+    }
+
     bool delete_metadata(const std::string& uid, const std::string& key, const std::string& user, const std::string& tenant = "default") {
         DeleteMetadataRequest request;
         request.set_uid(uid);
@@ -711,13 +779,44 @@ public:
     }
 
     bool trigger_sync(const std::string& user, const std::string& tenant = "default") {
-        std::cout << "✓ Triggered synchronization" << std::endl;
-        return true; // Just print a message for now
+        TriggerSyncRequest request;
+        request.set_tenant(tenant);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        TriggerSyncResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->TriggerSync(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Triggered synchronization for tenant '" << tenant << "'" << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to trigger synchronization: "
+                      << (status.ok() ? response.error() : status.error_message()) << std::endl;
+            return false;
+        }
     }
 
-    bool purge_old_versions(const std::string& uid, int days_old, const std::string& user, const std::string& tenant = "default") {
-        std::cout << "✗ Purge old versions operation not supported in this build" << std::endl;
-        return false;
+    bool purge_old_versions(const std::string& uid, int keep_count, const std::string& user, const std::string& tenant = "default") {
+        PurgeOldVersionsRequest request;
+        request.set_uid(uid);
+        request.set_keep_count(keep_count);
+        *request.mutable_auth() = create_auth_context(user, roles_, tenant);
+
+        PurgeOldVersionsResponse response;
+        grpc::ClientContext context;
+
+        grpc::Status status = stub_->PurgeOldVersions(&context, request, &response);
+
+        if (status.ok() && response.success()) {
+            std::cout << "✓ Purged old versions of '" << uid << "', keeping the " << keep_count
+                      << " most recent, in tenant '" << tenant << "'" << std::endl;
+            return true;
+        } else {
+            std::cout << "✗ Failed to purge old versions for '" << uid << "': " << response.error() << std::endl;
+            return false;
+        }
     }
 
     // Upload operation - combines touch and put
@@ -1207,6 +1306,8 @@ int main(int argc, char** argv) {
         std::cout << "  setmeta <uid> <key> <value>           - Set metadata for resource" << std::endl;
         std::cout << "  getmeta <uid> <key>                   - Get metadata for resource" << std::endl;
         std::cout << "  allmeta <uid>                         - Get all metadata for resource" << std::endl;
+        std::cout << "  getmetaversion <uid> <timestamp> <key> - Get metadata for a specific version" << std::endl;
+        std::cout << "  allmetaversion <uid> <timestamp>      - Get all metadata for a specific version" << std::endl;
         std::cout << "  delmeta <uid> <key>                   - Delete metadata for resource" << std::endl;
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
@@ -1233,7 +1334,7 @@ int main(int argc, char** argv) {
         std::cout << "Diagnostic operations:" << std::endl;
         std::cout << "  usage                                 - Show storage usage statistics" << std::endl;
         std::cout << "  sync                                  - Trigger synchronization" << std::endl;
-        std::cout << "  purge <uid> <days>                    - Purge versions older than specified days" << std::endl;
+        std::cout << "  purge <uid> <keep_count>              - Purge old versions, keeping the N most recent" << std::endl;
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         return 0;
     }
@@ -1349,6 +1450,12 @@ int main(int argc, char** argv) {
     else if (command == "allmeta" && argc - arg_offset == 2) {  // command + 1 arg
         client.get_all_metadata(argv[arg_offset + 1], user, tenant);
     }
+    else if (command == "getmetaversion" && argc - arg_offset == 4) {  // command + 3 args: uid, timestamp, key
+        client.get_metadata_for_version(argv[arg_offset + 1], argv[arg_offset + 2], argv[arg_offset + 3], user, tenant);
+    }
+    else if (command == "allmetaversion" && argc - arg_offset == 3) {  // command + 2 args: uid, timestamp
+        client.get_all_metadata_for_version(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
+    }
     else if (command == "delmeta" && argc - arg_offset == 3) {  // command + 2 args
         client.delete_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
@@ -1406,10 +1513,10 @@ int main(int argc, char** argv) {
     }
     else if (command == "purge" && argc - arg_offset == 3) {  // command + 2 args
         try {
-            int days = std::stoi(argv[arg_offset + 2]);
-            client.purge_old_versions(argv[arg_offset + 1], days, user, tenant);
+            int keep_count = std::stoi(argv[arg_offset + 2]);
+            client.purge_old_versions(argv[arg_offset + 1], keep_count, user, tenant);
         } catch (const std::exception& e) {
-            std::cout << "✗ Invalid days value: " << argv[arg_offset + 2] << std::endl;
+            std::cout << "✗ Invalid keep_count value: " << argv[arg_offset + 2] << std::endl;
             return 1;
         }
     }
