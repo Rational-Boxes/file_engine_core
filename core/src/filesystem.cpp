@@ -8,6 +8,12 @@
 namespace fileengine {
 
 namespace {
+// Convert a system_clock time_point to whole UNIX epoch seconds, matching the
+// int64 timestamp fields in the proto DirectoryEntry/FileInfo messages.
+int64_t to_epoch_seconds(const std::chrono::system_clock::time_point& tp) {
+    return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+}
+
 // Returns true if `candidate` is `ancestor` itself or nested somewhere inside
 // it, by walking the parent chain up to the root (empty parent_uid).
 //
@@ -199,12 +205,14 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
         entry.name = file_info.name;
         entry.type = file_info.type;
         entry.size = file_info.size;
-        // Set timestamps appropriately
-        entry.version_count = 0; // Would be populated from version info in a complete implementation
-        
+        // These int64 fields are otherwise read uninitialized by the gRPC layer.
+        entry.created_at = to_epoch_seconds(file_info.created_at);
+        entry.modified_at = to_epoch_seconds(file_info.modified_at);
+        entry.version_count = file_info.version_count;
+
         entries.push_back(entry);
     }
-    
+
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
@@ -237,12 +245,14 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
         entry.name = file_info.name;
         entry.type = file_info.type;
         entry.size = file_info.size;
-        // Set timestamps appropriately
-        entry.version_count = 0; // Would be populated from version info in a complete implementation
-        
+        // These int64 fields are otherwise read uninitialized by the gRPC layer.
+        entry.created_at = to_epoch_seconds(file_info.created_at);
+        entry.modified_at = to_epoch_seconds(file_info.modified_at);
+        entry.version_count = file_info.version_count;
+
         entries.push_back(entry);
     }
-    
+
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
