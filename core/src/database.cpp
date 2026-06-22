@@ -463,6 +463,35 @@ Result<void> Database::update_file_name(const std::string& uid, const std::strin
     }
 }
 
+Result<void> Database::update_file_size(const std::string& uid, int64_t size, const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+
+    // Get the schema name for this tenant
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string update_sql = "UPDATE \"" + schema_name + "\".files SET size = $2 WHERE uid = $1;";
+    std::string size_str = std::to_string(size);
+    const char* param_values[2] = {uid.c_str(), size_str.c_str()};
+
+    PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::ok();
+    } else {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to update file size: " + error);
+    }
+}
+
 Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::string& parent_uid, const std::string& tenant) {
     auto conn = connection_pool_->acquire();
     if (!conn || !conn->is_valid()) {
