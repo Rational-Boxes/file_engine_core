@@ -482,9 +482,12 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
         return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
     }
 
+    // uid <> $1 excludes the directory's own record from its child listing. The
+    // root record is self-referential (uid='' and parent_uid=''); without this
+    // it would appear as a phantom "root" child of itself.
     std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container "
                             "FROM \"" + schema_name + "\".files "
-                            "WHERE parent_uid = $1 AND deleted = FALSE "
+                            "WHERE parent_uid = $1 AND uid <> $1 AND deleted = FALSE "
                             "ORDER BY name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
@@ -567,9 +570,11 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
         return Result<std::vector<FileInfo>>::err("Invalid parameter: schema_name is empty");
     }
 
+    // uid <> $1 excludes the directory's own self-referential record (the root
+    // record has uid='' and parent_uid='') from its child listing.
     std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container, deleted "
                             "FROM \"" + schema_name + "\".files "
-                            "WHERE parent_uid = $1 "
+                            "WHERE parent_uid = $1 AND uid <> $1 "
                             "ORDER BY name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
