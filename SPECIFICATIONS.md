@@ -38,6 +38,33 @@ POSIX ACLs to control filesystem entity visibility and permissions.
 - view versions
 - retrieve back version
 - restore to version
+- manage ACL
+- ACL inherit
+
+### ACL principals
+
+Each ACL rule targets a *principal* and carries an effect (ALLOW, the default,
+or DENY). A matching DENY always wins over any ALLOW. The effective permission
+set is the union of every matching ALLOW rule, minus the union of every matching
+DENY rule. Four principal kinds are supported:
+
+- **User** — matches a single user identifier. Default kind when no prefix is given.
+- **Role** (`role:` prefix) — matches any requester whose effective roles
+  (request roles ∪ DB-stored roles) include the named role.
+- **Claim** (`claim:` prefix) — attribute-based (ABAC). The principal is written
+  `claim:<key>=<value>` and matches any requester whose authentication claims
+  contain that exact key/value pair. A malformed claim principal (no `=`) never
+  matches; a requester with no claims never matches a claim rule.
+- **Other** — matches every requester (world).
+
+The `role:` / `claim:` prefixes are a wire convention stripped at the gRPC
+boundary; the bare name (`engineering-lead`, or `department=engineering`) is what
+is stored. Claims are evaluated everywhere permissions are checked — file
+operations, `CheckPermission`, and `GetEffectivePermissions` — so an external
+indexer querying `GetEffectivePermissions` with a principal's claims receives the
+same decision the filesystem would enforce.
+
+The reserved `system_admin` role bypasses all ACL checks.
 
 ## Command-line interface
 

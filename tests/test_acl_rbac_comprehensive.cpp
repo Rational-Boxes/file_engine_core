@@ -657,42 +657,88 @@ void test_rbac_same_user_different_roles_different_resources() {
 }
 
 // =============================================================================
-// 3. CLAIM-BASED ACCESS CONTROL
-//    Claims are defined in AuthenticationContext proto but NOT implemented
-//    in the permission checking logic. These tests document this gap.
+// 3. CLAIM-BASED (ABAC) ACCESS CONTROL
+//    A CLAIM-type ACL rule stores its principal as "key=value" and matches a
+//    requester whose auth claims contain that exact pair. Claims flow through
+//    check_permission() and get_effective_permissions() as a trailing map arg.
 // =============================================================================
 
-void test_claims_not_implemented() {
-    // The AuthenticationContext proto message has:
-    //   map<string, string> claims = 4;
-    // But AclManager::check_permission() and calculate_effective_permissions()
-    // do NOT accept or inspect claims.
-    //
-    // This test documents that claim-based (ABAC) access control is NOT
-    // currently implemented. Permission decisions are based solely on:
-    //   1. User identity (user parameter)
-    //   2. Role memberships (roles parameter)
-    //   3. Group ACLs
-    //   4. OTHER ACLs
-    //
-    // To implement claims, the check_permission() signature would need to
-    // accept a claims map and the calculate_effective_permissions() algorithm
-    // would need to evaluate claim predicates.
-
+void test_claims_grant_matches_on_claim() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "res-claims-001";
 
-    // Grant permissions - only user/role/group/other supported
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    // Grant READ|WRITE to anyone whose claims contain department=engineering.
+    acl.grant_permission(res, "department=engineering", PrincipalType::CLAIM,
+                         PERM_READ | PERM_WRITE);
 
-    // check_permission does not accept claims - only user + roles
-    auto result = acl.check_permission(res, "alice", {}, PERM_READ);
-    TEST_ASSERT(result.success && result.value, "basic check works without claims");
+    // A requester presenting the matching claim is granted.
+    std::map<std::string, std::string> eng = {{"department", "engineering"}};
+    auto r1 = acl.check_permission(res, "alice", {}, PERM_READ, "", eng);
+    TEST_ASSERT(r1.success && r1.value, "matching claim grants READ");
+    auto r2 = acl.check_permission(res, "alice", {}, PERM_WRITE, "", eng);
+    TEST_ASSERT(r2.success && r2.value, "matching claim grants WRITE");
 
-    // Documenting: there is no way to grant/deny based on claims like
-    // "department=engineering" or "clearance_level=secret"
-    TEST_ASSERT(true, "Claims-based access control is not yet implemented");
+    // A requester with a different claim value is denied.
+    std::map<std::string, std::string> sales = {{"department", "sales"}};
+    auto r3 = acl.check_permission(res, "bob", {}, PERM_READ, "", sales);
+    TEST_ASSERT(r3.success && !r3.value, "non-matching claim value denied");
+
+    // A requester with no claims at all is denied.
+    auto r4 = acl.check_permission(res, "carol", {}, PERM_READ, "", {});
+    TEST_ASSERT(r4.success && !r4.value, "absent claim denied");
+}
+
+void test_claims_effective_permissions_union_with_roles() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "res-claims-002";
+
+    // READ via claim, WRITE via role: effective set is the union.
+    acl.grant_permission(res, "clearance=secret", PrincipalType::CLAIM, PERM_READ);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_WRITE);
+
+    std::map<std::string, std::string> secret = {{"clearance", "secret"}};
+    auto eff = acl.get_effective_permissions(res, "dave", {"editor"}, "", secret);
+    TEST_ASSERT(eff.success, "effective lookup succeeds");
+    TEST_ASSERT(has_perm(eff.value, PERM_READ), "claim contributes READ");
+    TEST_ASSERT(has_perm(eff.value, PERM_WRITE), "role contributes WRITE");
+
+    // Same principal without the claim loses only the claim-granted READ.
+    auto eff2 = acl.get_effective_permissions(res, "dave", {"editor"}, "", {});
+    TEST_ASSERT(!has_perm(eff2.value, PERM_READ), "no claim -> no READ");
+    TEST_ASSERT(has_perm(eff2.value, PERM_WRITE), "role WRITE still present");
+}
+
+void test_claims_deny_overrides_allow() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "res-claims-003";
+
+    // ALLOW READ to everyone, but DENY READ to a quarantined claim.
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ);
+    acl.grant_permission(res, "status=quarantined", PrincipalType::CLAIM, PERM_READ,
+                         "", "", AclEffect::DENY);
+
+    std::map<std::string, std::string> bad = {{"status", "quarantined"}};
+    auto r1 = acl.check_permission(res, "eve", {}, PERM_READ, "", bad);
+    TEST_ASSERT(r1.success && !r1.value, "matching DENY claim overrides ALLOW");
+
+    // A requester without the quarantine claim keeps the OTHER ALLOW.
+    auto r2 = acl.check_permission(res, "frank", {}, PERM_READ, "", {});
+    TEST_ASSERT(r2.success && r2.value, "non-quarantined keeps READ");
+}
+
+void test_claims_malformed_principal_never_matches() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "res-claims-004";
+
+    // A CLAIM principal with no '=' is malformed and must never match.
+    acl.grant_permission(res, "no-equals-sign", PrincipalType::CLAIM, PERM_READ);
+    std::map<std::string, std::string> any = {{"no-equals-sign", "x"}};
+    auto r = acl.check_permission(res, "grace", {}, PERM_READ, "", any);
+    TEST_ASSERT(r.success && !r.value, "malformed claim rule never matches");
 }
 
 // =============================================================================
@@ -1762,7 +1808,10 @@ int main() {
     run_test("same user different roles different resources", test_rbac_same_user_different_roles_different_resources);
 
     std::cout << "\n--- 3. Claim-Based Access Control (ABAC) ---\n";
-    run_test("claims not implemented (documented gap)", test_claims_not_implemented);
+    run_test("claim grant matches on claim (ABAC)", test_claims_grant_matches_on_claim);
+    run_test("claim + role effective union", test_claims_effective_permissions_union_with_roles);
+    run_test("claim DENY overrides ALLOW", test_claims_deny_overrides_allow);
+    run_test("malformed claim rule never matches", test_claims_malformed_principal_never_matches);
 
     std::cout << "\n--- 4. All Permission Types ---\n";
     run_test("all individual permissions", test_all_individual_permissions);
