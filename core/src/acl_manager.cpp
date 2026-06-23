@@ -99,7 +99,8 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
                                           const std::string& user,
                                           const std::vector<std::string>& roles,
                                           int required_permissions,
-                                          const std::string& tenant) {
+                                          const std::string& tenant,
+                                          const std::map<std::string, std::string>& claims) {
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
 
     // System-admin bypass: holding kSystemAdminRole grants all permissions.
@@ -115,7 +116,7 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
         return Result<bool>::err(acls_result.error);
     }
 
-    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles);
+    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
     bool has_permission = (effective_perms & required_permissions) == required_permissions;
     return Result<bool>::ok(has_permission);
 }
@@ -161,14 +162,15 @@ Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string
 Result<int> AclManager::get_effective_permissions(const std::string& resource_uid,
                                                  const std::string& user,
                                                  const std::vector<std::string>& roles,
-                                                 const std::string& tenant) {
+                                                 const std::string& tenant,
+                                                 const std::map<std::string, std::string>& claims) {
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
         return Result<int>::err(acls_result.error);
     }
 
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
-    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles);
+    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
 
     return Result<int>::ok(effective_perms);
 }
@@ -295,7 +297,8 @@ Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resour
 
 int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rules,
                                                const std::string& user,
-                                               const std::vector<std::string>& roles) {
+                                               const std::vector<std::string>& roles,
+                                               const std::map<std::string, std::string>& claims) {
     // Union model: every matching ALLOW grant contributes its bits, regardless
     // of principal type. DENY grants are unioned into a separate mask and
     // subtracted at the end so any matching deny wins (POSIX-NFSv4 style).
@@ -312,6 +315,18 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
                     if (rule.principal == role) return true;
                 }
                 return false;
+            case PrincipalType::CLAIM: {
+                // ABAC: the rule's principal is "key=value"; it matches iff the
+                // principal presents that exact claim. A malformed principal
+                // (no '=') or an absent/mismatched claim never matches. See
+                // plan §6.4.
+                auto eq = rule.principal.find('=');
+                if (eq == std::string::npos) return false;
+                const std::string key = rule.principal.substr(0, eq);
+                const std::string value = rule.principal.substr(eq + 1);
+                auto it = claims.find(key);
+                return it != claims.end() && it->second == value;
+            }
             case PrincipalType::GROUP:
                 // GROUP membership is not yet modeled (plan §2.3); treat as global.
                 return true;

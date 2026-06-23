@@ -217,6 +217,16 @@ private:
         return roles;
     }
 
+    // Helper function to get the principal's claims (key->value) from the auth
+    // context. These feed CLAIM-type (ABAC) ACL rule matching.
+    inline std::map<std::string, std::string> get_claims_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
+        std::map<std::string, std::string> claims;
+        for (const auto& kv : auth_ctx.claims()) {
+            claims[kv.first] = kv.second;
+        }
+        return claims;
+    }
+
     // Helper function to validate permissions. System-admin bypass is handled
     // inside AclManager::check_permission so this helper has a single path.
     inline bool validate_user_permissions(const std::string& resource_uid,
@@ -238,7 +248,8 @@ private:
         }
 
         std::vector<std::string> roles = get_roles_from_auth_context(auth_ctx);
-        auto result = acl_manager_->check_permission(resource_uid, user, roles, required_permissions, tenant);
+        std::map<std::string, std::string> claims = get_claims_from_auth_context(auth_ctx);
+        auto result = acl_manager_->check_permission(resource_uid, user, roles, required_permissions, tenant, claims);
         return result.success && result.value;
     }
 

@@ -32,7 +32,10 @@ The system is composed of several key components that work together:
 ### 5. Access Control
 - ACL-based permissions system supporting POSIX-style permissions
 - Role-based access control (RBAC) with hierarchical roles
-- Attribute-based access control (ABAC) through user claims
+- Attribute-based access control (ABAC) through `claim:<key>=<value>` ACL rules
+  matched against the requester's authentication claims (see SPECIFICATIONS.md
+  "ACL principals"). Evaluated for file operations, `CheckPermission`, and
+  `GetEffectivePermissions` alike
 - Integration with LDAP for user authentication and role management
 - Frontend integration with OAuth2 and JWT-based authentication
 

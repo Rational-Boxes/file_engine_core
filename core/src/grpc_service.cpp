@@ -1072,11 +1072,16 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     std::string principal = request->principal();
     // A "role:" prefix designates a role principal; the stored principal is the
     // bare role name so permission checks (which compare ROLE rules against the
-    // caller's effective role names) can match it. Everything else is a user.
+    // caller's effective role names) can match it. A "claim:" prefix designates
+    // a claim (ABAC) principal; the stored principal is the bare "key=value"
+    // matched against the requester's auth claims. Everything else is a user.
     PrincipalType principal_type = PrincipalType::USER;
     if (principal.rfind("role:", 0) == 0) {
         principal_type = PrincipalType::ROLE;
         principal = principal.substr(5);
+    } else if (principal.rfind("claim:", 0) == 0) {
+        principal_type = PrincipalType::CLAIM;
+        principal = principal.substr(6);
     }
     fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
@@ -1163,11 +1168,15 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     SERVER_LOG_DEBUG("GRPCService", "RevokePermission called for resource_uid: " + request->resource_uid() + " for principal " + request->principal());
     std::string resource_uid = canonical_uid(request->resource_uid());
     std::string principal = request->principal();
-    // Mirror GrantPermission: "role:" prefix targets a role principal.
+    // Mirror GrantPermission: "role:" prefix targets a role principal,
+    // "claim:" targets a claim (ABAC) principal stored as bare "key=value".
     PrincipalType principal_type = PrincipalType::USER;
     if (principal.rfind("role:", 0) == 0) {
         principal_type = PrincipalType::ROLE;
         principal = principal.substr(5);
+    } else if (principal.rfind("claim:", 0) == 0) {
+        principal_type = PrincipalType::CLAIM;
+        principal = principal.substr(6);
     }
     fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
@@ -1296,8 +1305,9 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
             break;
     }
 
+    std::map<std::string, std::string> claims = get_claims_from_auth_context(auth_context);
     auto result = acl_manager_->check_permission(resource_uid, user, roles,
-                                                 required_permissions_int, tenant);
+                                                 required_permissions_int, tenant, claims);
 
     response->set_success(result.success);
     if (result.success) {
@@ -1323,10 +1333,11 @@ grpc::Status GRPCFileService::GetEffectivePermissions(grpc::ServerContext* /*con
                      " user: " + user + " claims: " + std::to_string(auth_context.claims_size()));
 
     // Resolve the full effective permission set for this principal on the
-    // resource, evaluating ACLs only (no read/list of the entity). Claims are
-    // accepted on the auth context for forward compatibility; the current engine
-    // is RBAC (user + roles), so they do not yet alter the decision.
-    auto result = acl_manager_->get_effective_permissions(resource_uid, user, roles, tenant);
+    // resource, evaluating ACLs only (no read/list of the entity). The principal
+    // is (user, roles, claims): claims feed CLAIM-type (ABAC) rule matching so an
+    // external indexer gets the same decision the filesystem would enforce.
+    std::map<std::string, std::string> claims = get_claims_from_auth_context(auth_context);
+    auto result = acl_manager_->get_effective_permissions(resource_uid, user, roles, tenant, claims);
     if (!result.success) {
         response->set_success(false);
         response->set_error(result.error);

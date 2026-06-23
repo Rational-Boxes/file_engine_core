@@ -43,7 +43,11 @@ enum class PrincipalType {
     USER,
     ROLE,      // For role-based permissions
     GROUP,
-    OTHER
+    OTHER,
+    CLAIM      // ABAC: matches a principal whose auth claims contain a
+               // specific key=value pair. The stored `principal` is the
+               // bare "key=value" string (the "claim:" wire prefix is
+               // stripped at the gRPC boundary). See plan §6.4.
 };
 
 // ALLOW (default) contributes bits; DENY subtracts them at evaluation time so
@@ -125,22 +129,27 @@ public:
                                    const std::string& performed_by = "",
                                    AclEffect effect = AclEffect::ALLOW);
     
-    // Check if a user has specific permissions on a resource
-    Result<bool> check_permission(const std::string& resource_uid, 
-                                  const std::string& user, 
+    // Check if a user has specific permissions on a resource. `claims` are the
+    // principal's auth claims (key->value); they let CLAIM-type (ABAC) rules
+    // match. Defaulted + last so existing positional callers are unaffected.
+    Result<bool> check_permission(const std::string& resource_uid,
+                                  const std::string& user,
                                   const std::vector<std::string>& roles,
-                                  int required_permissions, 
-                                  const std::string& tenant = "");
+                                  int required_permissions,
+                                  const std::string& tenant = "",
+                                  const std::map<std::string, std::string>& claims = {});
     
     // Get all ACLs for a resource
     Result<std::vector<ACLRule>> get_acls_for_resource(const std::string& resource_uid, 
                                                        const std::string& tenant = "");
     
-    // Get effective permissions for a user on a resource
-    Result<int> get_effective_permissions(const std::string& resource_uid, 
-                                         const std::string& user, 
+    // Get effective permissions for a user on a resource. `claims` (last,
+    // defaulted) feed CLAIM-type (ABAC) rule matching.
+    Result<int> get_effective_permissions(const std::string& resource_uid,
+                                         const std::string& user,
                                          const std::vector<std::string>& roles,
-                                         const std::string& tenant = "");
+                                         const std::string& tenant = "",
+                                         const std::map<std::string, std::string>& claims = {});
     
     // Apply default ACLs when creating a new resource
     Result<void> apply_default_acls(const std::string& resource_uid, 
@@ -170,10 +179,12 @@ private:
                                                const std::string& user, 
                                                const std::string& tenant);
     
-    // Internal helper to calculate effective permissions
+    // Internal helper to calculate effective permissions. `claims` are matched
+    // against CLAIM-type rules (ABAC).
     int calculate_effective_permissions(const std::vector<ACLRule>& rules,
                                       const std::string& user,
-                                      const std::vector<std::string>& roles);
+                                      const std::vector<std::string>& roles,
+                                      const std::map<std::string, std::string>& claims);
 
     // Union request-supplied roles with DB-stored roles for the user (deduped).
     // Request roles support federated IdP setups; DB roles support local
