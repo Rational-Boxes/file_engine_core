@@ -402,6 +402,20 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
             PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
+            // Hidden child renditions (files only; a directory's children are
+            // not renditions, so leave 0).
+            info.rendition_count = 0;
+            if (!is_container) {
+                std::string rc_query = "SELECT COUNT(*) FROM \"" + schema_name +
+                                       "\".files WHERE parent_uid = $1 AND deleted = FALSE;";
+                const char* rc_params[1] = {info.uid.c_str()};
+                PGresult* rc_res = PQexecParams(pg_conn, rc_query.c_str(), 1, nullptr, rc_params, nullptr, nullptr, 0);
+                if (PQresultStatus(rc_res) == PGRES_TUPLES_OK && PQntuples(rc_res) > 0) {
+                    info.rendition_count = std::stoi(PQgetvalue(rc_res, 0, 0));
+                }
+                PQclear(rc_res);
+            }
+
             PQclear(res);
             connection_pool_->release(conn);
             return Result<std::optional<FileInfo>>::ok(info);
@@ -514,10 +528,15 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
     // uid <> $1 excludes the directory's own record from its child listing. The
     // root record is self-referential (uid='' and parent_uid=''); without this
     // it would appear as a phantom "root" child of itself.
-    std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container "
-                            "FROM \"" + schema_name + "\".files "
-                            "WHERE parent_uid = $1 AND uid <> $1 AND deleted = FALSE "
-                            "ORDER BY name;";
+    // rendition_count is the number of non-deleted hidden children, but only for
+    // file entities (a directory's children are not hidden renditions, so 0).
+    std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, "
+                            "CASE WHEN f.is_container THEN 0 ELSE "
+                            "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count "
+                            "FROM \"" + schema_name + "\".files f "
+                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.deleted = FALSE "
+                            "ORDER BY f.name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
     // Validate that the parameter value is not null
@@ -549,6 +568,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
             info.permissions = std::stoi(PQgetvalue(res, i, 4));
             bool is_container = (strcmp(PQgetvalue(res, i, 5), "t") == 0 || strcmp(PQgetvalue(res, i, 5), "1") == 0);
             info.type = is_container ? FileType::DIRECTORY : FileType::REGULAR_FILE;
+            info.rendition_count = std::stoi(PQgetvalue(res, i, 6));  // hidden children (files only)
             // Use current time for timestamps since we don't have these in the schema
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
@@ -601,10 +621,13 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
 
     // uid <> $1 excludes the directory's own self-referential record (the root
     // record has uid='' and parent_uid='') from its child listing.
-    std::string query_sql = "SELECT uid, name, size, owner, permission_map, is_container, deleted "
-                            "FROM \"" + schema_name + "\".files "
-                            "WHERE parent_uid = $1 AND uid <> $1 "
-                            "ORDER BY name;";
+    std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
+                            "CASE WHEN f.is_container THEN 0 ELSE "
+                            "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count "
+                            "FROM \"" + schema_name + "\".files f "
+                            "WHERE f.parent_uid = $1 AND f.uid <> $1 "
+                            "ORDER BY f.name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
 
@@ -638,6 +661,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
             info.permissions = std::stoi(PQgetvalue(res, i, 4));
             bool is_container = (strcmp(PQgetvalue(res, i, 5), "t") == 0 || strcmp(PQgetvalue(res, i, 5), "1") == 0);
             info.type = is_container ? FileType::DIRECTORY : FileType::REGULAR_FILE;
+            info.rendition_count = std::stoi(PQgetvalue(res, i, 7));  // index 7: after deleted (6)
             // Use current time for timestamps since we don't have these in the schema
             auto now = std::chrono::system_clock::now();
             info.created_at = now;
@@ -832,6 +856,20 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
             PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
 
+            // Hidden child renditions (files only; a directory's children are
+            // not renditions, so leave 0).
+            info.rendition_count = 0;
+            if (!is_container) {
+                std::string rc_query = "SELECT COUNT(*) FROM \"" + schema_name +
+                                       "\".files WHERE parent_uid = $1 AND deleted = FALSE;";
+                const char* rc_params[1] = {info.uid.c_str()};
+                PGresult* rc_res = PQexecParams(pg_conn, rc_query.c_str(), 1, nullptr, rc_params, nullptr, nullptr, 0);
+                if (PQresultStatus(rc_res) == PGRES_TUPLES_OK && PQntuples(rc_res) > 0) {
+                    info.rendition_count = std::stoi(PQgetvalue(rc_res, 0, 0));
+                }
+                PQclear(rc_res);
+            }
+
             PQclear(res);
             connection_pool_->release(conn);
             return Result<std::optional<FileInfo>>::ok(info);
@@ -932,6 +970,20 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
             }
             PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
+
+            // Hidden child renditions (files only; a directory's children are
+            // not renditions, so leave 0).
+            info.rendition_count = 0;
+            if (!is_container) {
+                std::string rc_query = "SELECT COUNT(*) FROM \"" + schema_name +
+                                       "\".files WHERE parent_uid = $1 AND deleted = FALSE;";
+                const char* rc_params[1] = {info.uid.c_str()};
+                PGresult* rc_res = PQexecParams(pg_conn, rc_query.c_str(), 1, nullptr, rc_params, nullptr, nullptr, 0);
+                if (PQresultStatus(rc_res) == PGRES_TUPLES_OK && PQntuples(rc_res) > 0) {
+                    info.rendition_count = std::stoi(PQgetvalue(rc_res, 0, 0));
+                }
+                PQclear(rc_res);
+            }
 
             PQclear(res);
             connection_pool_->release(conn);
@@ -1084,6 +1136,20 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
             }
             PQclear(version_res);
             info.version_count = 1; // For this implementation, use 1
+
+            // Hidden child renditions (files only; a directory's children are
+            // not renditions, so leave 0).
+            info.rendition_count = 0;
+            if (!is_container) {
+                std::string rc_query = "SELECT COUNT(*) FROM \"" + schema_name +
+                                       "\".files WHERE parent_uid = $1 AND deleted = FALSE;";
+                const char* rc_params[1] = {info.uid.c_str()};
+                PGresult* rc_res = PQexecParams(pg_conn, rc_query.c_str(), 1, nullptr, rc_params, nullptr, nullptr, 0);
+                if (PQresultStatus(rc_res) == PGRES_TUPLES_OK && PQntuples(rc_res) > 0) {
+                    info.rendition_count = std::stoi(PQgetvalue(rc_res, 0, 0));
+                }
+                PQclear(rc_res);
+            }
 
             PQclear(res);
             connection_pool_->release(conn);

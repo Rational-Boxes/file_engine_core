@@ -199,6 +199,7 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
             dir_entry->set_created_at(entry.created_at);
             dir_entry->set_modified_at(entry.modified_at);
             dir_entry->set_version_count(entry.version_count);
+            dir_entry->set_rendition_count(entry.rendition_count);
         }
         SERVER_LOG_INFO("GRPCService", "ListDirectory successful for uid: " + dir_uid);
     }
@@ -259,6 +260,7 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
             dir_entry->set_created_at(entry.created_at);
             dir_entry->set_modified_at(entry.modified_at);
             dir_entry->set_version_count(entry.version_count);
+            dir_entry->set_rendition_count(entry.rendition_count);
         }
         SERVER_LOG_INFO("GRPCService", "ListDirectoryWithDeleted successful for uid: " + dir_uid);
     }
@@ -592,6 +594,7 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
         info->set_modified_at(std::chrono::duration_cast<std::chrono::seconds>(
             result.value.modified_at.time_since_epoch()).count());
         info->set_version(result.value.version);
+        info->set_rendition_count(result.value.rendition_count);
         SERVER_LOG_INFO("GRPCService", "Stat successful for uid: " + file_uid);
     } else {
         response->set_error(result.error);
