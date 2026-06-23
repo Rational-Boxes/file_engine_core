@@ -143,3 +143,20 @@ fails. Then it wakes every FILEENGINE_S3_RETRY_SECONDS and attempts to
 conduct a synchronization. There needs to be a flag for a loss of connectivity
 that causes the sync thread to become active until connection restored
 and any new files synced up.
+## File renditions (files as containers)
+
+A file entity may hold hidden child entities called **renditions** —
+alternate-format copies of the parent file (e.g. a PDF rendering of a document),
+produced by an external re-rendition service.
+
+- **Model:** renditions are stored as child rows with `parent_uid` set to the
+  file's UID. Named `<timestamp>-format.ext`. One level (renditions are leaves).
+- **Hidden:** they never appear in normal directory listings (they are children
+  of the file, not of the directory). They are revealed only by listing the
+  file's UID directly: `ListDirectory(<file-uid>)`.
+- **Discoverability:** `rendition_count` is reported on `Stat`/`FileInfo` and on
+  `DirectoryEntry` (files only; `0` for directories).
+- **Move/Copy/Delete:** move carries renditions (they reference the stable file
+  UID); copy deep-copies them to the new UID; delete cascades to them.
+- **Accounting:** storage-usage and cache-culling include renditions, since they
+  are real stored blobs (physical-blob accounting).
