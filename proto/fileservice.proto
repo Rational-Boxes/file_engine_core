@@ -45,6 +45,7 @@ service FileService {
     rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
     rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
     rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+    rpc GetEffectivePermissions(GetEffectivePermissionsRequest) returns (GetEffectivePermissionsResponse);
 
     // Role management operations
     rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
@@ -434,6 +435,21 @@ message CheckPermissionResponse {
     bool success = 1;
     string error = 2;
     bool has_permission = 3;            // Whether the user has the required permission
+}
+
+// Interrogate the full effective permission set for a principal on a resource,
+// in one call, without accessing the entity's contents. The principal is the
+// auth context's user + roles (set them to query an arbitrary principal).
+message GetEffectivePermissionsRequest {
+    string resource_uid = 1;            // Resource UUID to evaluate
+    AuthenticationContext auth = 2;     // Principal (user + roles) being evaluated
+}
+
+message GetEffectivePermissionsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated Permission permissions = 3; // Effective (granted) permissions
+    int32 permission_bits = 4;           // Raw effective bitmask (server-internal flags)
 }
 
 // Role management operations
