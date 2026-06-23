@@ -1311,6 +1311,53 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+grpc::Status GRPCFileService::GetEffectivePermissions(grpc::ServerContext* /*context*/,
+                                             const fileengine_rpc::GetEffectivePermissionsRequest* request,
+                                             fileengine_rpc::GetEffectivePermissionsResponse* response) {
+    std::string resource_uid = canonical_uid(request->resource_uid());
+    auto auth_context = request->auth();
+    std::string tenant = get_tenant_from_auth_context(auth_context);
+    std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
+    SERVER_LOG_DEBUG("GRPCService", "GetEffectivePermissions for resource_uid: " + resource_uid +
+                     " user: " + user + " claims: " + std::to_string(auth_context.claims_size()));
+
+    // Resolve the full effective permission set for this principal on the
+    // resource, evaluating ACLs only (no read/list of the entity). Claims are
+    // accepted on the auth context for forward compatibility; the current engine
+    // is RBAC (user + roles), so they do not yet alter the decision.
+    auto result = acl_manager_->get_effective_permissions(resource_uid, user, roles, tenant);
+    if (!result.success) {
+        response->set_success(false);
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetEffectivePermissions failed for " + resource_uid + ": " + result.error);
+        return grpc::Status::OK;
+    }
+
+    int bits = result.value;
+    response->set_success(true);
+    response->set_permission_bits(bits);
+    // Decompose the internal bit-flag mask into the wire Permission enum.
+    auto add = [&](fileengine::Permission flag, fileengine_rpc::Permission p) {
+        if (bits & static_cast<int>(flag)) response->add_permissions(p);
+    };
+    add(fileengine::Permission::READ, fileengine_rpc::READ);
+    add(fileengine::Permission::WRITE, fileengine_rpc::WRITE);
+    add(fileengine::Permission::DELETE, fileengine_rpc::DELETE);
+    add(fileengine::Permission::LIST_DELETED, fileengine_rpc::LIST_DELETED);
+    add(fileengine::Permission::UNDELETE, fileengine_rpc::UNDELETE);
+    add(fileengine::Permission::VIEW_VERSIONS, fileengine_rpc::VIEW_VERSIONS);
+    add(fileengine::Permission::RETRIEVE_BACK_VERSION, fileengine_rpc::RETRIEVE_BACK_VERSION);
+    add(fileengine::Permission::RESTORE_TO_VERSION, fileengine_rpc::RESTORE_TO_VERSION);
+    add(fileengine::Permission::EXECUTE, fileengine_rpc::EXECUTE);
+    add(fileengine::Permission::MANAGE_ACL, fileengine_rpc::MANAGE_ACL);
+    add(fileengine::Permission::ACL_INHERIT, fileengine_rpc::ACL_INHERIT);
+
+    SERVER_LOG_INFO("GRPCService", "GetEffectivePermissions ok for " + resource_uid +
+                    " bits=" + std::to_string(bits));
+    return grpc::Status::OK;
+}
+
 // Streaming operations for large files
 grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
                                               grpc::ServerReader<fileengine_rpc::PutFileRequest>* reader,

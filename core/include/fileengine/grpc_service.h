@@ -137,6 +137,10 @@ public:
                                 const fileengine_rpc::CheckPermissionRequest* request,
                                 fileengine_rpc::CheckPermissionResponse* response) override;
 
+    grpc::Status GetEffectivePermissions(grpc::ServerContext* context,
+                                const fileengine_rpc::GetEffectivePermissionsRequest* request,
+                                fileengine_rpc::GetEffectivePermissionsResponse* response) override;
+
     // Role management operations
     grpc::Status CreateRole(grpc::ServerContext* context,
                            const fileengine_rpc::CreateRoleRequest* request,
