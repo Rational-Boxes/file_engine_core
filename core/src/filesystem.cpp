@@ -209,6 +209,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
         entry.created_at = to_epoch_seconds(file_info.created_at);
         entry.modified_at = to_epoch_seconds(file_info.modified_at);
         entry.version_count = file_info.version_count;
+        entry.rendition_count = file_info.rendition_count;
 
         entries.push_back(entry);
     }
@@ -249,6 +250,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
         entry.created_at = to_epoch_seconds(file_info.created_at);
         entry.modified_at = to_epoch_seconds(file_info.modified_at);
         entry.version_count = file_info.version_count;
+        entry.rendition_count = file_info.rendition_count;
 
         entries.push_back(entry);
     }
@@ -315,7 +317,20 @@ Result<void> FileSystem::remove(const std::string& file_uid, const std::string& 
     if (!db_result.success) {
         return Result<void>::err("Failed to remove file from database: " + db_result.error);
     }
-    
+
+    // Cascade to hidden renditions: they are children of the file, so removing
+    // the file removes its alternate-format copies too (one level). Best-effort.
+    auto rend_list = context->db->list_files_in_directory(file_uid, tenant);
+    if (rend_list.success) {
+        for (const auto& rend : rend_list.value) {
+            auto del = context->db->delete_file(rend.uid, tenant);
+            if (!del.success) {
+                SERVER_LOG_ERROR("FileSystem::remove", ServerLogger::getInstance().detailed_log_prefix() +
+                          "Failed to remove rendition " + rend.uid + ": " + del.error);
+            }
+        }
+    }
+
     return Result<void>::ok();
 }
 
@@ -921,6 +936,47 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                 backup_queue_.push({new_uid, tenant, latest_version});
             }
             queue_cv_.notify_one(); // Wake up the backup worker thread
+        }
+
+        // Deep-copy hidden renditions: the source file's children become children
+        // of the new copy (one level; names are preserved per convention). copy()
+        // rejects a file as a destination parent, so copy each rendition's content
+        // and row directly here. Best-effort: a rendition failure doesn't fail the
+        // file copy (renditions are regenerable by the re-rendition service).
+        auto rend_list = context->db->list_files_in_directory(src_uid, tenant);
+        if (rend_list.success) {
+            for (const auto& rend : rend_list.value) {
+                if (rend.type == FileType::DIRECTORY) continue;  // one level: files only
+                auto rv = list_versions(rend.uid, user, roles, tenant);
+                if (!rv.success || rv.value.empty()) {
+                    SERVER_LOG_ERROR("FileSystem::copy", ServerLogger::getInstance().detailed_log_prefix() +
+                              "Skipping rendition with no version: " + rend.uid);
+                    continue;
+                }
+                std::string r_ver = rv.value.back();
+                auto r_read = context->storage->read_file(
+                    context->storage->get_storage_path(rend.uid, r_ver, tenant), tenant);
+                if (!r_read.success) continue;
+                std::string r_new_uid = Utils::generate_uuid();
+                auto r_store = context->storage->store_file(r_new_uid, r_ver, r_read.value, tenant);
+                if (!r_store.success) continue;
+                if (context->storage_tracker) {
+                    context->storage_tracker->record_file_creation(r_store.value, r_read.value.size(), tenant);
+                }
+                auto r_grants = compute_initial_acl_grants(new_uid, user, tenant);
+                auto r_db = context->db->create_file_with_acls(
+                    r_new_uid, rend.name, new_uid + "/" + rend.name, new_uid,
+                    FileType::REGULAR_FILE, user, rend.permissions, r_grants, tenant);
+                if (!r_db.success) {
+                    SERVER_LOG_ERROR("FileSystem::copy", ServerLogger::getInstance().detailed_log_prefix() +
+                              "Failed to copy rendition " + rend.name + ": " + r_db.error);
+                    continue;
+                }
+                context->db->update_file_current_version(r_new_uid, r_ver, tenant);
+                context->db->insert_version(r_new_uid, r_ver, r_read.value.size(), r_store.value, tenant);
+                context->db->update_file_size(r_new_uid, static_cast<int64_t>(r_read.value.size()), tenant);
+                context->db->update_file_modified(r_new_uid, tenant);
+            }
         }
 
         return Result<void>::ok();

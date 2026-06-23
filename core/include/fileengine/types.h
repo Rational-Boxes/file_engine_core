@@ -28,6 +28,7 @@ struct FileInfo {
     std::string owner;
     int permissions;
     int32_t version_count;        // Number of versions for the file
+    int32_t rendition_count = 0;  // Hidden child renditions (files only; 0 for dirs)
 };
 
 // Directory entry - updated to use UUID for identification
@@ -39,6 +40,7 @@ struct DirectoryEntry {
     int64_t created_at;           // Unix timestamp for creation time
     int64_t modified_at;          // Unix timestamp for modification time
     int32_t version_count;        // Number of versions for files
+    int32_t rendition_count = 0;  // Hidden child renditions (files only; 0 for dirs)
 };
 
 // Result types
