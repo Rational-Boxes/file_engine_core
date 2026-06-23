@@ -184,6 +184,13 @@ std::vector<uint8_t> CryptoUtils::encrypt_data(const std::vector<uint8_t>& data,
 }
 
 std::vector<uint8_t> CryptoUtils::decrypt_data(const std::vector<uint8_t>& encrypted_data, const std::string& key) {
+    // Empty plaintext encrypts to an empty blob (see encrypt_data), and a null
+    // payload can also reach the store from a 0-byte upload. Treat an empty
+    // stored blob as empty content rather than failing the read. Only a
+    // non-empty-but-truncated blob (1..27 bytes) is genuinely corrupt.
+    if (encrypted_data.empty()) {
+        return std::vector<uint8_t>();
+    }
     if (encrypted_data.size() < 12 + 16) { // At least IV + tag
         throw std::runtime_error("Encrypted data too short");
     }
