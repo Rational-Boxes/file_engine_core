@@ -32,6 +32,11 @@ public:
                                             int permissions, const std::string& tenant = "") = 0;
     virtual Result<void> update_file_modified(const std::string& uid, const std::string& tenant = "") = 0;
     virtual Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
+    // Update the stored byte size of a file's current content. Non-pure so
+    // existing mocks need no change; the concrete Database overrides it.
+    virtual Result<void> update_file_size(const std::string& /*uid*/, int64_t /*size*/, const std::string& /*tenant*/ = "") {
+        return Result<void>::ok();
+    }
     virtual Result<bool> delete_file(const std::string& uid, const std::string& tenant = "") = 0;
     virtual Result<bool> undelete_file(const std::string& uid, const std::string& tenant = "") = 0;
     virtual Result<std::optional<FileInfo>> get_file_by_uid(const std::string& uid, const std::string& tenant = "") = 0;

@@ -52,6 +52,7 @@ public:
                                                const std::string& tenant = "") override;
     Result<void> update_file_modified(const std::string& uid, const std::string& tenant) override;
     Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) override;
+    Result<void> update_file_size(const std::string& uid, int64_t size, const std::string& tenant = "") override;
     Result<bool> delete_file(const std::string& uid, const std::string& tenant) override;
     Result<bool> undelete_file(const std::string& uid, const std::string& tenant) override;
     Result<std::optional<FileInfo>> get_file_by_uid(const std::string& uid, const std::string& tenant) override;

@@ -438,12 +438,20 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     }
     
     // Record the version in the database
-    auto insert_version_result = context->db->insert_version(file_uid, version_timestamp, data.size(), 
+    auto insert_version_result = context->db->insert_version(file_uid, version_timestamp, data.size(),
                                                              storage_result.value, tenant);
     if (!insert_version_result.success) {
         return Result<void>::err("Failed to record version: " + insert_version_result.error);
     }
-    
+
+    // Keep files.size in sync with the current content so stat/listdir report
+    // the real byte size (the version table alone is not read by stat).
+    auto update_size_result = context->db->update_file_size(file_uid, static_cast<int64_t>(data.size()), tenant);
+    if (!update_size_result.success) {
+        SERVER_LOG_ERROR("FileSystem::put", ServerLogger::getInstance().detailed_log_prefix() +
+                  "Failed to update file size for " + file_uid + ": " + update_size_result.error);
+    }
+
     // Update the modification time
     auto update_time_result = context->db->update_file_modified(file_uid, tenant);
     if (!update_time_result.success) {
@@ -891,6 +899,13 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                                                                  store_result.value, tenant);
         if (!insert_version_result.success) {
             return Result<void>::err("Failed to record version: " + insert_version_result.error);
+        }
+
+        // Mirror the copied content's size onto the new file record.
+        auto copy_size_result = context->db->update_file_size(new_uid, static_cast<int64_t>(storage_result.value.size()), tenant);
+        if (!copy_size_result.success) {
+            SERVER_LOG_ERROR("FileSystem::copy", ServerLogger::getInstance().detailed_log_prefix() +
+                      "Failed to update file size for " + new_uid + ": " + copy_size_result.error);
         }
 
         // Update the modification time
