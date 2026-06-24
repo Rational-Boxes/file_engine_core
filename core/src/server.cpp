@@ -234,6 +234,12 @@ int main(int argc, char** argv) {
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
+    // File content moves through the StreamFileUpload/Download RPCs in small
+    // chunks, so no single message should be large. Raise the per-message cap
+    // anyway (default is 4 MiB) as a safety net for any unary path that still
+    // carries a whole payload; genuinely large files must use the streaming RPCs.
+    builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
+    builder.SetMaxSendMessageSize(64 * 1024 * 1024);
     // Set thread pool options based on the configuration
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::NUM_CQS, num_threads);
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, num_threads);
