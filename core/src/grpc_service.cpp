@@ -1164,6 +1164,52 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+grpc::Status GRPCFileService::GetResourceAcls(grpc::ServerContext* context,
+                                             const fileengine_rpc::GetResourceAclsRequest* request,
+                                             fileengine_rpc::GetResourceAclsResponse* response) {
+    (void)context;
+    std::string resource_uid = canonical_uid(request->resource_uid());
+    auto auth_context = request->auth();
+    std::string tenant = get_tenant_from_auth_context(auth_context);
+    std::string user = get_user_from_auth_context(auth_context);
+    SERVER_LOG_DEBUG("GRPCService", "GetResourceAcls called for resource_uid: " + resource_uid);
+
+    // Viewing a resource's ACL entries is a privileged operation (the ACL
+    // editor), so require MANAGE_ACL — the same bit grant/revoke require.
+    if (!validate_user_permissions(resource_uid, auth_context, static_cast<int>(Permission::MANAGE_ACL))) {
+        response->set_success(false);
+        response->set_error("User does not have permission to view ACLs");
+        SERVER_LOG_ERROR("GRPCService", "GetResourceAcls failed: User " + user + " lacks MANAGE_ACL on " + resource_uid);
+        return grpc::Status::OK;
+    }
+
+    auto tenant_context = tenant_manager_->get_tenant_context(tenant);
+    if (!tenant_context || !tenant_context->db) {
+        response->set_success(false);
+        response->set_error("Tenant context not found or database unavailable");
+        SERVER_LOG_ERROR("GRPCService", "GetResourceAcls failed: Tenant context not found for tenant: " + tenant);
+        return grpc::Status::OK;
+    }
+
+    auto result = tenant_context->db->get_acls_for_resource(resource_uid, tenant);
+    if (!result.success) {
+        response->set_success(false);
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "GetResourceAcls failed: " + result.error);
+        return grpc::Status::OK;
+    }
+
+    response->set_success(true);
+    for (const auto& e : result.value) {
+        auto* m = response->add_acls();
+        m->set_principal(e.principal);
+        m->set_type(e.type);
+        m->set_permissions(e.permissions);
+        m->set_effect(e.effect);
+    }
+    return grpc::Status::OK;
+}
+
 grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
                                               const fileengine_rpc::RevokePermissionRequest* request,
                                               fileengine_rpc::RevokePermissionResponse* response) {
