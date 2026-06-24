@@ -1834,4 +1834,36 @@ grpc::Status GRPCFileService::GetAllRoles(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+grpc::Status GRPCFileService::ListClaims(grpc::ServerContext* context,
+                                        const fileengine_rpc::ListClaimsRequest* request,
+                                        fileengine_rpc::ListClaimsResponse* response) {
+    (void)context;
+    SERVER_LOG_DEBUG("GRPCService", "ListClaims called");
+
+    auto auth_context = request->auth();
+    std::string tenant = get_tenant_from_auth_context(auth_context);
+
+    auto tenant_context = tenant_manager_->get_tenant_context(tenant);
+    if (!tenant_context || !tenant_context->db) {
+        response->set_success(false);
+        response->set_error("Tenant context not found or database unavailable");
+        SERVER_LOG_ERROR("GRPCService", "ListClaims failed: Tenant context not found for tenant: " + tenant);
+        return grpc::Status::OK;
+    }
+
+    auto result = tenant_context->db->list_claims(request->prefix(), request->limit(), tenant);
+    if (!result.success) {
+        response->set_success(false);
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "ListClaims failed: " + result.error);
+        return grpc::Status::OK;
+    }
+
+    response->set_success(true);
+    for (const auto& c : result.value) {
+        response->add_claims(c);
+    }
+    return grpc::Status::OK;
+}
+
 } // namespace fileengine

@@ -151,6 +151,12 @@ public:
                                                         const std::string& principal,
                                                         int type,
                                                         const std::string& tenant = "") = 0;
+    // Catalog the distinct CLAIM-type ACL principals ("key=value") defined across
+    // the tenant, for an ACL editor's claim type-ahead. `prefix` is a
+    // case-insensitive filter ("" = all); `limit` caps results (<= 0 = no cap).
+    virtual Result<std::vector<std::string>> list_claims(const std::string& prefix,
+                                                         int limit,
+                                                         const std::string& tenant = "") = 0;
 
     // Role management operations
     virtual Result<void> create_role(const std::string& role, const std::string& tenant = "") = 0;

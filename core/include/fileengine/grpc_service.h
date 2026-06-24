@@ -170,6 +170,10 @@ public:
                             const fileengine_rpc::GetAllRolesRequest* request,
                             fileengine_rpc::GetAllRolesResponse* response) override;
 
+    grpc::Status ListClaims(grpc::ServerContext* context,
+                           const fileengine_rpc::ListClaimsRequest* request,
+                           fileengine_rpc::ListClaimsResponse* response) override;
+
     // Streaming operations for large files
     grpc::Status StreamFileUpload(grpc::ServerContext* context,
                                  grpc::ServerReader<fileengine_rpc::PutFileRequest>* reader,

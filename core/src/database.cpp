@@ -2869,6 +2869,57 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
     return Result<std::vector<IDatabase::AclEntry>>::ok(acls);
 }
 
+Result<std::vector<std::string>> Database::list_claims(const std::string& prefix,
+                                                       int limit,
+                                                       const std::string& tenant) {
+    auto conn = connection_pool_->acquire();
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<std::string>>::err("Failed to acquire database connection");
+    }
+
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    // principal_type 4 == PrincipalType::CLAIM (ABAC "key=value" principals).
+    std::string sql = "SELECT DISTINCT principal FROM " + schema + ".acls WHERE principal_type = 4";
+
+    std::string pattern;
+    if (!prefix.empty()) {
+        // Escape LIKE metacharacters so the prefix matches literally.
+        for (char c : prefix) {
+            if (c == '\\' || c == '%' || c == '_') pattern += '\\';
+            pattern += c;
+        }
+        pattern += '%';
+        sql += " AND principal ILIKE $1";
+    }
+    sql += " ORDER BY principal";
+    if (limit > 0) sql += " LIMIT " + std::to_string(limit);
+
+    PGresult* res;
+    if (!pattern.empty()) {
+        const char* pv[1] = {pattern.c_str()};
+        res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, pv, nullptr, nullptr, 0);
+    } else {
+        res = PQexecParams(pg_conn, sql.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 0);
+    }
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to list claims: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<std::string>>::err(error);
+    }
+
+    std::vector<std::string> claims;
+    int nrows = PQntuples(res);
+    for (int i = 0; i < nrows; ++i) claims.push_back(PQgetvalue(res, i, 0));
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<std::string>>::ok(claims);
+}
+
 // Role management implementations
 // roles and user_roles tables are created at tenant init time by
 // create_tenant_schema. Local role definitions persisted here are UNIONed
