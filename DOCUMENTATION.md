@@ -36,6 +36,10 @@ The system is composed of several key components that work together:
   matched against the requester's authentication claims (see SPECIFICATIONS.md
   "ACL principals"). Evaluated for file operations, `CheckPermission`, and
   `GetEffectivePermissions` alike
+- Claim catalog (`ListClaims` RPC): enumerates the distinct CLAIM (`key=value`)
+  principals already defined in a tenant's ACLs, with an optional
+  case-insensitive prefix and result cap. Lets an ACL editor offer claim
+  type-ahead without a separate claim registry; per-tenant schema scoped
 - Integration with LDAP for user authentication and role management
 - Frontend integration with OAuth2 and JWT-based authentication
 
@@ -89,6 +93,7 @@ The system provides a Protocol Buffers interface for all filesystem operations, 
 - Metadata operations (stat, exists, set/get metadata)
 - Version operations (list_versions, get_version)
 - Access control operations (ACL management)
+- Role and claim management (role CRUD/membership, `ListClaims` claim catalog)
 - Administrative functions
 
 ## Configuration
