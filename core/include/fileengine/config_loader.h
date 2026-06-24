@@ -77,6 +77,21 @@ struct Config {
     bool log_to_file = false;
     size_t log_rotation_size_mb = 10;
     int log_retention_days = 7;
+
+    // Event queueing (optional; see design_documents/redis_event_queueing_plan.md
+    // and convert_search_ai/design_documents/EVENT_CONTRACT.md). Disabled by
+    // default — existing deployments are unaffected until opted in. The Redis
+    // connection honors the REDDIS_* keys already present in .env.
+    bool        events_enabled = false;
+    std::string events_redis_host = "localhost";
+    int         events_redis_port = 6379;
+    std::string events_redis_password;
+    int         events_redis_db = 0;
+    // Single stream shared by all tenants; the tenant is carried as an event
+    // field and consumers are multi-tenant aware (EVENT_CONTRACT.md §5).
+    std::string events_stream = "fileengine:events";
+    long long   events_stream_maxlen = 100000;
+    size_t      events_outbox_capacity = 10000;
 };
 
 class ConfigLoader {

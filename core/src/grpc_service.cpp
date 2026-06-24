@@ -1157,6 +1157,8 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "GrantPermission failed for resource_uid: " + resource_uid + " with error: " + result.error);
     } else {
         SERVER_LOG_INFO("GRPCService", "GrantPermission successful for resource_uid: " + resource_uid);
+        // Data-governance event: a permission was granted on this resource.
+        filesystem_->publish_acl_change(tenant, resource_uid, principal, converted_permissions, user);
     }
 
     return grpc::Status::OK;
@@ -1248,6 +1250,8 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "RevokePermission failed for resource_uid: " + resource_uid + " with error: " + result.error);
     } else {
         SERVER_LOG_INFO("GRPCService", "RevokePermission successful for resource_uid: " + resource_uid);
+        // Data-governance event: a permission was revoked on this resource.
+        filesystem_->publish_acl_change(tenant, resource_uid, principal, converted_permissions, user);
     }
 
     return grpc::Status::OK;
@@ -1651,6 +1655,9 @@ grpc::Status GRPCFileService::DeleteRole(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "DeleteRole failed for role: " + request->role() + " with error: " + result.error);
     } else {
         SERVER_LOG_INFO("GRPCService", "DeleteRole successful for role: " + request->role());
+        // Data-governance event: deleting a role revokes its grants from all members.
+        filesystem_->publish_role_change(tenant, FileEventType::RoleDeleted,
+                                         request->role(), "", user);
     }
 
     return grpc::Status::OK;
@@ -1684,6 +1691,9 @@ grpc::Status GRPCFileService::AssignUserToRole(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "AssignUserToRole failed for user: " + request->user() + " to role: " + request->role() + " with error: " + result.error);
     } else {
         SERVER_LOG_INFO("GRPCService", "AssignUserToRole successful for user: " + request->user() + " to role: " + request->role());
+        // Data-governance event: role membership grants effective access.
+        filesystem_->publish_role_change(tenant, FileEventType::RoleAssigned,
+                                         request->role(), request->user(), user);
     }
 
     return grpc::Status::OK;
@@ -1717,6 +1727,9 @@ grpc::Status GRPCFileService::RemoveUserFromRole(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "RemoveUserFromRole failed for user: " + request->user() + " from role: " + request->role() + " with error: " + result.error);
     } else {
         SERVER_LOG_INFO("GRPCService", "RemoveUserFromRole successful for user: " + request->user() + " from role: " + request->role());
+        // Data-governance event: removing membership revokes effective access.
+        filesystem_->publish_role_change(tenant, FileEventType::RoleMemberRemoved,
+                                         request->role(), request->user(), user);
     }
 
     return grpc::Status::OK;

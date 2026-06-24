@@ -8,6 +8,7 @@
 #include "cache_manager.h"
 #include "tenant_manager.h"
 #include "file_culler.h"
+#include "event_sink.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -180,11 +181,53 @@ public:
         file_culler_ = std::move(file_culler);
     }
 
+    // Setter for the optional event sink. When unset (nullptr), no events are
+    // emitted — the default. Injected by the server when event queueing is
+    // enabled (see event_sink_factory.h).
+    virtual void set_event_sink(std::shared_ptr<IEventSink> event_sink) {
+        event_sink_ = std::move(event_sink);
+    }
+
+    // Emit an acl.changed event from an external ACL path. The gRPC layer calls
+    // AclManager directly (it supports GROUP/ROLE principals and DENY effects
+    // that FileSystem::grant_permission doesn't model), so it uses this hook to
+    // publish the event. No-op when events are disabled.
+    void publish_acl_change(const std::string& tenant, const std::string& resource_uid,
+                            const std::string& principal, int permissions,
+                            const std::string& user) noexcept {
+        emit_acl_event(tenant, resource_uid, principal, permissions, user);
+    }
+
+    // Emit a role-membership event (role.assigned / role.member_removed /
+    // role.deleted) from the gRPC role RPCs, which call RoleManager directly.
+    // `member` is empty for role.deleted. No-op when events are disabled.
+    void publish_role_change(const std::string& tenant, FileEventType type,
+                             const std::string& role, const std::string& member,
+                             const std::string& user) noexcept {
+        emit_role_event(tenant, type, role, member, user);
+    }
+
 private:
     std::shared_ptr<TenantManager> tenant_manager_;
     std::shared_ptr<AclManager> acl_manager_;
     std::unique_ptr<CacheManager> cache_manager_;
     std::unique_ptr<FileCuller> file_culler_;
+    std::shared_ptr<IEventSink> event_sink_;  // optional; nullptr = events disabled
+
+    // Best-effort emission of a file-activity event after a successful mutation.
+    // noexcept + fully guarded: never disturbs the calling operation. Enriches
+    // the envelope (name/parent/size/version/is_folder/is_rendition) via a
+    // best-effort DB read; a rendition is detected when the parent is a file.
+    void emit_fs_event(const std::string& tenant, FileEventType type,
+                       const std::string& uid, const std::string& user) noexcept;
+    // ACL grant/revoke event for a resource + principal.
+    void emit_acl_event(const std::string& tenant, const std::string& resource_uid,
+                        const std::string& principal, int permissions,
+                        const std::string& user) noexcept;
+    // Role-membership event (no resource): role +/- member.
+    void emit_role_event(const std::string& tenant, FileEventType type,
+                         const std::string& role, const std::string& member,
+                         const std::string& user) noexcept;
     
     // Helper to get tenant context for operations
     TenantContext* get_tenant_context(const std::string& tenant);

@@ -16,6 +16,52 @@ std::string ConfigLoader::get_env_var(const std::string& var, const std::string&
     return env_val ? std::string(env_val) : default_val;
 }
 
+// REDDIS_HOST may be a bare host ("localhost") or "host:port". Split off the
+// port only when it's an unambiguous host:port (single colon, no scheme/path,
+// not an IPv6 literal); otherwise treat the whole value as the host.
+static void apply_redis_host(const std::string& value, Config& config) {
+    if (value.empty()) return;
+    auto colon = value.rfind(':');
+    if (colon != std::string::npos && value.find('/') == std::string::npos &&
+        value.find(':') == colon) {
+        try {
+            config.events_redis_port = std::stoi(value.substr(colon + 1));
+            config.events_redis_host = value.substr(0, colon);
+            return;
+        } catch (...) {
+            // not a numeric port — fall through and use the whole value as host
+        }
+    }
+    config.events_redis_host = value;
+}
+
+// Apply the optional event-queueing keys from a parsed key/value map onto the
+// config. The Redis connection uses FILEENGINE_REDIS_* (canonical); the older
+// REDDIS_* keys are still honored as a legacy alias and read first so the
+// canonical names take precedence when both are present. Host is read before
+// port so an explicit *_PORT always wins over a port embedded in *_HOST.
+static void apply_events_config(const std::map<std::string, std::string>& vars, Config& config) {
+    auto get = [&](const char* k) -> const std::string* {
+        auto it = vars.find(k);
+        return it == vars.end() ? nullptr : &it->second;
+    };
+    if (auto v = get("FILEENGINE_EVENTS_ENABLED")) config.events_enabled = (*v == "true" || *v == "1");
+
+    // Connection — legacy REDDIS_* first, canonical FILEENGINE_REDIS_* override.
+    if (auto v = get("REDDIS_HOST")) apply_redis_host(*v, config);
+    if (auto v = get("FILEENGINE_REDIS_HOST")) apply_redis_host(*v, config);
+    if (auto v = get("REDDIS_PORT")) config.events_redis_port = std::stoi(*v);
+    if (auto v = get("FILEENGINE_REDIS_PORT")) config.events_redis_port = std::stoi(*v);
+    if (auto v = get("REDDIS_PASSWORD")) config.events_redis_password = *v;
+    if (auto v = get("FILEENGINE_REDIS_PASSWORD")) config.events_redis_password = *v;
+    if (auto v = get("REDDIS_DB")) config.events_redis_db = std::stoi(*v);
+    if (auto v = get("FILEENGINE_REDIS_DB")) config.events_redis_db = std::stoi(*v);
+
+    if (auto v = get("FILEENGINE_EVENTS_STREAM")) config.events_stream = *v;
+    if (auto v = get("FILEENGINE_EVENTS_STREAM_MAXLEN")) config.events_stream_maxlen = std::stoll(*v);
+    if (auto v = get("FILEENGINE_EVENTS_OUTBOX_CAPACITY")) config.events_outbox_capacity = std::stoul(*v);
+}
+
 std::map<std::string, std::string> ConfigLoader::parse_env_file(const std::string& filepath) {
     std::map<std::string, std::string> env_vars;
     std::ifstream file(filepath);
@@ -163,6 +209,9 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     if (env_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(env_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (env_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(env_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
 
+    // Event queueing (optional). Redis connection uses the REDDIS_* keys.
+    apply_events_config(env_vars, config);
+
     return config;
 }
 
@@ -290,6 +339,22 @@ Config ConfigLoader::load_from_env() {
 
     env_value = get_env_var("FILEENGINE_LOG_RETENTION_DAYS", "");
     if (!env_value.empty()) config.log_retention_days = std::stoi(env_value);
+
+    // Event queueing (optional) from process environment. Collect the keys we
+    // care about into a map and reuse the shared applier.
+    {
+        std::map<std::string, std::string> ev;
+        for (const char* key : {"FILEENGINE_EVENTS_ENABLED",
+                                "REDDIS_HOST", "REDDIS_PORT", "REDDIS_PASSWORD", "REDDIS_DB",
+                                "FILEENGINE_REDIS_HOST", "FILEENGINE_REDIS_PORT",
+                                "FILEENGINE_REDIS_PASSWORD", "FILEENGINE_REDIS_DB",
+                                "FILEENGINE_EVENTS_STREAM", "FILEENGINE_EVENTS_STREAM_MAXLEN",
+                                "FILEENGINE_EVENTS_OUTBOX_CAPACITY"}) {
+            const char* v = std::getenv(key);
+            if (v && *v) ev[key] = v;
+        }
+        apply_events_config(ev, config);
+    }
 
     return config;
 }
@@ -479,6 +544,9 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (default_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(default_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (default_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(default_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
 
+    // Event queueing (optional) from .env
+    apply_events_config(default_file_vars, config);
+
     // 3. Load from config file specified on command line with --config or -c (overrides .env and system config)
     std::string config_file = ".env"; // Default if no --config specified
     for (int i = 1; i < argc; i++) {
@@ -607,6 +675,9 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (cmdline_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(cmdline_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (cmdline_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(cmdline_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
 
+    // Event queueing (optional) from the --config file
+    apply_events_config(cmdline_file_vars, config);
+
     // 4. Load from environment variables (overrides config files)
     Config env_config = load_from_env();
     if (!env_config.db_host.empty() && env_config.db_host != "localhost") config.db_host = env_config.db_host;
@@ -648,6 +719,16 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_config.log_to_file) config.log_to_file = env_config.log_to_file;
     if (env_config.log_rotation_size_mb != 10) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
     if (env_config.log_retention_days != 7) config.log_retention_days = env_config.log_retention_days;
+
+    // Event queueing — process-env overrides files (compared against defaults)
+    if (env_config.events_enabled) config.events_enabled = true;
+    if (env_config.events_redis_host != "localhost") config.events_redis_host = env_config.events_redis_host;
+    if (env_config.events_redis_port != 6379) config.events_redis_port = env_config.events_redis_port;
+    if (!env_config.events_redis_password.empty()) config.events_redis_password = env_config.events_redis_password;
+    if (env_config.events_redis_db != 0) config.events_redis_db = env_config.events_redis_db;
+    if (env_config.events_stream != "fileengine:events") config.events_stream = env_config.events_stream;
+    if (env_config.events_stream_maxlen != 100000) config.events_stream_maxlen = env_config.events_stream_maxlen;
+    if (env_config.events_outbox_capacity != 10000) config.events_outbox_capacity = env_config.events_outbox_capacity;
 
     // 5. Load from command-line arguments (highest priority)
     Config cmd_config = load_from_cmd_args(argc, argv);
