@@ -157,6 +157,9 @@ add_library(fileengine_core SHARED
     src/server_logger.cpp      # Add server logger source file
     src/crypto_utils.cpp       # Add crypto utilities source file
     src/rest_server.cpp        # Monitoring HTTP listener (Phase A)
+    src/event.cpp              # File-activity event model + JSON envelope
+    src/event_sink.cpp         # Async bounded-outbox sink base
+    src/event_sink_factory.cpp # Builds the configured sink (or none)
 )
 
 # Include directories
@@ -191,6 +194,25 @@ endif()
 target_compile_definitions(fileengine_core PRIVATE
     _GNU_SOURCE
 )
+
+# Optional Redis-based file-activity event emission (off by default; requires
+# hiredis-devel). When unavailable the event subsystem still compiles, but the
+# factory returns no sink so nothing is published.
+option(FILEENGINE_ENABLE_EVENTS "Build with Redis event emission (requires hiredis-devel)" OFF)
+if(FILEENGINE_ENABLE_EVENTS)
+    find_library(HIREDIS_LIB hiredis)
+    find_path(HIREDIS_INC hiredis/hiredis.h)
+    if(HIREDIS_LIB AND HIREDIS_INC)
+        target_sources(fileengine_core PRIVATE src/redis_event_sink.cpp)
+        target_include_directories(fileengine_core PRIVATE ${HIREDIS_INC})
+        target_link_libraries(fileengine_core ${HIREDIS_LIB})
+        target_compile_definitions(fileengine_core PRIVATE FILEENGINE_HAS_EVENTS=1)
+        message(STATUS "FileEngine event emission ENABLED (hiredis: ${HIREDIS_LIB})")
+    else()
+        message(WARNING "FILEENGINE_ENABLE_EVENTS=ON but hiredis not found; "
+                        "event emission compiled out (install hiredis-devel)")
+    endif()
+endif()
 
 # Add executable
 add_executable(fileengine_server

@@ -24,6 +24,7 @@
 #include "fileengine/file_culler.h"
 #include "fileengine/server_logger.h"
 #include "fileengine/rest_server.h"
+#include "fileengine/event_sink_factory.h"
 
 #ifdef FILEENGINE_HAS_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -163,6 +164,12 @@ int main(int argc, char** argv) {
     std::cout << "Initializing filesystem..." << std::endl;
     auto filesystem = std::make_shared<fileengine::FileSystem>(tenant_manager);
     filesystem->set_acl_manager(acl_manager);
+
+    // Optional file-activity event emission (Redis). make_event_sink returns
+    // nullptr when disabled/not compiled in, so this is a no-op by default.
+    if (auto event_sink = fileengine::make_event_sink(config)) {
+        filesystem->set_event_sink(event_sink);
+    }
 
     // Initialize file culling system
     std::cout << "Initializing file culling system..." << std::endl;

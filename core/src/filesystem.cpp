@@ -119,6 +119,7 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
 
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Successfully created directory with UID: " + new_uid);
+    emit_fs_event(tenant, FileEventType::DirCreated, new_uid, user);
     return Result<std::string>::ok(new_uid);
 }
 
@@ -173,6 +174,7 @@ Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& us
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Successfully marked directory " + dir_uid + " as deleted");
 
+    emit_fs_event(tenant, FileEventType::DirDeleted, dir_uid, user);
     return Result<void>::ok();
 }
 
@@ -295,6 +297,7 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
         return Result<std::string>::err("Failed to create file in database: " + db_result.error);
     }
 
+    emit_fs_event(tenant, FileEventType::FileCreated, new_uid, user);
     return Result<std::string>::ok(new_uid);
 }
 
@@ -331,6 +334,7 @@ Result<void> FileSystem::remove(const std::string& file_uid, const std::string& 
         }
     }
 
+    emit_fs_event(tenant, FileEventType::FileDeleted, file_uid, user);
     return Result<void>::ok();
 }
 
@@ -353,7 +357,8 @@ Result<void> FileSystem::undelete(const std::string& file_uid, const std::string
     if (!db_result.success) {
         return Result<void>::err("Failed to undelete file in database: " + db_result.error);
     }
-    
+
+    emit_fs_event(tenant, FileEventType::FileRestored, file_uid, user);
     return Result<void>::ok();
 }
 
@@ -505,6 +510,7 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
               "Put operation completed successfully for file_uid: " + file_uid +
               " [CONCURRENCY CRITICAL] NOTE: Race conditions possible during async operations after this point");
 
+    emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
     return Result<void>::ok();
 }
 
@@ -782,6 +788,7 @@ Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst
         return Result<void>::err("Failed to move file in database: " + db_result.error);
     }
 
+    emit_fs_event(tenant, FileEventType::FileMoved, src_uid, user);
     return Result<void>::ok();
 }
 
@@ -864,6 +871,7 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             }
         }
 
+        emit_fs_event(tenant, FileEventType::DirCreated, new_uid, user);
         return Result<void>::ok();
     } else {
         // It's a regular file - copy the file content and metadata
@@ -979,6 +987,7 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             }
         }
 
+        emit_fs_event(tenant, FileEventType::FileCreated, new_uid, user);
         return Result<void>::ok();
     }
 }
@@ -1002,7 +1011,8 @@ Result<void> FileSystem::rename(const std::string& uid, const std::string& new_n
     if (!db_result.success) {
         return Result<void>::err("Failed to rename file: " + db_result.error);
     }
-    
+
+    emit_fs_event(tenant, FileEventType::FileRenamed, uid, user);
     return Result<void>::ok();
 }
 
@@ -1125,6 +1135,9 @@ Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
     }
 
     auto result = context->db->restore_to_version(file_uid, version_timestamp, user, tenant);
+    if (result.success && result.value) {
+        emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+    }
     return result;
 }
 
@@ -1401,6 +1414,9 @@ Result<void> FileSystem::grant_permission(const std::string& resource_uid,
 
     auto result = acl_manager_->grant_permission(resource_uid, principal, PrincipalType::USER,
                                                  permissions, tenant, user);
+    if (result.success) {
+        emit_acl_event(tenant, resource_uid, principal, permissions, user);
+    }
     return result;
 }
 
@@ -1422,6 +1438,9 @@ Result<void> FileSystem::revoke_permission(const std::string& resource_uid,
     
     auto result = acl_manager_->revoke_permission(resource_uid, principal, PrincipalType::USER,
                                                   permissions, tenant, user);
+    if (result.success) {
+        emit_acl_event(tenant, resource_uid, principal, permissions, user);
+    }
     return result;
 }
 
@@ -1444,9 +1463,106 @@ void FileSystem::shutdown() {
     // Stop the async backup worker thread
     stop_async_backup_worker();
 
+    // Drain and stop the event sink (joins its worker). Safe if unset.
+    if (event_sink_) {
+        event_sink_->stop();
+    }
+
     // Cleanup operations
     if (cache_manager_) {
         cache_manager_->cleanup_cache();
+    }
+}
+
+void FileSystem::emit_fs_event(const std::string& tenant, FileEventType type,
+                               const std::string& uid, const std::string& user) noexcept {
+    if (!event_sink_) return;  // events disabled — cheap no-op, no DB work
+    try {
+        FileEvent ev;
+        ev.event_id = Utils::generate_uuid();
+        ev.type = type;
+        ev.tenant = tenant.empty() ? "default" : tenant;
+        ev.file_uid = uid;
+        ev.actor = user;
+        ev.ts = Utils::get_timestamp_string();
+
+        // Best-effort enrichment. include_deleted so delete/rmdir events still
+        // resolve metadata for the row that was just soft-deleted.
+        auto context = get_tenant_context(tenant);
+        if (context && context->db) {
+            auto info = context->db->get_file_by_uid_include_deleted(uid, tenant);
+            if (info.success && info.value.has_value()) {
+                const auto& fi = info.value.value();
+                ev.name = fi.name;
+                ev.parent_uid = fi.parent_uid;
+                ev.path = fi.path;
+                ev.size = fi.size;
+                ev.version = fi.version;
+                ev.is_folder = (fi.type == FileType::DIRECTORY);
+            }
+            // A rendition is a hidden child of a *file*: detect via parent type
+            // so consumers can ignore the conversion service's own output.
+            if (!ev.parent_uid.empty()) {
+                auto parent = context->db->get_file_by_uid_include_deleted(ev.parent_uid, tenant);
+                if (parent.success && parent.value.has_value()) {
+                    ev.is_rendition = (parent.value.value().type == FileType::REGULAR_FILE);
+                }
+            }
+        }
+        event_sink_->publish(ev);
+    } catch (...) {
+        // fail-open: event emission must never disturb the filesystem operation
+    }
+}
+
+void FileSystem::emit_acl_event(const std::string& tenant, const std::string& resource_uid,
+                                const std::string& principal, int permissions,
+                                const std::string& user) noexcept {
+    if (!event_sink_) return;
+    try {
+        FileEvent ev;
+        ev.event_id = Utils::generate_uuid();
+        ev.type = FileEventType::AclChanged;
+        ev.tenant = tenant.empty() ? "default" : tenant;
+        ev.file_uid = resource_uid;
+        ev.principal = principal;
+        ev.permissions = permissions;
+        ev.actor = user;
+        ev.ts = Utils::get_timestamp_string();
+
+        auto context = get_tenant_context(tenant);
+        if (context && context->db) {
+            auto info = context->db->get_file_by_uid_include_deleted(resource_uid, tenant);
+            if (info.success && info.value.has_value()) {
+                const auto& fi = info.value.value();
+                ev.name = fi.name;
+                ev.parent_uid = fi.parent_uid;
+                ev.path = fi.path;
+                ev.is_folder = (fi.type == FileType::DIRECTORY);
+            }
+        }
+        event_sink_->publish(ev);
+    } catch (...) {
+        // fail-open
+    }
+}
+
+void FileSystem::emit_role_event(const std::string& tenant, FileEventType type,
+                                 const std::string& role, const std::string& member,
+                                 const std::string& user) noexcept {
+    if (!event_sink_) return;
+    try {
+        FileEvent ev;
+        ev.event_id = Utils::generate_uuid();
+        ev.type = type;
+        ev.tenant = tenant.empty() ? "default" : tenant;
+        ev.role = role;
+        ev.member = member;
+        ev.actor = user;
+        ev.ts = Utils::get_timestamp_string();
+        event_sink_->publish(ev);
+    } catch (...) {
+        // fail-open
     }
 }
 
