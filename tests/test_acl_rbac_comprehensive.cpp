@@ -211,6 +211,29 @@ public:
         return Result<std::vector<AclEntry>>::ok(std::vector<AclEntry>{});
     }
 
+    // Catalog distinct CLAIM-type (type 4) principals; case-insensitive prefix.
+    Result<std::vector<std::string>> list_claims(const std::string& prefix,
+                                                 int limit,
+                                                 const std::string& tenant = "") override {
+        auto lower = [](std::string s) {
+            for (char& c : s) if (c >= 'A' && c <= 'Z') c += 32;
+            return s;
+        };
+        std::string lp = lower(prefix);
+        std::vector<std::string> claims;
+        for (const auto& kv : acls_) {
+            for (const auto& entry : kv.second) {
+                if (entry.type != 4) continue;  // PrincipalType::CLAIM
+                if (!lp.empty() && lower(entry.principal).compare(0, lp.size(), lp) != 0) continue;
+                if (std::find(claims.begin(), claims.end(), entry.principal) == claims.end())
+                    claims.push_back(entry.principal);
+            }
+        }
+        std::sort(claims.begin(), claims.end());
+        if (limit > 0 && (int)claims.size() > limit) claims.resize(limit);
+        return Result<std::vector<std::string>>::ok(claims);
+    }
+
     // Role management - tenant-aware in-memory persistence (matches the real
     // Database now that Phase 4 wires the tables up).
     Result<void> create_role(const std::string& role, const std::string& tenant) override {

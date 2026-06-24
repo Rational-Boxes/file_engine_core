@@ -120,6 +120,9 @@ public:
                                                 const std::string& principal,
                                                 int type,
                                                 const std::string& tenant = "") override;
+    Result<std::vector<std::string>> list_claims(const std::string& prefix,
+                                                 int limit,
+                                                 const std::string& tenant = "") override;
 
     // Role management operations
     Result<void> create_role(const std::string& role, const std::string& tenant = "") override;
