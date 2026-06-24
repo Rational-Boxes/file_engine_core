@@ -214,7 +214,7 @@ install -d %{buildroot}/var/log/fileengine
 rm -rf %{buildroot}
 
 %changelog
-* Thu Jun 19 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
+* Fri Jun 19 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
 - Add fileengine-cli-static: a self-contained statically-linked CLI package
   (no fileengine-libs / libstdc++ dependency) for client-only machines,
   alongside the existing dynamic fileengine-cli. Build now passes
