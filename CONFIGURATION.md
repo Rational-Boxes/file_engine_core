@@ -165,6 +165,37 @@ design; deletes are not propagated to the object store.
 | `FILEENGINE_CACHE_THRESHOLD` | `0.8` | LRU eviction threshold as a fraction of max cache size (0.0–1.0) |
 | `FILEENGINE_MAX_CACHE_SIZE_MB` | `1024` | Maximum in-memory file cache size in MB |
 
+### Event emission (Redis)
+
+File-activity events (`file.created` / `file.updated` / `file.restored` /
+`file.deleted`, plus ACL/role changes) are published to a Redis stream. This is
+how downstream services — notably `convert_search_ai` — learn to generate
+document renditions (thumbnail / preview / inline-PDF) and keep their search
+index current. **Emission is off by default and must be turned on for the
+preview / AI pipeline to work automatically.**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `FILEENGINE_EVENTS_ENABLED` | `false` | Master switch. When `false`, no events are published and uploads produce no automatic previews. |
+| `FILEENGINE_REDIS_HOST` | `localhost` | Redis host (also accepts `host:port`). |
+| `FILEENGINE_REDIS_PORT` | `6379` | Redis port. |
+| `FILEENGINE_REDIS_PASSWORD` | *(none)* | Redis AUTH password. |
+| `FILEENGINE_REDIS_DB` | `0` | Redis logical DB index. |
+| `FILEENGINE_EVENTS_STREAM` | `fileengine:events` | Stream key events are `XADD`ed to. |
+| `FILEENGINE_EVENTS_STREAM_MAXLEN` | `100000` | Approximate stream trim length. |
+| `FILEENGINE_EVENTS_OUTBOX_CAPACITY` | `10000` | In-process outbox depth before back-pressure. |
+
+> **Build requirement.** Event emission also needs the binary to be compiled
+> with `-DFILEENGINE_ENABLE_EVENTS=ON` (requires `hiredis-devel`). If the flag is
+> set at runtime but the binary was built without it, the server logs a warning
+> and runs with events disabled. On startup with both in place you should see:
+> `[EventSink] Redis event emission enabled -> <host>:<port> (stream '<name>')`.
+>
+> Consuming side: `convert_search_ai`'s **ingest worker** (a separate process —
+> `convert-search-ai-worker`) reads this stream and writes renditions. Both the
+> flag here and that worker must be running, or uploads (incl. WebDAV / sync)
+> never get previews.
+
 ### gRPC server
 
 | Key | Default | Description |
