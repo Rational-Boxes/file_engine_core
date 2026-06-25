@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <shared_mutex>
+#include <functional>
 
 namespace fileengine {
 
@@ -64,6 +65,26 @@ public:
                                              const std::string& user,
                                              const std::vector<std::string>& roles = {},
                                              const std::string& tenant = "");
+
+    // Streaming write: pulls plaintext chunks via `next_chunk` (fills the vector,
+    // returns false at end-of-input) and writes them compress->encrypt->disk
+    // without ever holding the whole file in memory. Performs the same
+    // version/size/backup/event bookkeeping as put(). On failure the partial
+    // file is removed.
+    virtual Result<void> put_stream(const std::string& file_uid,
+                                    const std::function<bool(std::vector<uint8_t>&)>& next_chunk,
+                                    const std::string& user,
+                                    const std::vector<std::string>& roles = {},
+                                    const std::string& tenant = "");
+    // Streaming read: resolves the current version and emits plaintext chunks via
+    // `on_chunk` (disk->decrypt->decompress), never buffering the whole file.
+    // `on_chunk` returns false to abort early. Falls back to the whole-buffer
+    // get() (incl. S3 restore) when the file is not present locally.
+    virtual Result<void> get_stream(const std::string& file_uid,
+                                    const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+                                    const std::string& user,
+                                    const std::vector<std::string>& roles = {},
+                                    const std::string& tenant = "");
 
     // Metadata operations
     virtual Result<FileInfo> stat(const std::string& file_uid, const std::string& user,

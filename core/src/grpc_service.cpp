@@ -1432,53 +1432,55 @@ grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    fileengine_rpc::PutFileRequest request;
-    std::vector<uint8_t> full_data;
-    std::string file_uid;
-    fileengine_rpc::AuthenticationContext auth_context;
-    bool first_chunk = true;
-
-    while (reader->Read(&request)) {
-        if (first_chunk) {
-            file_uid = request.uid();
-            auth_context = request.auth();
-            first_chunk = false;
-        }
-
-        // Append chunk data to full data
-        auto chunk_data = request.data();
-        full_data.insert(full_data.end(), chunk_data.begin(), chunk_data.end());
-    }
-
-    // Now process the full data
-    if (!file_uid.empty()) {
-        std::string tenant = get_tenant_from_auth_context(auth_context);
-        std::string user = get_user_from_auth_context(auth_context);
-    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
-
-        // Check permissions - user needs write access to the file
-        if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
-            response->set_success(false);
-            response->set_error("User does not have permission to write to file");
-            SERVER_LOG_ERROR("GRPCService", "StreamFileUpload failed: User " + user + " does not have permission to write to file " + file_uid);
-            return grpc::Status::OK;
-        }
-
-        auto result = filesystem_->put(file_uid, full_data, user, roles, tenant);
-
-        response->set_success(result.success);
-        if (!result.success) {
-            response->set_error(result.error);
-            SERVER_LOG_ERROR("GRPCService", "StreamFileUpload failed for uid: " + file_uid + " with error: " + result.error);
-        } else {
-            SERVER_LOG_INFO("GRPCService", "StreamFileUpload successful for uid: " + file_uid);
-        }
-    } else {
+    // Read the first message for the target uid + auth (the data field, if any,
+    // is the first body chunk). Subsequent messages carry only data.
+    fileengine_rpc::PutFileRequest first;
+    if (!reader->Read(&first)) {
         response->set_success(false);
         response->set_error("No file data received");
         SERVER_LOG_ERROR("GRPCService", "StreamFileUpload failed: No file data received");
+        return grpc::Status::OK;
+    }
+    const std::string file_uid = first.uid();
+    const fileengine_rpc::AuthenticationContext auth_context = first.auth();
+    if (file_uid.empty()) {
+        response->set_success(false);
+        response->set_error("No file data received");
+        SERVER_LOG_ERROR("GRPCService", "StreamFileUpload failed: missing uid");
+        return grpc::Status::OK;
     }
 
+    const std::string tenant = get_tenant_from_auth_context(auth_context);
+    const std::string user = get_user_from_auth_context(auth_context);
+    const std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
+
+    // Pull body chunks straight from the gRPC stream into the streaming writer —
+    // the whole file is never assembled in memory. The first chunk is the data
+    // already read above; the rest come from successive Read() calls.
+    bool first_pending = true;
+    fileengine_rpc::PutFileRequest msg;
+    auto next_chunk = [&](std::vector<uint8_t>& out) -> bool {
+        out.clear();
+        if (first_pending) {
+            first_pending = false;
+            const std::string& d = first.data();
+            out.assign(d.begin(), d.end());
+            return true;
+        }
+        if (!reader->Read(&msg)) return false;
+        const std::string& d = msg.data();
+        out.assign(d.begin(), d.end());
+        return true;
+    };
+
+    auto result = filesystem_->put_stream(file_uid, next_chunk, user, roles, tenant);
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "StreamFileUpload failed for uid: " + file_uid + " with error: " + result.error);
+    } else {
+        SERVER_LOG_INFO("GRPCService", "StreamFileUpload successful for uid: " + file_uid);
+    }
     return grpc::Status::OK;
 }
 
@@ -1493,42 +1495,26 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
     std::string user = get_user_from_auth_context(auth_context);
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
-    // Check permissions - user needs read access to the file
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
-        fileengine_rpc::GetFileResponse response;
-        response.set_success(false);
-        response.set_error("User does not have permission to read file");
-        writer->Write(response);
-        SERVER_LOG_ERROR("GRPCService", "StreamFileDownload failed: User " + user + " does not have permission to read file " + file_uid);
-        return grpc::Status::OK;
-    }
-
-    auto result = filesystem_->get(file_uid, user, roles, tenant);
+    // Stream plaintext chunks straight from storage to the client — the whole
+    // file is never assembled in memory (get_stream re-validates READ access and
+    // handles decrypt/decompress + S3 restore). Each chunk is written as it is
+    // produced; a Write() failure (client disconnect) aborts early.
+    auto result = filesystem_->get_stream(
+        file_uid,
+        [&](const uint8_t* p, size_t n) -> bool {
+            fileengine_rpc::GetFileResponse response;
+            response.set_success(true);
+            response.set_data(std::string(reinterpret_cast<const char*>(p), n));
+            return writer->Write(response);
+        },
+        user, roles, tenant);
 
     if (result.success) {
-        // Simulate streaming by sending chunks
-        const size_t chunk_size = 1024 * 64; // 64KB chunks
-        const auto& data = result.value;
-        size_t offset = 0;
-
-        while (offset < data.size()) {
-            fileengine_rpc::GetFileResponse response;
-            size_t current_chunk_size = std::min(chunk_size, data.size() - offset);
-            std::string chunk_data(reinterpret_cast<const char*>(&data[offset]), current_chunk_size);
-            
-            response.set_data(chunk_data);
-            response.set_success(true);
-            response.set_error("");
-
-            if (!writer->Write(response)) {
-                SERVER_LOG_ERROR("GRPCService", "StreamFileDownload failed for uid: " + file_uid + " with error: Client disconnected");
-                break; // Client disconnected
-            }
-
-            offset += current_chunk_size;
-        }
         SERVER_LOG_INFO("GRPCService", "StreamFileDownload successful for uid: " + file_uid);
     } else {
+        // Emit an error frame. NOTE: with GCM the auth tag trails the ciphertext,
+        // so a tag failure can surface only after some chunks were already sent;
+        // the client treats a success=false frame as "discard what was received".
         fileengine_rpc::GetFileResponse response;
         response.set_success(false);
         response.set_error(result.error);

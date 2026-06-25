@@ -8,6 +8,8 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
+#include <filesystem>
 
 namespace fileengine {
 
@@ -134,6 +136,118 @@ Result<std::string> S3Storage::store_file(const std::string& virtual_path, const
     }
 #else
     // For non-AWS SDK builds, return an error indicating the feature is not available
+    return Result<std::string>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");
+#endif
+}
+
+Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_path,
+                                                    const std::string& version_timestamp,
+                                                    const std::string& local_path,
+                                                    const std::string& tenant) {
+    if (!initialized_) {
+        return Result<std::string>::err("S3 storage not initialized");
+    }
+
+    std::string key = path_to_key(virtual_path, version_timestamp);
+    if (!tenant.empty()) {
+        key = tenant + "/" + key;
+    }
+
+#ifdef USE_AWS_SDK
+    if (!s3_client_) {
+        return Result<std::string>::err("S3 client not initialized");
+    }
+
+    // S3 multipart requires parts of at least 5 MiB (except the last). Stream the
+    // local file in PART_SIZE slices so only one part is held in memory at a time.
+    constexpr std::streamsize PART_SIZE = 8 * 1024 * 1024;  // 8 MiB
+    std::error_code ec;
+    std::uintmax_t file_size = std::filesystem::file_size(local_path, ec);
+    if (ec) {
+        return Result<std::string>::err("Cannot stat local file: " + local_path);
+    }
+    // Small files: a single PutObject (the default path) is cheaper than multipart.
+    if (file_size <= static_cast<std::uintmax_t>(PART_SIZE)) {
+        return IObjectStore::store_file_from_path(virtual_path, version_timestamp, local_path, tenant);
+    }
+
+    Aws::S3::Model::CreateMultipartUploadRequest create_req;
+    create_req.SetBucket(Aws::String(bucket_));
+    create_req.SetKey(Aws::String(key));
+    auto created = s3_client_->CreateMultipartUpload(create_req);
+    if (!created.IsSuccess()) {
+        return Result<std::string>::err("Failed to start S3 multipart upload: " +
+                                        created.GetError().GetMessage());
+    }
+    const Aws::String upload_id = created.GetResult().GetUploadId();
+
+    std::ifstream in(local_path, std::ios::binary);
+    if (!in.is_open()) {
+        Aws::S3::Model::AbortMultipartUploadRequest abort_req;
+        abort_req.SetBucket(Aws::String(bucket_));
+        abort_req.SetKey(Aws::String(key));
+        abort_req.SetUploadId(upload_id);
+        s3_client_->AbortMultipartUpload(abort_req);
+        return Result<std::string>::err("Cannot open local file for multipart upload: " + local_path);
+    }
+
+    Aws::S3::Model::CompletedMultipartUpload completed;
+    std::vector<char> buf(static_cast<size_t>(PART_SIZE));
+    int part_number = 1;
+    std::string err_msg;
+    bool ok = true;
+
+    while (in) {
+        in.read(buf.data(), PART_SIZE);
+        std::streamsize n = in.gcount();
+        if (n <= 0) break;
+
+        auto body = Aws::MakeShared<Aws::StringStream>("S3Part", "");
+        body->write(buf.data(), n);
+        body->flush();
+
+        Aws::S3::Model::UploadPartRequest part_req;
+        part_req.SetBucket(Aws::String(bucket_));
+        part_req.SetKey(Aws::String(key));
+        part_req.SetUploadId(upload_id);
+        part_req.SetPartNumber(part_number);
+        part_req.SetContentLength(static_cast<long long>(n));
+        part_req.SetBody(body);
+
+        auto part_res = s3_client_->UploadPart(part_req);
+        if (!part_res.IsSuccess()) {
+            ok = false;
+            err_msg = part_res.GetError().GetMessage();
+            break;
+        }
+        Aws::S3::Model::CompletedPart cp;
+        cp.SetPartNumber(part_number);
+        cp.SetETag(part_res.GetResult().GetETag());
+        completed.AddParts(cp);
+        ++part_number;
+    }
+
+    if (!ok) {
+        Aws::S3::Model::AbortMultipartUploadRequest abort_req;
+        abort_req.SetBucket(Aws::String(bucket_));
+        abort_req.SetKey(Aws::String(key));
+        abort_req.SetUploadId(upload_id);
+        s3_client_->AbortMultipartUpload(abort_req);
+        return Result<std::string>::err("S3 multipart upload failed: " + err_msg);
+    }
+
+    Aws::S3::Model::CompleteMultipartUploadRequest complete_req;
+    complete_req.SetBucket(Aws::String(bucket_));
+    complete_req.SetKey(Aws::String(key));
+    complete_req.SetUploadId(upload_id);
+    complete_req.SetMultipartUpload(completed);
+    auto complete_res = s3_client_->CompleteMultipartUpload(complete_req);
+    if (!complete_res.IsSuccess()) {
+        return Result<std::string>::err("Failed to complete S3 multipart upload: " +
+                                        complete_res.GetError().GetMessage());
+    }
+    return Result<std::string>::ok(key);
+#else
     return Result<std::string>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");
 #endif
 }

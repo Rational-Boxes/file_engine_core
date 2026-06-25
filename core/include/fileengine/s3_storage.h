@@ -10,6 +10,12 @@
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/s3/model/CreateMultipartUploadRequest.h>
+#include <aws/s3/model/UploadPartRequest.h>
+#include <aws/s3/model/CompleteMultipartUploadRequest.h>
+#include <aws/s3/model/AbortMultipartUploadRequest.h>
+#include <aws/s3/model/CompletedMultipartUpload.h>
+#include <aws/s3/model/CompletedPart.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
@@ -44,6 +50,10 @@ public:
     // File storage operations (automatically compress and encrypt)
     Result<std::string> store_file(const std::string& virtual_path, const std::string& version_timestamp,
                                    const std::vector<uint8_t>& data, const std::string& tenant = "") override;
+    // Streams a local file to S3 via multipart upload for large files (bounded to
+    // one part in memory); small files fall back to a single PutObject.
+    Result<std::string> store_file_from_path(const std::string& virtual_path, const std::string& version_timestamp,
+                                             const std::string& local_path, const std::string& tenant = "") override;
     Result<std::vector<uint8_t>> read_file(const std::string& storage_path, const std::string& tenant = "") override;
     Result<void> delete_file(const std::string& storage_path, const std::string& tenant = "") override;
     Result<bool> file_exists(const std::string& storage_path, const std::string& tenant = "") override;

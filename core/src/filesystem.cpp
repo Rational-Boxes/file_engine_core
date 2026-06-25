@@ -4,6 +4,8 @@
 #include "fileengine/crypto_utils.h"
 #include <algorithm>
 #include <optional>
+#include <fstream>
+#include <filesystem>
 
 namespace fileengine {
 
@@ -699,6 +701,240 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
     return Result<std::vector<uint8_t>>::err("File content not found in storage or object store");
 }
 
+Result<void> FileSystem::put_stream(const std::string& file_uid,
+                                    const std::function<bool(std::vector<uint8_t>&)>& next_chunk,
+                                    const std::string& user,
+                                    const std::vector<std::string>& roles,
+                                    const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db || !context->storage) {
+        return Result<void>::err("Database or storage not available for tenant: " + tenant);
+    }
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
+    if (!perm_result.success || !perm_result.value) {
+        return Result<void>::err("User does not have permission to write file");
+    }
+    auto file_info_result = context->db->get_file_by_uid(file_uid, tenant);
+    if (!file_info_result.success || !file_info_result.value.has_value()) {
+        return Result<void>::err("File does not exist");
+    }
+    // Mirror put()'s culling safety guard: without an object store we cannot
+    // safely free local space (and a stream has no known size to cull by).
+    if (file_culler_ && !context->object_store) {
+        return Result<void>::err("Cache culling requires object store configuration to prevent data loss");
+    }
+
+    const std::string version_timestamp = Utils::get_timestamp_string();
+    const std::string storage_path = context->storage->get_storage_path(file_uid, version_timestamp, tenant);
+
+    const bool do_compress = context->storage->is_compression_enabled();
+    const bool do_encrypt = context->storage->is_encryption_enabled();
+    std::string encryption_key;
+    if (do_encrypt) {
+        encryption_key = context->config.encryption_key;
+        if (encryption_key.empty()) return Result<void>::err("Encryption key not available");
+    }
+
+    try {
+        std::filesystem::create_directories(std::filesystem::path(storage_path).parent_path());
+    } catch (const std::exception& e) {
+        return Result<void>::err("Failed to create storage directory: " + std::string(e.what()));
+    }
+
+    std::ofstream ofs(storage_path, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) {
+        return Result<void>::err("Failed to open storage file for writing: " + storage_path);
+    }
+
+    uint64_t original_size = 0;
+    try {
+        std::unique_ptr<CompressStream> compressor;
+        std::unique_ptr<EncryptStream> encryptor;
+        if (do_compress) compressor = std::make_unique<CompressStream>();
+        if (do_encrypt) encryptor = std::make_unique<EncryptStream>(encryption_key);
+
+        std::vector<uint8_t> chunk, cbuf, ebuf;
+        auto sink = [&](const uint8_t* p, size_t n) {
+            if (n > 0) ofs.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
+        };
+        // Push one plaintext chunk through compress -> encrypt -> disk.
+        auto feed = [&](const uint8_t* p, size_t n) {
+            if (do_compress) { compressor->update(p, n, cbuf); p = cbuf.data(); n = cbuf.size(); }
+            if (n == 0) return;
+            if (do_encrypt) { encryptor->update(p, n, ebuf); sink(ebuf.data(), ebuf.size()); }
+            else sink(p, n);
+        };
+
+        while (next_chunk(chunk)) {
+            if (chunk.empty()) continue;
+            original_size += chunk.size();
+            feed(chunk.data(), chunk.size());
+        }
+
+        if (original_size == 0) {
+            // Empty content -> empty blob (matches the one-shot convention where
+            // compress/encrypt of empty data yields an empty stored blob).
+            ofs.close();
+        } else {
+            if (do_compress) {
+                compressor->finish(cbuf);            // flush trailing compressed bytes
+                if (!cbuf.empty()) {
+                    if (do_encrypt) { encryptor->update(cbuf.data(), cbuf.size(), ebuf); sink(ebuf.data(), ebuf.size()); }
+                    else sink(cbuf.data(), cbuf.size());
+                }
+            }
+            if (do_encrypt) {
+                encryptor->finish(ebuf);             // appends the 16-byte GCM tag
+                sink(ebuf.data(), ebuf.size());
+            }
+            ofs.flush();
+            ofs.close();
+        }
+        if (ofs.fail()) throw std::runtime_error("write error on " + storage_path);
+    } catch (const std::exception& e) {
+        if (ofs.is_open()) ofs.close();
+        std::error_code ec;
+        std::filesystem::remove(storage_path, ec);   // drop the partial file
+        return Result<void>::err(std::string("Failed to stream file to storage: ") + e.what());
+    }
+
+    // Bookkeeping — identical to put().
+    if (context->storage_tracker) {
+        context->storage_tracker->record_file_creation(storage_path, original_size, tenant);
+    }
+    auto update_result = context->db->update_file_current_version(file_uid, version_timestamp, tenant);
+    if (!update_result.success) return Result<void>::err("Failed to update current version: " + update_result.error);
+    auto insert_version_result = context->db->insert_version(file_uid, version_timestamp,
+                                                             static_cast<int64_t>(original_size), storage_path, tenant);
+    if (!insert_version_result.success) return Result<void>::err("Failed to record version: " + insert_version_result.error);
+    auto update_size_result = context->db->update_file_size(file_uid, static_cast<int64_t>(original_size), tenant);
+    if (!update_size_result.success) {
+        SERVER_LOG_ERROR("FileSystem::put_stream", "Failed to update file size for " + file_uid + ": " + update_size_result.error);
+    }
+    context->db->update_file_modified(file_uid, tenant);
+
+    if (context->object_store) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            backup_queue_.push({file_uid, tenant, version_timestamp});
+        }
+        queue_cv_.notify_one();
+    }
+    emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+    return Result<void>::ok();
+}
+
+Result<void> FileSystem::get_stream(const std::string& file_uid,
+                                    const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+                                    const std::string& user,
+                                    const std::vector<std::string>& roles,
+                                    const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<void>::err("Database not available for tenant: " + tenant);
+    }
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
+    if (!perm_result.success || !perm_result.value) {
+        return Result<void>::err("User does not have permission to read file");
+    }
+    auto file_info_result = context->db->get_file_by_uid(file_uid, tenant);
+    if (!file_info_result.success || !file_info_result.value.has_value()) {
+        return Result<void>::err("File does not exist");
+    }
+
+    std::string current_version = file_info_result.value->version;
+    if (current_version.empty()) {
+        auto versions_result = list_versions(file_uid, user, roles, tenant);
+        if (!versions_result.success || versions_result.value.empty()) {
+            return Result<void>::err("No versions available for file");
+        }
+        current_version = versions_result.value[0];
+    }
+
+    std::string local_storage_path;
+    auto path_result = context->db->get_version_storage_path(file_uid, current_version, tenant);
+    if (path_result.success && path_result.value.has_value()) {
+        local_storage_path = path_result.value.value();
+    } else {
+        local_storage_path = context->storage->get_storage_path(file_uid, current_version, tenant);
+    }
+
+    bool file_exists_locally = false;
+    if (context->storage) {
+        auto exists_result = context->storage->file_exists(local_storage_path, tenant);
+        if (exists_result.success) file_exists_locally = exists_result.value;
+    }
+
+    // Cold path (not on local disk): reuse the whole-buffer get(), which handles
+    // S3 restore + decrypt/decompress, and emit it as a single chunk. This keeps
+    // the rare restore path simple; the common local path below streams.
+    if (!file_exists_locally) {
+        auto r = get(file_uid, user, roles, tenant);
+        if (!r.success) return Result<void>::err(r.error);
+        if (!r.value.empty()) on_chunk(r.value.data(), r.value.size());
+        return Result<void>::ok();
+    }
+
+    const bool do_compress = context->storage->is_compression_enabled();
+    const bool do_encrypt = context->storage->is_encryption_enabled();
+    std::string encryption_key;
+    if (do_encrypt) {
+        encryption_key = context->config.encryption_key;
+        if (encryption_key.empty()) return Result<void>::err("Encryption key not available");
+    }
+
+    std::ifstream ifs(local_storage_path, std::ios::binary);
+    if (!ifs.is_open()) {
+        return Result<void>::err("Failed to open file for reading: " + local_storage_path);
+    }
+
+    try {
+        std::unique_ptr<DecryptStream> decryptor;
+        std::unique_ptr<DecompressStream> decompressor;
+        if (do_encrypt) decryptor = std::make_unique<DecryptStream>(encryption_key);
+        if (do_compress) decompressor = std::make_unique<DecompressStream>();
+
+        std::vector<char> buf(256 * 1024);
+        std::vector<uint8_t> dbuf, ddbuf;
+        bool aborted = false;
+        // Emit decrypted+decompressed plaintext to the caller.
+        auto emit = [&](const uint8_t* p, size_t n) {
+            if (n == 0 || aborted) return;
+            if (do_compress) {
+                decompressor->update(p, n, ddbuf);
+                if (!ddbuf.empty() && !on_chunk(ddbuf.data(), ddbuf.size())) aborted = true;
+            } else {
+                if (!on_chunk(p, n)) aborted = true;
+            }
+        };
+        // disk bytes -> decrypt -> emit
+        auto consume = [&](const uint8_t* p, size_t n) {
+            if (do_encrypt) { decryptor->update(p, n, dbuf); emit(dbuf.data(), dbuf.size()); }
+            else emit(p, n);
+        };
+
+        while (!aborted) {
+            ifs.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            std::streamsize n = ifs.gcount();
+            if (n <= 0) break;
+            consume(reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(n));
+        }
+        if (!aborted) {
+            if (do_encrypt) {
+                decryptor->finish(dbuf);     // verifies the GCM tag (throws on mismatch)
+                if (!dbuf.empty()) emit(dbuf.data(), dbuf.size());
+            }
+            if (do_compress) {
+                decompressor->finish(ddbuf);
+                if (!ddbuf.empty()) on_chunk(ddbuf.data(), ddbuf.size());
+            }
+        }
+    } catch (const std::exception& e) {
+        return Result<void>::err(std::string("Failed to stream file from storage: ") + e.what());
+    }
+    return Result<void>::ok();
+}
+
 Result<FileInfo> FileSystem::stat(const std::string& file_uid, const std::string& user,
                                   const std::vector<std::string>& roles,
                                   const std::string& tenant) {
@@ -1199,15 +1435,10 @@ Result<void> FileSystem::backup_to_object_store_with_version(const std::string& 
     // This ensures we're backing up the specific version that was stored
     std::string local_storage_path = context->storage->get_storage_path(file_uid, version_timestamp, tenant);
 
-    // Read the file from local storage
-    auto storage_result = context->storage->read_file(local_storage_path, tenant);
-    if (!storage_result.success) {
-        return Result<void>::err("Failed to read file from local storage: " + storage_result.error);
-    }
-
-    // Store in object store using the file UID and version timestamp
-    auto obj_store_result = context->object_store->store_file(file_uid, version_timestamp,
-                                                              storage_result.value, tenant);
+    // Stream the local file to the object store (multipart for large files), so
+    // the backup never holds the whole payload in memory.
+    auto obj_store_result = context->object_store->store_file_from_path(file_uid, version_timestamp,
+                                                                        local_storage_path, tenant);
     if (!obj_store_result.success) {
         return Result<void>::err("Failed to store file in object store: " + obj_store_result.error);
     }
