@@ -115,6 +115,7 @@ install -d -o fileengine -g fileengine -m 750 /var/log/fileengine
 %config(noreplace) /etc/fileengine/core.conf
 %config(noreplace) /etc/logrotate.d/fileengine
 %{_unitdir}/fileengine.service
+%{_sysusersdir}/fileengine.conf
 %dir %attr(750,fileengine,fileengine) /var/lib/fileengine
 %dir %attr(750,fileengine,fileengine) /var/log/fileengine
 
@@ -210,6 +211,12 @@ install -m 644 ../core.conf %{buildroot}/etc/fileengine/core.conf
 # Logrotate.
 install -d %{buildroot}/etc/logrotate.d
 install -m 644 ../fileengine.logrotate %{buildroot}/etc/logrotate.d/fileengine
+
+# systemd-sysusers config (creates the 'fileengine' service account + group, and
+# self-provides user(fileengine)/group(fileengine) so the server RPM installs in
+# a minimal container with no pre-existing account). Shipped in the tarball, like
+# the unit/config/logrotate files above.
+install -D -m 644 ../fileengine.sysusers %{buildroot}%{_sysusersdir}/fileengine.conf
 
 # Pre-create runtime dirs so the %dir directives have something to own.
 install -d %{buildroot}/var/lib/fileengine
