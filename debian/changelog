@@ -1,3 +1,12 @@
+fileengine-core (2.0.0-1) unstable; urgency=medium
+
+  * ACL model: read-by-default with access-time parent-container traversal.
+  * New "everyone" (OTHER) principal alias for clear deny-to-all rules.
+  * New CULL_VERSIONS permission; PurgeOldVersions now requires it instead of
+    WRITE (breaking change for existing purge callers).
+
+ -- FileEngine Team <maintainer@fileengine.example.com>  Fri, 26 Jun 2026 00:00:00 +0000
+
 fileengine-core (1.0.0-2) unstable; urgency=low
 
   * Split into four binary packages: fileengine-libs, fileengine-server,

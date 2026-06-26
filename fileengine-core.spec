@@ -5,7 +5,7 @@
 %define _libname     libfileengine_core.so
 
 Name:           fileengine-core
-Version:        1.0.0
+Version:        2.0.0
 Release:        1%{?dist}
 Summary:        Distributed virtual filesystem — meta package
 License:        MIT
@@ -226,6 +226,11 @@ install -d %{buildroot}/var/log/fileengine
 rm -rf %{buildroot}
 
 %changelog
+* Fri Jun 26 2026 FileEngine Team <maintainer@fileengine.example.com> - 2.0.0-1
+- Read-by-default ACLs with access-time parent-container traversal.
+- New "everyone" principal alias; new CULL_VERSIONS permission. PurgeOldVersions
+  now requires CULL_VERSIONS instead of WRITE (breaking).
+
 * Fri Jun 19 2026 FileEngine Team <maintainer@fileengine.example.com> - 1.0.0-1
 - Add fileengine-cli-static: a self-contained statically-linked CLI package
   (no fileengine-libs / libstdc++ dependency) for client-only machines,

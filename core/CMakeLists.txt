@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(file_engine_core_core VERSION 1.0.0)
+project(file_engine_core_core VERSION 2.0.0)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
