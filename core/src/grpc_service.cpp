@@ -1082,6 +1082,12 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     } else if (principal.rfind("claim:", 0) == 0) {
         principal_type = PrincipalType::CLAIM;
         principal = principal.substr(6);
+    } else if (principal == kEveryoneGroup || principal == "other") {
+        // The "everyone" group (legacy alias "other") targets the OTHER catch-all
+        // principal — a rule that applies to every user regardless of identity
+        // (e.g. a DENY READ to hide a resource from everyone). The principal
+        // string is kept as-is; OTHER rules match by type, not by name.
+        principal_type = PrincipalType::OTHER;
     }
     fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
@@ -1228,6 +1234,12 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     } else if (principal.rfind("claim:", 0) == 0) {
         principal_type = PrincipalType::CLAIM;
         principal = principal.substr(6);
+    } else if (principal == kEveryoneGroup || principal == "other") {
+        // The "everyone" group (legacy alias "other") targets the OTHER catch-all
+        // principal — a rule that applies to every user regardless of identity
+        // (e.g. a DENY READ to hide a resource from everyone). The principal
+        // string is kept as-is; OTHER rules match by type, not by name.
+        principal_type = PrincipalType::OTHER;
     }
     fileengine_rpc::Permission permission = request->permission();
     auto auth_context = request->auth();
