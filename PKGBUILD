@@ -1,6 +1,6 @@
 # Maintainer: FileEngine Team
 pkgname=fileengine-core
-pkgver=2.0.0
+pkgver=2.1.0
 pkgrel=1
 pkgdesc="A distributed virtual filesystem with horizontal scaling and hybrid cloud/on-premises deployment support"
 arch=('x86_64')

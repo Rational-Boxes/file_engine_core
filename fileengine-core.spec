@@ -5,7 +5,7 @@
 %define _libname     libfileengine_core.so
 
 Name:           fileengine-core
-Version:        2.0.0
+Version:        2.1.0
 Release:        1%{?dist}
 Summary:        Distributed virtual filesystem — meta package
 License:        MIT
@@ -226,6 +226,10 @@ install -d %{buildroot}/var/log/fileengine
 rm -rf %{buildroot}
 
 %changelog
+* Fri Jun 26 2026 FileEngine Team <maintainer@fileengine.example.com> - 2.1.0-1
+- ACL: target the "everyone" (OTHER) principal via Grant/RevokePermission
+  ("everyone"/legacy "other"), enabling everyone-wide grants and denies.
+
 * Fri Jun 26 2026 FileEngine Team <maintainer@fileengine.example.com> - 2.0.0-1
 - Read-by-default ACLs with access-time parent-container traversal.
 - New "everyone" principal alias; new CULL_VERSIONS permission. PurgeOldVersions

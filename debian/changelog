@@ -1,3 +1,11 @@
+fileengine-core (2.1.0-1) unstable; urgency=low
+
+  * ACL: the "everyone" (OTHER) principal can now be targeted via the
+    Grant/RevokePermission RPCs ("everyone"/legacy "other" -> OTHER), enabling
+    everyone-wide grants and denies (e.g. DENY READ to hide a resource).
+
+ -- FileEngine Team <maintainer@fileengine.example.com>  Fri, 26 Jun 2026 00:00:00 +0000
+
 fileengine-core (2.0.0-1) unstable; urgency=medium
 
   * ACL model: read-by-default with access-time parent-container traversal.
