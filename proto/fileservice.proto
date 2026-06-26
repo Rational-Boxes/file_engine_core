@@ -106,6 +106,7 @@ enum Permission {
     EXECUTE = 8;           // Execute permission
     MANAGE_ACL = 9;        // Grant/revoke permissions on this resource (Phase 5)
     ACL_INHERIT = 10;      // Marks a rule for parent->child propagation (Phase 5)
+    CULL_VERSIONS = 11;    // Permanently purge old versions (destroy-data op; must be granted explicitly)
 }
 
 // Directory operations

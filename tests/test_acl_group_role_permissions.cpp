@@ -297,6 +297,7 @@ void test_acl_group_role_permissions() {
     
     // Create an ACL manager
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
     
     // Test resource UID
     std::string resource_uid = "test-resource-uuid";
