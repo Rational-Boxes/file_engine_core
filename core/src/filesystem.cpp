@@ -1110,35 +1110,19 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
         emit_fs_event(tenant, FileEventType::DirCreated, new_uid, user);
         return Result<void>::ok();
     } else {
-        // It's a regular file - copy the file content and metadata
-        // Get the current version of the source file
+        // It's a regular file — copy the full version history so the copy is a
+        // faithful duplicate (history preserved). list_versions() returns
+        // NEWEST-first, so the latest is front(); the previous code used back()
+        // (the OLDEST version), which copied stale/empty content — e.g. the empty
+        // initial version of a touch-then-write file — and dropped history.
         auto versions_result = list_versions(src_uid, user, roles, tenant);
         if (!versions_result.success || versions_result.value.empty()) {
             return Result<void>::err("No versions available for source file");
         }
+        const auto& versions = versions_result.value;        // newest-first
+        const std::string current_version = versions.front();
 
-        // Get the latest version
-        std::string latest_version = versions_result.value.back();
-
-        // Read the file content from storage
-        std::string src_storage_path = context->storage->get_storage_path(src_uid, latest_version, tenant);
-        auto storage_result = context->storage->read_file(src_storage_path, tenant);
-        if (!storage_result.success) {
-            return Result<void>::err("Failed to read source file from storage: " + storage_result.error);
-        }
-
-        // Store the file content with the new UID
-        auto store_result = context->storage->store_file(new_uid, latest_version, storage_result.value, tenant);
-        if (!store_result.success) {
-            return Result<void>::err("Failed to store copied file: " + store_result.error);
-        }
-
-        // Record file creation in storage tracker for cache management
-        if (context->storage_tracker) {
-            context->storage_tracker->record_file_creation(store_result.value, storage_result.value.size(), tenant);
-        }
-
-        // Atomic creation: file row + default/inherited ACLs in one transaction.
+        // Create the new file row first (atomic with default/inherited ACLs).
         auto grants = compute_initial_acl_grants(dst_uid, user, tenant);
         auto db_result = context->db->create_file_with_acls(new_uid, src_info.name, new_path, dst_uid,
                                                            FileType::REGULAR_FILE, user, src_info.permissions,
@@ -1147,21 +1131,44 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             return Result<void>::err("Failed to create file in database: " + db_result.error);
         }
 
-        // Update the file's current version in the database
-        auto update_result = context->db->update_file_current_version(new_uid, latest_version, tenant);
+        // Copy every version's content (oldest -> newest) under the new UID.
+        int64_t current_size = 0;
+        for (auto it = versions.rbegin(); it != versions.rend(); ++it) {
+            const std::string& ver = *it;
+            std::string src_storage_path = context->storage->get_storage_path(src_uid, ver, tenant);
+            auto storage_result = context->storage->read_file(src_storage_path, tenant);
+            if (!storage_result.success) {
+                return Result<void>::err("Failed to read source version " + ver + ": " + storage_result.error);
+            }
+            auto store_result = context->storage->store_file(new_uid, ver, storage_result.value, tenant);
+            if (!store_result.success) {
+                return Result<void>::err("Failed to store copied version " + ver + ": " + store_result.error);
+            }
+            if (context->storage_tracker) {
+                context->storage_tracker->record_file_creation(store_result.value, storage_result.value.size(), tenant);
+            }
+            auto insert_version_result = context->db->insert_version(new_uid, ver, storage_result.value.size(),
+                                                                     store_result.value, tenant);
+            if (!insert_version_result.success) {
+                return Result<void>::err("Failed to record version " + ver + ": " + insert_version_result.error);
+            }
+            if (ver == current_version) current_size = static_cast<int64_t>(storage_result.value.size());
+            // Schedule an object-store backup for this version.
+            if (context->object_store) {
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex_);
+                    backup_queue_.push({new_uid, tenant, ver});
+                }
+                queue_cv_.notify_one(); // Wake up the backup worker thread
+            }
+        }
+
+        // Point the new file at the newest version + mirror its size.
+        auto update_result = context->db->update_file_current_version(new_uid, current_version, tenant);
         if (!update_result.success) {
             return Result<void>::err("Failed to update current version: " + update_result.error);
         }
-
-        // Record the version in the database
-        auto insert_version_result = context->db->insert_version(new_uid, latest_version, storage_result.value.size(),
-                                                                 store_result.value, tenant);
-        if (!insert_version_result.success) {
-            return Result<void>::err("Failed to record version: " + insert_version_result.error);
-        }
-
-        // Mirror the copied content's size onto the new file record.
-        auto copy_size_result = context->db->update_file_size(new_uid, static_cast<int64_t>(storage_result.value.size()), tenant);
+        auto copy_size_result = context->db->update_file_size(new_uid, current_size, tenant);
         if (!copy_size_result.success) {
             SERVER_LOG_ERROR("FileSystem::copy", ServerLogger::getInstance().detailed_log_prefix() +
                       "Failed to update file size for " + new_uid + ": " + copy_size_result.error);
@@ -1171,15 +1178,6 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
         auto update_time_result = context->db->update_file_modified(new_uid, tenant);
         if (!update_time_result.success) {
             // Log error but don't fail the operation
-        }
-
-        // If we have an object store, schedule a backup for the copied file
-        if (context->object_store) {
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
-                backup_queue_.push({new_uid, tenant, latest_version});
-            }
-            queue_cv_.notify_one(); // Wake up the backup worker thread
         }
 
         // Deep-copy hidden renditions: the source file's children become children
