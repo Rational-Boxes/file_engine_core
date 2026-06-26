@@ -971,6 +971,33 @@ Result<bool> FileSystem::exists(const std::string& file_uid, const std::string& 
     return Result<bool>::ok(db_result.value.has_value());
 }
 
+namespace {
+// If `desired` already names a child of `parent_uid`, append " (n)" before the
+// extension to make it unique: "report.pdf" -> "report (1).pdf". Used so copy
+// and move never create two siblings with the same name.
+std::string unique_child_name(const std::shared_ptr<IDatabase>& db,
+                              const std::string& parent_uid,
+                              const std::string& desired,
+                              const std::string& tenant) {
+    auto existing = db->list_files_in_directory(parent_uid, tenant);
+    if (!existing.success) return desired;
+    const auto& files = existing.value;
+    auto taken = [&](const std::string& n) {
+        return std::any_of(files.begin(), files.end(),
+                           [&](const FileInfo& f) { return f.name == n; });
+    };
+    if (!taken(desired)) return desired;
+    const std::size_t dot = desired.rfind('.');
+    const std::string base = (dot != std::string::npos && dot != 0) ? desired.substr(0, dot) : desired;
+    const std::string ext  = (dot != std::string::npos && dot != 0) ? desired.substr(dot)    : "";
+    for (int n = 1; n < 100000; ++n) {
+        std::string cand = base + " (" + std::to_string(n) + ")" + ext;
+        if (!taken(cand)) return cand;
+    }
+    return desired;
+}
+}  // namespace
+
 Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst_uid,
                               const std::string& user,
                               const std::vector<std::string>& roles,
@@ -1018,10 +1045,24 @@ Result<void> FileSystem::move(const std::string& src_uid, const std::string& dst
         return Result<void>::err("Cannot move a directory into itself or its own subtree");
     }
 
+    // Compute a collision-free name in the destination BEFORE re-parenting (so
+    // the node isn't yet a child of dst and can't collide with itself).
+    const std::string move_name =
+        unique_child_name(context->db, dst_uid, src_info_result.value->name, tenant);
+
     // Update the parent_uid in the database to move the file/directory
     auto db_result = context->db->update_file_parent(src_uid, dst_uid, tenant);
     if (!db_result.success) {
         return Result<void>::err("Failed to move file in database: " + db_result.error);
+    }
+
+    // De-duplicate the name on collision (best-effort: the move already succeeded).
+    if (move_name != src_info_result.value->name) {
+        auto rn = context->db->update_file_name(src_uid, move_name, tenant);
+        if (!rn.success) {
+            SERVER_LOG_ERROR("FileSystem::move", ServerLogger::getInstance().detailed_log_prefix() +
+                      "Moved but failed to de-duplicate name for " + src_uid + ": " + rn.error);
+        }
     }
 
     emit_fs_event(tenant, FileEventType::FileMoved, src_uid, user);
@@ -1080,15 +1121,17 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
         return Result<void>::err("Cannot copy a directory into itself or its own subtree");
     }
 
-    // Generate a new UID for the copied file
+    // Generate a new UID + a collision-free name for the copy (so copying into a
+    // folder that already has "x.txt" yields "x (1).txt", not a duplicate).
     std::string new_uid = Utils::generate_uuid();
-    std::string new_path = dst_uid + "/" + src_info.name; // Construct new path
+    std::string copy_name = unique_child_name(context->db, dst_uid, src_info.name, tenant);
+    std::string new_path = dst_uid + "/" + copy_name;
 
     // If it's a directory, we need to recursively copy all contents
     if (src_info.type == FileType::DIRECTORY) {
         // Atomic creation: directory row + default/inherited ACLs from dst.
         auto grants = compute_initial_acl_grants(dst_uid, user, tenant);
-        auto db_result = context->db->create_file_with_acls(new_uid, src_info.name, new_path, dst_uid,
+        auto db_result = context->db->create_file_with_acls(new_uid, copy_name, new_path, dst_uid,
                                                            FileType::DIRECTORY, user, src_info.permissions,
                                                            grants, tenant);
         if (!db_result.success) {
@@ -1124,7 +1167,7 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
 
         // Create the new file row first (atomic with default/inherited ACLs).
         auto grants = compute_initial_acl_grants(dst_uid, user, tenant);
-        auto db_result = context->db->create_file_with_acls(new_uid, src_info.name, new_path, dst_uid,
+        auto db_result = context->db->create_file_with_acls(new_uid, copy_name, new_path, dst_uid,
                                                            FileType::REGULAR_FILE, user, src_info.permissions,
                                                            grants, tenant);
         if (!db_result.success) {
