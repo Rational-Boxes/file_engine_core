@@ -294,6 +294,7 @@ void test_user_permissions() {
     
     auto db = std::make_shared<MockDatabase>();
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
     
     std::string resource_uid = "test-resource-uuid";
     std::string user = "test_user";
@@ -348,6 +349,7 @@ void test_role_permissions() {
     
     auto db = std::make_shared<MockDatabase>();
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
     
     std::string resource_uid = "test-resource-uuid";
     std::string user = "test_user";
@@ -394,6 +396,7 @@ void test_group_permissions() {
     
     auto db = std::make_shared<MockDatabase>();
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
     
     std::string resource_uid = "test-resource-uuid";
     std::string user = "test_user";
@@ -422,6 +425,7 @@ void test_permission_priority() {
     
     auto db = std::make_shared<MockDatabase>();
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
     
     std::string resource_uid = "test-resource-uuid";
     std::string user = "test_user";
@@ -470,6 +474,7 @@ void test_root_directory_rule() {
 
     auto db = std::make_shared<MockDatabase>();
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
 
     std::string root_uid = "";  // Empty string represents the root directory
     std::string user = "any_user";
@@ -502,6 +507,7 @@ void test_permission_combinations() {
     
     auto db = std::make_shared<MockDatabase>();
     AclManager acl_manager(db);
+    acl_manager.set_default_read(false);  // classic private-by-default: isolate grant/revoke mechanics (read-by-default is covered in test_acl_rbac_comprehensive)
     
     std::string resource_uid = "test-resource-uuid";
     std::string user = "test_user";

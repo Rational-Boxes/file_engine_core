@@ -1137,6 +1137,9 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::ACL_INHERIT:
             converted_permissions = static_cast<int>(fileengine::Permission::ACL_INHERIT);
             break;
+        case fileengine_rpc::Permission::CULL_VERSIONS:
+            converted_permissions = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
+            break;
         default:
             converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1276,6 +1279,9 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::ACL_INHERIT:
             converted_permissions = static_cast<int>(fileengine::Permission::ACL_INHERIT);
             break;
+        case fileengine_rpc::Permission::CULL_VERSIONS:
+            converted_permissions = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
+            break;
         default:
             converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1350,6 +1356,9 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::ACL_INHERIT:
             required_permissions_int = static_cast<int>(fileengine::Permission::ACL_INHERIT);
             break;
+        case fileengine_rpc::Permission::CULL_VERSIONS:
+            required_permissions_int = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
+            break;
         default:
             required_permissions_int = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1413,6 +1422,7 @@ grpc::Status GRPCFileService::GetEffectivePermissions(grpc::ServerContext* /*con
     add(fileengine::Permission::EXECUTE, fileengine_rpc::EXECUTE);
     add(fileengine::Permission::MANAGE_ACL, fileengine_rpc::MANAGE_ACL);
     add(fileengine::Permission::ACL_INHERIT, fileengine_rpc::ACL_INHERIT);
+    add(fileengine::Permission::CULL_VERSIONS, fileengine_rpc::CULL_VERSIONS);
 
     SERVER_LOG_INFO("GRPCService", "GetEffectivePermissions ok for " + resource_uid +
                     " bits=" + std::to_string(bits));
@@ -1583,12 +1593,14 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
     std::string user = get_user_from_auth_context(auth_context);
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
-    // Check permissions - user needs write access to the file.
-    // system_admin bypass is applied inside AclManager::check_permission.
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) {
+    // Purging old versions permanently destroys data, so it requires the
+    // dedicated CULL_VERSIONS permission — WRITE is deliberately insufficient.
+    // This permission is never granted by default and must be granted
+    // explicitly. system_admin bypass is applied inside check_permission.
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::CULL_VERSIONS))) {
         response->set_success(false);
-        response->set_error("User does not have permission to purge old versions");
-        SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed: User " + user + " does not have permission to purge old versions for " + file_uid);
+        response->set_error("User does not have permission to purge old versions (requires CULL_VERSIONS)");
+        SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed: User " + user + " lacks CULL_VERSIONS to purge old versions for " + file_uid);
         return grpc::Status::OK;
     }
 

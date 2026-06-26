@@ -9,6 +9,9 @@
 namespace fileengine {
 
 enum class Permission {
+    CULL_VERSIONS = 0x2000, // Permanently purge old versions — the one genuine
+                            // destroy-data operation. Never granted by default;
+                            // must be granted explicitly. See plan §2.5.
     ACL_INHERIT = 0x1000, // Marks a rule for parent->child propagation
     MANAGE_ACL = 0x800, // Grant/revoke permissions on this resource
     READ = 0x400,     // Read permission
@@ -38,6 +41,24 @@ inline int operator&(Permission left, int right) {
 inline int operator|(Permission left, int right) {
     return static_cast<int>(left) | right;
 }
+
+// The union of every permission bit — a system_admin's effective permission
+// set, mirroring the check_permission bypass (which passes for any required
+// permission). Control bits (ACL_INHERIT) are included so that
+// (kAllPermissions & required) == required holds for every possible `required`.
+inline constexpr int kAllPermissions =
+      static_cast<int>(Permission::CULL_VERSIONS)
+    | static_cast<int>(Permission::ACL_INHERIT)
+    | static_cast<int>(Permission::MANAGE_ACL)
+    | static_cast<int>(Permission::READ)
+    | static_cast<int>(Permission::WRITE)
+    | static_cast<int>(Permission::DELETE)
+    | static_cast<int>(Permission::LIST_DELETED)
+    | static_cast<int>(Permission::UNDELETE)
+    | static_cast<int>(Permission::VIEW_VERSIONS)
+    | static_cast<int>(Permission::RETRIEVE_BACK_VERSION)
+    | static_cast<int>(Permission::RESTORE_TO_VERSION)
+    | static_cast<int>(Permission::EXECUTE);
 
 enum class PrincipalType {
     USER,
@@ -74,6 +95,14 @@ class IDatabase;
 // system_admin role to legitimately privileged requests.
 inline constexpr const char* kSystemAdminRole = "system_admin";
 
+// Human-facing name for the "everyone" principal. A rule whose PrincipalType
+// is OTHER matches every principal regardless of the stored principal string,
+// so a rule on this name targets all users. Grant DENY READ to
+// {kEveryoneGroup, PrincipalType::OTHER} to hide a resource (and, via parent
+// traversal, its whole subtree) from everyone — overriding the read-by-default
+// baseline, since a matching DENY always wins. See plan §2.4.
+inline constexpr const char* kEveryoneGroup = "everyone";
+
 class AclManager {
 public:
     AclManager(std::shared_ptr<IDatabase> db);
@@ -82,6 +111,16 @@ public:
     // Defaults to false (private-by-default).
     void set_default_world_readable(bool enabled) { default_world_readable_ = enabled; }
     bool default_world_readable() const { return default_world_readable_; }
+
+    // Read-by-default. When enabled (the default), every principal holds a
+    // baseline READ on every resource, so an entity with no specific ACL is
+    // readable by any user. The baseline is cleared by any matching DENY READ
+    // (e.g. DENY to the everyone/OTHER principal), and a resource is only
+    // reachable if its parent container chain is also readable — see
+    // check_permission's path traversal. Set false for a strict
+    // private-by-default deployment.
+    void set_default_read(bool enabled) { default_read_ = enabled; }
+    bool default_read() const { return default_read_; }
 
     // Returns true iff the user (via request roles or DB-stored roles) holds
     // kSystemAdminRole.
@@ -173,6 +212,7 @@ public:
 private:
     std::shared_ptr<IDatabase> db_;
     bool default_world_readable_ = false;
+    bool default_read_ = true;
     
     // Internal helper to get user permissions from the database
     Result<std::vector<ACLRule>> get_user_acls(const std::string& resource_uid, 
@@ -185,6 +225,19 @@ private:
                                       const std::string& user,
                                       const std::vector<std::string>& roles,
                                       const std::map<std::string, std::string>& claims);
+
+    // Path traversal: returns true iff every ancestor container of
+    // `resource_uid` grants READ to the principal. A DENY READ on any ancestor
+    // (e.g. a DENY to everyone on a folder) makes the whole subtree
+    // unreachable, naturally respecting parent-container permissions. A
+    // resource with no file record or an empty parent is treated as
+    // root-level, hence reachable. `roles` are already-resolved effective
+    // roles. Fails closed if an ancestor's ACLs cannot be resolved.
+    bool ancestors_readable(const std::string& resource_uid,
+                            const std::string& user,
+                            const std::vector<std::string>& roles,
+                            const std::map<std::string, std::string>& claims,
+                            const std::string& tenant);
 
     // Union request-supplied roles with DB-stored roles for the user (deduped).
     // Request roles support federated IdP setups; DB roles support local

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 
 // ACLs are stored separately from file metadata to maintain security boundaries
@@ -117,8 +118,19 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
     }
 
     int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
-    bool has_permission = (effective_perms & required_permissions) == required_permissions;
-    return Result<bool>::ok(has_permission);
+    if ((effective_perms & required_permissions) != required_permissions) {
+        return Result<bool>::ok(false);
+    }
+
+    // Path traversal: a resource is only reachable if every ancestor container
+    // grants READ to the principal. This makes a DENY READ on a folder (e.g. to
+    // everyone) hide the entire subtree, naturally respecting the parent
+    // container's permissions.
+    if (!ancestors_readable(resource_uid, user, effective_roles, claims, tenant)) {
+        return Result<bool>::ok(false);
+    }
+
+    return Result<bool>::ok(true);
 }
 
 bool AclManager::is_system_admin(const std::string& user,
@@ -164,13 +176,32 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
                                                  const std::vector<std::string>& roles,
                                                  const std::string& tenant,
                                                  const std::map<std::string, std::string>& claims) {
+    auto effective_roles = resolve_effective_roles(user, roles, tenant);
+
+    // system_admin bypasses all ACL checks, so its effective permission set is
+    // every bit — mirroring check_permission. Resolved before any ACL/parent
+    // lookup so an admin's answer never depends on (or is collapsed by) the
+    // resource's ACLs or an unreadable ancestor.
+    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
+            != effective_roles.end()) {
+        return Result<int>::ok(kAllPermissions);
+    }
+
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
         return Result<int>::err(acls_result.error);
     }
 
-    auto effective_roles = resolve_effective_roles(user, roles, tenant);
     int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
+
+    // Reflect parent-container traversal: if any ancestor container is
+    // unreadable the resource is unreachable, so the effective permission set
+    // collapses to none — the same access an enforcing check_permission would
+    // grant. (Skip the walk when there's nothing to lose.)
+    if (effective_perms != 0 &&
+        !ancestors_readable(resource_uid, user, effective_roles, claims, tenant)) {
+        effective_perms = 0;
+    }
 
     return Result<int>::ok(effective_perms);
 }
@@ -303,7 +334,12 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
     // of principal type. DENY grants are unioned into a separate mask and
     // subtracted at the end so any matching deny wins (POSIX-NFSv4 style).
     // See plan §6.1.
-    int allow_mask = 0;
+    // Read-by-default: every principal starts with a baseline READ so a resource
+    // with no explicit ALLOW is still readable by any user. A matching DENY
+    // (including a DENY to the everyone/OTHER principal) clears it below, since
+    // deny always wins. Disable via set_default_read(false) for a strict
+    // private-by-default deployment. See plan §2.4.
+    int allow_mask = default_read_ ? static_cast<int>(Permission::READ) : 0;
     int deny_mask = 0;
 
     auto matches_principal = [&](const ACLRule& rule) -> bool {
@@ -346,6 +382,46 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
     }
 
     return allow_mask & ~deny_mask;
+}
+
+bool AclManager::ancestors_readable(const std::string& resource_uid,
+                                    const std::string& user,
+                                    const std::vector<std::string>& roles,
+                                    const std::map<std::string, std::string>& claims,
+                                    const std::string& tenant) {
+    // Walk from the resource up to the filesystem root. Every ancestor
+    // container must grant READ to the principal, else the resource is
+    // unreachable — this is what makes a DENY READ on a folder (e.g. to
+    // everyone) hide its entire subtree. `roles` are already-resolved
+    // effective roles, passed straight through.
+    const int read_bit = static_cast<int>(Permission::READ);
+    std::set<std::string> visited;
+    std::string current = resource_uid;
+
+    while (true) {
+        auto file = db_->get_file_by_uid(current, tenant);
+        // No file record (bare resource / unit-test fixture) — nothing above it
+        // to traverse; treat as root-level and therefore reachable.
+        if (!file.success || !file.value.has_value()) {
+            return true;
+        }
+        const std::string parent = file.value->parent_uid;
+        if (parent.empty()) {
+            return true; // reached the filesystem root
+        }
+        if (!visited.insert(parent).second) {
+            return true; // defensive cycle guard — should not happen
+        }
+        auto parent_acls = get_acls_for_resource(parent, tenant);
+        if (!parent_acls.success) {
+            return false; // fail closed if an ancestor's ACLs can't be resolved
+        }
+        int eff = calculate_effective_permissions(parent_acls.value, user, roles, claims);
+        if ((eff & read_bit) != read_bit) {
+            return false; // an ancestor denies READ -> subtree unreachable
+        }
+        current = parent;
+    }
 }
 
 } // namespace fileengine
