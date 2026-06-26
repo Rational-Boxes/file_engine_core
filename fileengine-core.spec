@@ -23,6 +23,9 @@ BuildRequires:  grpc-devel, protobuf-devel, protobuf-compiler
 BuildRequires:  aws-sdk-cpp-core-devel
 BuildRequires:  aws-sdk-cpp-storage-devel
 BuildRequires:  libcurl-devel, libuuid-devel
+# Redis event emission (-DFILEENGINE_ENABLE_EVENTS=ON) links hiredis; required so
+# the packaged server can publish fileengine:events for the preview/AI pipeline.
+BuildRequires:  hiredis-devel
 BuildRequires:  systemd-rpm-macros
 # Monitoring (Phase A): libsystemd for sd_notify; cpp-httplib + nlohmann/json
 # are vendored under third_party/, no system packages needed for those.
@@ -54,7 +57,8 @@ Requires:       fileengine-server = %{version}-%{release}
 # ---------------------------------------------------------------------------
 %package -n fileengine-libs
 Summary:        FileEngine shared library
-Requires:       postgresql, openssl, libcurl, libuuid
+# hiredis: the library is built with Redis event emission enabled.
+Requires:       postgresql, openssl, libcurl, libuuid, hiredis
 %description -n fileengine-libs
 The libfileengine_core.so shared library used by the FileEngine server and
 client binaries. Install on any machine that runs either of them.
@@ -181,7 +185,8 @@ cmake .. \
     -DCMAKE_INSTALL_PREFIX=%{_prefix} \
     -DCMAKE_INSTALL_LIBDIR=%{_lib} \
     -DCMAKE_SKIP_INSTALL_RPATH=ON \
-    -DBUILD_STATIC_CLI=ON
+    -DBUILD_STATIC_CLI=ON \
+    -DFILEENGINE_ENABLE_EVENTS=ON
 make %{?_smp_mflags}
 
 %install
