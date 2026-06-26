@@ -3,7 +3,7 @@
 .PHONY: dist arch-package deb-package rpm-package clean
 
 # Variables
-VERSION := 1.0.0
+VERSION := 2.1.0
 PACKAGE_NAME := fileengine-core
 BUILD_DIR := build
 INSTALL_PREFIX := /opt/file_engine_core
