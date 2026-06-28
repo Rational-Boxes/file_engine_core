@@ -134,7 +134,10 @@ We welcome contributions! Please see the issue tracker for current tasks or to r
 
 ## License
 
-This project is licensed under the GPL-3.0 License - see the LICENSE file for details.
+Copyright (C) 2026 James Hickman <james@rationalboxes.com>
+
+This project is licensed under the **GNU General Public License, version 3 (or
+later)** — see the [LICENSE](LICENSE) file for the full text.
 
 ## Support
 
