@@ -1,5 +1,7 @@
 # FileEngine Core
 
+> ⚠️ **Active development — not production-ready.** This project is under active development and should **not** be considered safe for mission-critical use.
+
 A simplified, focused implementation of the FileEngine distributed virtual filesystem.
 
 ## Overview
