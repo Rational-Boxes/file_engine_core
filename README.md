@@ -2,11 +2,11 @@
 
 > ⚠️ **Active development — not production-ready.** This project is under active development and should **not** be considered safe for mission-critical use.
 
-A simplified, focused implementation of the FileEngine distributed virtual filesystem.
+The core implementation of the FileEngine distributed virtual filesystem.
 
 ## Overview
 
-FileEngine Core is a refactor of the original FileEngine project, focusing on core functionality while maintaining the advanced features needed for production use:
+FileEngine Core is the canonical implementation of the FileEngine distributed virtual filesystem, providing the advanced features needed for production use:
 
 - Distributed virtual filesystem with horizontal scaling
 - Multi-tenant architecture with complete isolation
