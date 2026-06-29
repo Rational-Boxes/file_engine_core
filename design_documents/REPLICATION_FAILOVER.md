@@ -1,7 +1,7 @@
 # file_engine_core — Postgres read-only failover
 
-Status: **Partial on `feature/replica-failover`** — activation + read-only-mode
-lifecycle complete; read routing to the secondary is the remaining step (below).
+Status: **Implemented on `feature/replica-failover`** — config activation, read-only-mode
+lifecycle, and read/write connection routing are all in place.
 
 Part of the workspace-wide replica-failover feature (see the matching branches in
 `convert_search_ai`, `mcp`, `http_bridge`, `webdav_bridge`). The core owns the
@@ -55,26 +55,34 @@ completes that existing design rather than introducing a breaker.
    writes (clear error) and the health endpoint reports `readonly_mode`, and the
    server auto-recovers when the primary returns.
 
-## Remaining step — read routing to the secondary
+## Read/write connection routing
 
-The database issues queries via `connection_pool_->acquire()` at ~54 call sites
-(primary pool only); there is no central read/write helper. To serve reads from the
-standby while degraded, the planned change is:
+The database previously issued every query via `connection_pool_->acquire()` (primary
+pool only) at 54 call sites. Reads and writes are now **cleanly separated by connection**:
 
-- give `Database` a **secondary `ConnectionPool`** built from `secondary_conn_info_`
-  (created in `configure_secondary_connection`);
-- add `ConnectionPool& active_read_pool()` returning the secondary when
-  `using_secondary_` is set, else the primary;
-- route the read call sites through it (writes are already gated off at the gRPC layer
-  while read-only, so only reads reach the DB during an outage).
+- `connection_router.h` — `enum class DbOp { Read, Write }` and a pure
+  `select_pool(op, primary, secondary, using_secondary)`:
+  - **Write** → always the primary (never the read-only replica).
+  - **Read** → the replica only while failed over *and* a replica exists, else the primary.
+- `Database` owns a dedicated **secondary `ConnectionPool`** (built in
+  `configure_secondary_connection`) and a single `acquire(DbOp)` helper that applies
+  `select_pool`.
+- All 54 sites were reclassified: **24 writes → `acquire(DbOp::Write)`**,
+  **28 reads → `acquire(DbOp::Read)`**. The two primary health probes
+  (`is_connected`, `check_connection`) intentionally stay on the primary pool so the
+  monitor can detect the master's state.
 
-This touches the hot query path and must be implemented and validated with the core's
-C++ build + test suite (`tests/`), which is why it is staged separately from the
-low-risk activation/lifecycle changes above.
+So during an outage: writes are rejected at the gRPC layer (and never reach the
+replica); reads transparently serve from the local standby; recovery restores both to
+the primary.
 
 ## Testing
 
+- `tests/test_connection_router.cpp` (target `test_connection_router`) **exhaustively**
+  unit-tests the routing decision (pure, no DB): writes always primary (incl. during
+  failover and with no replica); reads primary in normal operation; reads replica only
+  while failed over with a replica present; and the healthy→failover→recovered sequence.
 - Activation + lifecycle changes are config/flag/atomic level (no hot-path edits).
-- Read-routing should land with unit/integration coverage under `tests/` (primary-up
-  reads from primary; primary-down reads from the secondary; writes rejected while
-  degraded; recovery), run via the core build.
+- End-to-end behavior (primary-down reads served by the on-prem standby, writes
+  rejected, auto-recovery) should additionally be exercised by the core integration
+  suite against a real standby via the full build.
