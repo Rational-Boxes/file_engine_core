@@ -2339,29 +2339,29 @@ void Database::start_connection_monitoring() {
     
     connection_monitor_thread_ = std::thread([this]() {
         while (monitoring_active_.load()) {
-            if (!is_connected() && primary_available_.load()) {
-                // Primary just went down -> enter disconnected read-only fallback
-                // mode. Writes are rejected at the gRPC layer (is_server_in_readonly_mode);
-                // reads serve from the configured secondary (REPLICATION_FAILOVER.md).
-                primary_available_.store(false);
-                if (!secondary_conn_info_.empty()) {
-                    using_secondary_.store(true);
-                }
-                ConnectionPoolManager::get_instance().set_server_in_readonly_mode(true);
-                std::cerr << "Database primary unavailable; entering read-only fallback mode."
-                          << std::endl;
-            } else if (!primary_available_.load()) {
-                // Primary is down -> keep probing; resume normal operation on success.
-                if (connect()) {
-                    primary_available_.store(true);
-                    using_secondary_.store(false);
-                    ConnectionPoolManager::get_instance().set_server_in_readonly_mode(false);
+            // Probe the primary: a cheap health check while up, a reconnect attempt
+            // while down. The disconnect/recovery transition is the pure, unit-tested
+            // next_failover_state() (REPLICATION_FAILOVER.md).
+            const bool was_up = primary_available_.load();
+            const bool reachable = was_up ? is_connected() : connect();
+
+            ConnectionPoolManager& mgr = ConnectionPoolManager::get_instance();
+            FailoverState cur{was_up, using_secondary_.load(), mgr.is_server_in_readonly_mode()};
+            FailoverState next = next_failover_state(cur, reachable, !secondary_conn_info_.empty());
+
+            if (next != cur) {
+                primary_available_.store(next.primary_available);
+                using_secondary_.store(next.using_secondary);
+                mgr.set_server_in_readonly_mode(next.readonly_mode);
+                if (!next.primary_available) {
+                    std::cerr << "Database primary unavailable; entering read-only fallback mode."
+                              << std::endl;
+                } else {
                     std::cout << "Database connection to primary restored; resuming normal operation."
                               << std::endl;
                 }
             }
 
-            // Sleep for a while before checking again
             std::this_thread::sleep_for(std::chrono::seconds(retry_interval_seconds_));
         }
     });

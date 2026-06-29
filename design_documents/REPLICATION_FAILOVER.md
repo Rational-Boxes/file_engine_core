@@ -78,11 +78,22 @@ the primary.
 
 ## Testing
 
-- `tests/test_connection_router.cpp` (target `test_connection_router`) **exhaustively**
-  unit-tests the routing decision (pure, no DB): writes always primary (incl. during
-  failover and with no replica); reads primary in normal operation; reads replica only
-  while failed over with a replica present; and the healthy→failover→recovered sequence.
-- Activation + lifecycle changes are config/flag/atomic level (no hot-path edits).
-- End-to-end behavior (primary-down reads served by the on-prem standby, writes
-  rejected, auto-recovery) should additionally be exercised by the core integration
-  suite against a real standby via the full build.
+Both halves of the failover logic are extracted as **pure functions** so they are
+exhaustively unit-testable without a database or a background thread — the database is
+"mocked" by a reachability boolean / sentinel pool pointers. See
+`tests/test_connection_router.cpp` (target `test_connection_router`):
+
+- **Routing decision** (`select_pool`): writes always to the primary (incl. during
+  failover and with no replica); reads to the primary in normal operation; reads to the
+  replica only while failed over *and* a replica exists.
+- **Failover state machine** (`next_failover_state`, driven by the connection monitor):
+  healthy+reachable → unchanged; healthy+unreachable → read-only (using the replica if
+  present, else read-only with no replica); degraded+still-unreachable → stays degraded
+  (no flapping); degraded+reachable → full recovery. Plus the end-to-end
+  healthy → down → down → recovered sequence checked together with `select_pool`.
+
+The monitor thread is a thin driver around `next_failover_state`, and `Database::acquire`
+a thin driver around `select_pool`, so the unit tests cover the decision logic directly.
+Method-level wiring (each of the 54 sites passing the right `DbOp`) and real libpq
+behavior against an actual standby are covered by the core integration suite via the
+full build.

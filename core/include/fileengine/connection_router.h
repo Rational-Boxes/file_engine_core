@@ -28,6 +28,38 @@ PoolPtr select_pool(DbOp op, PoolPtr primary, PoolPtr secondary, bool using_seco
     return (using_secondary && secondary) ? secondary : primary;
 }
 
+// The failover state driven by the connection monitor. Extracted as a pure
+// transition so the disconnect/recovery state machine is unit-testable without a
+// database or a background thread (the DB is modelled by ``primary_reachable``).
+struct FailoverState {
+    bool primary_available = true;
+    bool using_secondary = false;
+    bool readonly_mode = false;
+
+    bool operator==(const FailoverState& o) const {
+        return primary_available == o.primary_available
+            && using_secondary == o.using_secondary
+            && readonly_mode == o.readonly_mode;
+    }
+    bool operator!=(const FailoverState& o) const { return !(*this == o); }
+};
+
+// Compute the next state from a fresh primary-reachability probe:
+//   - up   + unreachable -> enter read-only fallback (use the replica if present);
+//   - down + reachable   -> resume normal operation;
+//   - otherwise          -> unchanged.
+inline FailoverState next_failover_state(FailoverState cur, bool primary_reachable, bool has_secondary) {
+    if (cur.primary_available && !primary_reachable) {
+        return FailoverState{/*primary_available=*/false, /*using_secondary=*/has_secondary,
+                             /*readonly_mode=*/true};
+    }
+    if (!cur.primary_available && primary_reachable) {
+        return FailoverState{/*primary_available=*/true, /*using_secondary=*/false,
+                             /*readonly_mode=*/false};
+    }
+    return cur;
+}
+
 }  // namespace fileengine
 
 #endif  // FILEENGINE_CONNECTION_ROUTER_H
