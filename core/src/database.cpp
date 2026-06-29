@@ -1,6 +1,7 @@
 #include "fileengine/database.h"
 #include "fileengine/utils.h"
 #include "fileengine/server_logger.h"
+#include "fileengine/connection_pool_manager.h"
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -2321,17 +2322,28 @@ void Database::start_connection_monitoring() {
     
     connection_monitor_thread_ = std::thread([this]() {
         while (monitoring_active_.load()) {
-            // Check if primary is down but was previously available
             if (!is_connected() && primary_available_.load()) {
-                // Try to reconnect to primary
+                // Primary just went down -> enter disconnected read-only fallback
+                // mode. Writes are rejected at the gRPC layer (is_server_in_readonly_mode);
+                // reads serve from the configured secondary (REPLICATION_FAILOVER.md).
+                primary_available_.store(false);
+                if (!secondary_conn_info_.empty()) {
+                    using_secondary_.store(true);
+                }
+                ConnectionPoolManager::get_instance().set_server_in_readonly_mode(true);
+                std::cerr << "Database primary unavailable; entering read-only fallback mode."
+                          << std::endl;
+            } else if (!primary_available_.load()) {
+                // Primary is down -> keep probing; resume normal operation on success.
                 if (connect()) {
-                    // Primary connection restored
                     primary_available_.store(true);
                     using_secondary_.store(false);
-                    std::cout << "Database connection to primary restored." << std::endl;
+                    ConnectionPoolManager::get_instance().set_server_in_readonly_mode(false);
+                    std::cout << "Database connection to primary restored; resuming normal operation."
+                              << std::endl;
                 }
             }
-            
+
             // Sleep for a while before checking again
             std::this_thread::sleep_for(std::chrono::seconds(retry_interval_seconds_));
         }

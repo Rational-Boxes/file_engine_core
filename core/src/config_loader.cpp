@@ -124,6 +124,32 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     it = env_vars.find("FILEENGINE_PG_PASSWORD");
     if (it != env_vars.end()) config.db_password = it->second;
 
+    // Read-only replica (secondary) database for disconnect fault tolerance
+    // (REPLICATION_FAILOVER.md). Setting FILEENGINE_PG_REPLICA_HOST enables it;
+    // FILEENGINE_PG_REPLICA_ENABLED=true defaults the host to localhost. Replica
+    // connection params default to the primary's (a streaming standby normally
+    // shares db name / role), overridable per field.
+    config.secondary_db_port = config.db_port;
+    config.secondary_db_name = config.db_name;
+    config.secondary_db_user = config.db_user;
+    config.secondary_db_password = config.db_password;
+    it = env_vars.find("FILEENGINE_PG_REPLICA_HOST");
+    if (it != env_vars.end()) {
+        config.secondary_db_host = it->second;
+    } else {
+        auto en = env_vars.find("FILEENGINE_PG_REPLICA_ENABLED");
+        if (en != env_vars.end() && (en->second == "true" || en->second == "1" || en->second == "TRUE"))
+            config.secondary_db_host = "localhost";
+    }
+    it = env_vars.find("FILEENGINE_PG_REPLICA_PORT");
+    if (it != env_vars.end()) config.secondary_db_port = std::stoi(it->second);
+    it = env_vars.find("FILEENGINE_PG_REPLICA_DATABASE");
+    if (it != env_vars.end()) config.secondary_db_name = it->second;
+    it = env_vars.find("FILEENGINE_PG_REPLICA_USER");
+    if (it != env_vars.end()) config.secondary_db_user = it->second;
+    it = env_vars.find("FILEENGINE_PG_REPLICA_PASSWORD");
+    if (it != env_vars.end()) config.secondary_db_password = it->second;
+
     // Storage configuration
     it = env_vars.find("FILEENGINE_STORAGE_BASE");
     if (it != env_vars.end()) config.storage_base_path = it->second;

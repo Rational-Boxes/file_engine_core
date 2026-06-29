@@ -1,0 +1,111 @@
+Starting FileEngine gRPC Server...
+Config loaded:
+  DB Host: localhost
+  DB Port: 5434
+  DB Name: fileengine
+  Storage Path: /home/telendry/temp/fileengine
+  S3 Endpoint: http://localhost:9000
+  Log Level: debug
+  Log File: ./log/fileengine.log
+  Log to Console: true
+Connecting to database...
+[2026-06-17 14:31:24.094] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.094] [INFO] [ConnectionPool] Successfully initialized connection #1 for pool.
+[2026-06-17 14:31:24.103] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.103] [INFO] [ConnectionPool] Successfully initialized connection #2 for pool.
+[2026-06-17 14:31:24.111] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.111] [INFO] [ConnectionPool] Successfully initialized connection #3 for pool.
+[2026-06-17 14:31:24.119] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.119] [INFO] [ConnectionPool] Successfully initialized connection #4 for pool.
+[2026-06-17 14:31:24.128] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.128] [INFO] [ConnectionPool] Successfully initialized connection #5 for pool.
+[2026-06-17 14:31:24.136] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.136] [INFO] [ConnectionPool] Successfully initialized connection #6 for pool.
+[2026-06-17 14:31:24.146] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.146] [INFO] [ConnectionPool] Successfully initialized connection #7 for pool.
+[2026-06-17 14:31:24.155] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.155] [INFO] [ConnectionPool] Successfully initialized connection #8 for pool.
+[2026-06-17 14:31:24.162] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.162] [INFO] [ConnectionPool] Successfully initialized connection #9 for pool.
+[2026-06-17 14:31:24.171] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:31:24.171] [INFO] [ConnectionPool] Successfully initialized connection #10 for pool.
+[2026-06-17 14:31:24.171] [INFO] [ConnectionPool] Successfully initialized all 10 connections in the pool.
+[2026-06-17 14:31:24.171] [INFO] [Database] Successfully initialized database connection pool.
+Database connected successfully.
+Database connection monitoring started.
+Ensuring database schema exists...
+[2026-06-17 14:31:24.186] [INFO] [Database] Successfully created or verified global tables.
+Database schema verified.
+Initializing object store...
+S3 storage initialized successfully.
+[2026-06-17 14:31:30.222] [ERROR] [StorageTracker] Error initializing from existing files: filesystem error: recursive directory iterator cannot open directory: No such file or directory [/home/telendry/temp/fileengine/default]
+Initializing local storage...
+Initializing tenant manager...
+Initializing filesystem...
+Initializing file culling system...
+Initializing default tenant...
+NOTICE:  column "granted_by" of relation "acls" already exists, skipping
+NOTICE:  column "effect" of relation "acls" already exists, skipping
+NOTICE:  index "idx_acls_principal" does not exist, skipping
+NOTICE:  index "idx_acls_resource_uid" does not exist, skipping
+Warning: Failed to initialize default tenant
+Initializing object store sync...
+Object store sync initialized and started.
+File culling system initialized and started.
+Initializing gRPC service...
+Attempting to bind gRPC server to 0.0.0.0:50051
+Setting gRPC server to use 10 threads
+gRPC Server listening on 0.0.0.0:50051 with 10 threads
+NOTICE:  schema "tenant_default" already exists, skipping
+NOTICE:  relation "files" already exists, skipping
+NOTICE:  relation "idx_files_uid_tenant_default" already exists, skipping
+NOTICE:  relation "idx_files_parent_uid_tenant_default" already exists, skipping
+NOTICE:  relation "versions" already exists, skipping
+NOTICE:  relation "idx_versions_file_uid_tenant_default" already exists, skipping
+NOTICE:  relation "metadata" already exists, skipping
+NOTICE:  relation "idx_metadata_file_uid_tenant_default" already exists, skipping
+NOTICE:  relation "idx_metadata_key_name_tenant_default" already exists, skipping
+NOTICE:  relation "acls" already exists, skipping
+NOTICE:  column "granted_by" of relation "acls" already exists, skipping
+NOTICE:  column "effect" of relation "acls" already exists, skipping
+NOTICE:  relation "acl_audit" already exists, skipping
+NOTICE:  relation "idx_acl_audit_resource_tenant_default" already exists, skipping
+NOTICE:  relation "idx_acls_principal_type_tenant_default" already exists, skipping
+NOTICE:  index "idx_acls_principal" does not exist, skipping
+NOTICE:  index "idx_acls_resource_uid" does not exist, skipping
+NOTICE:  relation "roles" already exists, skipping
+NOTICE:  relation "user_roles" already exists, skipping
+NOTICE:  relation "idx_user_roles_user_tenant_default" already exists, skipping
+NOTICE:  relation "idx_user_roles_role_tenant_default" already exists, skipping
+[2026-06-17 14:32:46.245] [ERROR] [FileSystem::mkdir] [thread:140673419654848] Non-admin user attempting to create in root directory
+[2026-06-17 14:32:46.245] [ERROR] [GRPCService::MakeDirectory] [thread:140673419654848] MakeDirectory failed to create directory: Only system_admin can create in root directory
+[2026-06-17 14:33:09.648] [ERROR] [FileSystem::mkdir] [thread:140673483675328] Non-admin user attempting to create in root directory
+[2026-06-17 14:33:09.649] [ERROR] [GRPCService::MakeDirectory] [thread:140673483675328] MakeDirectory failed to create directory: Only system_admin can create in root directory
+[2026-06-17 14:35:01.746] [INFO] [GRPCService::MakeDirectory] [thread:140672862516928] MakeDirectory successful for parent_uid: , name: smoke_dir, UID: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:35:22.482] [INFO] [GRPCService] ListDirectory successful for uid: 
+[2026-06-17 14:35:22.521] [ERROR] [GRPCService::MakeDirectory] [thread:140673470871232] MakeDirectory failed: User alice does not have permission to create directory in ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:35:22.562] [INFO] [GRPCService::MakeDirectory] [thread:140673445263040] MakeDirectory successful for parent_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96, name: admin_sub, UID: e8f85a01-4241-4478-b4a4-914904650efd
+[2026-06-17 14:35:41.047] [INFO] [GRPCService] GrantPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:35:41.088] [INFO] [GRPCService::MakeDirectory] [thread:140672862516928] MakeDirectory successful for parent_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96, name: alice_sub, UID: 0b344374-c3c8-4ef8-808b-a9337299bc95
+[2026-06-17 14:35:41.127] [ERROR] [GRPCService] GrantPermission failed: User alice does not have MANAGE_ACL on ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:35:59.807] [INFO] [GRPCService] ListDirectory successful for uid: 
+[2026-06-17 14:35:59.849] [INFO] [GRPCService] ListDirectory successful for uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:36:13.047] [INFO] [GRPCService] CheckPermission successful for resource_uid: 0b344374-c3c8-4ef8-808b-a9337299bc95
+[2026-06-17 14:36:13.088] [INFO] [GRPCService::Touch] [thread:140673432458944] Touch successful for parent_uid: 0b344374-c3c8-4ef8-808b-a9337299bc95, name: hello.txt, UID: 3d191068-a3db-49dc-bed8-542980e1e920
+[2026-06-17 14:36:13.136] [INFO] [GRPCService] ListDirectory successful for uid: 0b344374-c3c8-4ef8-808b-a9337299bc95
+[2026-06-17 14:36:29.300] [INFO] [GRPCService] CreateRole successful for role: editor
+[2026-06-17 14:36:29.338] [INFO] [GRPCService] AssignUserToRole successful for user: bob to role: editor
+[2026-06-17 14:36:50.118] [INFO] [GRPCService] CheckPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:36:50.154] [INFO] [GRPCService] CheckPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:12.176] [INFO] [GRPCService] CheckPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:12.232] [INFO] [GRPCService] CheckPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:12.268] [INFO] [GRPCService] CheckPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:36.135] [INFO] [GRPCService] CheckPermission successful for resource_uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:36.173] [INFO] [GRPCService] ListDirectory successful for uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:36.211] [INFO] [GRPCService] RemoveFile successful for uid: 3d191068-a3db-49dc-bed8-542980e1e920
+[2026-06-17 14:37:52.900] [INFO] [GRPCService] RemoveFile successful for uid: 0b344374-c3c8-4ef8-808b-a9337299bc95
+[2026-06-17 14:37:52.937] [INFO] [GRPCService] RemoveFile successful for uid: e8f85a01-4241-4478-b4a4-914904650efd
+[2026-06-17 14:37:52.974] [INFO] [GRPCService] RemoveFile successful for uid: ec1a79bb-2b15-4287-9e9a-2cb5683c5f96
+[2026-06-17 14:37:53.010] [INFO] [GRPCService] ListDirectory successful for uid: 
+
+Shutting down gRPC server...
