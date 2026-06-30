@@ -1,6 +1,7 @@
 #include "fileengine/database.h"
 #include "fileengine/utils.h"
 #include "fileengine/server_logger.h"
+#include "fileengine/connection_pool_manager.h"
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -19,6 +20,7 @@ Database::Database(const std::string& host, int port, const std::string& dbname,
                    const std::string& user, const std::string& password, int pool_size)
     : connection_pool_(std::make_shared<ConnectionPool>(host, port, dbname, user, password, pool_size)),
       hostname_(host),
+      pool_size_(pool_size),
       retry_interval_seconds_(30) {  // Set default retry interval
 }
 
@@ -62,7 +64,7 @@ bool Database::is_connected() const {
 
 Result<void> Database::create_schema() {
     SERVER_LOG_DEBUG("Database", "Attempting to create global schema.");
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         SERVER_LOG_ERROR("Database", "Failed to acquire database connection for schema creation.");
         return Result<void>::err("Failed to acquire database connection for schema creation");
@@ -135,7 +137,7 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
               ", owner: " + owner + ", permissions: " + std::to_string(permissions) +
               ", tenant: " + tenant);
 
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         SERVER_LOG_ERROR("Database::insert_file", ServerLogger::getInstance().detailed_log_prefix() +
                   "Failed to acquire database connection for UID: " + uid);
@@ -244,7 +246,7 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
 
 Result<void> Database::update_file_modified(const std::string& uid, const std::string& tenant) {
 // This is redundant, all versions are stored and tracked by time stamp. The first and last vrtdion time dytsmps are ctime and mtime
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -259,7 +261,7 @@ Result<void> Database::update_file_modified(const std::string& uid, const std::s
 
 Result<void> Database::update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) {
 // This is redundant, all versions are stored and tracked by time stamp. The first and last vrtdion time dytsmps are ctime and mtime
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -273,7 +275,7 @@ Result<void> Database::update_file_current_version(const std::string& uid, const
 }
 
 Result<bool> Database::delete_file(const std::string& uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection");
     }
@@ -303,7 +305,7 @@ Result<bool> Database::delete_file(const std::string& uid, const std::string& te
 }
 
 Result<bool> Database::undelete_file(const std::string& uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection");
     }
@@ -332,7 +334,7 @@ Result<bool> Database::undelete_file(const std::string& uid, const std::string& 
 }
 
 Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -434,7 +436,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
 }
 
 Result<std::optional<FileInfo>> Database::get_file_by_path(const std::string& path, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -450,7 +452,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_path(const std::string& pa
 }
 
 Result<void> Database::update_file_name(const std::string& uid, const std::string& new_name, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -478,7 +480,7 @@ Result<void> Database::update_file_name(const std::string& uid, const std::strin
 }
 
 Result<void> Database::update_file_size(const std::string& uid, int64_t size, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -507,7 +509,7 @@ Result<void> Database::update_file_size(const std::string& uid, int64_t size, co
 }
 
 Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::string& parent_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -601,7 +603,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
 }
 
 Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(const std::string& parent_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -694,7 +696,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
 }
 
 Result<std::vector<FileInfo>> Database::list_all_files(const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -773,7 +775,7 @@ Result<std::vector<FileInfo>> Database::list_all_files(const std::string& tenant
 }
 
 Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std::string& name, const std::string& parent_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -888,7 +890,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
 }
 
 Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_deleted(const std::string& name, const std::string& parent_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -1003,7 +1005,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
 }
 
 Result<int64_t> Database::get_file_size(const std::string& file_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<int64_t>::err("Failed to acquire database connection");
     }
@@ -1039,7 +1041,7 @@ Result<int64_t> Database::get_file_size(const std::string& file_uid, const std::
 }
 
 Result<int64_t> Database::get_directory_size(const std::string& dir_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<int64_t>::err("Failed to acquire database connection");
     }
@@ -1075,7 +1077,7 @@ Result<int64_t> Database::get_directory_size(const std::string& dir_uid, const s
 }
 
 Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const std::string& uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<FileInfo>>::err("Failed to acquire database connection");
     }
@@ -1169,7 +1171,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
 }
 
 Result<void> Database::update_file_parent(const std::string& uid, const std::string& new_parent_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -1203,7 +1205,7 @@ Result<void> Database::update_file_parent(const std::string& uid, const std::str
 }
 
 Result<std::string> Database::path_to_uid(const std::string& path, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::string>::err("Failed to acquire database connection");
     }
@@ -1218,7 +1220,7 @@ Result<std::string> Database::path_to_uid(const std::string& path, const std::st
 }
 
 Result<std::vector<std::string>> Database::uid_to_path(const std::string& uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -1257,7 +1259,7 @@ Result<std::vector<std::string>> Database::uid_to_path(const std::string& uid, c
 
 Result<int64_t> Database::insert_version(const std::string& file_uid, const std::string& version_timestamp,
                                           int64_t size, const std::string& storage_path, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<int64_t>::err("Failed to acquire database connection");
     }
@@ -1303,7 +1305,7 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
 }
 
 Result<std::optional<std::string>> Database::get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<std::string>>::err("Failed to acquire database connection");
     }
@@ -1340,7 +1342,7 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
 }
 
 Result<std::vector<std::string>> Database::list_versions(const std::string& file_uid, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -1375,7 +1377,7 @@ Result<std::vector<std::string>> Database::list_versions(const std::string& file
 }
 
 Result<bool> Database::delete_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection");
     }
@@ -1408,7 +1410,7 @@ Result<bool> Database::restore_to_version(const std::string& file_uid, const std
     // existing payload is reused (no re-encrypt / re-compress) and the new
     // row's timestamp wins on read.
     (void)user; // accepted for API parity; the FS layer already enforced WRITE permission
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection for restore operation");
     }
@@ -1480,7 +1482,7 @@ Result<bool> Database::restore_to_version(const std::string& file_uid, const std
 
 // Add all missing methods here
 Result<void> Database::set_metadata(const std::string& file_uid, const std::string& version_timestamp, const std::string& key, const std::string& value, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -1518,7 +1520,7 @@ Result<void> Database::set_metadata(const std::string& file_uid, const std::stri
 }
 
 Result<std::optional<std::string>> Database::get_metadata(const std::string& file_uid, const std::string& version_timestamp, const std::string& key, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::optional<std::string>>::err("Failed to acquire database connection");
     }
@@ -1560,7 +1562,7 @@ Result<std::optional<std::string>> Database::get_metadata(const std::string& fil
 }
 
 Result<std::map<std::string, std::string>> Database::get_all_metadata(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::map<std::string, std::string>>::err("Failed to acquire database connection");
     }
@@ -1602,7 +1604,7 @@ Result<std::map<std::string, std::string>> Database::get_all_metadata(const std:
 }
 
 Result<void> Database::delete_metadata(const std::string& file_uid, const std::string& version_timestamp, const std::string& key, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -1636,7 +1638,7 @@ Result<void> Database::delete_metadata(const std::string& file_uid, const std::s
 }
 
 Result<void> Database::execute(const std::string& sql, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -1658,7 +1660,7 @@ Result<void> Database::execute(const std::string& sql, const std::string& tenant
 }
 
 Result<std::vector<std::vector<std::string>>> Database::query(const std::string& sql, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::vector<std::string>>>::err("Failed to acquire database connection");
     }
@@ -1700,7 +1702,7 @@ Result<void> Database::update_file_access_stats(const std::string& uid, const st
 }
 
 Result<std::vector<std::string>> Database::get_least_accessed_files(int limit, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -1732,7 +1734,7 @@ Result<std::vector<std::string>> Database::get_least_accessed_files(int limit, c
 }
 
 Result<std::vector<std::string>> Database::get_infrequently_accessed_files(int days_threshold, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -1764,7 +1766,7 @@ Result<std::vector<std::string>> Database::get_infrequently_accessed_files(int d
 }
 
 Result<int64_t> Database::get_storage_usage(const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<int64_t>::err("Failed to acquire database connection");
     }
@@ -1803,7 +1805,7 @@ Result<int64_t> Database::get_storage_capacity(const std::string& tenant) {
 }
 
 Result<void> Database::create_tenant_schema(const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection for tenant schema creation");
     }
@@ -2172,7 +2174,7 @@ Result<bool> Database::tenant_schema_exists(const std::string& tenant) {
         return Result<bool>::err("Cannot check existence for empty tenant name");
     }
 
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection for tenant schema check");
     }
@@ -2213,7 +2215,7 @@ Result<bool> Database::tenant_schema_exists(const std::string& tenant) {
 }
 
 Result<void> Database::cleanup_tenant_data(const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -2274,7 +2276,7 @@ Result<void> Database::cleanup_tenant_data(const std::string& tenant) {
 }
 
 Result<std::vector<std::string>> Database::list_tenants() {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -2306,10 +2308,26 @@ Result<std::vector<std::string>> Database::list_tenants() {
 void Database::configure_secondary_connection(const std::string& host, int port, const std::string& database_name,
                                              const std::string& user, const std::string& password) {
     std::ostringstream conn_stream;
-    conn_stream << "host=" << host << " port=" << port 
+    conn_stream << "host=" << host << " port=" << port
                 << " dbname=" << database_name << " user=" << user
                 << " password=" << password;
     secondary_conn_info_ = conn_stream.str();
+
+    // A dedicated pool for the read-only standby. Reads route here while failed
+    // over (see acquire()). Initialized eagerly; if the standby is down now it can
+    // still be acquired (and retried) later.
+    secondary_pool_ = std::make_shared<ConnectionPool>(host, port, database_name, user, password, pool_size_);
+    if (!secondary_pool_->initialize()) {
+        std::cerr << "Secondary database pool failed to initialize (will retry on use): "
+                  << host << ":" << port << std::endl;
+    }
+}
+
+std::shared_ptr<DatabaseConnection> Database::acquire(DbOp op) {
+    // Writes always use the primary; reads use the replica only while failed over.
+    ConnectionPool* pool = select_pool(op, connection_pool_.get(),
+                                       secondary_pool_.get(), using_secondary_.load());
+    return pool ? pool->acquire() : nullptr;
 }
 
 void Database::start_connection_monitoring() {
@@ -2321,18 +2339,29 @@ void Database::start_connection_monitoring() {
     
     connection_monitor_thread_ = std::thread([this]() {
         while (monitoring_active_.load()) {
-            // Check if primary is down but was previously available
-            if (!is_connected() && primary_available_.load()) {
-                // Try to reconnect to primary
-                if (connect()) {
-                    // Primary connection restored
-                    primary_available_.store(true);
-                    using_secondary_.store(false);
-                    std::cout << "Database connection to primary restored." << std::endl;
+            // Probe the primary: a cheap health check while up, a reconnect attempt
+            // while down. The disconnect/recovery transition is the pure, unit-tested
+            // next_failover_state() (REPLICATION_FAILOVER.md).
+            const bool was_up = primary_available_.load();
+            const bool reachable = was_up ? is_connected() : connect();
+
+            ConnectionPoolManager& mgr = ConnectionPoolManager::get_instance();
+            FailoverState cur{was_up, using_secondary_.load(), mgr.is_server_in_readonly_mode()};
+            FailoverState next = next_failover_state(cur, reachable, !secondary_conn_info_.empty());
+
+            if (next != cur) {
+                primary_available_.store(next.primary_available);
+                using_secondary_.store(next.using_secondary);
+                mgr.set_server_in_readonly_mode(next.readonly_mode);
+                if (!next.primary_available) {
+                    std::cerr << "Database primary unavailable; entering read-only fallback mode."
+                              << std::endl;
+                } else {
+                    std::cout << "Database connection to primary restored; resuming normal operation."
+                              << std::endl;
                 }
             }
-            
-            // Sleep for a while before checking again
+
             std::this_thread::sleep_for(std::chrono::seconds(retry_interval_seconds_));
         }
     });
@@ -2429,7 +2458,7 @@ Result<std::string> Database::create_file_with_acls(const std::string& uid,
         return Result<std::string>::err("Invalid parameter: name is empty");
     }
 
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<std::string>::err("Failed to acquire database connection");
     }
@@ -2556,7 +2585,7 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
                                const std::string& tenant,
                                const std::string& performed_by,
                                int effect) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -2645,7 +2674,7 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
                                   const std::string& tenant,
                                   const std::string& performed_by,
                                   int effect) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -2777,7 +2806,7 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
 
 Result<std::vector<IDatabase::AclEntry>> Database::get_acls_for_resource(const std::string& resource_uid,
                                                                          const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<IDatabase::AclEntry>>::err("Failed to acquire database connection");
     }
@@ -2823,7 +2852,7 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
                                                                  const std::string& principal,
                                                                  int type,
                                                                  const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<IDatabase::AclEntry>>::err("Failed to acquire database connection");
     }
@@ -2872,7 +2901,7 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
 Result<std::vector<std::string>> Database::list_claims(const std::string& prefix,
                                                        int limit,
                                                        const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -2929,7 +2958,7 @@ Result<void> Database::create_role(const std::string& role, const std::string& t
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
     }
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -2955,7 +2984,7 @@ Result<void> Database::delete_role(const std::string& role, const std::string& t
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
     }
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -2994,7 +3023,7 @@ Result<void> Database::assign_user_to_role(const std::string& user, const std::s
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
     }
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -3020,7 +3049,7 @@ Result<void> Database::remove_user_from_role(const std::string& user, const std:
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
     }
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
     }
@@ -3042,7 +3071,7 @@ Result<void> Database::remove_user_from_role(const std::string& user, const std:
 }
 
 Result<std::vector<std::string>> Database::get_roles_for_user(const std::string& user, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -3070,7 +3099,7 @@ Result<std::vector<std::string>> Database::get_roles_for_user(const std::string&
 }
 
 Result<std::vector<std::string>> Database::get_users_for_role(const std::string& role, const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }
@@ -3098,7 +3127,7 @@ Result<std::vector<std::string>> Database::get_users_for_role(const std::string&
 }
 
 Result<std::vector<std::string>> Database::get_all_roles(const std::string& tenant) {
-    auto conn = connection_pool_->acquire();
+    auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
         return Result<std::vector<std::string>>::err("Failed to acquire database connection");
     }

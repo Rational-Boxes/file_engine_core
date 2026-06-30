@@ -158,3 +158,9 @@ target_include_directories(crypto_stream_tests PRIVATE
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
 )
+
+# Read/write connection-routing failover unit test (header-only; no core link).
+add_executable(test_connection_router test_connection_router.cpp)
+target_include_directories(test_connection_router PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+)

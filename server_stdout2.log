@@ -1,0 +1,129 @@
+Starting FileEngine gRPC Server...
+Config loaded:
+  DB Host: localhost
+  DB Port: 5434
+  DB Name: fileengine
+  Storage Path: /home/telendry/temp/fileengine
+  S3 Endpoint: http://localhost:9000
+  Log Level: debug
+  Log File: ./log/fileengine.log
+  Log to Console: true
+Connecting to database...
+[2026-06-17 14:52:06.317] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.318] [INFO] [ConnectionPool] Successfully initialized connection #1 for pool.
+[2026-06-17 14:52:06.330] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.330] [INFO] [ConnectionPool] Successfully initialized connection #2 for pool.
+[2026-06-17 14:52:06.343] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.343] [INFO] [ConnectionPool] Successfully initialized connection #3 for pool.
+[2026-06-17 14:52:06.353] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.353] [INFO] [ConnectionPool] Successfully initialized connection #4 for pool.
+[2026-06-17 14:52:06.362] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.362] [INFO] [ConnectionPool] Successfully initialized connection #5 for pool.
+[2026-06-17 14:52:06.384] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.384] [INFO] [ConnectionPool] Successfully initialized connection #6 for pool.
+[2026-06-17 14:52:06.396] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.396] [INFO] [ConnectionPool] Successfully initialized connection #7 for pool.
+[2026-06-17 14:52:06.408] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.408] [INFO] [ConnectionPool] Successfully initialized connection #8 for pool.
+[2026-06-17 14:52:06.417] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.417] [INFO] [ConnectionPool] Successfully initialized connection #9 for pool.
+[2026-06-17 14:52:06.428] [INFO] [DatabaseConnection] Successfully connected to database.
+[2026-06-17 14:52:06.428] [INFO] [ConnectionPool] Successfully initialized connection #10 for pool.
+[2026-06-17 14:52:06.428] [INFO] [ConnectionPool] Successfully initialized all 10 connections in the pool.
+[2026-06-17 14:52:06.428] [INFO] [Database] Successfully initialized database connection pool.
+Database connected successfully.
+Database connection monitoring started.
+Ensuring database schema exists...
+NOTICE:  relation "file_access_stats" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_file_uid" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_hostname" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_last_accessed" already exists, skipping
+NOTICE:  relation "idx_file_access_stats_access_count" already exists, skipping
+NOTICE:  relation "tenants" already exists, skipping
+[2026-06-17 14:52:06.431] [INFO] [Database] Successfully created or verified global tables.
+Database schema verified.
+Initializing object store...
+S3 storage initialized successfully.
+[2026-06-17 14:52:11.486] [ERROR] [StorageTracker] Error initializing from existing files: filesystem error: recursive directory iterator cannot open directory: No such file or directory [/home/telendry/temp/fileengine/default]
+Initializing local storage...
+Initializing tenant manager...
+Initializing filesystem...
+Initializing file culling system...
+Initializing default tenant...
+NOTICE:  schema "tenant_default" already exists, skipping
+NOTICE:  relation "files" already exists, skipping
+NOTICE:  relation "idx_files_uid_tenant_default" already exists, skipping
+NOTICE:  relation "idx_files_parent_uid_tenant_default" already exists, skipping
+NOTICE:  relation "versions" already exists, skipping
+NOTICE:  relation "idx_versions_file_uid_tenant_default" already exists, skipping
+NOTICE:  relation "metadata" already exists, skipping
+NOTICE:  relation "idx_metadata_file_uid_tenant_default" already exists, skipping
+NOTICE:  relation "idx_metadata_key_name_tenant_default" already exists, skipping
+NOTICE:  relation "acls" already exists, skipping
+NOTICE:  column "granted_by" of relation "acls" already exists, skipping
+NOTICE:  column "effect" of relation "acls" already exists, skipping
+NOTICE:  relation "acl_audit" already exists, skipping
+NOTICE:  relation "idx_acl_audit_resource_tenant_default" already exists, skipping
+NOTICE:  relation "idx_acls_principal_type_tenant_default" already exists, skipping
+NOTICE:  index "idx_acls_principal" does not exist, skipping
+NOTICE:  index "idx_acls_resource_uid" does not exist, skipping
+NOTICE:  relation "roles" already exists, skipping
+NOTICE:  relation "user_roles" already exists, skipping
+NOTICE:  relation "idx_user_roles_user_tenant_default" already exists, skipping
+NOTICE:  relation "idx_user_roles_role_tenant_default" already exists, skipping
+Default tenant initialized successfully.
+Initializing object store sync...
+Object store sync initialized and started.
+File culling system initialized and started.
+Initializing gRPC service...
+Attempting to bind gRPC server to 0.0.0.0:50051
+Setting gRPC server to use 10 threads
+gRPC Server listening on 0.0.0.0:50051 with 10 threads
+NOTICE:  schema "tenant_default" already exists, skipping
+NOTICE:  relation "files" already exists, skipping
+NOTICE:  relation "idx_files_uid_tenant_default" already exists, skipping
+NOTICE:  relation "idx_files_parent_uid_tenant_default" already exists, skipping
+NOTICE:  relation "versions" already exists, skipping
+NOTICE:  relation "idx_versions_file_uid_tenant_default" already exists, skipping
+NOTICE:  relation "metadata" already exists, skipping
+NOTICE:  relation "idx_metadata_file_uid_tenant_default" already exists, skipping
+NOTICE:  relation "idx_metadata_key_name_tenant_default" already exists, skipping
+NOTICE:  relation "acls" already exists, skipping
+NOTICE:  column "granted_by" of relation "acls" already exists, skipping
+NOTICE:  column "effect" of relation "acls" already exists, skipping
+NOTICE:  relation "acl_audit" already exists, skipping
+NOTICE:  relation "idx_acl_audit_resource_tenant_default" already exists, skipping
+NOTICE:  relation "idx_acls_principal_type_tenant_default" already exists, skipping
+NOTICE:  index "idx_acls_principal" does not exist, skipping
+NOTICE:  index "idx_acls_resource_uid" does not exist, skipping
+NOTICE:  relation "roles" already exists, skipping
+NOTICE:  relation "user_roles" already exists, skipping
+NOTICE:  relation "idx_user_roles_user_tenant_default" already exists, skipping
+NOTICE:  relation "idx_user_roles_role_tenant_default" already exists, skipping
+[2026-06-17 14:52:30.030] [ERROR] [FileSystem::mkdir] [thread:140348596860608] Non-admin user attempting to create in root directory
+[2026-06-17 14:52:30.030] [ERROR] [GRPCService::MakeDirectory] [thread:140348596860608] MakeDirectory failed to create directory: Only system_admin can create in root directory
+[2026-06-17 14:52:30.070] [INFO] [GRPCService::MakeDirectory] [thread:140348609664704] MakeDirectory successful for parent_uid: , name: smoke, UID: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:30.109] [INFO] [GRPCService] ListDirectory successful for uid: 
+[2026-06-17 14:52:30.151] [INFO] [GRPCService::Touch] [thread:140348532840128] Touch successful for parent_uid: 40b88715-3cb6-4050-9180-d8503711747a, name: hello.txt, UID: 10fa573f-051b-4d2c-a8fa-6531eebd1315
+[2026-06-17 14:52:30.189] [INFO] [GRPCService] ListDirectory successful for uid: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:30.233] [INFO] [GRPCService::PutFile] [thread:140348622468800] PutFile successful for uid: 10fa573f-051b-4d2c-a8fa-6531eebd1315
+[2026-06-17 14:52:30.270] [INFO] [GRPCService] GetFile successful for uid: 10fa573f-051b-4d2c-a8fa-6531eebd1315
+[2026-06-17 14:52:30.320] [INFO] [GRPCService] Stat successful for uid: 10fa573f-051b-4d2c-a8fa-6531eebd1315
+[2026-06-17 14:52:44.027] [INFO] [GRPCService] GrantPermission successful for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:44.064] [INFO] [GRPCService] CheckPermission successful for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:44.103] [ERROR] [GRPCService] GrantPermission failed: User alice does not have MANAGE_ACL on 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:44.141] [INFO] [GRPCService] GrantPermission successful for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:44.178] [INFO] [GRPCService] CheckPermission successful for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:52:44.213] [ERROR] [GRPCService] RevokePermission failed for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a with error: Failed to remove ACL: ERROR:  operator is not unique: ~ unknown
+LINE 1: ...nt_default.acls   SET permissions = permissions & ~$4, updat...
+                                                             ^
+HINT:  Could not choose a best candidate operator. You might need to add explicit type casts.
+
+[2026-06-17 14:52:44.248] [INFO] [GRPCService] CheckPermission successful for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a
+[2026-06-17 14:53:00.996] [ERROR] [GRPCService] RevokePermission failed for resource_uid: 40b88715-3cb6-4050-9180-d8503711747a with error: Failed to remove ACL: ERROR:  operator is not unique: ~ unknown
+LINE 1: ...nt_default.acls   SET permissions = permissions & ~$4, updat...
+                                                             ^
+HINT:  Could not choose a best candidate operator. You might need to add explicit type casts.
+
+
+Shutting down gRPC server...

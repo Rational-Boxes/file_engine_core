@@ -4,6 +4,7 @@
 #include "types.h"
 #include "IDatabase.h"
 #include "connection_pool.h"
+#include "connection_router.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -155,10 +156,17 @@ private:
     std::shared_ptr<ConnectionPool> connection_pool_;
     std::string hostname_;
 
-    // Secondary/local database connection for read-only operations when primary is unavailable
+    // Secondary/local database (read-only standby) for failover. Reads route here
+    // while failed over; writes always use the primary (REPLICATION_FAILOVER.md).
     std::shared_ptr<DatabaseConnection> secondary_connection_;
+    std::shared_ptr<ConnectionPool> secondary_pool_;
     std::string secondary_conn_info_;
     std::atomic<bool> using_secondary_{false};
+    int pool_size_{10};                  // reused when building the secondary pool
+
+    // Acquire a connection for the given operation kind: writes -> primary; reads
+    // -> the replica while failed over, else the primary.
+    std::shared_ptr<DatabaseConnection> acquire(DbOp op);
 
     // Connection health monitoring
     std::atomic<bool> primary_available_{true};

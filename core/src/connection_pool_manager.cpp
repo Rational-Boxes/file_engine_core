@@ -2,7 +2,11 @@
 #include "fileengine/connection_pool.h"
 #include <mutex>
 
-// TODO: For database connection recovery when configured with a local slave database a global state needs to be tracked for te server being in disconnected read-only mode
+// Disconnected read-only mode (REPLICATION_FAILOVER.md): the global flag below is
+// driven by Database's connection monitor — set when the primary is unreachable and
+// a secondary is configured, cleared when the primary is restored. The gRPC service
+// rejects writes while it is set. (Read routing to the secondary is tracked in the
+// design doc as the remaining step.)
 
 namespace fileengine {
 
