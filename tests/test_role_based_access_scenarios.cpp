@@ -94,7 +94,7 @@ public:
     
     // Version operations
     Result<int64_t> insert_version(const std::string& file_uid, const std::string& version_timestamp,
-                                  int64_t size, const std::string& storage_path, const std::string& tenant = "") override {
+                                  int64_t size, const std::string& storage_path, const std::string& revised_by = "", const std::string& tenant = "") override {
         return Result<int64_t>::ok(0);
     }
     Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") override {

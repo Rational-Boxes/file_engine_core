@@ -188,6 +188,13 @@ public:
         fileengine::Logger::debug("ListDir", "Attempting to list directory with UID: ", uid, " for user: ", user, ", show_deleted: ", show_deleted ? "true" : "false", ", tenant: ", tenant);
 
         // Shared rendering for either response type (both expose .entries()).
+        auto fmt_epoch = [](int64_t s) -> std::string {
+            if (s <= 0) return "-";
+            std::time_t t = static_cast<std::time_t>(s);
+            std::tm tm{}; gmtime_r(&t, &tm);
+            char buf[20]; std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+            return std::string(buf);
+        };
         auto render = [&](const auto& response) -> bool {
             fileengine::Logger::debug("ListDir", "Directory listing successful, found ", response.entries_size(), " entries");
             if (show_deleted) {
@@ -203,7 +210,11 @@ public:
                     type_str = "LINK";
                 }
                 fileengine::Logger::detail("ListDir", "Entry - Name: ", entry.name(), ", UID: ", entry.uid(), ", Type: ", type_str);
-                std::cout << "  [" << type_str << "] " << entry.name() << " (UID: " << entry.uid() << ")" << std::endl;
+                std::cout << "  [" << type_str << "] " << entry.name() << " (UID: " << entry.uid() << ")"
+                          << "  created " << fmt_epoch(entry.created_at()) << " by " << entry.created_by()
+                          << ", modified " << fmt_epoch(entry.modified_at()) << " by " << entry.modified_by();
+                if (entry.deleted()) std::cout << "  [deleted]";
+                std::cout << std::endl;
             }
             return true;
         };

@@ -201,6 +201,9 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
             dir_entry->set_version_count(entry.version_count);
             dir_entry->set_rendition_count(entry.rendition_count);
             dir_entry->set_deleted(entry.deleted);
+            dir_entry->set_owner(entry.owner);
+            dir_entry->set_created_by(entry.created_by);
+            dir_entry->set_modified_by(entry.modified_by);
         }
         SERVER_LOG_INFO("GRPCService", "ListDirectory successful for uid: " + dir_uid);
     }
@@ -263,6 +266,9 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
             dir_entry->set_version_count(entry.version_count);
             dir_entry->set_rendition_count(entry.rendition_count);
             dir_entry->set_deleted(entry.deleted);
+            dir_entry->set_owner(entry.owner);
+            dir_entry->set_created_by(entry.created_by);
+            dir_entry->set_modified_by(entry.modified_by);
         }
         SERVER_LOG_INFO("GRPCService", "ListDirectoryWithDeleted successful for uid: " + dir_uid);
     }

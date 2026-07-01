@@ -58,7 +58,8 @@ public:
 
     // Version operations (using UUIDs and timestamp strings)
     virtual Result<int64_t> insert_version(const std::string& file_uid, const std::string& version_timestamp,
-                                            int64_t size, const std::string& storage_path, const std::string& tenant = "") = 0;
+                                            int64_t size, const std::string& storage_path,
+                                            const std::string& revised_by = "", const std::string& tenant = "") = 0;
     virtual Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
     virtual Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant = "") = 0;
     // Remove a single version row for a file. Non-pure so existing mocks need

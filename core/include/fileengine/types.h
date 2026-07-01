@@ -26,6 +26,8 @@ struct FileInfo {
     std::chrono::system_clock::time_point modified_at;
     std::string version;          // Version as timestamp string instead of integer
     std::string owner;
+    std::string created_by;       // User who created the file (first revision; else owner)
+    std::string modified_by;      // User who wrote the latest revision (else owner)
     int permissions;
     int32_t version_count;        // Number of versions for the file
     int32_t rendition_count = 0;  // Hidden child renditions (files only; 0 for dirs)
@@ -43,6 +45,9 @@ struct DirectoryEntry {
     int32_t version_count;        // Number of versions for files
     int32_t rendition_count = 0;  // Hidden child renditions (files only; 0 for dirs)
     bool deleted = false;         // Soft-deleted (only set by listdir_with_deleted)
+    std::string owner;            // Owning user (from the metadata DB)
+    std::string created_by;       // Creator (first revision; else owner)
+    std::string modified_by;      // Latest reviser (else owner)
 };
 
 // Result types

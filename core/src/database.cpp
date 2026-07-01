@@ -160,7 +160,8 @@ Result<std::string> Database::insert_file(const std::string& uid, const std::str
             "size = EXCLUDED.size, "
             "owner = EXCLUDED.owner, "
             "permission_map = EXCLUDED.permission_map, "
-            "is_container = EXCLUDED.is_container "
+            "is_container = EXCLUDED.is_container, "
+            "updated_at = CURRENT_TIMESTAMP "        // bump mtime on any metadata change
         "RETURNING uid;";
 
     // Convert file type to integer
@@ -508,6 +509,34 @@ Result<void> Database::update_file_size(const std::string& uid, int64_t size, co
     }
 }
 
+// Parse a version_timestamp ("YYYYMMDD_HHMMSS.mmm", UTC — see Utils::get_timestamp_string)
+// into epoch seconds. Returns false for null/empty/unparseable values.
+static bool parse_vts_epoch(const char* vts, int64_t& out) {
+    if (vts == nullptr || vts[0] == '\0') return false;
+    std::tm tm{};
+    if (strptime(vts, "%Y%m%d_%H%M%S", &tm) == nullptr) return false;
+    out = static_cast<int64_t>(timegm(&tm));  // input is UTC (gmtime)
+    return true;
+}
+
+// Provenance from the revision history: ctime + creator = first revision,
+// mtime + last reviser = latest revision (per the versioning model). Falls back
+// to the metadata-DB files.created_at/updated_at + files.owner for rows with no
+// revisions (directories, freshly-touched files). Sets info.created_at/modified_at
+// and info.created_by/modified_by. `info.owner` must already be set.
+static void apply_listing_provenance(FileInfo& info,
+                                     int64_t files_created_epoch, int64_t files_updated_epoch,
+                                     const char* first_vts, const char* first_by,
+                                     const char* last_vts, const char* last_by) {
+    int64_t created = files_created_epoch, modified = files_updated_epoch, e;
+    if (parse_vts_epoch(first_vts, e)) created = e;
+    if (parse_vts_epoch(last_vts, e)) modified = e;
+    info.created_at  = std::chrono::system_clock::time_point(std::chrono::seconds(created));
+    info.modified_at = std::chrono::system_clock::time_point(std::chrono::seconds(modified));
+    info.created_by  = (first_by && first_by[0]) ? std::string(first_by) : info.owner;
+    info.modified_by = (last_by  && last_by[0])  ? std::string(last_by)  : info.owner;
+}
+
 Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::string& parent_uid, const std::string& tenant) {
     auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
@@ -535,7 +564,13 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
     std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, "
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
-                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
+                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
+                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
                             "FROM \"" + schema_name + "\".files f "
                             "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.deleted = FALSE "
                             "ORDER BY f.name;";
@@ -571,10 +606,15 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
             bool is_container = (strcmp(PQgetvalue(res, i, 5), "t") == 0 || strcmp(PQgetvalue(res, i, 5), "1") == 0);
             info.type = is_container ? FileType::DIRECTORY : FileType::REGULAR_FILE;
             info.rendition_count = std::stoi(PQgetvalue(res, i, 6));  // hidden children (files only)
-            // Use current time for timestamps since we don't have these in the schema
-            auto now = std::chrono::system_clock::now();
-            info.created_at = now;
-            info.modified_at = now;
+            // Provenance from revisions (ctime/creator = first, mtime/reviser =
+            // latest), falling back to files.created_at/updated_at + owner. info.owner
+            // is set above (index 3) so the fallback resolves.
+            apply_listing_provenance(info,
+                std::stoll(PQgetvalue(res, i, 7)), std::stoll(PQgetvalue(res, i, 8)),
+                PQgetisnull(res, i, 9)  ? nullptr : PQgetvalue(res, i, 9),
+                PQgetisnull(res, i, 10) ? nullptr : PQgetvalue(res, i, 10),
+                PQgetisnull(res, i, 11) ? nullptr : PQgetvalue(res, i, 11),
+                PQgetisnull(res, i, 12) ? nullptr : PQgetvalue(res, i, 12));
             // Get the latest version from the versions table
             std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
             const char* version_param_values[1] = {info.uid.c_str()};
@@ -626,7 +666,13 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
     std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
-                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
+                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
+                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
                             "FROM \"" + schema_name + "\".files f "
                             "WHERE f.parent_uid = $1 AND f.uid <> $1 "
                             "ORDER BY f.name;";
@@ -665,10 +711,14 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
             info.type = is_container ? FileType::DIRECTORY : FileType::REGULAR_FILE;
             info.deleted = (strcmp(PQgetvalue(res, i, 6), "t") == 0 || strcmp(PQgetvalue(res, i, 6), "1") == 0);  // index 6: f.deleted
             info.rendition_count = std::stoi(PQgetvalue(res, i, 7));  // index 7: after deleted (6)
-            // Use current time for timestamps since we don't have these in the schema
-            auto now = std::chrono::system_clock::now();
-            info.created_at = now;
-            info.modified_at = now;
+            // Provenance from revisions; files columns (8/9) + owner are the
+            // fallback. VTS/by subqueries are 10..13.
+            apply_listing_provenance(info,
+                std::stoll(PQgetvalue(res, i, 8)), std::stoll(PQgetvalue(res, i, 9)),
+                PQgetisnull(res, i, 10) ? nullptr : PQgetvalue(res, i, 10),
+                PQgetisnull(res, i, 11) ? nullptr : PQgetvalue(res, i, 11),
+                PQgetisnull(res, i, 12) ? nullptr : PQgetvalue(res, i, 12),
+                PQgetisnull(res, i, 13) ? nullptr : PQgetvalue(res, i, 13));
             // Get the latest version from the versions table
             std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
             const char* version_param_values[1] = {info.uid.c_str()};
@@ -1259,7 +1309,8 @@ Result<std::vector<std::string>> Database::uid_to_path(const std::string& uid, c
 }
 
 Result<int64_t> Database::insert_version(const std::string& file_uid, const std::string& version_timestamp,
-                                          int64_t size, const std::string& storage_path, const std::string& tenant) {
+                                          int64_t size, const std::string& storage_path,
+                                          const std::string& revised_by, const std::string& tenant) {
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<int64_t>::err("Failed to acquire database connection");
@@ -1272,19 +1323,22 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
 
     // Insert the version into the versions table with its storage path
     // Keep the version_timestamp as a string to avoid conversion issues
-    std::string insert_sql = "INSERT INTO \"" + schema_name + "\".versions (file_uid, version_timestamp, size, storage_path) "
-                             "VALUES ($1, $2, $3, $4) "
+    std::string insert_sql = "INSERT INTO \"" + schema_name + "\".versions (file_uid, version_timestamp, size, storage_path, revised_by) "
+                             "VALUES ($1, $2, $3, $4, $5) "
                              "ON CONFLICT (file_uid, version_timestamp) DO UPDATE SET "
-                             "size = EXCLUDED.size, storage_path = EXCLUDED.storage_path "
+                             "size = EXCLUDED.size, storage_path = EXCLUDED.storage_path, revised_by = EXCLUDED.revised_by "
                              "RETURNING id;";
-    const char* param_values[4] = {
+    // Own the size string so param_values doesn't point at a freed temporary.
+    std::string size_str = std::to_string(size);
+    const char* param_values[5] = {
         file_uid.c_str(),
         version_timestamp.c_str(),  // Keep as string
-        std::to_string(size).c_str(),
-        storage_path.c_str()
+        size_str.c_str(),
+        storage_path.c_str(),
+        revised_by.c_str()          // acting user who wrote this revision
     };
 
-    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 4, nullptr, param_values, nullptr, nullptr, 0);
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 5, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         if (PQntuples(res) > 0) {
@@ -1846,8 +1900,17 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "owner TEXT NOT NULL, "
         "permission_map INTEGER NOT NULL, "
         "is_container BOOLEAN NOT NULL, "
-        "deleted BOOLEAN NOT NULL DEFAULT FALSE"
+        "deleted BOOLEAN NOT NULL DEFAULT FALSE, "
+        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "  // fallback ctime (no revisions)
+        "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"    // fallback mtime; bumped on change
         ");";
+
+    // Migration for tenants whose files table predates these columns. ADD COLUMN
+    // IF NOT EXISTS backfills existing rows via the CURRENT_TIMESTAMP default.
+    std::string migrate_files_timestamps =
+        "ALTER TABLE \"" + escaped_schema + "\".files "
+        "ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;";
 
     std::string create_idx_uid = "CREATE INDEX IF NOT EXISTS idx_files_uid_" + escaped_schema +
         " ON \"" + escaped_schema + "\".files(uid);";
@@ -1860,8 +1923,16 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "version_timestamp TEXT NOT NULL, "
         "size BIGINT NOT NULL, "
         "storage_path TEXT NOT NULL, "
+        "revised_by VARCHAR(255) NOT NULL DEFAULT 'unknown', "  // acting user who wrote the revision
         "UNIQUE (file_uid, version_timestamp) "
         ");";
+
+    // Migration for tenants created before revised_by existed: ADD COLUMN IF NOT
+    // EXISTS backfills every existing revision row with the 'unknown' placeholder
+    // (the column DEFAULT). New revisions carry the real acting user.
+    std::string migrate_versions_revised_by =
+        "ALTER TABLE \"" + escaped_schema + "\".versions "
+        "ADD COLUMN IF NOT EXISTS revised_by VARCHAR(255) NOT NULL DEFAULT 'unknown';";
 
     std::string create_idx_versions = "CREATE INDEX IF NOT EXISTS idx_versions_file_uid_" + escaped_schema +
         " ON \"" + escaped_schema + "\".versions(file_uid);";
@@ -1891,6 +1962,10 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
     }
     PQclear(res);
 
+    // Idempotent backfill migration for pre-existing tenants (non-critical).
+    res = PQexec(pg_conn, migrate_files_timestamps.c_str());
+    PQclear(res);  // columns may already exist; status is irrelevant
+
     res = PQexec(pg_conn, create_idx_uid.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
 
@@ -1905,6 +1980,10 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         return Result<void>::err("Failed to create tenant versions table: " + error);
     }
     PQclear(res);
+
+    // Idempotent backfill migration for pre-existing tenants (non-critical).
+    res = PQexec(pg_conn, migrate_versions_revised_by.c_str());
+    PQclear(res);  // column may already exist; status is irrelevant
 
     res = PQexec(pg_conn, create_idx_versions.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
@@ -2494,7 +2573,8 @@ Result<std::string> Database::create_file_with_acls(const std::string& uid,
             "size = EXCLUDED.size, "
             "owner = EXCLUDED.owner, "
             "permission_map = EXCLUDED.permission_map, "
-            "is_container = EXCLUDED.is_container "
+            "is_container = EXCLUDED.is_container, "
+            "updated_at = CURRENT_TIMESTAMP "        // bump mtime on any metadata change
         "RETURNING uid;";
 
     bool is_container = (type == FileType::DIRECTORY);

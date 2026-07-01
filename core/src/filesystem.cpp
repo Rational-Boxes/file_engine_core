@@ -215,6 +215,9 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
         entry.version_count = file_info.version_count;
         entry.rendition_count = file_info.rendition_count;
         entry.deleted = file_info.deleted;
+        entry.owner = file_info.owner;
+        entry.created_by = file_info.created_by;
+        entry.modified_by = file_info.modified_by;
 
         entries.push_back(entry);
     }
@@ -257,6 +260,9 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
         entry.version_count = file_info.version_count;
         entry.rendition_count = file_info.rendition_count;
         entry.deleted = file_info.deleted;
+        entry.owner = file_info.owner;
+        entry.created_by = file_info.created_by;
+        entry.modified_by = file_info.modified_by;
 
         entries.push_back(entry);
     }
@@ -463,7 +469,7 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     
     // Record the version in the database
     auto insert_version_result = context->db->insert_version(file_uid, version_timestamp, data.size(),
-                                                             storage_result.value, tenant);
+                                                             storage_result.value, user, tenant);
     if (!insert_version_result.success) {
         return Result<void>::err("Failed to record version: " + insert_version_result.error);
     }
@@ -807,7 +813,7 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     auto update_result = context->db->update_file_current_version(file_uid, version_timestamp, tenant);
     if (!update_result.success) return Result<void>::err("Failed to update current version: " + update_result.error);
     auto insert_version_result = context->db->insert_version(file_uid, version_timestamp,
-                                                             static_cast<int64_t>(original_size), storage_path, tenant);
+                                                             static_cast<int64_t>(original_size), storage_path, user, tenant);
     if (!insert_version_result.success) return Result<void>::err("Failed to record version: " + insert_version_result.error);
     auto update_size_result = context->db->update_file_size(file_uid, static_cast<int64_t>(original_size), tenant);
     if (!update_size_result.success) {
@@ -1193,7 +1199,7 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                 context->storage_tracker->record_file_creation(store_result.value, storage_result.value.size(), tenant);
             }
             auto insert_version_result = context->db->insert_version(new_uid, ver, storage_result.value.size(),
-                                                                     store_result.value, tenant);
+                                                                     store_result.value, user, tenant);
             if (!insert_version_result.success) {
                 return Result<void>::err("Failed to record version " + ver + ": " + insert_version_result.error);
             }
@@ -1260,7 +1266,7 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                     continue;
                 }
                 context->db->update_file_current_version(r_new_uid, r_ver, tenant);
-                context->db->insert_version(r_new_uid, r_ver, r_read.value.size(), r_store.value, tenant);
+                context->db->insert_version(r_new_uid, r_ver, r_read.value.size(), r_store.value, user, tenant);
                 context->db->update_file_size(r_new_uid, static_cast<int64_t>(r_read.value.size()), tenant);
                 context->db->update_file_modified(r_new_uid, tenant);
             }

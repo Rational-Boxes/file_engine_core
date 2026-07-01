@@ -101,7 +101,7 @@ public:
     Result<void> update_file_parent(const std::string&, const std::string&, const std::string&) override { return Result<void>::ok(); }
     Result<std::string> path_to_uid(const std::string&, const std::string&) override { return Result<std::string>::ok(""); }
     Result<std::vector<std::string>> uid_to_path(const std::string&, const std::string&) override { return Result<std::vector<std::string>>::ok({}); }
-    Result<int64_t> insert_version(const std::string&, const std::string&, int64_t, const std::string&, const std::string&) override { return Result<int64_t>::ok(0); }
+    Result<int64_t> insert_version(const std::string&, const std::string&, int64_t, const std::string&, const std::string&, const std::string&) override { return Result<int64_t>::ok(0); }
     Result<std::optional<std::string>> get_version_storage_path(const std::string&, const std::string&, const std::string&) override { return Result<std::optional<std::string>>::ok(std::nullopt); }
     Result<std::vector<std::string>> list_versions(const std::string&, const std::string&) override { return Result<std::vector<std::string>>::ok({}); }
     Result<bool> restore_to_version(const std::string&, const std::string&, const std::string&, const std::string&) override { return Result<bool>::ok(true); }
