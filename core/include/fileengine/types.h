@@ -29,6 +29,7 @@ struct FileInfo {
     int permissions;
     int32_t version_count;        // Number of versions for the file
     int32_t rendition_count = 0;  // Hidden child renditions (files only; 0 for dirs)
+    bool deleted = false;         // Soft-deleted (surfaced by *_with_deleted listings)
 };
 
 // Directory entry - updated to use UUID for identification
@@ -41,6 +42,7 @@ struct DirectoryEntry {
     int64_t modified_at;          // Unix timestamp for modification time
     int32_t version_count;        // Number of versions for files
     int32_t rendition_count = 0;  // Hidden child renditions (files only; 0 for dirs)
+    bool deleted = false;         // Soft-deleted (only set by listdir_with_deleted)
 };
 
 // Result types

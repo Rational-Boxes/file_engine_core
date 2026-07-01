@@ -663,6 +663,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
             info.permissions = std::stoi(PQgetvalue(res, i, 4));
             bool is_container = (strcmp(PQgetvalue(res, i, 5), "t") == 0 || strcmp(PQgetvalue(res, i, 5), "1") == 0);
             info.type = is_container ? FileType::DIRECTORY : FileType::REGULAR_FILE;
+            info.deleted = (strcmp(PQgetvalue(res, i, 6), "t") == 0 || strcmp(PQgetvalue(res, i, 6), "1") == 0);  // index 6: f.deleted
             info.rendition_count = std::stoi(PQgetvalue(res, i, 7));  // index 7: after deleted (6)
             // Use current time for timestamps since we don't have these in the schema
             auto now = std::chrono::system_clock::now();

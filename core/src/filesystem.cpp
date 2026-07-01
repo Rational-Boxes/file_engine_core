@@ -214,6 +214,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
         entry.modified_at = to_epoch_seconds(file_info.modified_at);
         entry.version_count = file_info.version_count;
         entry.rendition_count = file_info.rendition_count;
+        entry.deleted = file_info.deleted;
 
         entries.push_back(entry);
     }
@@ -255,6 +256,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::
         entry.modified_at = to_epoch_seconds(file_info.modified_at);
         entry.version_count = file_info.version_count;
         entry.rendition_count = file_info.rendition_count;
+        entry.deleted = file_info.deleted;
 
         entries.push_back(entry);
     }
