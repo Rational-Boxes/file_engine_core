@@ -330,58 +330,70 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
                                                const std::string& user,
                                                const std::vector<std::string>& roles,
                                                const std::map<std::string, std::string>& claims) {
-    // Union model: every matching ALLOW grant contributes its bits, regardless
-    // of principal type. DENY grants are unioned into a separate mask and
-    // subtracted at the end so any matching deny wins (POSIX-NFSv4 style).
-    // See plan §6.1.
-    // Read-by-default: every principal starts with a baseline READ so a resource
-    // with no explicit ALLOW is still readable by any user. A matching DENY
-    // (including a DENY to the everyone/OTHER principal) clears it below, since
-    // deny always wins. Disable via set_default_read(false) for a strict
-    // private-by-default deployment. See plan §2.4.
-    int allow_mask = default_read_ ? static_cast<int>(Permission::READ) : 0;
-    int deny_mask = 0;
+    // Tiered, most-specific-wins evaluation. For each permission bit the first
+    // tier that has a matching rule decides it; within a tier a DENY beats an
+    // ALLOW. Tiers, highest precedence first:
+    //   [0] USER          — a rule for this exact user
+    //   [1] ROLE / CLAIM  — a matching role, a matching claim, or a group
+    //   [2] OTHER         — explicit "everyone" rules
+    //   fall-through      — READ allowed (read-by-default), everything else denied
+    //
+    // This lets a more-specific ALLOW override a less-specific DENY, which the
+    // old flat "allow & ~deny" model could not express: e.g. a private home
+    // folder (everyone DENY, owner ALLOW) or a role-gated section (everyone DENY
+    // read, role ALLOW) — the user/role resolves before the everyone-DENY.
+    // Read-by-default is the terminal fall-through; disable via
+    // set_default_read(false) for strict private-by-default. See plan §6.1.
 
-    auto matches_principal = [&](const ACLRule& rule) -> bool {
+    // Classify a rule: 0=user tier, 1=role/claim tier, 2=everyone tier, -1=no match.
+    auto tier_of = [&](const ACLRule& rule) -> int {
         switch (rule.type) {
             case PrincipalType::USER:
-                return rule.principal == user;
+                return rule.principal == user ? 0 : -1;
             case PrincipalType::ROLE:
                 for (const auto& role : roles) {
-                    if (rule.principal == role) return true;
+                    if (rule.principal == role) return 1;
                 }
-                return false;
+                return -1;
             case PrincipalType::CLAIM: {
-                // ABAC: the rule's principal is "key=value"; it matches iff the
-                // principal presents that exact claim. A malformed principal
-                // (no '=') or an absent/mismatched claim never matches. See
-                // plan §6.4.
+                // ABAC: principal is "key=value"; matches iff that exact claim is
+                // presented. Malformed (no '=') or absent/mismatched never matches.
                 auto eq = rule.principal.find('=');
-                if (eq == std::string::npos) return false;
+                if (eq == std::string::npos) return -1;
                 const std::string key = rule.principal.substr(0, eq);
                 const std::string value = rule.principal.substr(eq + 1);
                 auto it = claims.find(key);
-                return it != claims.end() && it->second == value;
+                return (it != claims.end() && it->second == value) ? 1 : -1;
             }
             case PrincipalType::GROUP:
-                // GROUP membership is not yet modeled (plan §2.3); treat as global.
-                return true;
+                // GROUP membership is not yet modeled (plan §2.3); treat as a
+                // global match in the role/claim tier.
+                return 1;
             case PrincipalType::OTHER:
-                return true;
+                return 2;
         }
-        return false;
+        return -1;
     };
 
+    int allow[3] = {0, 0, 0};
+    int deny[3] = {0, 0, 0};
     for (const auto& rule : rules) {
-        if (!matches_principal(rule)) continue;
-        if (rule.effect == AclEffect::DENY) {
-            deny_mask |= rule.permissions;
-        } else {
-            allow_mask |= rule.permissions;
-        }
+        int t = tier_of(rule);
+        if (t < 0) continue;
+        if (rule.effect == AclEffect::DENY) deny[t] |= rule.permissions;
+        else allow[t] |= rule.permissions;
     }
 
-    return allow_mask & ~deny_mask;
+    int result = 0;
+    int undecided = ~0;  // permission bits not yet settled by a higher tier
+    for (int t = 0; t < 3; ++t) {
+        result |= (allow[t] & ~deny[t]) & undecided;  // grant this tier's allows (deny wins in-tier)
+        undecided &= ~(allow[t] | deny[t]);            // any bit this tier touched is now settled
+    }
+    if (default_read_) {
+        result |= static_cast<int>(Permission::READ) & undecided;  // terminal read-by-default
+    }
+    return result;
 }
 
 bool AclManager::ancestors_readable(const std::string& resource_uid,

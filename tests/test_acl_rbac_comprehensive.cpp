@@ -1881,18 +1881,88 @@ void test_everyone_deny_blocks_read() {
     TEST_ASSERT(check.success && !check.value, "everyone DENY blocks READ for any user");
 }
 
-void test_everyone_deny_overrides_user_allow() {
+void test_user_allow_beats_everyone_deny() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
-    std::string res = "doc-locked";
+    std::string res = "home-alice";
 
-    // Even an explicit per-user ALLOW cannot beat a DENY to everyone — deny wins.
+    // Home-folder pattern: deny everyone, but the owner keeps access. The user
+    // tier resolves before the everyone tier, so alice's ALLOW wins over the
+    // everyone DENY — while a non-owner still falls through to that DENY.
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
     acl.grant_permission(res, kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions(res, "alice", {});
-    TEST_ASSERT(!has_perm(eff.value, PERM_READ), "everyone DENY beats a specific user ALLOW");
+    TEST_ASSERT(has_perm(eff.value, PERM_READ), "user ALLOW beats everyone DENY (home folder)");
+
+    auto other = acl.get_effective_permissions(res, "bob", {});
+    TEST_ASSERT(!has_perm(other.value, PERM_READ), "everyone DENY still blocks a non-owner");
+}
+
+void test_role_allow_beats_everyone_deny() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "dept-engineering";
+
+    // Role-gated section: deny everyone read, allow the role read+write. A member
+    // resolves at the role/claim tier (before the everyone DENY); a non-member
+    // falls through to the everyone DENY.
+    acl.grant_permission(res, "engineering", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    auto member = acl.get_effective_permissions(res, "alice", {"engineering"});
+    TEST_ASSERT(has_perm(member.value, PERM_READ) && has_perm(member.value, PERM_WRITE),
+                "role ALLOW beats everyone DENY for a member");
+    auto outsider = acl.get_effective_permissions(res, "bob", {"sales"});
+    TEST_ASSERT(!has_perm(outsider.value, PERM_READ), "everyone DENY blocks a non-member");
+}
+
+void test_deny_wins_within_a_tier() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    std::string res = "doc-mixed";
+
+    // Same tier (role): a DENY beats an ALLOW for the same bit.
+    acl.grant_permission(res, "r-allow", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "r-deny", PrincipalType::ROLE, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+
+    auto eff = acl.get_effective_permissions(res, "u", {"r-allow", "r-deny"});
+    TEST_ASSERT(has_perm(eff.value, PERM_READ), "role READ allowed");
+    TEST_ASSERT(!has_perm(eff.value, PERM_WRITE), "role DENY beats role ALLOW in-tier (write)");
+}
+
+void test_user_tier_beats_role_tier() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+
+    // User tier resolves before the role tier: a user DENY beats a role ALLOW,
+    // and a user ALLOW beats a role DENY, for the same bit.
+    std::string res = "doc-tiers";
+    acl.grant_permission(res, "team", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+    auto eff = acl.get_effective_permissions(res, "alice", {"team"});
+    TEST_ASSERT(has_perm(eff.value, PERM_READ), "role READ applies (user tier silent on read)");
+    TEST_ASSERT(!has_perm(eff.value, PERM_WRITE), "user DENY beats role ALLOW (write)");
+
+    std::string res2 = "doc-tiers2";
+    acl.grant_permission(res2, "team", PrincipalType::ROLE, PERM_WRITE,
+                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+    acl.grant_permission(res2, "alice", PrincipalType::USER, PERM_WRITE);
+    auto eff2 = acl.get_effective_permissions(res2, "alice", {"team"});
+    TEST_ASSERT(has_perm(eff2.value, PERM_WRITE), "user ALLOW beats role DENY (write)");
+}
+
+void test_write_denied_by_default() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    // No ACLs: everyone reads (read-by-default) but write is not granted.
+    auto eff = acl.get_effective_permissions("doc-fresh", "anyone", {});
+    TEST_ASSERT(has_perm(eff.value, PERM_READ), "read allowed by default");
+    TEST_ASSERT(!has_perm(eff.value, PERM_WRITE), "write denied by default (fall-through)");
 }
 
 void test_parent_readable_child_readable() {
@@ -2202,7 +2272,11 @@ int main() {
 
     std::cout << "\n--- 13. Read-by-default, everyone group, parent traversal ---\n";
     run_test("everyone DENY blocks read for any user", test_everyone_deny_blocks_read);
-    run_test("everyone DENY overrides a specific user ALLOW", test_everyone_deny_overrides_user_allow);
+    run_test("user ALLOW beats everyone DENY (home folder)", test_user_allow_beats_everyone_deny);
+    run_test("role ALLOW beats everyone DENY (gated section)", test_role_allow_beats_everyone_deny);
+    run_test("DENY wins within a tier", test_deny_wins_within_a_tier);
+    run_test("user tier beats role tier", test_user_tier_beats_role_tier);
+    run_test("write denied by default (read-by-default)", test_write_denied_by_default);
     run_test("readable parent -> child readable by default", test_parent_readable_child_readable);
     run_test("user with parent access reads unowned file", test_user_with_parent_read_can_read_unowned_file);
     run_test("parent DENY blocks child subtree", test_parent_deny_blocks_child_subtree);
