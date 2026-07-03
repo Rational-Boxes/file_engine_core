@@ -1117,10 +1117,20 @@ void test_default_acls_creator_gets_rwe() {
     TEST_ASSERT(result.success, "apply_default_acls should succeed");
 
     auto perms = acl.get_effective_permissions(res, "creator_user", {});
+    // Creator gets FULL control over what they create: read/write/execute, delete,
+    // the deleted-item lifecycle (list-deleted/undelete) and the version lifecycle
+    // (view/retrieve/restore), plus MANAGE_ACL. CULL_VERSIONS stays opt-in.
     TEST_ASSERT(has_perm(perms.value, PERM_READ), "creator should have READ");
     TEST_ASSERT(has_perm(perms.value, PERM_WRITE), "creator should have WRITE");
     TEST_ASSERT(has_perm(perms.value, PERM_EXECUTE), "creator should have EXECUTE");
-    TEST_ASSERT(!has_perm(perms.value, PERM_DELETE), "creator should NOT have DELETE by default");
+    TEST_ASSERT(has_perm(perms.value, PERM_DELETE), "creator should have DELETE");
+    TEST_ASSERT(has_perm(perms.value, PERM_LIST_DELETED), "creator should have LIST_DELETED");
+    TEST_ASSERT(has_perm(perms.value, PERM_UNDELETE), "creator should have UNDELETE");
+    TEST_ASSERT(has_perm(perms.value, PERM_VIEW_VERSIONS), "creator should have VIEW_VERSIONS");
+    TEST_ASSERT(has_perm(perms.value, PERM_RETRIEVE_BACK_VERSION), "creator should have RETRIEVE_BACK_VERSION");
+    TEST_ASSERT(has_perm(perms.value, PERM_RESTORE_TO_VERSION), "creator should have RESTORE_TO_VERSION");
+    TEST_ASSERT(has_perm(perms.value, PERM_MANAGE_ACL), "creator should have MANAGE_ACL");
+    TEST_ASSERT(!has_perm(perms.value, PERM_CULL_VERSIONS), "creator should NOT have CULL_VERSIONS by default (destructive, opt-in)");
 }
 
 void test_default_acls_other_gets_read_when_world_readable() {
@@ -1508,7 +1518,10 @@ void test_grpc_bitmask_regression_octal_vs_hex() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "regression-resource";
-    acl.apply_default_acls(res, "alice");
+    // Grant exactly READ|WRITE (NOT DELETE/LIST_DELETED) so the octal-collision
+    // checks below are meaningful — the creator's default ACL now includes DELETE
+    // and LIST_DELETED (full owner control), which would mask this regression.
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
 
     // Correct enum constants: creator can READ and WRITE their own resource.
     auto correct_read  = acl.check_permission(res, "alice", {}, static_cast<int>(Permission::READ));
@@ -1518,9 +1531,9 @@ void test_grpc_bitmask_regression_octal_vs_hex() {
     TEST_ASSERT(correct_write.success && correct_write.value,
                 "creator must satisfy WRITE check using Permission::WRITE");
 
-    // Legacy octal constants: creator's default ACL does NOT grant DELETE or
-    // LIST_DELETED, so the octal-bit check would have failed. This documents
-    // the bug class — if these flip to true, someone re-introduced octal.
+    // Legacy octal constants: alice was granted only READ|WRITE, so a check for
+    // DELETE (0400) or LIST_DELETED (0200) must fail. This documents the bug
+    // class — if these flip to true, someone re-introduced octal.
     auto legacy_read  = acl.check_permission(res, "alice", {}, legacy_octal_read);
     auto legacy_write = acl.check_permission(res, "alice", {}, legacy_octal_write);
     TEST_ASSERT(legacy_read.success  && !legacy_read.value,
@@ -2226,7 +2239,7 @@ int main() {
     run_test("inherit from empty parent", test_inherit_from_empty_parent);
 
     std::cout << "\n--- 8. Default ACLs ---\n";
-    run_test("default ACLs: creator gets R|W|X", test_default_acls_creator_gets_rwe);
+    run_test("default ACLs: creator gets FULL control", test_default_acls_creator_gets_rwe);
     run_test("default ACLs: other gets READ when world-readable enabled", test_default_acls_other_gets_read_when_world_readable);
     run_test("default ACLs: read-by-default (any user can read)", test_default_acls_read_by_default);
     run_test("default-read can be disabled (private-by-default opt-in)", test_default_read_can_be_disabled);

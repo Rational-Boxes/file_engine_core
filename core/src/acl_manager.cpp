@@ -231,14 +231,21 @@ std::vector<std::string> AclManager::resolve_effective_roles(const std::string& 
 Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
                                            const std::string& creator,
                                            const std::string& tenant) {
-    // Creator always gets full access on the resource they created, including
-    // MANAGE_ACL so they can grant/revoke permissions for other principals.
-    // ACL_INHERIT is set so the creator's rule cascades to children if this
-    // resource is later treated as a parent.
+    // Creator gets FULL control on the resource they created — so they can manage
+    // their own content end to end: delete + list-deleted/undelete, and the full
+    // version lifecycle (view/retrieve/restore), plus MANAGE_ACL to share it.
+    // ACL_INHERIT cascades the rule to children. (CULL_VERSIONS is destructive and
+    // stays opt-in, granted explicitly.)
     auto grant_result = grant_permission(resource_uid, creator, PrincipalType::USER,
                                         static_cast<int>(Permission::READ)
                                         | static_cast<int>(Permission::WRITE)
                                         | static_cast<int>(Permission::EXECUTE)
+                                        | static_cast<int>(Permission::DELETE)
+                                        | static_cast<int>(Permission::LIST_DELETED)
+                                        | static_cast<int>(Permission::UNDELETE)
+                                        | static_cast<int>(Permission::VIEW_VERSIONS)
+                                        | static_cast<int>(Permission::RETRIEVE_BACK_VERSION)
+                                        | static_cast<int>(Permission::RESTORE_TO_VERSION)
                                         | static_cast<int>(Permission::MANAGE_ACL)
                                         | static_cast<int>(Permission::ACL_INHERIT),
                                         tenant, creator);

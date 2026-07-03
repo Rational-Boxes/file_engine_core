@@ -1853,9 +1853,9 @@ void FileSystem::apply_acls_for_new_resource(const std::string& parent_uid,
     if (!acl_manager_) {
         return;
     }
-    // Creator always gets default USER bits (READ|WRITE|EXECUTE|MANAGE_ACL|
-    // ACL_INHERIT) so they can manage what they just created — regardless of
-    // what cascades down from the parent.
+    // Creator gets FULL control on what they just created (read/write/delete,
+    // list-deleted/undelete, the version lifecycle, MANAGE_ACL, inherit) so they
+    // can fully manage it — regardless of what cascades down from the parent.
     auto default_result = acl_manager_->apply_default_acls(new_uid, user, tenant);
     if (!default_result.success) {
         SERVER_LOG_WARN("FileSystem::apply_acls_for_new_resource",
@@ -1883,7 +1883,9 @@ std::vector<IDatabase::AclGrant> FileSystem::compute_initial_acl_grants(
         return grants;
     }
 
-    // Creator's default USER bits. Mirrors apply_default_acls semantics.
+    // Creator's default USER bits — FULL control. Mirrors apply_default_acls:
+    // delete + list-deleted/undelete + version lifecycle + MANAGE_ACL + inherit
+    // (CULL_VERSIONS stays opt-in).
     IDatabase::AclGrant creator_grant;
     creator_grant.principal = creator;
     creator_grant.type = static_cast<int>(PrincipalType::USER);
@@ -1891,6 +1893,12 @@ std::vector<IDatabase::AclGrant> FileSystem::compute_initial_acl_grants(
         static_cast<int>(Permission::READ)
         | static_cast<int>(Permission::WRITE)
         | static_cast<int>(Permission::EXECUTE)
+        | static_cast<int>(Permission::DELETE)
+        | static_cast<int>(Permission::LIST_DELETED)
+        | static_cast<int>(Permission::UNDELETE)
+        | static_cast<int>(Permission::VIEW_VERSIONS)
+        | static_cast<int>(Permission::RETRIEVE_BACK_VERSION)
+        | static_cast<int>(Permission::RESTORE_TO_VERSION)
         | static_cast<int>(Permission::MANAGE_ACL)
         | static_cast<int>(Permission::ACL_INHERIT);
     creator_grant.performed_by = creator;
