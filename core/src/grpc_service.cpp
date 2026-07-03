@@ -174,6 +174,12 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "ListDirectory failed for uid: " + dir_uid + " with error: " + result.error);
     } else {
         for (const auto& entry : result.value) {
+            // Hide entries the caller cannot read (e.g. private home folders), so a
+            // listing only shows what the user may actually access. system_admin
+            // bypasses this inside AclManager; read-by-default keeps normal entries.
+            if (!validate_user_permissions(entry.uid, auth_context, static_cast<int>(Permission::READ))) {
+                continue;
+            }
             auto* dir_entry = response->add_entries();
             dir_entry->set_uid(entry.uid);
             dir_entry->set_name(entry.name);
@@ -239,6 +245,10 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
         SERVER_LOG_ERROR("GRPCService", "ListDirectoryWithDeleted failed for uid: " + dir_uid + " with error: " + result.error);
     } else {
         for (const auto& entry : result.value) {
+            // Hide entries the caller cannot read (same policy as ListDirectory).
+            if (!validate_user_permissions(entry.uid, auth_context, static_cast<int>(Permission::READ))) {
+                continue;
+            }
             auto* dir_entry = response->add_entries();
             dir_entry->set_uid(entry.uid);
             dir_entry->set_name(entry.name);
