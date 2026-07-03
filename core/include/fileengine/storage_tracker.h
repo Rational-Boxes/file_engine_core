@@ -59,7 +59,11 @@ public:
     
     // Get overall storage report
     StorageUsage get_overall_storage_report();
-    
+
+    // Live status of the node/filesystem the files are cached on (fresh statvfs).
+    // This is host-level (NOT tenant-scoped) — the disk the store lives on.
+    StorageUsage get_node_usage() const;
+
 private:
     std::string base_path_;
     std::map<std::string, FileUsage> file_usage_map_;  // path -> FileUsage

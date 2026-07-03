@@ -1565,14 +1565,9 @@ grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
 
     try {
         if (storage_tracker_) {
-            fileengine::StorageUsage usage;
-            if (tenant == "default" || tenant.empty()) {
-                // Get overall storage usage if no specific tenant requested
-                usage = storage_tracker_->get_overall_storage_report();
-            } else {
-                // Get storage usage for specific tenant
-                usage = storage_tracker_->get_tenant_usage(tenant);
-            }
+            // Storage usage reports the status of the NODE / filesystem the files
+            // are cached on — it is host-level, not tenant-scoped.
+            fileengine::StorageUsage usage = storage_tracker_->get_node_usage();
 
             response->set_success(true);
             response->set_error("");

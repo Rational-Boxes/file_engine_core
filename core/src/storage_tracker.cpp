@@ -262,6 +262,12 @@ StorageUsage StorageTracker::get_overall_storage_report() {
     return overall_usage_;
 }
 
+StorageUsage StorageTracker::get_node_usage() const {
+    // Host/filesystem status of the disk the store is cached on — a live statvfs,
+    // independent of any tenant or tracked-file bookkeeping.
+    return get_filesystem_stats();
+}
+
 StorageUsage StorageTracker::get_filesystem_stats() const {
     struct statvfs fs_info;
     
