@@ -1156,13 +1156,12 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
             bool is_container = (strcmp(PQgetvalue(res, 0, 5), "t") == 0 || strcmp(PQgetvalue(res, 0, 5), "1") == 0);
             bool is_deleted = (strcmp(PQgetvalue(res, 0, 6), "t") == 0 || strcmp(PQgetvalue(res, 0, 6), "1") == 0);
 
-            if (is_deleted) {
-                // Even if we're including deleted files, return nullopt to indicate the file is not accessible
-                PQclear(res);
-                connection_pool_->release(conn);
-                return Result<std::optional<FileInfo>>::ok(std::nullopt);
-            }
-
+            // This is the *include_deleted* lookup: unlike get_file_by_uid (which
+            // filters WHERE deleted = FALSE) it MUST return soft-deleted rows too,
+            // with `deleted` set — otherwise callers can't resolve a just-deleted
+            // row's metadata (delete/rmdir event enrichment) and reachability checks
+            // can't detect a deleted ANCESTOR. Returning nullopt here was a latent
+            // bug that made both silently no-op.
             FileInfo info;
             info.uid = uid;
             info.name = name;
@@ -1172,6 +1171,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
             info.size = size;
             info.owner = owner;
             info.permissions = permissions;
+            info.deleted = is_deleted;
             // Use current time for timestamps since we don't have these in the schema
             auto now = std::chrono::system_clock::now();
             info.created_at = now;

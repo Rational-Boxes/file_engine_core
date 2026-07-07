@@ -208,7 +208,17 @@ public:
     // Used by callers to decide between inherit_acls and apply_default_acls.
     bool parent_has_inheritable_acls(const std::string& parent_uid,
                                      const std::string& tenant = "");
-    
+
+    // Reachability by deletion: true iff any STRICT ancestor (parent chain, not
+    // the node itself) is soft-deleted. A soft-deleted folder hides its whole
+    // subtree WITHOUT touching each descendant's own `deleted` flag, so delete/
+    // undelete of a parent never rewrites a child's independent state. Used by
+    // the permission path and by exists()/listdir() so descendants of a deleted
+    // folder never leak into any surface (listing, direct UID, search, dashboard).
+    // A node with no record or an empty parent is root-level, hence not hidden.
+    bool has_deleted_ancestor(const std::string& resource_uid,
+                              const std::string& tenant = "");
+
 private:
     std::shared_ptr<IDatabase> db_;
     bool default_world_readable_ = false;

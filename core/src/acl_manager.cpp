@@ -403,11 +403,46 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
     return result;
 }
 
+bool AclManager::has_deleted_ancestor(const std::string& resource_uid,
+                                      const std::string& tenant) {
+    // Walk the parent chain (STRICT ancestors only — never the node itself, whose
+    // own `deleted` flag is enforced by the caller's get_file_by_uid). If any
+    // ancestor is soft-deleted the resource is hidden. `include_deleted` is used
+    // so a deleted ancestor is *seen* (the default lookup filters deleted rows).
+    std::set<std::string> visited;
+    std::string current = resource_uid;
+    while (true) {
+        auto file = db_->get_file_by_uid_include_deleted(current, tenant);
+        if (!file.success || !file.value.has_value()) {
+            return false; // no record — root / bare resource — not hidden
+        }
+        const std::string parent = file.value->parent_uid;
+        if (parent.empty()) {
+            return false; // reached the filesystem root
+        }
+        if (!visited.insert(parent).second) {
+            return false; // defensive cycle guard
+        }
+        auto pinfo = db_->get_file_by_uid_include_deleted(parent, tenant);
+        if (pinfo.success && pinfo.value.has_value() && pinfo.value->deleted) {
+            return true; // a strict ancestor is soft-deleted -> subtree hidden
+        }
+        current = parent;
+    }
+}
+
 bool AclManager::ancestors_readable(const std::string& resource_uid,
                                     const std::string& user,
                                     const std::vector<std::string>& roles,
                                     const std::map<std::string, std::string>& claims,
                                     const std::string& tenant) {
+    // Reachability by deletion first: a resource under a soft-deleted folder is
+    // hidden regardless of ACLs, so it never leaks through any permission-gated
+    // surface (stat/get/read/listdir/check_permission -> search, dashboard).
+    if (has_deleted_ancestor(resource_uid, tenant)) {
+        return false;
+    }
+
     // Walk from the resource up to the filesystem root. Every ancestor
     // container must grant READ to the principal, else the resource is
     // unreachable — this is what makes a DENY READ on a folder (e.g. to
