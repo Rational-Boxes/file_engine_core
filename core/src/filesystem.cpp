@@ -151,18 +151,12 @@ Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& us
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "User " + user + " has permission to remove directory " + dir_uid);
 
-    // First, check if directory is empty
-    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
-              "Checking if directory " + dir_uid + " is empty");
-    auto list_result = listdir(dir_uid, user, roles, tenant);
-    if (list_result.success && !list_result.value.empty()) {
-        SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
-                  "Directory " + dir_uid + " is not empty, contains " +
-                  std::to_string(list_result.value.size()) + " items");
-        return Result<void>::err("Directory is not empty");
-    }
-    SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
-              "Directory " + dir_uid + " is empty, proceeding with removal");
+    // A non-empty directory may be deleted: soft-deleting the folder node hides
+    // its whole subtree by reachability (a descendant of a deleted folder is
+    // treated as unreachable everywhere — see AclManager::has_deleted_ancestor),
+    // WITHOUT rewriting each child's own `deleted` flag. So an undelete of this
+    // folder restores exactly the children that weren't individually deleted, and
+    // children someone did delete stay deleted. No recursive child delete needed.
 
     // Mark directory as deleted in database
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
@@ -189,12 +183,26 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
         return Result<std::vector<DirectoryEntry>>::err("Database not available for tenant: " + tenant);
     }
     
-    // Check permissions - the user needs read permission on the directory
+    // Check permissions - the user needs read permission on the directory.
+    // (validate_user_permissions -> ancestors_readable also hides the directory
+    // when one of ITS ancestors is soft-deleted.)
     auto perm_result = validate_user_permissions(dir_uid, user, roles, static_cast<int>(Permission::READ), tenant);
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<DirectoryEntry>>::err("User does not have permission to list directory");
     }
-    
+
+    // A directory that is itself soft-deleted must not enumerate its children —
+    // otherwise a stale/deep-linked UID could leak the contents of a deleted
+    // folder even though it's hidden from its parent's listing. The hardcoded
+    // system_admin bypasses this (and all ACL/reachability hiding) so a superuser
+    // is never locked out of inspecting or recovering a deleted subtree.
+    if (!acl_manager_ || !acl_manager_->is_system_admin(user, roles, tenant)) {
+        auto dir_info = context->db->get_file_by_uid_include_deleted(dir_uid, tenant);
+        if (dir_info.success && dir_info.value.has_value() && dir_info.value->deleted) {
+            return Result<std::vector<DirectoryEntry>>::err("Directory does not exist");
+        }
+    }
+
     // List files in the directory
     auto db_result = context->db->list_files_in_directory(dir_uid, tenant);
     if (!db_result.success) {
@@ -970,13 +978,24 @@ Result<bool> FileSystem::exists(const std::string& file_uid, const std::string& 
     if (!context || !context->db) {
         return Result<bool>::err("Database not available for tenant: " + tenant);
     }
-    
+
     auto db_result = context->db->get_file_by_uid(file_uid, tenant);
     if (!db_result.success) {
         return Result<bool>::err(db_result.error);
     }
-    
-    return Result<bool>::ok(db_result.value.has_value());
+    if (!db_result.value.has_value()) {
+        return Result<bool>::ok(false);
+    }
+
+    // exists() has no principal so it skips the ACL path — but reachability by
+    // deletion is principal-independent. A descendant of a soft-deleted folder
+    // must report as not-existing so it never leaks into surfaces built on
+    // exists() (e.g. the dashboard's is-live check).
+    if (acl_manager_ && acl_manager_->has_deleted_ancestor(file_uid, tenant)) {
+        return Result<bool>::ok(false);
+    }
+
+    return Result<bool>::ok(true);
 }
 
 namespace {
