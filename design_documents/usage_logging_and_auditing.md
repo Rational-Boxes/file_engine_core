@@ -29,11 +29,16 @@ tamper-evident, and retained.
 | **`acl_audit`** table, per tenant (`database.cpp`) — `resource_uid, principal, principal_type, action('grant'|'revoke'), permissions_before/after, performed_by, performed_at` | ACL grant/revoke | No role/privilege changes, no request context (source/session), no tamper-evidence, mutable |
 | **Event system** — `FileEventType` (`File/Dir Created/Updated/Deleted/Moved/Renamed/Restored`, `AclChanged`), `emit_fs_event`/`emit_acl_event` → Redis (`redis_event_queueing_plan.md`) | Mutations, for notifications/search/digests | **Fail-open by design** ("event emission must never disturb the filesystem operation") → not a complete record. **Reads are not emitted at all.** |
 | **`StorageTracker`** | per-file *aggregate* access counts | No per-access actor/time/result — can't answer "who read file X on the 3rd" |
-| **RoleManager** (`create_role`, `delete_role`, `assign_user_to_role`, `remove_user_from_role`) | privilege changes happen here | **Nothing is logged** |
+| **Core `RoleManager`** (`create_role`, `assign_user_to_role`, …) | the RBAC roles the core *consumes* on file ACLs | **Nothing is logged** |
+| **`ldap_manager` service** — the tenant admin console: user/group/role lifecycle, email invitations, self-service password reset/recovery, profile/password changes | where **user management and authentication self-service actually happen** | **Nothing is audited** — and password failures, lockouts, and recovery attempts have no record anywhere |
+| **Authentication at each door** (http-bridge, webdav, MCP, discussion bind to LDAP) | resolves identity per request | **Login failures / successes are not recorded** — no brute-force or takeover signal |
 
-So: permission changes are *partially* audited, mutations are logged only as
-fail-open events, **file reads and privilege changes are not audited at all**,
-and nothing is immutable or tamper-evident.
+So: permission changes are *partially* audited; mutations are logged only as
+fail-open events; **file reads, user/privilege management, and every
+authentication event (incl. password failures and recovery) are not audited at
+all**; and nothing is immutable or tamper-evident. Critically, the trail is
+**distributed** — file activity lives in the core, but user and auth activity
+lives in `ldap_manager` and the authenticating doors (§5).
 
 ---
 
@@ -55,21 +60,34 @@ policy decision (§6), not a silent drop.
 
 ## 3. What gets audited (the taxonomy)
 
-Grouped by `category`, each an `action`:
+Grouped by `category`, each an `action`. The **emitter** matters — audit is
+written by more than one service (§5), not the core alone:
 
-- **access** — `read`/`get`, `stat`, `list`, `list_deleted`, `read_version`,
-  `download_stream`, `exists`, and **denied** access attempts. (`check_permission`
-  itself is not audited to avoid recursion/noise; the *guarded operation* is.)
-- **mutate** — `create_file`, `create_dir`, `write`/`put`, `rename`, `move`,
-  `copy`, `soft_delete`, `undelete`, `restore_version`, `cull_versions`,
-  `set_metadata`, `delete_metadata`.
-- **permission** — `acl_grant`, `acl_revoke`, `acl_inherit`, `acl_default_apply`
-  (supersedes/absorbs today's `acl_audit`).
-- **privilege** — `role_create`, `role_delete`, `role_assign_user`,
-  `role_remove_user`. (Tenant lifecycle — `tenant_create`/`drop` — is a *global*
-  audit, §8.)
-- **admin** — `purge_versions`, `trigger_sync`, and **`audit_read`/`audit_export`**
-  (audit the auditors).
+- **access** *(Core gRPC)* — `read`/`get`, `stat`, `list`, `list_deleted`,
+  `read_version`, `download_stream`, `exists`, and **denied** access attempts.
+  (`check_permission` itself is not audited to avoid recursion/noise; the
+  *guarded operation* is.)
+- **mutate** *(Core gRPC)* — `create_file`, `create_dir`, `write`/`put`,
+  `rename`, `move`, `copy`, `soft_delete`, `undelete`, `restore_version`,
+  `cull_versions`, `set_metadata`, `delete_metadata`.
+- **permission** *(Core gRPC)* — `acl_grant`, `acl_revoke`, `acl_inherit`,
+  `acl_default_apply` (supersedes/absorbs today's `acl_audit`). These act on file
+  resources, so they stay in the core.
+- **user** *(ldap_manager)* — the tenant admin console owns the directory, so
+  **user and privilege lifecycle emits from `ldap_manager`, not the core**:
+  `user_create`, `user_delete`, `user_disable`, `role_create`, `role_delete`,
+  `role_assign_user`, `role_remove_user`, `group_add_member`,
+  `group_remove_member`, `profile_update`, `invite_send`. (The RBAC roles the core
+  *consumes* on file ACLs are managed here.)
+- **auth** *(every authenticating door + ldap_manager)* — authentication and
+  account recovery, including events that occur **before a session exists**:
+  `login_success`, `login_failure` (bad password / failed LDAP bind),
+  `account_lockout`, `password_reset_request`, `password_reset_complete`,
+  `password_change`. Actor is the *attempted* identity; these are the
+  brute-force / account-takeover signals a security team lives on.
+- **admin** *(Core + ldap_manager)* — `purge_versions`, `trigger_sync`, tenant
+  lifecycle (global, §8), and **`audit_read`/`audit_export`** (audit the
+  auditors).
 
 Every entry also records the **outcome**: `ok` | `denied` | `error`.
 
@@ -84,7 +102,7 @@ Append-only.
 CREATE TABLE "<schema>".audit_log (
     seq            BIGSERIAL PRIMARY KEY,      -- per-tenant monotonic order
     ts             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    category       SMALLINT     NOT NULL,      -- access|mutate|permission|privilege|admin
+    category       SMALLINT     NOT NULL,      -- access|mutate|permission|user|auth|admin
     action         VARCHAR(32)  NOT NULL,
     outcome        SMALLINT     NOT NULL,      -- ok|denied|error
     actor          VARCHAR(255) NOT NULL,      -- resolved end-user identity
@@ -112,28 +130,49 @@ the read byte range, the reviewer set, etc.).
 
 ---
 
-## 5. Where it's emitted (the single choke point)
+## 5. Where it's emitted (distributed emitters, one per-tenant sink)
 
-Three candidate layers:
+There is **no single choke point**. Audit originates in three places, all writing
+the *same* per-tenant `audit_log`:
 
-1. **gRPC service handlers** (`grpc_service`) — every RPC already has the
-   `AuthenticationContext` (user, roles, tenant, claims) and returns a
-   `Result`. This is the **natural cross-cutting seam**: one `audit(...)` helper
-   invoked once per handler with the resolved outcome. It also uniquely sees the
-   *source* metadata forwarded by the bridges (interface, client IP, request-id
-   — added to `AuthenticationContext`/metadata).
-2. **`FileSystem`/`AclManager`/`RoleManager`** — where the existing *events* are
-   emitted. Good for deep detail but blind to the request source and duplicated
-   across entry points.
-3. **A gRPC interceptor** — uniform, but too coarse to know target UIDs/outcomes
-   per method.
+1. **Core gRPC service handlers** — `access`, `mutate`, `permission`. Every RPC
+   already holds the `AuthenticationContext` (user, roles, tenant, claims) and a
+   `Result`, so one `audit(...)` per handler captures actor + outcome. Emitting
+   here — rather than in the inner `FileSystem`/`AclManager` — uniquely sees the
+   *source* metadata the bridges forward (interface, client IP, request-id). The
+   existing FileSystem event emit points stay as-is; they feed the separate
+   *event* pipeline. A thin `AuditSink` is threaded like today's `event_sink_`.
+2. **`ldap_manager` service** — the `user` category (user/role/group/profile/
+   invite lifecycle) and the self-service half of `auth` (`password_reset_request`
+   / `_complete`, `password_change`). It owns the directory and its Postgres
+   directly, so it writes its own audit entries. **User management does not pass
+   through the core**, so the core can't and shouldn't try to log it.
+3. **Every authenticating door** (http-bridge, webdav-bridge, MCP, discussion,
+   and ldap_manager's own login) — the `auth` outcomes. A failed LDAP bind happens
+   *before* a session exists, at whichever door the request hit, so each door
+   emits `login_failure` (actor = attempted username, outcome = denied, source =
+   that interface + IP) and `login_success`. This is what makes password-failure
+   and lockout auditing possible — the signal lives at the authentication layer,
+   not the core.
 
-**Recommendation: emit at the service-handler layer** (1), reusing the identity
-and outcome already in hand, and carry `source_iface`/`source_addr`/`request_id`
-by extending the auth/metadata the bridges pass. The FileSystem event emit points
-stay as-is (they feed the *event* pipeline). A thin `AuditSink` is threaded like
-the existing `event_sink_`. This keeps reads audited (they flow through the read
-RPCs) without touching hot inner loops.
+**The shared write contract.** Because several services append to one tenant's
+`audit_log`, there must be exactly one sanctioned way to write it:
+
+- *Option A — direct DB append.* Each service inserts into
+  `"<tenant_schema>".audit_log` with the append-only DB role (§7). Simplest —
+  every service already has Postgres — but the hash chain (§7) must be safe under
+  concurrent writers (a per-tenant advisory lock, or serial `seq` with deferred
+  chaining).
+- *Option B — a thin audit-ingest RPC/endpoint* (`AppendAudit(entry)`), one
+  writer owning ordering + the append-only guarantee + the hash chain; costs a
+  network hop on the (hopefully rare) auth-failure path.
+
+Leaning **B for the chain-critical categories** (one component owns tamper-
+evidence) with A acceptable where a service already holds the tenant connection —
+an open decision (§12). Either way the schema, categories, and access controls
+are identical across emitters, and each entry carries `source_iface` so a reader
+can tell a core file-read from an ldap_manager role change from a bridge login
+failure.
 
 ---
 
@@ -217,7 +256,7 @@ construction (subdomain / `X-Tenant`). Two tabs:
 
 - **Audit** — the immutable log. A filterable, paginated table over
   `QueryAuditLog`: filter by **actor**, **target** (file / user / role),
-  **category** (access · mutate · permission · privilege · admin), **action**,
+  **category** (access · mutate · permission · user · auth · admin), **action**,
   **outcome** (ok · denied · error), and **time range**. A one-click
   *denied/error* filter for security review. Each row expands to its `detail`
   (before/after permissions, move destination, version, byte range, and the
@@ -247,18 +286,23 @@ Design notes:
 
 ## 11. Rollout phases
 
-1. **Schema + writer** — provision `audit_log` (+ global) in tenant setup;
-   durable async writer with WAL; `AuditSink` wired into the service layer.
-2. **Privilege + permission** — audit RoleManager ops and fold `acl_audit` into
-   `audit_log` (keep `acl_audit` as a compatibility view during transition).
-   Fail-closed policy for these categories.
-3. **Mutations** — audit all write/delete/restore/metadata ops with `detail`.
-4. **Access logging** — audit reads/list/stat/version-reads incl. denials, with
-   the `AUDIT_ACCESS_MODE` throughput controls.
-5. **Tamper-evidence** — hash chain + `VerifyAuditChain` + append-only DB grants.
-6. **Query/export + retention** — the RPCs, REST/MCP exposure, partitioning,
+1. **Schema + write contract** — provision `audit_log` (+ global) in tenant
+   setup; the durable async writer with WAL; settle the shared write path (§5
+   Option A/B) so *every* emitter uses one sanctioned append.
+2. **Permission (core)** — fold `acl_audit` into `audit_log` (keep `acl_audit` as
+   a compatibility view during transition); fail-closed policy.
+3. **Auth (doors + ldap_manager)** — `login_failure`/`_success`, lockouts, and the
+   self-service `password_reset_*`/`password_change` from `ldap_manager`. Highest
+   security value, low volume — do it early.
+4. **User management (ldap_manager)** — user/role/group/profile/invite lifecycle
+   emitted from the admin console; fail-closed policy.
+5. **Mutations (core)** — audit all write/delete/restore/metadata ops with `detail`.
+6. **Access logging (core)** — audit reads/list/stat/version-reads incl. denials,
+   with the `AUDIT_ACCESS_MODE` throughput controls.
+7. **Tamper-evidence** — hash chain + `VerifyAuditChain` + append-only DB grants.
+8. **Query/export + retention** — the RPCs, REST/MCP exposure, partitioning,
    archival, per-tenant retention.
-7. **Frontend Audit & Events console** (§10) — the tenant-admin SPA view over the
+9. **Frontend Audit & Events console** (§10) — the tenant-admin SPA view over the
    query/export/verify APIs plus the admin-scoped live events feed.
 
 Forward-only: no backfill (there's no prior read history to reconstruct).
@@ -267,11 +311,19 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 
 ## 12. Open decisions (need a call before coding)
 
+- **Shared write path (§5 A vs B):** direct per-tenant DB append from each emitter
+  vs a single `AppendAudit` ingest owned by one writer. Drives how the hash chain
+  and append-only guarantee are enforced across the core, `ldap_manager`, and the
+  doors.
+- **Where auth failures are emitted:** each door on its own bind failure (needs a
+  shared audit-write helper in the bridges) vs. routing all authentication through
+  a common path that emits once. Doors are independent today, so the former is
+  likely — confirm.
 - **Access-log volume:** full-fidelity reads vs sampled vs aggregate `count` as
   the *default* (`AUDIT_ACCESS_MODE`). Compliance usually wants full; cost may
   push to sample-with-force-full-on-sensitive-subtrees.
-- **Fail-closed scope:** confirm `permission`/`privilege`/`admin` should block the
-  op on audit-write failure (recommended) vs degrade to WAL-only.
+- **Fail-closed scope:** confirm `permission`/`user`/`auth`/`admin` should block
+  the op on audit-write failure (recommended) vs degrade to WAL-only.
 - **Source metadata plumbing:** the bridges must forward client IP / interface /
   request-id into the `AuthenticationContext` (small proto/auth change) so
   `source_addr`/`source_iface` are populated — otherwise audit shows "who" but
