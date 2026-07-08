@@ -188,9 +188,10 @@ Audit must be **complete**, but reads are high-volume. Design:
   writer drains the WAL into Postgres and truncates on success. (Mirrors the
   core's existing "write local, sync async" philosophy.)
 - **Failure policy is per-category, configurable:**
-  - `permission`, `privilege`, `admin` → **fail-closed** by default: if the entry
-    can't be durably spooled, the *operation* is rejected. These are rare and
-    security-critical.
+  - `permission`, `user`, `auth`, `admin` → **fail-closed** by default: if the
+    entry can't be durably spooled, the *operation* is rejected. These are rare
+    and security-critical (a permission change, a role grant, or a password reset
+    must never happen silently).
   - `mutate` → spooled durably; op proceeds (WAL guarantees eventual capture).
   - `access` → spooled; on sustained backpressure, degrade per a knob
     (`AUDIT_ACCESS_MODE = full | sample:N | count`) — never silently to nothing;
