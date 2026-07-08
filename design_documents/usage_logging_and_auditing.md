@@ -404,6 +404,16 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
   `ldap_manager`-served tenant-admin console (co-located with user/role
   management). Leaning SPA — the audit data comes from the core via the REST
   bridge, not from `ldap_manager`.
+- **Rules engine — catalog vs DSL (§11):** ship a fixed, per-tenant-configurable
+  rule *catalog* first (recommended) and defer a general rule DSL until the
+  catalog's limits are felt.
+- **Auto-disable token revocation (§11):** the bridges issue stateless JWTs, so
+  "revoke live sessions" needs either a short token TTL + refresh (revocation is
+  implicit) or a shared deny-list the bridges check — decides how fast an
+  auto-disable actually cuts access.
+- **Anomaly/baseline detection (§11):** defer per-actor behavioural baselines to a
+  later phase (start with deterministic rate/sequence rules) — confirm that
+  staging.
 
 ---
 
