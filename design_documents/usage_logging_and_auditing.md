@@ -13,7 +13,9 @@ user privileges** must produce a durable audit record that a tenant
 administrator (and only they) can query and export for compliance — through a
 dedicated **Audit & Events console in the frontend** (§10). Denied attempts are
 recorded too — a rejected read of a sensitive file is exactly the signal a
-security team wants.
+security team wants. And the trail isn't only for hindsight: the same aggregated
+stream drives a **security rules engine** (§11) that detects suspicious activity
+in real time and can **flag, alert, or auto-disable**.
 
 This is distinct from the existing telemetry (aggregate ops metrics — see
 [`monitoring_and_telemetry.md`](monitoring_and_telemetry.md)) and from the event
@@ -253,7 +255,7 @@ Tenant administrators get a dedicated **Audit & Events** view in the SPA, gated 
 `AUDIT_READ` (§8) and hidden for everyone else. It lives in the admin area
 alongside the existing tenant user/role console (served by `ldap_manager`),
 consumes the §9 REST endpoints, and is scoped to the caller's tenant by
-construction (subdomain / `X-Tenant`). Two tabs:
+construction (subdomain / `X-Tenant`). Three tabs:
 
 - **Audit** — the immutable log. A filterable, paginated table over
   `QueryAuditLog`: filter by **actor**, **target** (file / user / role),
@@ -269,6 +271,10 @@ construction (subdomain / `X-Tenant`). Two tabs:
   plan) but in an **admin, tenant-wide** scope rather than the personal dashboard
   feed — recent file/permission activity across the tenant as it happens, still
   ACL-filtered to what the admin may see.
+- **Security** — the rules-engine surface (§11): open **incidents** (flagged
+  suspicious activity, each linking to its evidence rows in the Audit tab), **rule
+  configuration** (enable/disable, mode = flag · alert · auto-disable, thresholds,
+  dry-run toggle), and a **disabled-accounts** review with one-click re-enable.
 
 Design notes:
 
@@ -285,7 +291,66 @@ Design notes:
 
 ---
 
-## 11. Rollout phases
+## 11. Security rules engine (detect → flag / alert / auto-disable)
+
+The trail isn't only for hindsight. A **rules engine** rides the aggregated
+activity stream to catch suspicious behaviour as it happens and respond. It is a
+**consumer** of the same per-tenant feed the audit writer produces (§5) and the
+dashboard activity aggregator (discussion service) already builds — not a new
+emit point, and not in any request's hot path.
+
+**Where it runs.** A dedicated consumer alongside the existing event/activity
+aggregator: it subscribes to the audit/event stream (Redis), keeps small
+per-tenant sliding-window counters, evaluates rules, and acts. Per-tenant
+isolation is inherited from the stream; rules + responses are configured per
+tenant (with conservative system defaults).
+
+**What it detects.**
+- **Rate / threshold** — N `login_failure` for one actor or source IP in M minutes
+  (brute force); X `access` reads or `download_stream` bytes in Y minutes (bulk
+  exfiltration); a burst of `soft_delete` (mass deletion).
+- **Sequence / pattern** — `login_failure`×k then `login_success` (a successful
+  guess); a `permission`/`user` change immediately followed by broad access;
+  first-ever access from a new source IP/interface; access to a sensitive-tagged
+  subtree.
+- **Baseline / anomaly** (later phase) — deviation from an actor's rolling norm
+  (volume, hours, breadth of tree touched).
+
+**Graduated response, per rule.**
+- **flag** — record an incident, surface it in the console's Security tab (§10)
+  and the admin digest. No user impact.
+- **alert** — notify tenant admins out-of-band via the existing digest channel
+  (email/push), rate-limited so it never becomes a notification treadmill (the
+  Phase-3 anti-goal).
+- **auto-disable** — the strong response: disable the actor via `ldap_manager`
+  (`user_disable` / `account_lockout`) and/or revoke live tokens/sessions at the
+  bridges' token store. It orchestrates *existing* enforcement — it invents no new
+  kill path.
+
+**Auto-disable safeguards (this is the dangerous lever).**
+- **Off by default.** Every rule ships in `flag` or `alert` mode; auto-disable is
+  an explicit per-rule opt-in, and starts in a **dry-run** ("would have disabled")
+  window so an admin can confirm the rule is sane before it bites.
+- **Never lock everyone out.** Refuse to auto-disable the last enabled tenant
+  admin; service accounts are exemptible via an allowlist; a cooldown prevents
+  flapping.
+- **Reversible, human-in-the-loop.** A disabled account appears in the Security
+  tab with one-click re-enable; auto-disable can require admin confirmation rather
+  than acting unattended (a per-rule choice).
+- **Fully audited.** Every detect / flag / alert / disable is itself an
+  `admin`-category audit entry (which rule, why, the evidence rows), so the
+  engine's own actions are on the same immutable, tamper-evident record; an
+  auto-disable also emits the corresponding `user`/`auth` event.
+
+**Reuse, not reinvention.** The engine composes what already exists — the event
+aggregator, the Phase-3 digest delivery, `ldap_manager`'s disable/lockout, and the
+bridges' token store — behind a per-tenant rule set. Rules are a **fixed,
+configurable catalog** to start (brute-force lockout, exfiltration flag, mass-
+delete flag), with a richer DSL deferred (§13).
+
+---
+
+## 12. Rollout phases
 
 1. **Schema + write contract** — provision `audit_log` (+ global) in tenant
    setup; the durable async writer with WAL; settle the shared write path (§5
@@ -310,7 +375,7 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 
 ---
 
-## 12. Open decisions (need a call before coding)
+## 13. Open decisions (need a call before coding)
 
 - **Shared write path (§5 A vs B):** direct per-tenant DB append from each emitter
   vs a single `AppendAudit` ingest owned by one writer. Drives how the hash chain
@@ -342,7 +407,7 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 
 ---
 
-## 13. Non-goals
+## 14. Non-goals
 
 - Replacing telemetry/metrics (that's `monitoring_and_telemetry.md`).
 - Replacing the event stream (notifications/search keep using it).
