@@ -8,7 +8,7 @@ Name:           fileengine-core
 Version:        2.1.0
 Release:        1%{?dist}
 Summary:        Distributed virtual filesystem — meta package
-License:        MIT
+License:        AGPLv3+
 URL:            https://github.com/fileengine/fileengine-core
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
