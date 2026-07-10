@@ -1,6 +1,6 @@
 # Full Usage Logging & Auditing — Design Plan
 
-**Status:** Design draft (no code yet)
+**Status:** Design draft (no code yet) — key decisions resolved (§13); ready for review
 **Branch:** `design/audit-logging`
 **Audience:** people deciding what to build before any code lands
 
@@ -157,24 +157,38 @@ the *same* per-tenant `audit_log`:
    and lockout auditing possible — the signal lives at the authentication layer,
    not the core.
 
-**The shared write contract.** Because several services append to one tenant's
-`audit_log`, there must be exactly one sanctioned way to write it:
+**The shared write contract (decided): publish to a queue, one consumer writes
+the tables.** Because several services append to one tenant's `audit_log`, there
+is exactly one sanctioned way to write it — and it is **asynchronous through the
+existing Redis event queue** ([`redis_event_queueing_plan.md`](redis_event_queueing_plan.md)),
+not a synchronous DB insert from each emitter:
 
-- *Option A — direct DB append.* Each service inserts into
-  `"<tenant_schema>".audit_log` with the append-only DB role (§7). Simplest —
-  every service already has Postgres — but the hash chain (§7) must be safe under
-  concurrent writers (a per-tenant advisory lock, or serial `seq` with deferred
-  chaining).
-- *Option B — a thin audit-ingest RPC/endpoint* (`AppendAudit(entry)`), one
-  writer owning ordering + the append-only guarantee + the hash chain; costs a
-  network hop on the (hopefully rare) auth-failure path.
+- **Emitters publish security/audit events to a durable queue.** Every emitter —
+  core handlers, `ldap_manager`, each authenticating door — serializes an audit
+  entry (schema of §4, tagged with `tenant`) and enqueues it. Emitters never
+  touch `audit_log` directly and hold no chain state.
+- **A dedicated audit-consumer process drains the queue and writes the tables.**
+  One consumer owns ordering, the append-only guarantee, and the per-tenant hash
+  chain (§7) — the single-writer invariant that makes the chain safe without any
+  cross-service advisory lock. It batches multi-row INSERTs per tenant on the
+  append-only DB role, and is the same process that hosts the security rules
+  engine (§11), which already needs to see every event.
 
-Leaning **B for the chain-critical categories** (one component owns tamper-
-evidence) with A acceptable where a service already holds the tenant connection —
-an open decision (§12). Either way the schema, categories, and access controls
-are identical across emitters, and each entry carries `source_iface` so a reader
-can tell a core file-read from an ldap_manager role change from a bridge login
-failure.
+This supersedes the earlier A/B framing. **Option A** (direct per-emitter DB
+append) is rejected: concurrent writers across the core, `ldap_manager`, and the
+doors make the hash chain fragile. **Option B** (a synchronous `AppendAudit` RPC)
+is rejected for the auth-failure hot path: a queue publish is cheaper and does
+not couple a login attempt's latency to the audit writer's availability. The
+queue gives us B's single-writer tamper-evidence with A's decoupling.
+
+**Durability, not best-effort.** This queue is *not* the fail-open event stream
+of §2. The publish must be durable: an emitter that cannot enqueue treats it per
+the §6 failure policy (fail-closed categories reject the op; `mutate`/`access`
+spool to the local WAL and retry). The consumer acks only after the row is
+committed, so a consumer crash re-delivers rather than drops. Either way the
+schema, categories, and access controls are identical across emitters, and each
+entry carries `source_iface` so a reader can tell a core file-read from an
+ldap_manager role change from a bridge login failure.
 
 ---
 
@@ -182,13 +196,18 @@ failure.
 
 Audit must be **complete**, but reads are high-volume. Design:
 
-- **In-process durable writer:** handlers append to a bounded lock-free queue; a
-  writer thread flushes to `audit_log` in batches (multi-row INSERT) on the
-  per-tenant connection. This keeps the request path ~microseconds.
-- **Spool-ahead durability:** the queue is backed by an append-only local WAL
-  file (fsync-batched) so a DB blip or crash doesn't lose buffered records; the
-  writer drains the WAL into Postgres and truncates on success. (Mirrors the
-  core's existing "write local, sync async" philosophy.)
+- **Publish off the hot path:** handlers serialize an entry and publish it to the
+  shared queue (§5) via a bounded in-process buffer; the request path is a single
+  enqueue (~microseconds), never a DB round-trip. The out-of-process
+  audit-consumer flushes to `audit_log` in batches (multi-row INSERT) on the
+  per-tenant connection.
+- **Spool-ahead durability:** the in-process buffer is backed by an append-only
+  local WAL file (fsync-batched) so a queue outage or crash doesn't lose buffered
+  records; the emitter drains the WAL to the queue and truncates on success — the
+  consumer then owns the DB write. (Mirrors the core's existing "write local, sync
+  async" philosophy.) "Durably spooled" for the §6 failure policy means the entry
+  is committed to the WAL or accepted by the queue, not that the row has reached
+  `audit_log`.
 - **Failure policy is per-category, configurable:**
   - `permission`, `user`, `auth`, `admin` → **fail-closed** by default: if the
     entry can't be durably spooled, the *operation* is rejected. These are rare
@@ -251,11 +270,16 @@ query is itself audited). Each is ACL-gated identically to every other door.
 
 ## 10. Frontend surface — tenant-admin Audit & Events console
 
-Tenant administrators get a dedicated **Audit & Events** view in the SPA, gated by
-`AUDIT_READ` (§8) and hidden for everyone else. It lives in the admin area
-alongside the existing tenant user/role console (served by `ldap_manager`),
-consumes the §9 REST endpoints, and is scoped to the caller's tenant by
-construction (subdomain / `X-Tenant`). Three tabs:
+Tenant administrators get a dedicated **Audit & Events** view **folded into the
+existing `ldap_manager` tenant-admin console** ("LDAP-admin+"), co-located with
+the user/role/group management the admin already uses — not a separate route in
+the main SPA. It is gated by `AUDIT_READ` (§8) and hidden for everyone else,
+consumes the §9 REST endpoints (the audit *data* still comes from the core via
+the REST bridge; `ldap_manager` only hosts the surface and the `user`/`auth`
+audit it emits itself), and is scoped to the caller's tenant by construction
+(subdomain / `X-Tenant`). This keeps every tenant-administration action — user
+lifecycle, role grants, and now audit review + security rules — behind one
+console and one auth surface. Three tabs:
 
 - **Audit** — the immutable log. A filterable, paginated table over
   `QueryAuditLog`: filter by **actor**, **target** (file / user / role),
@@ -272,9 +296,12 @@ construction (subdomain / `X-Tenant`). Three tabs:
   feed — recent file/permission activity across the tenant as it happens, still
   ACL-filtered to what the admin may see.
 - **Security** — the rules-engine surface (§11): open **incidents** (flagged
-  suspicious activity, each linking to its evidence rows in the Audit tab), **rule
-  configuration** (enable/disable, mode = flag · alert · auto-disable, thresholds,
-  dry-run toggle), and a **disabled-accounts** review with one-click re-enable.
+  suspicious activity, each linking to its evidence rows in the Audit tab), the
+  **rule builder** (guided form *or* raw-DSL, with enable/disable, mode = flag ·
+  alert · auto-disable, severity, thresholds, dry-run, and validate-against-history),
+  a **disabled-accounts** review with one-click re-enable, and the **admin
+  notification settings** (which admins receive the mandatory serious-alert emails,
+  digest cadence for non-serious alerts).
 
 Design notes:
 
@@ -321,11 +348,27 @@ tenant (with conservative system defaults).
   and the admin digest. No user impact.
 - **alert** — notify tenant admins out-of-band via the existing digest channel
   (email/push), rate-limited so it never becomes a notification treadmill (the
-  Phase-3 anti-goal).
+  Phase-3 anti-goal). **Serious alerts email every Administrator-level user
+  (mandatory).** Each rule carries a `severity`; at `severity = serious` (or
+  higher) the response is a **guaranteed, immediate email to all admin-role users
+  of the tenant** — resolved from `ldap_manager` (the admin role membership), sent
+  the moment the incident is raised. This path is *not* subject to the digest
+  rate-limit or the every-N-minutes rollup: a brute-force lockout, a detected
+  successful password guess, or a bulk-exfiltration incident reaches a human
+  inbox immediately. Rate-limiting still applies *within* a single serious
+  incident (dedupe repeats of the same incident) so one attack is one email, not a
+  storm — but serious severity can never be silenced down to nothing, and the
+  email send is itself an `admin`-category audit entry. Non-serious alerts stay in
+  the rate-limited digest.
 - **auto-disable** — the strong response: disable the actor via `ldap_manager`
-  (`user_disable` / `account_lockout`) and/or revoke live tokens/sessions at the
-  bridges' token store. It orchestrates *existing* enforcement — it invents no new
-  kill path.
+  (`user_disable` / `account_lockout`). Live sessions expire on their own because
+  the bridges issue **short-TTL tokens** (decided, §13): revocation is *implicit*
+  — once the directory account is disabled, the next token refresh fails, so no
+  shared deny-list or token-store purge is needed. This bounds the exposure window
+  to the token TTL and keeps the bridges' stateless-JWT model intact; the priority
+  case it hardens is a **brute-force login attack**, where the account is locked
+  before a guessed password yields a durable session. It orchestrates *existing*
+  enforcement — it invents no new kill path.
 
 **Auto-disable safeguards (this is the dangerous lever).**
 - **Off by default.** Every rule ships in `flag` or `alert` mode; auto-disable is
@@ -344,17 +387,47 @@ tenant (with conservative system defaults).
 
 **Reuse, not reinvention.** The engine composes what already exists — the event
 aggregator, the Phase-3 digest delivery, `ldap_manager`'s disable/lockout, and the
-bridges' token store — behind a per-tenant rule set. Rules are a **fixed,
-configurable catalog** to start (brute-force lockout, exfiltration flag, mass-
-delete flag), with a richer DSL deferred (§13).
+bridges' token store — behind a per-tenant rule set. It runs in the same
+audit-consumer process (§5), so it sees every event as it is written.
+
+**Rules are a Security DSL (decided), seeded from defaults, edited in-console.**
+Not a hardcoded catalog: rules are expressed in a small, declarative
+**security DSL** — a rule is a `when` (event category/action + a sliding-window
+predicate: count/rate/sequence over an actor, source IP, or target subtree), a
+`threshold`, a `severity` (`info` · `warn` · `serious` · `critical` — drives the
+mandatory-admin-email path, above), and a graduated `response` (`flag` · `alert` ·
+`auto-disable`, with `dry-run`). The DSL is **deterministic** by construction
+(§13): fixed operators over the windowed counters, no learned baselines yet.
+
+- **System-default rule set to import from.** Every tenant is seeded with a
+  conservative, versioned **default rule pack** the tenant administrator imports
+  and then tunes — brute-force lockout, exfiltration flag, mass-delete flag — so
+  protection exists on day one without authoring anything. Defaults ship in
+  `flag`/`alert` (auto-disable stays opt-in, §11 safeguards).
+- **Rule editor in the console — build rules two ways.** The Security tab (§10)
+  gets a **rule builder** with a choice of entry:
+  - a **guided builder** (the default option) — a form/wizard that assembles a
+    valid rule from dropdowns (event → window → threshold → severity → response)
+    without the admin writing any DSL, then shows the DSL it produced;
+  - a **raw-DSL editor** for power users, with syntax validation.
+
+  Both paths let the admin add/clone/disable rules, adjust thresholds and windows,
+  set severity and the response mode, toggle dry-run, and **validate against
+  recent history** ("this rule would have fired N times last week") before
+  enabling. Rule edits are themselves `admin`-category audit entries.
+
+A richer expression language (nested boolean logic, cross-rule correlation) can
+grow from this grammar later; behavioural/anomaly baselines remain deferred
+(§13).
 
 ---
 
 ## 12. Rollout phases
 
 1. **Schema + write contract** — provision `audit_log` (+ global) in tenant
-   setup; the durable async writer with WAL; settle the shared write path (§5
-   Option A/B) so *every* emitter uses one sanctioned append.
+   setup; stand up the queue publish path (§5) with the emitter-side WAL and the
+   dedicated audit-consumer that writes the tables, so *every* emitter uses one
+   sanctioned, async append.
 2. **Permission (core)** — fold `acl_audit` into `audit_log` (keep `acl_audit` as
    a compatibility view during transition); fail-closed policy.
 3. **Auth (doors + ldap_manager)** — `login_failure`/`_success`, lockouts, and the
@@ -368,52 +441,68 @@ delete flag), with a richer DSL deferred (§13).
 7. **Tamper-evidence** — hash chain + `VerifyAuditChain` + append-only DB grants.
 8. **Query/export + retention** — the RPCs, REST/MCP exposure, partitioning,
    archival, per-tenant retention.
-9. **Frontend Audit & Events console** (§10) — the tenant-admin SPA view over the
-   query/export/verify APIs plus the admin-scoped live events feed.
+9. **Frontend Audit & Events console** (§10) — folded into the `ldap_manager`
+   tenant-admin console, over the query/export/verify APIs plus the admin-scoped
+   live events feed, and the security rule editor (§11).
 
 Forward-only: no backfill (there's no prior read history to reconstruct).
 
 ---
 
-## 13. Open decisions (need a call before coding)
+## 13. Decisions
 
-- **Shared write path (§5 A vs B):** direct per-tenant DB append from each emitter
-  vs a single `AppendAudit` ingest owned by one writer. Drives how the hash chain
-  and append-only guarantee are enforced across the core, `ldap_manager`, and the
-  doors.
-- **Where auth failures are emitted:** each door on its own bind failure (needs a
-  shared audit-write helper in the bridges) vs. routing all authentication through
-  a common path that emits once. Doors are independent today, so the former is
-  likely — confirm.
-- **Access-log volume:** full-fidelity reads vs sampled vs aggregate `count` as
-  the *default* (`AUDIT_ACCESS_MODE`). Compliance usually wants full; cost may
-  push to sample-with-force-full-on-sensitive-subtrees.
-- **Fail-closed scope:** confirm `permission`/`user`/`auth`/`admin` should block
-  the op on audit-write failure (recommended) vs degrade to WAL-only.
-- **Source metadata plumbing:** the bridges must forward client IP / interface /
-  request-id into the `AuthenticationContext` (small proto/auth change) so
-  `source_addr`/`source_iface` are populated — otherwise audit shows "who" but
-  not "from where."
-- **Retention defaults & archival target** per tenant; external hash anchoring
-  cadence (if any).
+### Resolved (calls made — folded into the sections above)
+
+- **Shared write path (§5): queue + consumer.** Emitters publish security/audit
+  events to the existing Redis queue; a dedicated audit-consumer process drains it
+  and writes `audit_log`, owning ordering, the append-only guarantee, and the hash
+  chain. Rejects both direct per-emitter DB append (fragile chain under concurrent
+  writers) and a synchronous `AppendAudit` RPC (couples the auth-failure path to
+  the writer's availability).
+- **Where auth failures are emitted (§5):** each authenticating door publishes its
+  *own* `login_failure`/`login_success` to the queue — no common auth choke point
+  to build. The queue is the shared write helper, so a door needs only a serialize
+  + publish, not a DB connection or chain state.
+- **Source metadata (§4/§5):** **yes — collect it.** Bridges forward client IP,
+  interface, and request-id into the `AuthenticationContext` (small proto/auth
+  change) so `source_addr`/`source_iface`/`request_id` are populated. "From where"
+  is a first-class field, not best-effort.
+- **Admin console location (§10): fold into `ldap_manager`.** The Audit & Events +
+  Security surface lives in the existing `ldap_manager` tenant-admin console
+  ("LDAP-admin+"), co-located with user/role management, *not* a separate SPA
+  route. The audit data still comes from the core via the REST bridge; the console
+  only hosts the view.
+- **Rules engine — DSL, not a fixed catalog (§11):** a small deterministic
+  **security DSL** with a **system-default rule pack** the tenant admin imports and
+  tunes, plus an in-console **rule builder** offering both a guided form and a
+  raw-DSL editor. Supersedes the earlier "catalog first, DSL later" lean.
+- **Serious alerts email admins — mandatory (§11):** every rule carries a
+  `severity`; a `serious`/`critical` incident sends a guaranteed, immediate email
+  to *all* Administrator-level users of the tenant (resolved via `ldap_manager`),
+  outside the digest rate-limit and never silenceable to nothing. Non-serious
+  alerts stay in the rate-limited digest.
+- **Auto-disable token revocation (§11): short token TTLs.** The bridges keep
+  stateless JWTs with short TTLs; disabling the directory account makes the next
+  refresh fail, so revocation is implicit — no shared deny-list. The priority case
+  is brute-force login lockout (lock the account before a guess yields a durable
+  session).
+- **Anomaly/baseline detection (§11): deterministic rules initially.** Ship
+  rate/sequence/threshold rules over sliding-window counters; defer per-actor
+  behavioural baselines to a later phase.
+
+### Still open (need a call before the relevant phase)
+
+- **Access-log volume default (§6):** full-fidelity reads vs sampled vs aggregate
+  `count` as the `AUDIT_ACCESS_MODE` *default*. Compliance usually wants full; cost
+  may push to sample-with-force-full-on-sensitive-subtrees. (Phase 6.)
+- **Fail-closed scope (§6):** confirm `permission`/`user`/`auth`/`admin` block the
+  op when the entry can't be durably enqueued/spooled (recommended) vs degrade to
+  WAL-only. (Phases 2–4.)
+- **Retention defaults & archival target** per tenant; external hash-anchoring
+  cadence, if any. (Phase 8.)
 - **Consolidation with the MCP tool-audit:** the MCP already writes a local
   tool-call audit; the core `audit_log` becomes the source of truth and the MCP's
   is either dropped or kept as a thin app-layer trace.
-- **Where the admin console lives (§10):** a route in the main SPA admin area
-  (reuses the app's auth/components, one place for admins) vs. folding it into the
-  `ldap_manager`-served tenant-admin console (co-located with user/role
-  management). Leaning SPA — the audit data comes from the core via the REST
-  bridge, not from `ldap_manager`.
-- **Rules engine — catalog vs DSL (§11):** ship a fixed, per-tenant-configurable
-  rule *catalog* first (recommended) and defer a general rule DSL until the
-  catalog's limits are felt.
-- **Auto-disable token revocation (§11):** the bridges issue stateless JWTs, so
-  "revoke live sessions" needs either a short token TTL + refresh (revocation is
-  implicit) or a shared deny-list the bridges check — decides how fast an
-  auto-disable actually cuts access.
-- **Anomaly/baseline detection (§11):** defer per-actor behavioural baselines to a
-  later phase (start with deterministic rate/sequence rules) — confirm that
-  staging.
 
 ---
 
@@ -422,4 +511,7 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 - Replacing telemetry/metrics (that's `monitoring_and_telemetry.md`).
 - Replacing the event stream (notifications/search keep using it).
 - Cross-tenant analytics (each tenant's audit is isolated by schema).
-- Real-time alerting (a downstream consumer of the export API, not core scope).
+- Integrating with an external SIEM / alerting platform. Real-time alerting
+  *within* the product — the rules engine's incidents and the mandatory
+  serious-alert admin emails (§11) — is in scope; shipping the trail to a
+  third-party SIEM is a downstream consumer of the export API (§9), not core scope.
