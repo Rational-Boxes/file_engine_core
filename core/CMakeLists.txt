@@ -160,6 +160,8 @@ add_library(fileengine_core SHARED
     src/event.cpp              # File-activity event model + JSON envelope
     src/event_sink.cpp         # Async bounded-outbox sink base
     src/event_sink_factory.cpp # Builds the configured sink (or none)
+    src/audit_entry.cpp        # Audit record model + envelope JSON (§4)
+    src/audit_sink_factory.cpp # Builds the durable audit sink (or a null sink)
 )
 
 # Include directories
@@ -204,6 +206,7 @@ if(FILEENGINE_ENABLE_EVENTS)
     find_path(HIREDIS_INC hiredis/hiredis.h)
     if(HIREDIS_LIB AND HIREDIS_INC)
         target_sources(fileengine_core PRIVATE src/redis_event_sink.cpp)
+        target_sources(fileengine_core PRIVATE src/audit_sink.cpp)  # durable audit sink (hiredis)
         target_include_directories(fileengine_core PRIVATE ${HIREDIS_INC})
         target_link_libraries(fileengine_core ${HIREDIS_LIB})
         target_compile_definitions(fileengine_core PRIVATE FILEENGINE_HAS_EVENTS=1)

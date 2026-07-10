@@ -60,6 +60,12 @@ static void apply_events_config(const std::map<std::string, std::string>& vars, 
     if (auto v = get("FILEENGINE_EVENTS_STREAM")) config.events_stream = *v;
     if (auto v = get("FILEENGINE_EVENTS_STREAM_MAXLEN")) config.events_stream_maxlen = std::stoll(*v);
     if (auto v = get("FILEENGINE_EVENTS_OUTBOX_CAPACITY")) config.events_outbox_capacity = std::stoul(*v);
+
+    // Durable audit stream — shares the Redis connection above.
+    if (auto v = get("FILEENGINE_AUDIT_ENABLED")) config.audit_enabled = (*v == "true" || *v == "1");
+    if (auto v = get("FILEENGINE_AUDIT_STREAM")) config.audit_stream = *v;
+    if (auto v = get("FILEENGINE_AUDIT_STREAM_MAXLEN")) config.audit_stream_maxlen = std::stoll(*v);
+    if (auto v = get("FILEENGINE_AUDIT_WAL_PATH")) config.audit_wal_path = *v;
 }
 
 std::map<std::string, std::string> ConfigLoader::parse_env_file(const std::string& filepath) {

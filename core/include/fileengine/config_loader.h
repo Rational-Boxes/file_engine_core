@@ -92,6 +92,15 @@ struct Config {
     std::string events_stream = "fileengine:events";
     long long   events_stream_maxlen = 100000;
     size_t      events_outbox_capacity = 10000;
+
+    // Durable audit emission (usage_logging_and_auditing.md §5). Separate,
+    // durable pipeline from the fail-open event stream above; shares the same
+    // Redis broker (events_redis_*) but a different stream, drained by the
+    // audit_service writer. WAL provides spool-ahead durability (§6).
+    bool        audit_enabled = false;
+    std::string audit_stream = "fileengine:audit";
+    long long   audit_stream_maxlen = 1000000;
+    std::string audit_wal_path = "audit.wal";
 };
 
 class ConfigLoader {
