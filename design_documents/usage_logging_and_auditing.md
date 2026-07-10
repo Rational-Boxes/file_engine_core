@@ -123,7 +123,8 @@ CREATE TABLE "<schema>".audit_log (
 CREATE INDEX idx_audit_actor  ON "<schema>".audit_log(actor, ts);
 CREATE INDEX idx_audit_target ON "<schema>".audit_log(target_uid, ts);
 CREATE INDEX idx_audit_action ON "<schema>".audit_log(category, action, ts);
--- Monthly range partitioning on ts for retention/archival (§7).
+-- Daily range partitioning on ts: a 30-day rolling window in-DB; each day that
+-- ages out is archived (encrypted) to object store, then its partition dropped (§7).
 ```
 
 `detail` as JSONB keeps the table narrow while preserving action-specific context
@@ -219,15 +220,19 @@ Audit must be **complete**, but reads are high-volume. Design:
   is committed to the WAL or accepted by the queue, not that the row has reached
   `audit_log`.
 - **Failure policy is per-category, configurable:**
-  - `permission`, `user`, `auth`, `admin` → **fail-closed** by default: if the
-    entry can't be durably spooled, the *operation* is rejected. These are rare
-    and security-critical (a permission change, a role grant, or a password reset
-    must never happen silently).
+  - `permission`, `user`, `auth`, `admin` → **fail-closed (decided, §13):** the
+    sensitive operation is **blocked if its security event fails to enqueue** — if
+    the entry can't be durably captured (queue-accepted *or* WAL-committed), the
+    *operation* itself is rejected. These are rare and security-critical (a
+    permission change, a role grant, or a password reset must never happen
+    silently or un-recorded).
   - `mutate` → spooled durably; op proceeds (WAL guarantees eventual capture).
-  - `access` → spooled; on sustained backpressure, degrade per a knob
-    (`AUDIT_ACCESS_MODE = full | sample:N | count`) — never silently to nothing;
-    dropping to `count` still records aggregate access, and the mode change is
-    itself audited.
+  - `access` → **full-fidelity by default (decided, §13):** `AUDIT_ACCESS_MODE`
+    defaults to `full` — every read/list/stat/version-read is recorded, denials
+    included. The knob (`full | sample:N | count`) exists only as a
+    backpressure-relief valve an operator can *opt into*; it never silently
+    degrades to nothing, dropping to `count` still records aggregate access, and
+    any mode change is itself audited.
 - **Read-path budget:** a single enqueue + name snapshot already resolved by the
   op. No extra DB round-trip on the hot path.
 
@@ -242,10 +247,17 @@ Audit must be **complete**, but reads are high-volume. Design:
   edit/removal breaks the chain; a `VerifyAuditChain` op (and a periodic job)
   walks it. Optionally anchor the latest hash to the object store / an external
   notary on a schedule for external verifiability.
-- **Retention & archival:** monthly range partitions; a retention job seals old
-  partitions and archives them (encrypted) to the tenant's S3 bucket, then drops
-  them per a per-tenant `AUDIT_RETENTION_DAYS`. Archived segments keep their hash
-  linkage so the chain remains verifiable end-to-end.
+- **Retention & archival (decided, §13): 30-day rolling DB window + daily
+  encrypted object-store archive.** The database keeps a **30-day rolling record**
+  (`AUDIT_RETENTION_DAYS = 30`, daily range partitions). A retention job runs
+  daily: for **each day that falls out of the window**, it seals that day's
+  partition, writes it as **one encrypted daily log file** (NDJSON) to the
+  tenant's object store, verifies the write, then drops the in-DB partition. Each
+  archived daily file carries its hash-chain linkage (its first `prev_hash` and
+  last `row_hash`) so the chain stays verifiable end-to-end across the DB→archive
+  boundary, and query/export (§9) transparently reads back archived days when a
+  request reaches past the 30-day window. External hash-anchoring to a notary
+  remains optional and is **out of scope for this version** (§13).
 
 ---
 
@@ -264,17 +276,22 @@ Audit must be **complete**, but reads are high-volume. Design:
 
 ---
 
-## 9. Query & export API (new RPCs → REST/MCP)
+## 9. Query & export API (new RPCs → REST)
 
 - `QueryAuditLog(tenant, {actor?, target_uid?, category?, action?, outcome?,
-  from?, to?}, page)` → filtered, ordered page. Requires `AUDIT_READ`.
+  from?, to?}, page)` → filtered, ordered page. Requires `AUDIT_READ`. Reads
+  transparently across the in-DB window and archived daily files (§7).
 - `ExportAuditLog(...)` → **streaming** RPC for compliance dumps (NDJSON/CSV),
   including archived partitions.
 - `VerifyAuditChain(tenant, range)` → integrity result.
 
-Surfaced through the http-bridge (REST) and MCP (so an agent can answer "who
-changed the Q3 deck's permissions?" — under the caller's `AUDIT_READ`, and that
-query is itself audited). Each is ACL-gated identically to every other door.
+Surfaced through the **http-bridge (REST) only** in this version. **No MCP
+surface to the security/audit system yet (decided, §13)** — an agent cannot query
+or export the audit log, and the security rules engine is not exposed as MCP
+tools. (The MCP bridge is still an *authenticating door* that emits `auth`/`access`
+events like any other, `source_iface = mcp`; what's deferred is a *read/query*
+surface into the security system.) Each REST endpoint is ACL-gated identically to
+every other door.
 
 ---
 
@@ -449,8 +466,9 @@ grow from this grammar later; behavioural/anomaly baselines remain deferred
 6. **Access logging (core)** — audit reads/list/stat/version-reads incl. denials,
    with the `AUDIT_ACCESS_MODE` throughput controls.
 7. **Tamper-evidence** — hash chain + `VerifyAuditChain` + append-only DB grants.
-8. **Query/export + retention** — the RPCs, REST/MCP exposure, partitioning,
-   archival, per-tenant retention.
+8. **Query/export + retention** — the RPCs, **REST-only** exposure (no MCP, §9),
+   daily partitioning, the 30-day rolling window, and daily encrypted object-store
+   archival (§7).
 9. **Frontend Audit & Events console** (§10) — folded into the `ldap_manager`
    tenant-admin console, over the query/export/verify APIs plus the admin-scoped
    live events feed, and the security rule editor (§11).
@@ -503,20 +521,29 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 - **Anomaly/baseline detection (§11): deterministic rules initially.** Ship
   rate/sequence/threshold rules over sliding-window counters; defer per-actor
   behavioural baselines to a later phase.
+- **Access-log volume (§6): full-fidelity by default.** `AUDIT_ACCESS_MODE`
+  defaults to `full` — every read/list/stat/version-read (denials included) is
+  recorded. Sampling/`count` remain an operator-opt-in backpressure valve, never
+  the default, never silently to nothing.
+- **Fail-closed scope (§6): block sensitive ops on enqueue failure.** For
+  `permission`/`user`/`auth`/`admin`, if the security event can't be durably
+  captured (queue-accepted or WAL-committed), the operation is rejected — no
+  degrade-to-WAL-only escape for these categories.
+- **Retention (§7): 30-day rolling DB window + daily encrypted archive.** Keep 30
+  days in Postgres (daily partitions); each day that ages out is written as one
+  encrypted daily log file (NDJSON) to the tenant's object store, then dropped,
+  with hash linkage preserved. External hash-anchoring stays optional and out of
+  scope this version.
+- **MCP surface (§9): none this version.** No MCP query/export or rules-engine
+  surface into the security system for now; the MCP bridge keeps *emitting*
+  audit events as an authenticating door, but its local tool-call audit is left
+  as-is (consolidation with `audit_log` deferred to a later version).
 
-### Still open (need a call before the relevant phase)
+### Still open
 
-- **Access-log volume default (§6):** full-fidelity reads vs sampled vs aggregate
-  `count` as the `AUDIT_ACCESS_MODE` *default*. Compliance usually wants full; cost
-  may push to sample-with-force-full-on-sensitive-subtrees. (Phase 6.)
-- **Fail-closed scope (§6):** confirm `permission`/`user`/`auth`/`admin` block the
-  op when the entry can't be durably enqueued/spooled (recommended) vs degrade to
-  WAL-only. (Phases 2–4.)
-- **Retention defaults & archival target** per tenant; external hash-anchoring
-  cadence, if any. (Phase 8.)
-- **Consolidation with the MCP tool-audit:** the MCP already writes a local
-  tool-call audit; the core `audit_log` becomes the source of truth and the MCP's
-  is either dropped or kept as a thin app-layer trace.
+*(None — the calls above close every decision needed to start Phase 1. Items
+explicitly deferred to later phases: cross-rule/nested DSL logic and behavioural
+baselines (§11), external hash-anchoring (§7), and MCP consolidation (§9).)*
 
 ---
 
