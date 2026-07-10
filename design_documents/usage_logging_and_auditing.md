@@ -157,22 +157,32 @@ the *same* per-tenant `audit_log`:
    and lockout auditing possible — the signal lives at the authentication layer,
    not the core.
 
-**The shared write contract (decided): publish to a queue, one consumer writes
-the tables.** Because several services append to one tenant's `audit_log`, there
-is exactly one sanctioned way to write it — and it is **asynchronous through the
-existing Redis event queue** ([`redis_event_queueing_plan.md`](redis_event_queueing_plan.md)),
-not a synchronous DB insert from each emitter:
+**The shared write contract (decided): one aggregating sink, one writer process,
+tenant on every event.** Because several services across many tenants must land
+in `audit_log`, there is exactly one sanctioned way to write it — and it is
+**asynchronous through a single, deployment-wide aggregating security-event sink**
+on the existing Redis event queue ([`redis_event_queueing_plan.md`](redis_event_queueing_plan.md)),
+not a synchronous DB insert from each emitter and not a sink or writer per tenant:
 
-- **Emitters publish security/audit events to a durable queue.** Every emitter —
-  core handlers, `ldap_manager`, each authenticating door — serializes an audit
-  entry (schema of §4, tagged with `tenant`) and enqueues it. Emitters never
-  touch `audit_log` directly and hold no chain state.
-- **A dedicated audit-consumer process drains the queue and writes the tables.**
-  One consumer owns ordering, the append-only guarantee, and the per-tenant hash
-  chain (§7) — the single-writer invariant that makes the chain safe without any
-  cross-service advisory lock. It batches multi-row INSERTs per tenant on the
-  append-only DB role, and is the same process that hosts the security rules
-  engine (§11), which already needs to see every event.
+- **One aggregating sink for all tenants.** Every emitter — core handlers,
+  `ldap_manager`, each authenticating door — publishes into the *same* sink,
+  regardless of tenant. There is no per-tenant queue and no per-emitter DB path.
+- **Every event carries its tenant context.** Each entry's envelope includes the
+  **`tenant`** it belongs to (alongside the §4 schema fields), so events for
+  different tenants share one stream yet remain individually distinguishable. The
+  tenant tag is what the writer routes on; it is never inferred from the transport.
+- **One writer process populates the tables for all tenants.** A single
+  audit-consumer drains the aggregating sink, **demultiplexes by `tenant`**, and
+  appends each entry to that tenant's `"<schema>".audit_log` on the append-only DB
+  role (batched multi-row INSERTs per tenant). Being the *only* writer, it owns
+  ordering and the per-tenant hash chain (§7) globally — the single-writer
+  invariant that makes each tenant's chain correct without any cross-service
+  advisory lock — while structural per-tenant isolation (§8) still holds because
+  rows only ever go to the schema named in their own envelope. It is the same
+  process that hosts the security rules engine (§11), which already needs to see
+  every event. (Scale-out, if ever needed, is by tenant-sharding the *single*
+  writer role — a partition of tenants per writer, never two writers on one
+  tenant — so the one-writer-per-tenant-chain invariant is preserved.)
 
 This supersedes the earlier A/B framing. **Option A** (direct per-emitter DB
 append) is rejected: concurrent writers across the core, `ldap_manager`, and the
@@ -453,12 +463,16 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 
 ### Resolved (calls made — folded into the sections above)
 
-- **Shared write path (§5): queue + consumer.** Emitters publish security/audit
-  events to the existing Redis queue; a dedicated audit-consumer process drains it
-  and writes `audit_log`, owning ordering, the append-only guarantee, and the hash
-  chain. Rejects both direct per-emitter DB append (fragile chain under concurrent
-  writers) and a synchronous `AppendAudit` RPC (couples the auth-failure path to
-  the writer's availability).
+- **Shared write path (§5): one aggregating sink, one writer, tenant on every
+  event.** All emitters publish into a single deployment-wide security-event sink
+  on the existing Redis queue; each event carries its `tenant` so events for
+  different tenants share one stream yet stay distinguishable. A single
+  audit-consumer process drains that sink, demultiplexes by tenant, and populates
+  every tenant's `audit_log` — owning ordering, the append-only guarantee, and the
+  per-tenant hash chain as the sole writer. Rejects both direct per-emitter DB
+  append (fragile chain under concurrent writers) and a synchronous `AppendAudit`
+  RPC (couples the auth-failure path to the writer's availability); there is no
+  per-tenant sink or per-tenant consumer.
 - **Where auth failures are emitted (§5):** each authenticating door publishes its
   *own* `login_failure`/`login_success` to the queue — no common auth choke point
   to build. The queue is the shared write helper, so a door needs only a serialize
