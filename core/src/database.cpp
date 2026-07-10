@@ -98,6 +98,39 @@ Result<void> Database::create_schema() {
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- Global audit log (usage_logging_and_auditing.md §8): tenant
+        -- create/drop and cross-tenant admin actions, readable only by
+        -- system_admin. Same shape as the per-tenant audit_log plus a nullable
+        -- tenant column (this table is not schema-isolated). Range-partitioned
+        -- by day like the per-tenant table; partitions and the hash chain are
+        -- owned by the single audit-consumer.
+        CREATE TABLE IF NOT EXISTS audit_log_global (
+            seq          BIGSERIAL,
+            event_id     UUID         NOT NULL,
+            ts           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+            category     SMALLINT     NOT NULL,
+            action       VARCHAR(32)  NOT NULL,
+            outcome      SMALLINT     NOT NULL,
+            actor        VARCHAR(255) NOT NULL,
+            actor_roles  TEXT,
+            target_uid   VARCHAR(64),
+            target_name  VARCHAR(1024),
+            target_type  SMALLINT,
+            detail       JSONB,
+            source_iface VARCHAR(16),
+            source_addr  VARCHAR(64),
+            request_id   VARCHAR(64),
+            tenant       VARCHAR(255),
+            prev_hash    BYTEA,
+            row_hash     BYTEA,
+            PRIMARY KEY (seq, ts),
+            UNIQUE (event_id, ts)
+        ) PARTITION BY RANGE (ts);
+
+        CREATE INDEX IF NOT EXISTS idx_audit_global_actor  ON audit_log_global(actor, ts);
+        CREATE INDEX IF NOT EXISTS idx_audit_global_action ON audit_log_global(category, action, ts);
+        CREATE INDEX IF NOT EXISTS idx_audit_global_tenant ON audit_log_global(tenant, ts);
     )SQL";
 
     // Execute global schema SQL statements
@@ -2125,6 +2158,77 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
     std::string drop_legacy_idx_resource =
         "DROP INDEX IF EXISTS \"" + escaped_schema + "\".idx_acls_resource_uid;";
     res = PQexec(pg_conn, drop_legacy_idx_resource.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    // ── Full audit log (design_documents/usage_logging_and_auditing.md §4) ────
+    // Complete, append-only, tamper-evident record of who did what to what,
+    // when, from where, and whether it was allowed. Supersedes acl_audit for the
+    // permission category (§1) and is distinct from the fail-open event stream.
+    // Written ONLY by the single out-of-process audit-consumer (§5): the core and
+    // the other emitters publish tenant-tagged entries to the aggregating Redis
+    // sink; the consumer demultiplexes by tenant and appends here, owning the
+    // per-tenant hash chain.
+    //
+    // RANGE-partitioned by day on ts for the 30-day rolling window + daily
+    // encrypted archival (§7). Postgres requires the partition key in every
+    // unique constraint, so the primary key is (seq, ts) rather than seq alone,
+    // and the idempotency key (at-least-once Redis redelivery must not duplicate
+    // a row or corrupt the hash chain) is UNIQUE (event_id, ts). Daily child
+    // partitions are created on demand by the consumer; none are created here,
+    // since nothing else ever writes this table. row_hash is nullable until the
+    // hash chain lands (Phase 7); the single-writer discipline is the Phase 1
+    // append-only guarantee (separate append-only DB role is also Phase 7).
+    std::string create_audit_log_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".audit_log ("
+        "    seq          BIGSERIAL,"
+        "    event_id     UUID         NOT NULL,"
+        "    ts           TIMESTAMPTZ  NOT NULL DEFAULT now(),"
+        "    category     SMALLINT     NOT NULL,"   // access|mutate|permission|user|auth|admin
+        "    action       VARCHAR(32)  NOT NULL,"
+        "    outcome      SMALLINT     NOT NULL,"   // ok|denied|error
+        "    actor        VARCHAR(255) NOT NULL,"
+        "    actor_roles  TEXT,"
+        "    target_uid   VARCHAR(64),"
+        "    target_name  VARCHAR(1024),"
+        "    target_type  SMALLINT,"
+        "    detail       JSONB,"
+        "    source_iface VARCHAR(16),"
+        "    source_addr  VARCHAR(64),"
+        "    request_id   VARCHAR(64),"
+        "    prev_hash    BYTEA,"
+        "    row_hash     BYTEA,"
+        "    PRIMARY KEY (seq, ts),"
+        "    UNIQUE (event_id, ts)"
+        ") PARTITION BY RANGE (ts);";
+    res = PQexec(pg_conn, create_audit_log_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant audit_log table: " + error);
+    }
+    PQclear(res);
+
+    // Query indexes for the console/export API (§9). Indexes on a partitioned
+    // parent are themselves partitioned and propagate to every child partition.
+    // Names are suffixed with the schema per the repo convention (index names
+    // are unique per-schema). Index creation is non-critical.
+    std::string create_idx_audit_actor =
+        "CREATE INDEX IF NOT EXISTS idx_audit_actor_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".audit_log(actor, ts);";
+    res = PQexec(pg_conn, create_idx_audit_actor.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    std::string create_idx_audit_target =
+        "CREATE INDEX IF NOT EXISTS idx_audit_target_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".audit_log(target_uid, ts);";
+    res = PQexec(pg_conn, create_idx_audit_target.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    std::string create_idx_audit_action =
+        "CREATE INDEX IF NOT EXISTS idx_audit_action_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".audit_log(category, action, ts);";
+    res = PQexec(pg_conn, create_idx_audit_action.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
 
     std::string create_roles_table =
