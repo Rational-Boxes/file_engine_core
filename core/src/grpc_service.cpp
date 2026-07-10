@@ -7,6 +7,7 @@
 #include <ctime>
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/server_logger.h"
+#include "json.hpp"
 
 namespace fileengine {
 
@@ -23,9 +24,38 @@ inline std::string canonical_uid(const std::string& uid) {
 GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                                  std::shared_ptr<TenantManager> tenant_manager,
                                  std::shared_ptr<AclManager> acl_manager,
-                                 std::unique_ptr<StorageTracker> storage_tracker)
+                                 std::unique_ptr<StorageTracker> storage_tracker,
+                                 std::shared_ptr<IAuditSink> audit_sink)
     : filesystem_(filesystem), tenant_manager_(tenant_manager), acl_manager_(acl_manager),
-      storage_tracker_(std::move(storage_tracker)) {
+      storage_tracker_(std::move(storage_tracker)), audit_sink_(std::move(audit_sink)) {
+}
+
+bool GRPCFileService::emit_permission_audit(const std::string& tenant, const std::string& action,
+                                            AuditOutcome outcome, const std::string& actor,
+                                            const std::vector<std::string>& roles,
+                                            const std::string& resource_uid,
+                                            const std::string& principal, int principal_type,
+                                            const char* effect, int permission_mask) {
+    if (!audit_sink_) return true;  // auditing disabled -> never blocks the op
+
+    AuditEntry e;
+    e.scope = AuditScope::Tenant;
+    e.tenant = tenant;
+    e.category = AuditCategory::Permission;
+    e.action = action;
+    e.outcome = outcome;
+    e.actor = actor;
+    e.actor_roles = roles;
+    e.target_uid = resource_uid;
+    e.target_type = AuditTargetType::Acl;
+    e.source_iface = "grpc";  // source_addr/request_id await bridge plumbing (§13)
+    nlohmann::json d;
+    d["principal"] = principal;
+    d["principal_type"] = principal_type;
+    d["effect"] = effect;
+    d["permissions"] = permission_mask;
+    e.detail = d.dump();
+    return audit_sink_->publish(std::move(e));
 }
 
 // Directory operations
@@ -1122,6 +1152,11 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to grant permissions");
         SERVER_LOG_ERROR("GRPCService", "GrantPermission failed: User " + user + " does not have MANAGE_ACL on " + resource_uid);
+        // A denied permission-change attempt is a security signal (§3) — record it
+        // best-effort; the op is already rejected so durability need not gate it.
+        emit_permission_audit(tenant, "acl_grant", AuditOutcome::Denied, user, roles,
+                              resource_uid, principal, static_cast<int>(principal_type),
+                              (request->effect() == fileengine_rpc::AclEffect::DENY ? "deny" : "allow"), 0);
         return grpc::Status::OK;
     }
 
@@ -1172,6 +1207,19 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     AclEffect rule_effect = (request->effect() == fileengine_rpc::AclEffect::DENY)
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
+    const char* effect_str = (rule_effect == AclEffect::DENY) ? "deny" : "allow";
+    // Fail-closed write-ahead (§6): durably record the intended change BEFORE it
+    // applies. If the audit entry cannot be durably captured, refuse to mutate
+    // rather than leave an un-audited permission change.
+    if (!emit_permission_audit(tenant, "acl_grant", AuditOutcome::Ok, user, roles,
+                               resource_uid, principal, static_cast<int>(principal_type),
+                               effect_str, converted_permissions)) {
+        response->set_success(false);
+        response->set_error("Permission change refused: audit log unavailable");
+        SERVER_LOG_ERROR("GRPCService", "GrantPermission refused (audit not durable) for " + resource_uid);
+        return grpc::Status::OK;
+    }
+
     auto result = acl_manager_->grant_permission(resource_uid, principal,
                                                  principal_type,
                                                  converted_permissions, tenant,
@@ -1182,6 +1230,11 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     if (!result.success) {
         response->set_error(result.error);
         SERVER_LOG_ERROR("GRPCService", "GrantPermission failed for resource_uid: " + resource_uid + " with error: " + result.error);
+        // The write-ahead entry recorded an intended grant that then errored;
+        // record the failure truthfully (best-effort).
+        emit_permission_audit(tenant, "acl_grant", AuditOutcome::Error, user, roles,
+                              resource_uid, principal, static_cast<int>(principal_type),
+                              effect_str, converted_permissions);
     } else {
         SERVER_LOG_INFO("GRPCService", "GrantPermission successful for resource_uid: " + resource_uid);
         // Data-governance event: a permission was granted on this resource.
@@ -1271,6 +1324,10 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to revoke permissions");
         SERVER_LOG_ERROR("GRPCService", "RevokePermission failed: User " + user + " does not have MANAGE_ACL on " + resource_uid);
+        // A denied permission-change attempt is a security signal (§3) — record it.
+        emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Denied, user, roles,
+                              resource_uid, principal, static_cast<int>(principal_type),
+                              (request->effect() == fileengine_rpc::AclEffect::DENY ? "deny" : "allow"), 0);
         return grpc::Status::OK;
     }
 
@@ -1320,6 +1377,17 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     AclEffect rule_effect = (request->effect() == fileengine_rpc::AclEffect::DENY)
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
+    const char* effect_str = (rule_effect == AclEffect::DENY) ? "deny" : "allow";
+    // Fail-closed write-ahead (§6): durably record the intended change first.
+    if (!emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Ok, user, roles,
+                               resource_uid, principal, static_cast<int>(principal_type),
+                               effect_str, converted_permissions)) {
+        response->set_success(false);
+        response->set_error("Permission change refused: audit log unavailable");
+        SERVER_LOG_ERROR("GRPCService", "RevokePermission refused (audit not durable) for " + resource_uid);
+        return grpc::Status::OK;
+    }
+
     auto result = acl_manager_->revoke_permission(resource_uid, principal,
                                                   principal_type,
                                                   converted_permissions, tenant,
@@ -1330,6 +1398,9 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     if (!result.success) {
         response->set_error(result.error);
         SERVER_LOG_ERROR("GRPCService", "RevokePermission failed for resource_uid: " + resource_uid + " with error: " + result.error);
+        emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Error, user, roles,
+                              resource_uid, principal, static_cast<int>(principal_type),
+                              effect_str, converted_permissions);
     } else {
         SERVER_LOG_INFO("GRPCService", "RevokePermission successful for resource_uid: " + resource_uid);
         // Data-governance event: a permission was revoked on this resource.

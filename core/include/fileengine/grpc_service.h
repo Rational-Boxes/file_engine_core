@@ -15,6 +15,7 @@
 #include "fileengine/role_manager.h"
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/storage_tracker.h"
+#include "fileengine/audit_sink.h"
 
 namespace fileengine {
 
@@ -24,7 +25,8 @@ public:
     explicit GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                              std::shared_ptr<TenantManager> tenant_manager,
                              std::shared_ptr<AclManager> acl_manager,
-                             std::unique_ptr<StorageTracker> storage_tracker);
+                             std::unique_ptr<StorageTracker> storage_tracker,
+                             std::shared_ptr<IAuditSink> audit_sink = nullptr);
 
     // Directory operations
     grpc::Status MakeDirectory(grpc::ServerContext* context,
@@ -205,6 +207,18 @@ private:
     std::shared_ptr<TenantManager> tenant_manager_;
     std::shared_ptr<AclManager> acl_manager_;
     std::unique_ptr<StorageTracker> storage_tracker_;
+    std::shared_ptr<IAuditSink> audit_sink_;  // durable audit emitter (§5); may be null
+
+    // Emit a permission-category audit entry (§3). Returns true if the entry was
+    // durably captured (or auditing is disabled) — permission is a fail-closed
+    // category (§6), so on a state-changing path a false return means the caller
+    // must refuse the op rather than mutate un-audited. `permission_mask` is our
+    // internal bitmask; `principal_type` is the PrincipalType int.
+    bool emit_permission_audit(const std::string& tenant, const std::string& action,
+                               AuditOutcome outcome, const std::string& actor,
+                               const std::vector<std::string>& roles,
+                               const std::string& resource_uid, const std::string& principal,
+                               int principal_type, const char* effect, int permission_mask);
 
     // Helper function to extract tenant from auth context
     inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {

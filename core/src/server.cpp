@@ -25,6 +25,7 @@
 #include "fileengine/server_logger.h"
 #include "fileengine/rest_server.h"
 #include "fileengine/event_sink_factory.h"
+#include "fileengine/audit_sink_factory.h"
 
 #ifdef FILEENGINE_HAS_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -171,6 +172,11 @@ int main(int argc, char** argv) {
         filesystem->set_event_sink(event_sink);
     }
 
+    // Durable audit emitter (§5). Never null: a NullAuditSink when disabled/not
+    // compiled in, so handlers can always publish(). Stopped via RAII (the sink's
+    // destructor joins the worker) when it and the service go out of scope.
+    auto audit_sink = fileengine::make_audit_sink(config);
+
     // Initialize file culling system
     std::cout << "Initializing file culling system..." << std::endl;
     auto file_culler = std::make_unique<fileengine::FileCuller>(storage.get(), s3_storage.get(), storage_tracker.get());
@@ -219,7 +225,7 @@ int main(int argc, char** argv) {
 
     // Create gRPC service
     std::cout << "Initializing gRPC service..." << std::endl;
-    fileengine::GRPCFileService service(filesystem, tenant_manager, acl_manager, std::move(storage_tracker));
+    fileengine::GRPCFileService service(filesystem, tenant_manager, acl_manager, std::move(storage_tracker), audit_sink);
 
     std::string server_address = config.server_address + ":" + std::to_string(config.server_port);
     std::cout << "Attempting to bind gRPC server to " << server_address << std::endl;
