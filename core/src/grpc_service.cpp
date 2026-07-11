@@ -58,6 +58,27 @@ bool GRPCFileService::emit_permission_audit(const std::string& tenant, const std
     return audit_sink_->publish(std::move(e));
 }
 
+void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::string& action,
+                                        AuditOutcome outcome, const std::string& actor,
+                                        const std::vector<std::string>& roles,
+                                        const std::string& target_uid, AuditTargetType target_type,
+                                        const std::string& detail_json) {
+    if (!audit_sink_) return;
+    AuditEntry e;
+    e.scope = AuditScope::Tenant;
+    e.tenant = tenant;
+    e.category = AuditCategory::Mutate;
+    e.action = action;
+    e.outcome = outcome;
+    e.actor = actor;
+    e.actor_roles = roles;
+    e.target_uid = target_uid;
+    e.target_type = target_type;
+    e.source_iface = "grpc";
+    e.detail = detail_json;
+    audit_sink_->publish(std::move(e));  // best-effort; the mutation proceeds regardless (§6)
+}
+
 // Directory operations
 grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
                                             const fileengine_rpc::MakeDirectoryRequest* request,
@@ -108,8 +129,9 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
         response->set_error("User does not have permission to create directory in this location");
         SERVER_LOG_ERROR("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
                   "MakeDirectory failed: User " + user + " does not have permission to create directory in " + parent_uid);
-        SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
-                  "MakeDirectory - exiting with permission error");
+        emit_mutate_audit(tenant, "create_dir", AuditOutcome::Denied, user, roles,
+                          parent_uid, AuditTargetType::Dir,
+                          nlohmann::json({{"name", name}}).dump());
         return grpc::Status::OK;
     }
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -140,8 +162,9 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
                   "MakeDirectory - exiting with filesystem error: " + result.error);
     }
 
-    SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
-              "MakeDirectory - returning status OK");
+    emit_mutate_audit(tenant, "create_dir", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, result.success ? result.value : parent_uid, AuditTargetType::Dir,
+                      nlohmann::json({{"parent", parent_uid}, {"name", name}}).dump());
     return grpc::Status::OK;
 }
 
@@ -161,6 +184,7 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to remove directory");
         SERVER_LOG_ERROR("GRPCService", "RemoveDirectory failed: User " + user + " does not have permission to remove directory " + dir_uid);
+        emit_mutate_audit(tenant, "soft_delete", AuditOutcome::Denied, user, roles, dir_uid, AuditTargetType::Dir);
         return grpc::Status::OK;
     }
 
@@ -174,6 +198,8 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "RemoveDirectory successful for uid: " + dir_uid);
     }
 
+    emit_mutate_audit(tenant, "soft_delete", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, dir_uid, AuditTargetType::Dir);
     return grpc::Status::OK;
 }
 
@@ -364,6 +390,9 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
                   "Touch failed: User " + user + " does not have permission to create file in directory " + parent_uid);
         SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
                   "Touch - exiting with permission error");
+        emit_mutate_audit(tenant, "create_file", AuditOutcome::Denied, user, roles,
+                          parent_uid, AuditTargetType::File,
+                          nlohmann::json({{"name", name}}).dump());
         return grpc::Status::OK;
     }
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
@@ -395,6 +424,9 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
 
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch - returning status OK");
+    emit_mutate_audit(tenant, "create_file", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, result.success ? result.value : parent_uid, AuditTargetType::File,
+                      nlohmann::json({{"name", name}}).dump());
     return grpc::Status::OK;
 }
 
@@ -422,6 +454,7 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to remove file");
         SERVER_LOG_ERROR("GRPCService", "RemoveFile failed: User " + user + " does not have permission to remove file " + file_uid);
+        emit_mutate_audit(tenant, "soft_delete", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File);
         return grpc::Status::OK;
     }
 
@@ -435,6 +468,8 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "RemoveFile successful for uid: " + file_uid);
     }
 
+    emit_mutate_audit(tenant, "soft_delete", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -455,6 +490,7 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to undelete file");
         SERVER_LOG_ERROR("GRPCService", "UndeleteFile failed: User " + user + " does not have permission to undelete file " + file_uid);
+        emit_mutate_audit(tenant, "undelete", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File);
         return grpc::Status::OK;
     }
 
@@ -468,6 +504,8 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "UndeleteFile successful for uid: " + file_uid);
     }
 
+    emit_mutate_audit(tenant, "undelete", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -518,6 +556,9 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
                   "PutFile failed: User " + user + " does not have permission to write to file " + file_uid);
         SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
                   "PutFile - exiting with permission error");
+        emit_mutate_audit(tenant, "write", AuditOutcome::Denied, user, roles,
+                          file_uid, AuditTargetType::File,
+                          nlohmann::json({{"size", file_data.size()}}).dump());
         return grpc::Status::OK;
     }
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
@@ -550,6 +591,9 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
 
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
               "PutFile - returning status OK");
+    emit_mutate_audit(tenant, "write", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"size", file_data.size()}}).dump());
     return grpc::Status::OK;
 }
 
@@ -701,6 +745,8 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to rename file");
         SERVER_LOG_ERROR("GRPCService", "Rename failed: User " + user + " does not have permission to rename file " + uid);
+        emit_mutate_audit(tenant, "rename", AuditOutcome::Denied, user, roles, uid, AuditTargetType::File,
+                          nlohmann::json({{"new_name", new_name}}).dump());
         return grpc::Status::OK;
     }
 
@@ -714,6 +760,9 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "Rename successful for uid: " + uid);
     }
 
+    emit_mutate_audit(tenant, "rename", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, uid, AuditTargetType::File,
+                      nlohmann::json({{"new_name", new_name}}).dump());
     return grpc::Status::OK;
 }
 
@@ -734,6 +783,8 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to move source file");
         SERVER_LOG_ERROR("GRPCService", "Move failed: User " + user + " does not have permission to move source file " + source_uid);
+        emit_mutate_audit(tenant, "move", AuditOutcome::Denied, user, roles, source_uid, AuditTargetType::File,
+                          nlohmann::json({{"dest_parent", dest_uid}}).dump());
         return grpc::Status::OK;
     }
 
@@ -741,6 +792,8 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to move to destination directory");
         SERVER_LOG_ERROR("GRPCService", "Move failed: User " + user + " does not have permission to move to destination directory " + dest_uid);
+        emit_mutate_audit(tenant, "move", AuditOutcome::Denied, user, roles, source_uid, AuditTargetType::File,
+                          nlohmann::json({{"dest_parent", dest_uid}}).dump());
         return grpc::Status::OK;
     }
 
@@ -754,6 +807,9 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "Move successful for source_uid: " + source_uid + " to " + dest_uid);
     }
 
+    emit_mutate_audit(tenant, "move", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, source_uid, AuditTargetType::File,
+                      nlohmann::json({{"dest_parent", dest_uid}}).dump());
     return grpc::Status::OK;
 }
 
@@ -774,6 +830,8 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to read source file");
         SERVER_LOG_ERROR("GRPCService", "Copy failed: User " + user + " does not have permission to read source file " + source_uid);
+        emit_mutate_audit(tenant, "copy", AuditOutcome::Denied, user, roles, source_uid, AuditTargetType::File,
+                          nlohmann::json({{"dest_parent", dest_uid}}).dump());
         return grpc::Status::OK;
     }
 
@@ -781,6 +839,8 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to write to destination directory");
         SERVER_LOG_ERROR("GRPCService", "Copy failed: User " + user + " does not have permission to write to destination directory " + dest_uid);
+        emit_mutate_audit(tenant, "copy", AuditOutcome::Denied, user, roles, source_uid, AuditTargetType::File,
+                          nlohmann::json({{"dest_parent", dest_uid}}).dump());
         return grpc::Status::OK;
     }
 
@@ -794,6 +854,9 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "Copy successful for source_uid: " + source_uid + " to " + dest_uid);
     }
 
+    emit_mutate_audit(tenant, "copy", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, source_uid, AuditTargetType::File,
+                      nlohmann::json({{"dest_parent", dest_uid}}).dump());
     return grpc::Status::OK;
 }
 
@@ -885,6 +948,8 @@ grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to restore to version");
         SERVER_LOG_ERROR("GRPCService", "RestoreToVersion failed: User " + user + " does not have permission to restore to version for " + file_uid);
+        emit_mutate_audit(tenant, "restore_version", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"version", version_timestamp}}).dump());
         return grpc::Status::OK;
     }
 
@@ -900,6 +965,9 @@ grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "RestoreToVersion failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_mutate_audit(tenant, "restore_version", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"version", version_timestamp}}).dump());
     return grpc::Status::OK;
 }
 
@@ -922,6 +990,8 @@ grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to set metadata");
         SERVER_LOG_ERROR("GRPCService", "SetMetadata failed: User " + user + " does not have permission to set metadata for " + file_uid);
+        emit_mutate_audit(tenant, "set_metadata", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"key", key}}).dump());
         return grpc::Status::OK;
     }
 
@@ -935,6 +1005,9 @@ grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "SetMetadata successful for uid: " + file_uid);
     }
 
+    emit_mutate_audit(tenant, "set_metadata", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"key", key}}).dump());
     return grpc::Status::OK;
 }
 
@@ -1024,6 +1097,8 @@ grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to delete metadata");
         SERVER_LOG_ERROR("GRPCService", "DeleteMetadata failed: User " + user + " does not have permission to delete metadata for " + file_uid);
+        emit_mutate_audit(tenant, "delete_metadata", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"key", key}}).dump());
         return grpc::Status::OK;
     }
 
@@ -1037,6 +1112,9 @@ grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "DeleteMetadata successful for uid: " + file_uid);
     }
 
+    emit_mutate_audit(tenant, "delete_metadata", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"key", key}}).dump());
     return grpc::Status::OK;
 }
 
@@ -1592,6 +1670,8 @@ grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
     } else {
         SERVER_LOG_INFO("GRPCService", "StreamFileUpload successful for uid: " + file_uid);
     }
+    emit_mutate_audit(tenant, "write", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -1697,6 +1777,8 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to purge old versions (requires CULL_VERSIONS)");
         SERVER_LOG_ERROR("GRPCService", "PurgeOldVersions failed: User " + user + " lacks CULL_VERSIONS to purge old versions for " + file_uid);
+        emit_mutate_audit(tenant, "cull_versions", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"keep_count", keep_count}}).dump());
         return grpc::Status::OK;
     }
 
@@ -1710,6 +1792,9 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "PurgeOldVersions successful for uid: " + file_uid + " (keep_count=" + std::to_string(keep_count) + ")");
     }
 
+    emit_mutate_audit(tenant, "cull_versions", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"keep_count", keep_count}}).dump());
     return grpc::Status::OK;
 }
 

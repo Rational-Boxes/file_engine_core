@@ -220,6 +220,16 @@ private:
                                const std::string& resource_uid, const std::string& principal,
                                int principal_type, const char* effect, int permission_mask);
 
+    // Emit a mutate-category audit entry (§3). Best-effort: mutate is NOT
+    // fail-closed (§6 — the op proceeds and the WAL guarantees eventual capture),
+    // so this returns void and its result is not gated on. `detail_json` is an
+    // optional pre-serialized JSON object (e.g. destination for move), or empty.
+    void emit_mutate_audit(const std::string& tenant, const std::string& action,
+                           AuditOutcome outcome, const std::string& actor,
+                           const std::vector<std::string>& roles,
+                           const std::string& target_uid, AuditTargetType target_type,
+                           const std::string& detail_json = "");
+
     // Helper function to extract tenant from auth context
     inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
         return auth_ctx.tenant().empty() ? "default" : auth_ctx.tenant();
