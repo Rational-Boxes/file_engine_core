@@ -2,6 +2,8 @@
 #define FILEENGINE_GRPC_SERVICE_H
 
 #include <grpcpp/grpcpp.h>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,7 +28,8 @@ public:
                              std::shared_ptr<TenantManager> tenant_manager,
                              std::shared_ptr<AclManager> acl_manager,
                              std::unique_ptr<StorageTracker> storage_tracker,
-                             std::shared_ptr<IAuditSink> audit_sink = nullptr);
+                             std::shared_ptr<IAuditSink> audit_sink = nullptr,
+                             const std::string& audit_access_mode = "full");
 
     // Directory operations
     grpc::Status MakeDirectory(grpc::ServerContext* context,
@@ -229,6 +232,22 @@ private:
                            const std::vector<std::string>& roles,
                            const std::string& target_uid, AuditTargetType target_type,
                            const std::string& detail_json = "");
+
+    // Emit an access-category audit entry (§3). Best-effort, and subject to the
+    // AUDIT_ACCESS_MODE throughput valve (§6): a Denied outcome is ALWAYS recorded
+    // in full (the security signal); a successful read is emitted per the mode
+    // (full = every; sample:N = 1-in-N; count[:K] = an aggregate every K).
+    void emit_access_audit(const std::string& tenant, const std::string& action,
+                           AuditOutcome outcome, const std::string& actor,
+                           const std::vector<std::string>& roles,
+                           const std::string& target_uid, AuditTargetType target_type,
+                           const std::string& detail_json = "");
+
+    // Access-log throughput mode, parsed once from AUDIT_ACCESS_MODE.
+    enum class AccessAuditMode { Full, Sample, Count };
+    AccessAuditMode access_mode_ = AccessAuditMode::Full;
+    std::uint64_t access_interval_ = 1;               // N for sample, K for count
+    std::atomic<std::uint64_t> access_counter_{0};    // successful-read counter for sampling
 
     // Helper function to extract tenant from auth context
     inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {

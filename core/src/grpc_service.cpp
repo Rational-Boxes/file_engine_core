@@ -25,9 +25,26 @@ GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                                  std::shared_ptr<TenantManager> tenant_manager,
                                  std::shared_ptr<AclManager> acl_manager,
                                  std::unique_ptr<StorageTracker> storage_tracker,
-                                 std::shared_ptr<IAuditSink> audit_sink)
+                                 std::shared_ptr<IAuditSink> audit_sink,
+                                 const std::string& audit_access_mode)
     : filesystem_(filesystem), tenant_manager_(tenant_manager), acl_manager_(acl_manager),
       storage_tracker_(std::move(storage_tracker)), audit_sink_(std::move(audit_sink)) {
+    // Parse AUDIT_ACCESS_MODE: "full" (default) | "sample:N" | "count[:K]".
+    auto parse_interval = [](const std::string& s, std::uint64_t fallback) -> std::uint64_t {
+        try {
+            std::uint64_t n = std::stoull(s);
+            return n < 1 ? 1 : n;
+        } catch (...) { return fallback; }
+    };
+    if (audit_access_mode.rfind("sample:", 0) == 0) {
+        access_mode_ = AccessAuditMode::Sample;
+        access_interval_ = parse_interval(audit_access_mode.substr(7), 1);
+    } else if (audit_access_mode == "count" || audit_access_mode.rfind("count:", 0) == 0) {
+        access_mode_ = AccessAuditMode::Count;
+        access_interval_ = audit_access_mode.size() > 6 ? parse_interval(audit_access_mode.substr(6), 1000) : 1000;
+    } else {
+        access_mode_ = AccessAuditMode::Full;  // full-fidelity default (§13)
+    }
 }
 
 bool GRPCFileService::emit_permission_audit(const std::string& tenant, const std::string& action,
@@ -77,6 +94,51 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
     e.source_iface = "grpc";
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));  // best-effort; the mutation proceeds regardless (§6)
+}
+
+void GRPCFileService::emit_access_audit(const std::string& tenant, const std::string& action,
+                                        AuditOutcome outcome, const std::string& actor,
+                                        const std::vector<std::string>& roles,
+                                        const std::string& target_uid, AuditTargetType target_type,
+                                        const std::string& detail_json) {
+    if (!audit_sink_) return;
+
+    // Denied accesses are ALWAYS recorded in full — the security signal must never
+    // be sampled away (§6/§13). The throughput valve applies to successful reads.
+    if (outcome != AuditOutcome::Denied && access_mode_ != AccessAuditMode::Full) {
+        const std::uint64_t n = access_counter_.fetch_add(1) + 1;
+        if (n % access_interval_ != 0) return;  // suppressed by sampling / aggregation
+        if (access_mode_ == AccessAuditMode::Count) {
+            // Coarse degraded mode: emit one aggregate marker every K reads instead
+            // of the individual entries (still records that access is happening).
+            AuditEntry agg;
+            agg.scope = AuditScope::Tenant;
+            agg.tenant = tenant;
+            agg.category = AuditCategory::Access;
+            agg.action = "access";
+            agg.outcome = AuditOutcome::Ok;
+            agg.actor = actor;
+            agg.source_iface = "grpc";
+            agg.detail = nlohmann::json({{"aggregated", access_interval_}, {"mode", "count"}}).dump();
+            audit_sink_->publish(std::move(agg));
+            return;
+        }
+        // Sample mode: this call is the 1-in-N that gets emitted as-is below.
+    }
+
+    AuditEntry e;
+    e.scope = AuditScope::Tenant;
+    e.tenant = tenant;
+    e.category = AuditCategory::Access;
+    e.action = action;
+    e.outcome = outcome;
+    e.actor = actor;
+    e.actor_roles = roles;
+    e.target_uid = target_uid;
+    e.target_type = target_type;
+    e.source_iface = "grpc";
+    e.detail = detail_json;
+    audit_sink_->publish(std::move(e));
 }
 
 // Directory operations
@@ -219,6 +281,7 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to list directory");
         SERVER_LOG_ERROR("GRPCService", "ListDirectory failed: User " + user + " does not have permission to list directory " + dir_uid);
+        emit_access_audit(tenant, "list", AuditOutcome::Denied, user, roles, dir_uid, AuditTargetType::Dir);
         return grpc::Status::OK;
     }
 
@@ -270,6 +333,8 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
         SERVER_LOG_INFO("GRPCService", "ListDirectory successful for uid: " + dir_uid);
     }
 
+    emit_access_audit(tenant, "list", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, dir_uid, AuditTargetType::Dir);
     return grpc::Status::OK;
 }
 
@@ -290,6 +355,7 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
         response->set_success(false);
         response->set_error("User does not have permission to list directory with deleted items");
         SERVER_LOG_ERROR("GRPCService", "ListDirectoryWithDeleted failed: User " + user + " does not have permission to list directory " + dir_uid);
+        emit_access_audit(tenant, "list_deleted", AuditOutcome::Denied, user, roles, dir_uid, AuditTargetType::Dir);
         return grpc::Status::OK;
     }
 
@@ -339,6 +405,8 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
         SERVER_LOG_INFO("GRPCService", "ListDirectoryWithDeleted successful for uid: " + dir_uid);
     }
 
+    emit_access_audit(tenant, "list_deleted", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, dir_uid, AuditTargetType::Dir);
     return grpc::Status::OK;
 }
 
@@ -614,6 +682,7 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to read file");
         SERVER_LOG_ERROR("GRPCService", "GetFile failed: User " + user + " does not have permission to read file " + file_uid);
+        emit_access_audit(tenant, "read", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File);
         return grpc::Status::OK;
     }
 
@@ -629,6 +698,8 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "GetFile failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "read", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -649,6 +720,7 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to access file information");
         SERVER_LOG_ERROR("GRPCService", "Stat failed: User " + user + " does not have permission to access file information for " + file_uid);
+        emit_access_audit(tenant, "stat", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File);
         return grpc::Status::OK;
     }
 
@@ -693,6 +765,8 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "Stat failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "stat", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -704,6 +778,8 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
     auto auth_context = request->auth();
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
+    std::string user = get_user_from_auth_context(auth_context);
+    std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     auto result = filesystem_->exists(file_uid, tenant);
 
@@ -716,6 +792,8 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "Exists failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "exists", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -877,6 +955,7 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to list file versions");
         SERVER_LOG_ERROR("GRPCService", "ListVersions failed: User " + user + " does not have permission to list file versions for " + file_uid);
+        emit_access_audit(tenant, "list_versions", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File);
         return grpc::Status::OK;
     }
 
@@ -893,6 +972,8 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "ListVersions failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "list_versions", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -913,6 +994,8 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to access file version");
         SERVER_LOG_ERROR("GRPCService", "GetVersion failed: User " + user + " does not have permission to access file version for " + file_uid);
+        emit_access_audit(tenant, "read_version", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"version", version_timestamp}}).dump());
         return grpc::Status::OK;
     }
 
@@ -927,6 +1010,9 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "GetVersion failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "read_version", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"version", version_timestamp}}).dump());
     return grpc::Status::OK;
 }
 
@@ -1028,6 +1114,8 @@ grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to get metadata");
         SERVER_LOG_ERROR("GRPCService", "GetMetadata failed: User " + user + " does not have permission to get metadata for " + file_uid);
+        emit_access_audit(tenant, "read_metadata", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"key", key}}).dump());
         return grpc::Status::OK;
     }
 
@@ -1042,6 +1130,9 @@ grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "GetMetadata failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "read_metadata", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"key", key}}).dump());
     return grpc::Status::OK;
 }
 
@@ -1061,6 +1152,7 @@ grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
         response->set_success(false);
         response->set_error("User does not have permission to get metadata");
         SERVER_LOG_ERROR("GRPCService", "GetAllMetadata failed: User " + user + " does not have permission to get metadata for " + file_uid);
+        emit_access_audit(tenant, "read_metadata", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File);
         return grpc::Status::OK;
     }
 
@@ -1077,6 +1169,8 @@ grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "GetAllMetadata failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "read_metadata", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 
@@ -1136,6 +1230,8 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
         response->set_success(false);
         response->set_error("User does not have permission to get metadata for version");
         SERVER_LOG_ERROR("GRPCService", "GetMetadataForVersion failed: User " + user + " does not have permission to get metadata for version for " + file_uid);
+        emit_access_audit(tenant, "read_metadata", AuditOutcome::Denied, user, roles, file_uid, AuditTargetType::File,
+                          nlohmann::json({{"version", version_timestamp}}).dump());
         return grpc::Status::OK;
     }
 
@@ -1150,6 +1246,9 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
         SERVER_LOG_ERROR("GRPCService", "GetMetadataForVersion failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "read_metadata", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"version", version_timestamp}}).dump());
     return grpc::Status::OK;
 }
 
@@ -1713,6 +1812,8 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "StreamFileDownload failed for uid: " + file_uid + " with error: " + result.error);
     }
 
+    emit_access_audit(tenant, "download_stream", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+                      user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
 

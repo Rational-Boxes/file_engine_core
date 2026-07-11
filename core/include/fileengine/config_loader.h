@@ -101,6 +101,10 @@ struct Config {
     std::string audit_stream = "fileengine:audit";
     long long   audit_stream_maxlen = 1000000;
     std::string audit_wal_path = "audit.wal";
+    // Access-log throughput valve (§6/§13). Default full-fidelity; "sample:N"
+    // emits 1-in-N successful reads; "count[:K]" emits an aggregate every K.
+    // Denied accesses are ALWAYS recorded in full regardless of the mode.
+    std::string audit_access_mode = "full";
 };
 
 class ConfigLoader {

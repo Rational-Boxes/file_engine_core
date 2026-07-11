@@ -66,6 +66,7 @@ static void apply_events_config(const std::map<std::string, std::string>& vars, 
     if (auto v = get("FILEENGINE_AUDIT_STREAM")) config.audit_stream = *v;
     if (auto v = get("FILEENGINE_AUDIT_STREAM_MAXLEN")) config.audit_stream_maxlen = std::stoll(*v);
     if (auto v = get("FILEENGINE_AUDIT_WAL_PATH")) config.audit_wal_path = *v;
+    if (auto v = get("FILEENGINE_AUDIT_ACCESS_MODE")) config.audit_access_mode = *v;
 }
 
 std::map<std::string, std::string> ConfigLoader::parse_env_file(const std::string& filepath) {
