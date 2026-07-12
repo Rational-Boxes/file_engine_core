@@ -10,6 +10,7 @@
 #include <functional>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 
 namespace fileengine {
@@ -74,6 +75,11 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> sync_in_progress_;
     mutable std::mutex sync_mutex_;
+    // Interruptible retry sleep in monitoring_loop: stop_sync_service() flips
+    // running_ and wakes this CV so the worker exits at once instead of blocking
+    // join() for the remainder of a retry_seconds interval.
+    std::mutex sync_wait_mutex_;
+    std::condition_variable sync_wait_cv_;
 
     std::atomic<size_t> synced_file_count_;
     std::atomic<size_t> failed_sync_count_;

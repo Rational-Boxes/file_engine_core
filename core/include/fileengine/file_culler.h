@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -63,8 +64,13 @@ private:
     CullingConfig config_;
 
     std::thread culling_thread_;
-    bool running_;
+    std::atomic<bool> running_;
     mutable std::mutex config_mutex_;
+    // Interruptible sleep between culling passes: stop() flips running_ and wakes
+    // this CV so the worker exits immediately instead of blocking join() for the
+    // rest of its (multi-minute) sleep.
+    std::mutex cull_wait_mutex_;
+    std::condition_variable cull_wait_cv_;
     std::atomic<size_t> culled_file_count_;
     std::atomic<size_t> culled_byte_count_;
 

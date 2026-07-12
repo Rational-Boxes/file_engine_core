@@ -294,7 +294,10 @@ int main(int argc, char** argv) {
 
     sd_notify(0, "STOPPING=1\nSTATUS=Shutting down\n");
     std::cout << "\nShutting down gRPC server..." << std::endl;
-    server->Shutdown();
+    // Bounded graceful shutdown: let in-flight RPCs drain for a few seconds, then
+    // force-cancel. A no-deadline Shutdown() blocks forever on a stuck or
+    // long-lived streaming call (StreamFileUpload/Download).
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
     if (rest_listener) rest_listener->stop();
 
     // Stop services in reverse order

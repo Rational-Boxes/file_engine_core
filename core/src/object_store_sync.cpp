@@ -51,12 +51,18 @@ Result<void> ObjectStoreSync::start_sync_service() {
 
 void ObjectStoreSync::stop_sync_service() {
     if (running_.load()) {
-        running_ = false;
-        
+        {
+            // Flip the flag under the wait mutex so the monitoring loop cannot
+            // miss the wakeup between checking running_ and blocking on the CV.
+            std::lock_guard<std::mutex> wait_lock(sync_wait_mutex_);
+            running_ = false;
+        }
+        sync_wait_cv_.notify_all();
+
         if (sync_thread_.joinable()) {
             sync_thread_.join();
         }
-        
+
         if (recovery_thread_.joinable()) {
             recovery_thread_.join();
         }
@@ -327,7 +333,9 @@ void ObjectStoreSync::monitoring_loop() {
 
             // If still not healthy after recovery attempt, wait for retry interval
             if (!is_connection_healthy()) {
-                std::this_thread::sleep_for(std::chrono::seconds(config_.retry_seconds));
+                std::unique_lock<std::mutex> wait_lock(sync_wait_mutex_);
+                sync_wait_cv_.wait_for(wait_lock, std::chrono::seconds(config_.retry_seconds),
+                                       [this] { return !running_.load(); });
                 continue; // Skip sync if connection is still down
             } else {
                 // Connection was restored, reset the flag
@@ -345,8 +353,11 @@ void ObjectStoreSync::monitoring_loop() {
             }
         }
 
-        // Sleep for the configured retry interval before checking again
-        std::this_thread::sleep_for(std::chrono::seconds(config_.retry_seconds));
+        // Sleep for the configured retry interval before checking again, waking
+        // immediately on stop so shutdown isn't blocked for up to retry_seconds.
+        std::unique_lock<std::mutex> wait_lock(sync_wait_mutex_);
+        sync_wait_cv_.wait_for(wait_lock, std::chrono::seconds(config_.retry_seconds),
+                               [this] { return !running_.load(); });
     }
 }
 

@@ -33,7 +33,13 @@ void FileCuller::start_automatic_culling() {
 
 void FileCuller::stop_automatic_culling() {
     if (running_) {
-        running_ = false;
+        {
+            // Set the flag under the wait mutex so the worker cannot miss the
+            // wakeup between checking running_ and blocking on the CV.
+            std::lock_guard<std::mutex> wait_lock(cull_wait_mutex_);
+            running_ = false;
+        }
+        cull_wait_cv_.notify_all();
         if (culling_thread_.joinable()) {
             culling_thread_.join();
         }
@@ -151,8 +157,11 @@ void FileCuller::culling_loop() {
             perform_culling();
         }
         
-        // Sleep for a while before checking again
-        std::this_thread::sleep_for(std::chrono::minutes(5));  // Check every 5 minutes
+        // Sleep before the next pass, but wake immediately on stop so shutdown
+        // isn't blocked for up to 5 minutes waiting out this interval.
+        std::unique_lock<std::mutex> wait_lock(cull_wait_mutex_);
+        cull_wait_cv_.wait_for(wait_lock, std::chrono::minutes(5),
+                               [this] { return !running_.load(); });
     }
 }
 
