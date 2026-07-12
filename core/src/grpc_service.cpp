@@ -83,11 +83,19 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
                                         const std::string& target_uid, AuditTargetType target_type,
                                         const std::string& detail_json) {
     if (!audit_sink_) return;
-    // Drop hidden-child / sidecar (rendition) writes unless explicitly enabled —
-    // the conversion service's thumbnail/preview output is noise, not signal.
-    if (!audit_hidden_children_ && target_type == AuditTargetType::File &&
-        filesystem_ && filesystem_->is_hidden_child(target_uid, tenant)) {
-        return;
+    // Resolve the target's display name (and detect rendition/sidecar hidden
+    // children) for file/dir/version targets in a single lookup path.
+    std::string resolved_name;
+    if (filesystem_ && (target_type == AuditTargetType::File ||
+                        target_type == AuditTargetType::Dir ||
+                        target_type == AuditTargetType::Version)) {
+        bool is_hidden = false;
+        filesystem_->resolve_audit_target(target_uid, tenant, resolved_name, is_hidden);
+        // Drop hidden-child / sidecar (rendition) writes unless explicitly enabled
+        // — the conversion service's thumbnail/preview output is noise, not signal.
+        if (!audit_hidden_children_ && target_type == AuditTargetType::File && is_hidden) {
+            return;
+        }
     }
     AuditEntry e;
     e.scope = AuditScope::Tenant;
@@ -98,6 +106,7 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
     e.actor = actor;
     e.actor_roles = roles;
     e.target_uid = target_uid;
+    e.target_name = resolved_name;
     e.target_type = target_type;
     e.source_iface = "grpc";
     e.detail = detail_json;
@@ -111,12 +120,18 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
                                         const std::string& detail_json) {
     if (!audit_sink_) return;
 
-    // Drop reads of hidden-child / sidecar (rendition) entities unless explicitly
-    // enabled: viewing a generated thumbnail/preview is not an auditable access.
-    // Checked before the sampling valve so hidden children never consume a sample.
-    if (!audit_hidden_children_ && target_type == AuditTargetType::File &&
-        filesystem_ && filesystem_->is_hidden_child(target_uid, tenant)) {
-        return;
+    // Resolve the target's display name (and detect rendition/sidecar hidden
+    // children) for file/dir/version targets. Done before the sampling valve so a
+    // hidden child never consumes a sample and reads of them can be dropped.
+    std::string resolved_name;
+    if (filesystem_ && (target_type == AuditTargetType::File ||
+                        target_type == AuditTargetType::Dir ||
+                        target_type == AuditTargetType::Version)) {
+        bool is_hidden = false;
+        filesystem_->resolve_audit_target(target_uid, tenant, resolved_name, is_hidden);
+        if (!audit_hidden_children_ && target_type == AuditTargetType::File && is_hidden) {
+            return;
+        }
     }
 
     // Denied accesses are ALWAYS recorded in full — the security signal must never
@@ -151,6 +166,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
     e.actor = actor;
     e.actor_roles = roles;
     e.target_uid = target_uid;
+    e.target_name = resolved_name;
     e.target_type = target_type;
     e.source_iface = "grpc";
     e.detail = detail_json;

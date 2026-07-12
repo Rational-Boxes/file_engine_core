@@ -92,10 +92,12 @@ public:
                                   const std::string& tenant = "");
     virtual Result<bool> exists(const std::string& file_uid, const std::string& tenant = "");
 
-    // True if `uid` is a hidden child / sidecar — a file whose parent is itself a
-    // file (a rendition, per file_renditions.md). Best-effort: false on any lookup
-    // failure. Used by the audit path to suppress conversion-service noise.
-    bool is_hidden_child(const std::string& uid, const std::string& tenant);
+    // Resolve audit metadata for a target file/dir in one lookup path: its display
+    // name, and whether it is a hidden child / sidecar (a rendition — parent is a
+    // file, per file_renditions.md). Best-effort: leaves the outputs untouched on
+    // any lookup failure. At most two DB lookups (the target row, then its parent).
+    void resolve_audit_target(const std::string& uid, const std::string& tenant,
+                              std::string& out_name, bool& out_is_hidden_child);
 
     // Path operations
     virtual Result<void> move(const std::string& src_uid, const std::string& dst_uid,

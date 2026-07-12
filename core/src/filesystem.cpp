@@ -1758,23 +1758,26 @@ Result<bool> FileSystem::check_permission(const std::string& resource_uid,
     return result;
 }
 
-bool FileSystem::is_hidden_child(const std::string& uid, const std::string& tenant) {
-    // A rendition/sidecar is a hidden child of a *file*: detect via parent type
-    // (mirrors the is_rendition enrichment on the event envelope). Best-effort —
-    // never let this disturb the calling audit/filesystem path.
-    if (uid.empty()) return false;
+void FileSystem::resolve_audit_target(const std::string& uid, const std::string& tenant,
+                                      std::string& out_name, bool& out_is_hidden_child) {
+    // Best-effort enrichment for the audit log — never let it disturb the caller.
+    if (uid.empty()) return;
     try {
         auto* context = get_tenant_context(tenant);
-        if (!context || !context->db) return false;
+        if (!context || !context->db) return;
         auto info = context->db->get_file_by_uid_include_deleted(uid, tenant);
-        if (!info.success || !info.value.has_value()) return false;
+        if (!info.success || !info.value.has_value()) return;
+        out_name = info.value.value().name;
+        // A rendition/sidecar is a hidden child of a *file*: detect via parent type
+        // (mirrors the is_rendition enrichment on the event envelope).
         const std::string& parent_uid = info.value.value().parent_uid;
-        if (parent_uid.empty()) return false;
+        if (parent_uid.empty()) return;
         auto parent = context->db->get_file_by_uid_include_deleted(parent_uid, tenant);
-        if (!parent.success || !parent.value.has_value()) return false;
-        return parent.value.value().type == FileType::REGULAR_FILE;
+        if (parent.success && parent.value.has_value()) {
+            out_is_hidden_child = (parent.value.value().type == FileType::REGULAR_FILE);
+        }
     } catch (...) {
-        return false;
+        // leave outputs unchanged on failure
     }
 }
 
