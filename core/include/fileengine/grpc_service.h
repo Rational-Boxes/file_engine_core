@@ -29,7 +29,8 @@ public:
                              std::shared_ptr<AclManager> acl_manager,
                              std::unique_ptr<StorageTracker> storage_tracker,
                              std::shared_ptr<IAuditSink> audit_sink = nullptr,
-                             const std::string& audit_access_mode = "full");
+                             const std::string& audit_access_mode = "full",
+                             bool audit_hidden_children = false);
 
     // Directory operations
     grpc::Status MakeDirectory(grpc::ServerContext* context,
@@ -248,6 +249,12 @@ private:
     AccessAuditMode access_mode_ = AccessAuditMode::Full;
     std::uint64_t access_interval_ = 1;               // N for sample, K for count
     std::atomic<std::uint64_t> access_counter_{0};    // successful-read counter for sampling
+
+    // When false (default), audit entries whose target is a hidden child / sidecar
+    // (a rendition — a file's hidden child) are dropped from both the access and
+    // mutate logs: the conversion service's thumbnail/preview churn is noise, not a
+    // security signal. Set FILEENGINE_AUDIT_HIDDEN_CHILDREN=true to record them.
+    bool audit_hidden_children_ = false;
 
     // Helper function to extract tenant from auth context
     inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {

@@ -1753,9 +1753,29 @@ Result<bool> FileSystem::check_permission(const std::string& resource_uid,
         return Result<bool>::ok(true);
     }
     
-    auto result = acl_manager_->check_permission(resource_uid, user, roles, 
+    auto result = acl_manager_->check_permission(resource_uid, user, roles,
                                                  required_permissions, tenant);
     return result;
+}
+
+bool FileSystem::is_hidden_child(const std::string& uid, const std::string& tenant) {
+    // A rendition/sidecar is a hidden child of a *file*: detect via parent type
+    // (mirrors the is_rendition enrichment on the event envelope). Best-effort —
+    // never let this disturb the calling audit/filesystem path.
+    if (uid.empty()) return false;
+    try {
+        auto* context = get_tenant_context(tenant);
+        if (!context || !context->db) return false;
+        auto info = context->db->get_file_by_uid_include_deleted(uid, tenant);
+        if (!info.success || !info.value.has_value()) return false;
+        const std::string& parent_uid = info.value.value().parent_uid;
+        if (parent_uid.empty()) return false;
+        auto parent = context->db->get_file_by_uid_include_deleted(parent_uid, tenant);
+        if (!parent.success || !parent.value.has_value()) return false;
+        return parent.value.value().type == FileType::REGULAR_FILE;
+    } catch (...) {
+        return false;
+    }
 }
 
 void FileSystem::shutdown() {

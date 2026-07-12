@@ -26,9 +26,11 @@ GRPCFileService::GRPCFileService(std::shared_ptr<FileSystem> filesystem,
                                  std::shared_ptr<AclManager> acl_manager,
                                  std::unique_ptr<StorageTracker> storage_tracker,
                                  std::shared_ptr<IAuditSink> audit_sink,
-                                 const std::string& audit_access_mode)
+                                 const std::string& audit_access_mode,
+                                 bool audit_hidden_children)
     : filesystem_(filesystem), tenant_manager_(tenant_manager), acl_manager_(acl_manager),
-      storage_tracker_(std::move(storage_tracker)), audit_sink_(std::move(audit_sink)) {
+      storage_tracker_(std::move(storage_tracker)), audit_sink_(std::move(audit_sink)),
+      audit_hidden_children_(audit_hidden_children) {
     // Parse AUDIT_ACCESS_MODE: "full" (default) | "sample:N" | "count[:K]".
     auto parse_interval = [](const std::string& s, std::uint64_t fallback) -> std::uint64_t {
         try {
@@ -81,6 +83,12 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
                                         const std::string& target_uid, AuditTargetType target_type,
                                         const std::string& detail_json) {
     if (!audit_sink_) return;
+    // Drop hidden-child / sidecar (rendition) writes unless explicitly enabled —
+    // the conversion service's thumbnail/preview output is noise, not signal.
+    if (!audit_hidden_children_ && target_type == AuditTargetType::File &&
+        filesystem_ && filesystem_->is_hidden_child(target_uid, tenant)) {
+        return;
+    }
     AuditEntry e;
     e.scope = AuditScope::Tenant;
     e.tenant = tenant;
@@ -102,6 +110,14 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
                                         const std::string& target_uid, AuditTargetType target_type,
                                         const std::string& detail_json) {
     if (!audit_sink_) return;
+
+    // Drop reads of hidden-child / sidecar (rendition) entities unless explicitly
+    // enabled: viewing a generated thumbnail/preview is not an auditable access.
+    // Checked before the sampling valve so hidden children never consume a sample.
+    if (!audit_hidden_children_ && target_type == AuditTargetType::File &&
+        filesystem_ && filesystem_->is_hidden_child(target_uid, tenant)) {
+        return;
+    }
 
     // Denied accesses are ALWAYS recorded in full — the security signal must never
     // be sampled away (§6/§13). The throughput valve applies to successful reads.

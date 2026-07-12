@@ -92,6 +92,11 @@ public:
                                   const std::string& tenant = "");
     virtual Result<bool> exists(const std::string& file_uid, const std::string& tenant = "");
 
+    // True if `uid` is a hidden child / sidecar — a file whose parent is itself a
+    // file (a rendition, per file_renditions.md). Best-effort: false on any lookup
+    // failure. Used by the audit path to suppress conversion-service noise.
+    bool is_hidden_child(const std::string& uid, const std::string& tenant);
+
     // Path operations
     virtual Result<void> move(const std::string& src_uid, const std::string& dst_uid,
                               const std::string& user,

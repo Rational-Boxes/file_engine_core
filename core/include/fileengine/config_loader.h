@@ -105,6 +105,11 @@ struct Config {
     // emits 1-in-N successful reads; "count[:K]" emits an aggregate every K.
     // Denied accesses are ALWAYS recorded in full regardless of the mode.
     std::string audit_access_mode = "full";
+    // Audit hidden-child / sidecar entities (renditions: a file's hidden children,
+    // per file_renditions.md). Default OFF: the conversion service's own thumbnail/
+    // preview writes — and reads of them — are pure noise for a security log. Set
+    // true when a future feature stores user-supplied hidden sidecars worth auditing.
+    bool        audit_hidden_children = false;
 };
 
 class ConfigLoader {
