@@ -1,7 +1,67 @@
 # FileEngine Core - Project Context
 
+> **This file leads with a workspace-wide map** (the section below) so that a
+> cold start — no prior context — has the whole ecosystem in view. Everything
+> after "## Overview" is specific to the `file_engine_core` service itself.
+
+## Workspace Quick-Start (multi-project map)
+
+The parent directory `/home/telendry/code/file_projects/` is a **meta-project**: a
+platform of cooperating services around the canonical **FileEngine gRPC core**.
+Sibling projects resolve each other by relative path (e.g. Python services import
+`../python_interface`). There is no single git root — each project is versioned
+independently.
+
+### The one-paragraph architecture
+A browser (**frontend**, Vue 3 SPA) talks to protocol **bridges** over
+REST/WebDAV. The bridges authenticate the caller against **LDAP**, mint an
+opaque **HS256 bearer token**, and forward the resolved identity to the
+**core** as a trusted `AuthenticationContext`. The **core** (this project) is the
+sole enforcer of ACLs, versioning, tenancy, and storage (PostgreSQL metadata +
+local FS + S3/MinIO objects). Feature services (search/AI, discussion) sit
+beside the bridges, re-checking every access *as the end-user* via the core's
+`CheckPermission`. All services publish security events to a Redis stream that
+the **audit_service** drains into a tamper-evident, hash-chained log.
+
+### Service map (dev topology per `scripts/start_backend_services.sh`)
+
+| Project | Lang | Role | Port(s) | Auth |
+|---|---|---|---|---|
+| **file_engine_core** | C++17 | Canonical gRPC filesystem + ACL/RBAC engine | gRPC **50051**, REST monitor **8081** | Trusts `AuthenticationContext` (upstream-authenticated) |
+| **http_bridge** | C++17 | REST/JSON gateway → core; LDAP+JWT+OAuth | main **8090**, monitor **8091** (loopback) | Basic/Bearer/OAuth → LDAP → HS256 JWT |
+| **webdav_bridge** | C++17 | WebDAV gateway → core; path→UUID resolver (Postgres) | main **8088**, monitor **8089** (loopback) | Basic/Digest → LDAP |
+| **ldap_manager** | Python/FastAPI | Tenant user/role admin, invites, password reset | api **8093**, monitor **8094** (loopback) | Bearer (bridge JWT) |
+| **convert_search_ai** (csai) | Python/FastAPI | Doc conversion, FTS/vector search, RAG chat | app **8092**, worker (portless) | Bearer/LDAP; per-user `CheckPermission` |
+| **discussion_threaded_communication** | Python/FastAPI | Doc-anchored threads, reviews, live sync | api **8094**, mcp **8095**, consumer/digest (portless) | Bearer/LDAP; per-user `CheckPermission` |
+| **mcp** | Python | MCP server exposing core to LLM agents (append-only, recoverable) | http **8096** | LDAP (stdio) / Basic+Bearer (http) |
+| **audit_service** | Python | Drains Redis audit stream → hash-chained Postgres log; query API; rules engine | api **8097** (loopback), consumers (portless) | Bearer (JWT), AUDIT_READ scope |
+| **frontend** | Vue 3 / TS | Web UI orchestrating the four services above | dev **3000** (Vite) | Opaque bearer token in localStorage |
+| **python_interface** / **javascript_interface** | Python / TS | Client SDKs speaking gRPC to the core | — | Trusted upstream (identity passed verbatim) |
+| **scripts** | Bash/Ansible | Dev launcher + centralized deploy (Ansible → Podman/Quadlet) | — | SSH / Ansible Vault |
+| **docker_unified** | Compose | Single-host container stack (nginx TLS edge, per-tenant subdomains) | nginx **80/443** | — |
+| **DEPRICATED_file_engine_cpp** | C++ | **Deprecated** predecessor of the core — do not modify | — | — |
+
+**Shared infra (dev):** PostgreSQL `:5434`, OpenLDAP `:1389`, MinIO `:9000`, Redis `:6379`.
+
+### Security / trust model (read before touching auth)
+- **Core trusts its input.** Every RPC carries `AuthenticationContext{user, roles, tenant, claims}`; the core does **not** authenticate — it authorizes. Whoever calls gRPC directly is fully trusted, so gRPC (`:50051`) must never be network-exposed. Authentication lives in the bridges/LDAP.
+- **`system_admin` role bypasses all ACL checks** in the core. The SDKs pass roles verbatim, so an untrusted SDK caller can forge it — SDKs are safe only server-side.
+- **Bridges are the security boundary:** LDAP bind → JWT (HS256, `FILEENGINE_JWT_SECRET` shared across services for local verification), tenant resolution, request-size caps, CORS scoping.
+- **Feature services fail-closed:** permission cache (TTL ≤ 5 min, event-invalidated); core unreachable ⇒ deny.
+- **Monitoring endpoints** (`/healthz` `/readyz` `/poolz`) are unauthenticated and **must bind loopback-only** (the core's REST monitor defaults to `0.0.0.0:8081` — that is a known exposure to verify per deployment).
+- **Audit is tamper-evident** (SHA-256 hash chain) and, for auth events, **fail-closed** (login refused if the audit stream is unreachable).
+
+### Where to look first
+- **Proto contract (source of truth):** `file_engine_core/proto/fileservice.proto` — copied into each bridge/SDK; keep in sync.
+- **Run the whole stack (dev):** `scripts/start_backend_services.sh` (needs the 4 infra services up).
+- **Run the whole stack (containers):** `docker_unified/` (`docker compose -f docker-compose.yml -f docker-compose.test.yml up -d`).
+- **Deploy (prod):** `scripts/Ansible/` (roles per service; secrets in Ansible Vault).
+- **End-user docs** live in **frontend**, not here (per project convention).
+
+---
+
 ## Overview
-FileEngine Core is a C++17 distributed virtual filesystem with horizontal scaling and hybrid cloud/on-premises deployment. It provides multi-tenant file management with POSIX ACLs, S3/MinIO object store integration, and a gRPC API. Version 1.0.0.
+FileEngine Core is a C++17 distributed virtual filesystem with horizontal scaling and hybrid cloud/on-premises deployment. It provides multi-tenant file management with POSIX ACLs, S3/MinIO object store integration, and a gRPC API. Version 2.1.0 (CMakeLists.txt).
 
 ## Project Structure
 ```
