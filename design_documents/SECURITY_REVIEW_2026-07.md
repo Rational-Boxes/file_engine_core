@@ -31,8 +31,8 @@ the system fails to enforce *its own* intended model.
 | M1 | Medium | ALLOW/DENY precedence — hierarchical resolution | core | **Fixed** (core `security/hardening`) |
 | M2 | Medium | `GROUP`-type ACL matches every principal | core | **Open** (latent) |
 | M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Fixed** (http_bridge `security/hardening`) |
-| M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Open** |
-| M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Open** |
+| M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Fixed** (webdav `security/hardening`) |
+| M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
 | L2 | Low | Core REST monitor defaults to `0.0.0.0:8081` | core | **Open** |
 | L3 | Low | Audit fail-**open** when disabled; OAuth/refresh unaudited | http_bridge | **Open** |
@@ -195,11 +195,16 @@ This is a design proposal for review — **not yet implemented.**
   intact. **webdav:** its tenant is host-derived only (`extractTenantFromHostname`)
   with no client `X-Tenant` override, so the header-injection vector does not
   exist there; Host is set by the proxy. No change made in webdav.
-- **M4 — webdav COPY/MOVE:** `webdav_server.cpp:861, 1025` ignore the
-  `Destination` authority and the `Overwrite` header (silent clobber, contract
-  violation).
-- **M5 — XML injection:** `webdav_server.cpp:662, 716, 745, 835` reflect
-  path/name into PROPFIND/PROPPATCH XML without escaping.
+- **M4 — webdav COPY/MOVE — FIXED:** a `prepareDestination()` guard now runs
+  before both handlers: the `Destination` authority must match the request host
+  (else **502**), and RFC 4918 `Overwrite` is honored — an existing target with
+  `Overwrite: F` yields **412**, and with `Overwrite: T` the target is deleted
+  first (the core permission-checks the delete, so an unauthorized overwrite is
+  **403**). Resolution uses the caller's auth, so destination permissions are
+  enforced with appropriate status codes.
+- **M5 — XML injection — FIXED:** added `xmlEscape()` and applied it to every
+  path/name reflected into PROPFIND/PROPPATCH `<D:href>`/`<D:displayname>`
+  (9 sites), escaping `& < > " '`.
 
 ---
 
