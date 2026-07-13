@@ -92,11 +92,24 @@ struct ACLRule {
 
 class IDatabase;
 
-// Reserved role name. A user whose effective roles (request_roles ∪ DB-stored
-// roles) contain this string bypasses all ACL checks. There is no enable
-// flag — the trust model is that upstream authentication only attaches the
-// system_admin role to legitimately privileged requests.
+// Reserved role names. A user whose effective roles (request_roles ∪ DB-stored
+// roles) contain either of these bypasses all ACL checks for the resource. There
+// is no enable flag — the trust model is that upstream authentication only
+// attaches these roles to legitimately privileged requests.
+//
+//   kSystemAdminRole — a GLOBAL platform operator. Reserved for deployment
+//     operators; the bridges grant it only from an explicit operators group,
+//     never from a per-tenant "administrators" group.
+//   kTenantAdminRole — admin of the CALLER'S OWN tenant only. Its bypass is
+//     inherently tenant-scoped: this AclManager resolves against a single
+//     tenant's schema (db_), so a tenant_admin can never reach another tenant's
+//     resources. The bridges map a tenant's "administrators" group to this role.
+//
+// Separating the two contains the blast radius of a per-tenant admin (finding
+// H2): a mis-placed or attacker-created "administrators" group grants control of
+// one tenant, not the whole deployment.
 inline constexpr const char* kSystemAdminRole = "system_admin";
+inline constexpr const char* kTenantAdminRole = "tenant_admin";
 
 // Human-facing name for the "everyone" principal. A rule whose PrincipalType
 // is OTHER matches every principal regardless of the stored principal string,
@@ -127,10 +140,22 @@ public:
     bool default_read() const { return default_read_; }
 
     // Returns true iff the user (via request roles or DB-stored roles) holds
-    // kSystemAdminRole.
+    // kSystemAdminRole (the global platform operator).
     bool is_system_admin(const std::string& user,
                          const std::vector<std::string>& request_roles,
                          const std::string& tenant = "");
+
+    // Returns true iff the user holds kTenantAdminRole (admin of THIS tenant).
+    bool is_tenant_admin(const std::string& user,
+                         const std::vector<std::string>& request_roles,
+                         const std::string& tenant = "");
+
+    // Returns true iff the user is an admin of this tenant by EITHER role
+    // (system_admin OR tenant_admin). Use this for in-tenant admin gates (e.g.
+    // root-directory creation) where both should qualify.
+    bool is_admin(const std::string& user,
+                  const std::vector<std::string>& request_roles,
+                  const std::string& tenant = "");
 
     // Request-scoped ACL lookup cache. Within the lifetime of a CacheScope,
     // repeat get_acls_for_resource lookups for the same (resource, tenant)

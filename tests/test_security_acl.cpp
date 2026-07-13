@@ -313,6 +313,76 @@ void test_hierarchical_precedence() {
           "a user without the role is denied by everyone DENY");
 }
 
+// H2 — tenant-scoped superuser boundary. tenant_admin grants full control within
+// the caller's OWN tenant but is NOT the global system_admin operator, so a
+// per-tenant admin can never inherit global-operator capabilities.
+void test_tenant_admin_is_scoped_not_global() {
+    std::cout << "test_tenant_admin_is_scoped_not_global\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+
+    // A tenant_admin is a tenant admin + an admin — but NOT a global system_admin.
+    CHECK(acl.is_tenant_admin("carol", {"tenant_admin"}, "acme"), "tenant_admin -> is_tenant_admin");
+    CHECK(acl.is_admin("carol", {"tenant_admin"}, "acme"),        "tenant_admin -> is_admin");
+    CHECK(!acl.is_system_admin("carol", {"tenant_admin"}, "acme"),
+          "tenant_admin must NOT be a global system_admin (H2 boundary)");
+
+    // A system_admin is a global operator + admin, but not the tenant role.
+    CHECK(acl.is_system_admin("root", {"system_admin"}, "acme"),  "system_admin -> is_system_admin");
+    CHECK(acl.is_admin("root", {"system_admin"}, "acme"),         "system_admin -> is_admin");
+    CHECK(!acl.is_tenant_admin("root", {"system_admin"}, "acme"), "system_admin is not tenant_admin");
+
+    // A plain user is neither.
+    CHECK(!acl.is_admin("bob", {"users"}, "acme"), "plain user is not an admin");
+}
+
+// Both admin roles fully bypass ACLs within the tenant; a plain user does not.
+void test_admin_roles_bypass_within_tenant() {
+    std::cout << "test_admin_roles_bypass_within_tenant\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);   // no grants at all
+    AclManager acl(db);
+    acl.set_default_read(false);    // strict: nothing allowed without a grant
+
+    // tenant_admin and system_admin both get full control, incl. the destructive
+    // CULL_VERSIONS bit that is never granted by default.
+    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_CULL), "tenant_admin bypasses to CULL within tenant");
+    CHECK(can(acl, "F", "root",  {"system_admin"}, P_CULL), "system_admin bypasses to CULL");
+    int eff = acl.get_effective_permissions("F", "carol", {"tenant_admin"}, "acme").value;
+    CHECK((eff & P_CULL) && (eff & P_MANAGE) && (eff & P_DELETE),
+          "tenant_admin effective permission set is all bits");
+    // a plain user with no grant is denied in strict mode
+    CHECK(!can(acl, "F", "bob", {"users"}, P_READ), "plain user denied without a grant");
+}
+
+// The boundary is STRUCTURAL: each tenant has its own AclManager + data store, so
+// the same tenant_admin role, evaluated by a different tenant's manager, only ever
+// sees that tenant's data. Two isolated mocks stand in for two tenant schemas.
+void test_tenant_admin_boundary_is_per_manager() {
+    std::cout << "test_tenant_admin_boundary_is_per_manager\n";
+    auto tenantA = std::make_shared<MockDatabase>();
+    auto tenantB = std::make_shared<MockDatabase>();
+    tenantA->add_node("docA", "", false);
+    tenantB->add_node("docB", "", false);
+    AclManager aclA(tenantA), aclB(tenantB);
+    aclA.set_default_read(false);
+    aclB.set_default_read(false);
+    aclB.grant_permission("docB", "secret=1", PrincipalType::CLAIM, P_READ);  // a grant only in tenant B
+
+    // A tenant_admin has full control of the tenant whose manager handles the
+    // request (here, tenant A's own node):
+    CHECK(can(aclA, "docA", "carol", {"tenant_admin"}, P_DELETE),
+          "tenant_admin controls its own tenant's node");
+    // ...and tenant A's manager holds NONE of tenant B's ACL data — the schemas do
+    // not bleed. (In production, M3 also ensures a tenant_admin request is only
+    // ever routed to their own tenant's manager.)
+    CHECK(aclA.get_acls_for_resource("docB").value.empty(),
+          "tenant A's manager has no ACL data for tenant B's node (boundary)");
+    CHECK(!aclB.get_acls_for_resource("docB").value.empty(),
+          "tenant B's manager does hold its own node's ACL");
+}
+
 int main() {
     std::cout << "=== AclManager security semantics ===\n";
     test_write_does_not_imply_destructive();
@@ -323,6 +393,9 @@ int main() {
     test_claim_abac_exact_match();
     test_default_read_toggle();
     test_hierarchical_precedence();
+    test_tenant_admin_is_scoped_not_global();
+    test_admin_roles_bypass_within_tenant();
+    test_tenant_admin_boundary_is_per_manager();
     std::cout << "\nAll " << g_checks << " checks passed.\n";
     return 0;
 }
