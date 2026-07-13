@@ -142,7 +142,7 @@ Result<void> FileSystem::rmdir(const std::string& dir_uid, const std::string& us
     // Check permissions - the user needs write permission on the directory
     SERVER_LOG_DEBUG("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Checking permissions for user: " + user + " on directory: " + dir_uid);
-    auto perm_result = validate_user_permissions(dir_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(dir_uid, user, roles, static_cast<int>(Permission::DELETE), tenant); // dedicated DELETE bit (H1)
     if (!perm_result.success || !perm_result.value) {
         SERVER_LOG_ERROR("FileSystem::rmdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "User " + user + " does not have permission to remove directory " + dir_uid);
@@ -328,7 +328,7 @@ Result<void> FileSystem::remove(const std::string& file_uid, const std::string& 
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::DELETE), tenant); // dedicated DELETE bit (H1)
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to remove file");
     }
@@ -365,7 +365,7 @@ Result<void> FileSystem::undelete(const std::string& file_uid, const std::string
     }
     
     // Check permissions - the user needs write permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::UNDELETE), tenant); // dedicated UNDELETE bit (H1)
     if (!perm_result.success || !perm_result.value) {
         return Result<void>::err("User does not have permission to undelete file");
     }
@@ -1330,7 +1330,7 @@ Result<std::vector<std::string>> FileSystem::list_versions(const std::string& fi
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::VIEW_VERSIONS), tenant); // dedicated VIEW_VERSIONS bit (H1)
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<std::string>>::err("User does not have permission to list versions");
     }
@@ -1354,7 +1354,7 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
     }
     
     // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::READ), tenant);
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::RETRIEVE_BACK_VERSION), tenant); // dedicated RETRIEVE_BACK_VERSION bit (H1)
     if (!perm_result.success || !perm_result.value) {
         return Result<std::vector<uint8_t>>::err("User does not have permission to access version");
     }
@@ -1433,7 +1433,7 @@ Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
 
     // Check if user has special permission to restore to version
     // Typically requires WRITE permission or special version management permission
-    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(fileengine::Permission::WRITE), tenant); // WRITE permission
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(fileengine::Permission::RESTORE_TO_VERSION), tenant); // dedicated RESTORE_TO_VERSION bit (H1)
     if (!perm_result.success || !perm_result.value) {
         return Result<bool>::err("User does not have permission to restore to version");
     }

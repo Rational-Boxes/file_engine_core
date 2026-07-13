@@ -274,7 +274,7 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions before removing
-    if (!validate_user_permissions(dir_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    if (!validate_user_permissions(dir_uid, auth_context, static_cast<int>(Permission::DELETE))) { // DELETE permission (dedicated bit; security review H1)
         response->set_success(false);
         response->set_error("User does not have permission to remove directory");
         SERVER_LOG_ERROR("GRPCService", "RemoveDirectory failed: User " + user + " does not have permission to remove directory " + dir_uid);
@@ -550,7 +550,7 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions on the file
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::DELETE))) { // DELETE permission (dedicated bit; security review H1)
         response->set_success(false);
         response->set_error("User does not have permission to remove file");
         SERVER_LOG_ERROR("GRPCService", "RemoveFile failed: User " + user + " does not have permission to remove file " + file_uid);
@@ -586,7 +586,7 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
 
     // For now, we'll just check if the user has permission to write in the directory
     // In a real implementation, there would be a special undelete permission check
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::UNDELETE))) { // UNDELETE permission (dedicated bit; security review H1)
         response->set_success(false);
         response->set_error("User does not have permission to undelete file");
         SERVER_LOG_ERROR("GRPCService", "UndeleteFile failed: User " + user + " does not have permission to undelete file " + file_uid);
@@ -983,7 +983,7 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to list file versions
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::VIEW_VERSIONS))) { // VIEW_VERSIONS permission (dedicated bit; security review H1)
         response->set_success(false);
         response->set_error("User does not have permission to list file versions");
         SERVER_LOG_ERROR("GRPCService", "ListVersions failed: User " + user + " does not have permission to list file versions for " + file_uid);
@@ -1022,7 +1022,7 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
     std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
 
     // Check permissions - user needs read access to access file version
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::READ))) { // READ permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::RETRIEVE_BACK_VERSION))) { // RETRIEVE_BACK_VERSION permission (dedicated bit; security review H1)
         response->set_success(false);
         response->set_error("User does not have permission to access file version");
         SERVER_LOG_ERROR("GRPCService", "GetVersion failed: User " + user + " does not have permission to access file version for " + file_uid);
@@ -1062,7 +1062,7 @@ grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
 
     // Check permissions - user needs write access to restore to version
     // In some systems, this might be a special permission, but typically requires write access
-    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::WRITE))) { // WRITE permission
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::RESTORE_TO_VERSION))) { // RESTORE_TO_VERSION permission (dedicated bit; security review H1)
         response->set_success(false);
         response->set_error("User does not have permission to restore to version");
         SERVER_LOG_ERROR("GRPCService", "RestoreToVersion failed: User " + user + " does not have permission to restore to version for " + file_uid);

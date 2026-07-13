@@ -26,8 +26,8 @@ the system fails to enforce *its own* intended model.
 | C2 | Critical | Empty-password LDAP bind = auth bypass | both bridges | **Fixed** (`41bde9f`, `165e814`) |
 | C3 | Critical | LDAP filter injection on webdav live auth path | webdav_bridge | **Fixed** (`165e814`) |
 | C4 | Critical | Plaintext credentials logged at default level | webdav_bridge | **Fixed** (`165e814`) |
-| H1 | High | Destructive ops gated on `WRITE`, not their dedicated bits | core | **Open** (needs decision) |
-| H2 | High | Any `cn=administrators` group maps to `system_admin` | both bridges | **Open** |
+| H1 | High | Destructive ops gated on `WRITE`, not their dedicated bits | core | **Fixed** (core `security/hardening`) |
+| H2 | High | Any `cn=administrators` group maps to `system_admin` | both bridges | **Proposed** (tenant-scoped superuser — design below) |
 | M1 | Medium | "DENY always wins" only holds within a tier | core | **Open** (documented) |
 | M2 | Medium | `GROUP`-type ACL matches every principal | core | **Open** (latent) |
 | M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Open** |
@@ -93,31 +93,82 @@ ACL in the tenant.
 
 ---
 
-## High findings (open — need a decision)
+## High findings
 
-### H1 — Destructive ops gated on `WRITE`, not their dedicated bits
-`RemoveFile`/`RemoveDirectory` check `WRITE` not `DELETE`
+### H1 — Destructive ops gated on `WRITE`, not their dedicated bits — **FIXED**
+`RemoveFile`/`RemoveDirectory` checked `WRITE` not `DELETE`
 (`grpc_service.cpp:553, 277`); `UndeleteFile` not `UNDELETE` (589);
 `RestoreToVersion` not `RESTORE_TO_VERSION` (1065); `ListVersions`/`GetVersion`
-use `READ` not `VIEW_VERSIONS`/`RETRIEVE_BACK_VERSION`. The DELETE / UNDELETE /
-VIEW_VERSIONS / RESTORE bits are grantable/deniable but **never enforced** — a
-"WRITE-only" collaborator silently gets delete + history rollback, and a targeted
-`DENY DELETE` is a no-op.
-- **Recommendation:** switch the handlers to the dedicated bits. Because a
-  WRITE-only user *can* currently delete, this is a semantic change — gate it
-  behind `FILEENGINE_STRICT_PERMISSION_BITS` (default off → on) for a safe
-  rollout. The core unit test already proves the bits are independent, so the
-  change is localized to the handlers.
+used `READ` not `VIEW_VERSIONS`/`RETRIEVE_BACK_VERSION`. The DELETE / UNDELETE /
+VIEW_VERSIONS / RESTORE bits were grantable/deniable but **never enforced** — a
+"WRITE-only" collaborator silently got delete + history rollback, and a targeted
+`DENY DELETE` was a no-op.
 
-### H2 — Any `cn=administrators` group maps to `system_admin`
+- **Fix (implemented):** both enforcement layers now check the dedicated bits —
+  the gRPC handlers (`core/src/grpc_service.cpp`) and the `FileSystem` methods
+  (`core/src/filesystem.cpp`): DELETE for remove file/dir, UNDELETE for undelete,
+  RESTORE_TO_VERSION for restore, VIEW_VERSIONS for ListVersions,
+  RETRIEVE_BACK_VERSION for GetVersion.
+- **Why it is backward-safe (no flag needed):** `apply_default_acls`
+  (`acl_manager.cpp`) already grants a resource's creator the **full** bit set
+  (DELETE, LIST_DELETED, UNDELETE, VIEW_VERSIONS, RETRIEVE_BACK_VERSION,
+  RESTORE_TO_VERSION, MANAGE_ACL). Owners and `system_admin` are unaffected; only
+  a collaborator *explicitly* granted WRITE-only loses implicit delete/rollback —
+  which is the intended effect. `test_security_acl.cpp` proves the bits are
+  independent at the ACL layer.
+
+### H2 — Any `cn=administrators` group maps to `system_admin` — **PROPOSAL**
 `http_bridge/src/ldap_authenticator.cpp:1148–1152`,
 `webdav_bridge/src/ldap_authenticator.cpp:794–798`. The Basic-auth role
 resolution searches domain-wide bases, case-insensitively; membership in *any*
 group named `administrators` (not scoped to the request tenant) yields the global
 `system_admin` bypass. The JWT path is properly tenant-bucketed — the two paths
-disagree.
-- **Recommendation:** scope the `administrators → system_admin` mapping to the
-  request tenant's admin group DN; drop the domain-wide fallback search.
+disagree. Root cause: the core's `system_admin` is a **global** bypass, so any
+"local admin" role that maps to it inherently crosses tenant boundaries.
+
+#### Proposed fix: a tenant-scoped superuser
+
+Introduce a distinct **tenant-scoped superuser** that grants full-control *within
+one tenant only*, and reserve the existing global `system_admin` for genuine
+deployment operators. A tenant's "administrators" group maps to the scoped role,
+never to the global one.
+
+**1. Core — new reserved role `tenant_admin`, scoped bypass.**
+`AclManager::check_permission` already receives the request `tenant`. Add a
+second reserved role alongside `kSystemAdminRole`:
+```cpp
+static constexpr const char* kSystemAdminRole = "system_admin";  // global (all tenants)
+static constexpr const char* kTenantAdminRole = "tenant_admin";  // this tenant only
+```
+`check_permission`/`get_effective_permissions` bypass ACLs when the caller holds
+`system_admin` **OR** holds `tenant_admin` *and the resource's tenant equals the
+auth-context tenant*. Because every resource lookup is already tenant-scoped
+(`get_schema_prefix(tenant)`), a `tenant_admin` in tenant A resolving a tenant-B
+resource simply operates in A's schema and cannot see B — the scoped bypass adds
+no cross-tenant reach. `is_system_admin()` gains a sibling `is_tenant_admin()`;
+role administration (C1 gate) accepts either.
+
+**2. Bridges — map the tenant admin group to the scoped role.**
+Replace `if (r == "administrators") add "system_admin"` with a mapping to
+`tenant_admin`, and — critically — only when the `administrators` group is found
+**under the request tenant's OU** (`ou=<tenant>,…`), not via the domain-wide
+subtree fallback. `system_admin` is granted only from an explicit, separately
+named operators group (e.g. `cn=platform-operators,ou=system`), never from a
+per-tenant `administrators` group.
+
+**3. Result.** A tenant admin gets full control of their own tenant and **zero**
+reach into others, even if a same-named `administrators` group exists elsewhere
+in the directory. The blast radius of a mis-placed or attacker-created
+`administrators` group is contained to a single tenant. `system_admin` becomes a
+deliberately-provisioned platform role.
+
+**Migration:** existing deployments that rely on `administrators → system_admin`
+keep working if the operators group is seeded; otherwise tenant admins transparently
+downgrade to tenant-scoped (a *tightening*, not a break). Add tests: a
+`tenant_admin` bypasses within-tenant but is denied cross-tenant; the bridge maps
+`administrators` only from the tenant OU.
+
+This is a design proposal for review — **not yet implemented.**
 
 ---
 

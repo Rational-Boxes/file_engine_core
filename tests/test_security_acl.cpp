@@ -162,10 +162,13 @@ bool can(AclManager& acl, const std::string& uid, const std::string& user,
 }  // namespace
 
 // A WRITE-only grant must NOT confer any of the dedicated destructive/version
-// permissions. (This is the ACL-layer invariant behind finding H1: the gRPC
-// handlers currently gate delete/undelete/restore on WRITE, collapsing these
-// distinct bits — the E2E suite covers the handler side; here we prove the bits
-// are genuinely independent so a corrected handler has real bits to check.)
+// permissions. This is the ACL-layer invariant behind finding H1. The gRPC
+// handlers + FileSystem layer now gate RemoveFile/RemoveDirectory on DELETE,
+// UndeleteFile on UNDELETE, RestoreToVersion on RESTORE_TO_VERSION, and
+// ListVersions/GetVersion on VIEW_VERSIONS/RETRIEVE_BACK_VERSION (H1 fixed), so
+// these bits are real gates — this test proves they are genuinely independent
+// of WRITE. Resource creators keep full control (apply_default_acls grants them
+// the whole set); only narrowly-granted WRITE-only collaborators are affected.
 void test_write_does_not_imply_destructive() {
     std::cout << "test_write_does_not_imply_destructive\n";
     auto db = std::make_shared<MockDatabase>();
