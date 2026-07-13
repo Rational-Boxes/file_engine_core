@@ -44,8 +44,9 @@ struct Config {
     // /v1/version, /metrics in Phase B). The trust boundary is the network
     // perimeter; no in-process auth or TLS on this port.
     bool        http_metrics_enabled = true;
-    std::string http_metrics_addr = "0.0.0.0";
+    std::string http_metrics_addr = "127.0.0.1";  // loopback by default; unauthenticated monitor (security review L2)
     int         http_metrics_port = 8081;
+    std::string http_metrics_allow_ips = "";       // optional comma-separated client-IP allowlist; empty = allow any that reaches the bound address
     bool        metrics_tenant_label = true;  // emit tenant label on metrics
 
     // Security configuration

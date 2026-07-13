@@ -223,6 +223,8 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     if (it != env_vars.end()) config.http_metrics_enabled = (it->second == "true" || it->second == "1");
     it = env_vars.find("FILEENGINE_HTTP_METRICS_ADDR");
     if (it != env_vars.end()) config.http_metrics_addr = it->second;
+    it = env_vars.find("FILEENGINE_HTTP_METRICS_ALLOW_IPS");
+    if (it != env_vars.end()) config.http_metrics_allow_ips = it->second;
     it = env_vars.find("FILEENGINE_HTTP_METRICS_PORT");
     if (it != env_vars.end()) config.http_metrics_port = std::stoi(it->second);
     it = env_vars.find("FILEENGINE_METRICS_TENANT_LABEL");
@@ -331,6 +333,8 @@ Config ConfigLoader::load_from_env() {
     if (!env_value.empty()) config.http_metrics_enabled = (env_value == "true" || env_value == "1");
     env_value = get_env_var("FILEENGINE_HTTP_METRICS_ADDR", "");
     if (!env_value.empty()) config.http_metrics_addr = env_value;
+    env_value = get_env_var("FILEENGINE_HTTP_METRICS_ALLOW_IPS", "");
+    if (!env_value.empty()) config.http_metrics_allow_ips = env_value;
     env_value = get_env_var("FILEENGINE_HTTP_METRICS_PORT", "");
     if (!env_value.empty()) config.http_metrics_port = std::stoi(env_value);
     env_value = get_env_var("FILEENGINE_METRICS_TENANT_LABEL", "");
@@ -546,6 +550,8 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (it != default_file_vars.end()) config.http_metrics_enabled = (it->second == "true" || it->second == "1");
     it = default_file_vars.find("FILEENGINE_HTTP_METRICS_ADDR");
     if (it != default_file_vars.end()) config.http_metrics_addr = it->second;
+    it = default_file_vars.find("FILEENGINE_HTTP_METRICS_ALLOW_IPS");
+    if (it != default_file_vars.end()) config.http_metrics_allow_ips = it->second;
     it = default_file_vars.find("FILEENGINE_HTTP_METRICS_PORT");
     if (it != default_file_vars.end()) config.http_metrics_port = std::stoi(it->second);
     it = default_file_vars.find("FILEENGINE_METRICS_TENANT_LABEL");
@@ -677,6 +683,8 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (it != cmdline_file_vars.end()) config.http_metrics_enabled = (it->second == "true" || it->second == "1");
     it = cmdline_file_vars.find("FILEENGINE_HTTP_METRICS_ADDR");
     if (it != cmdline_file_vars.end()) config.http_metrics_addr = it->second;
+    it = cmdline_file_vars.find("FILEENGINE_HTTP_METRICS_ALLOW_IPS");
+    if (it != cmdline_file_vars.end()) config.http_metrics_allow_ips = it->second;
     it = cmdline_file_vars.find("FILEENGINE_HTTP_METRICS_PORT");
     if (it != cmdline_file_vars.end()) config.http_metrics_port = std::stoi(it->second);
     it = cmdline_file_vars.find("FILEENGINE_METRICS_TENANT_LABEL");

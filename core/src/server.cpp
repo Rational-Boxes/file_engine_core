@@ -264,6 +264,19 @@ int main(int argc, char** argv) {
     if (config.http_metrics_enabled) {
         rest_listener = std::make_unique<fileengine::RestServer>(
             database, cache_manager.get(), file_culler.get());
+        // Optional client-IP allowlist for the unauthenticated monitor (L2):
+        // split FILEENGINE_HTTP_METRICS_ALLOW_IPS on commas, trimming blanks.
+        if (!config.http_metrics_allow_ips.empty()) {
+            std::vector<std::string> ips;
+            std::stringstream ss(config.http_metrics_allow_ips);
+            std::string ip;
+            while (std::getline(ss, ip, ',')) {
+                size_t b = ip.find_first_not_of(" \t");
+                size_t e = ip.find_last_not_of(" \t");
+                if (b != std::string::npos) ips.push_back(ip.substr(b, e - b + 1));
+            }
+            rest_listener->set_allowed_ips(std::move(ips));
+        }
         if (!rest_listener->start(config.http_metrics_addr,
                                   config.http_metrics_port)) {
             std::cerr << "WARNING: REST monitoring listener failed to bind "

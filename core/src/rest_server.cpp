@@ -29,7 +29,33 @@ RestServer::~RestServer() {
     stop();
 }
 
+void RestServer::set_allowed_ips(std::vector<std::string> ips) {
+    allow_ips_ = std::move(ips);
+}
+
 void RestServer::install_routes() {
+    // Optional IP allowlist, enforced before any route runs. Reads allow_ips_
+    // live so set_allowed_ips() may be called after construction. Empty list =
+    // no restriction (the bind address is the primary control). (L2.)
+    http_->set_pre_routing_handler(
+        [this](const httplib::Request& req, httplib::Response& res) {
+            if (!allow_ips_.empty()) {
+                bool allowed = false;
+                for (const auto& ip : allow_ips_) {
+                    if (ip == req.remote_addr) { allowed = true; break; }
+                }
+                if (!allowed) {
+                    SERVER_LOG_WARN("RestServer",
+                                    "monitoring request from " + req.remote_addr +
+                                    " rejected (not in allowlist)");
+                    res.status = 403;
+                    res.set_content("forbidden\n", "text/plain");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+
     // ---------------------------------------------------------------------
     // /healthz — liveness. Always 200 as long as the process is responding.
     // ---------------------------------------------------------------------
