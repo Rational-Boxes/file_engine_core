@@ -34,9 +34,9 @@ the system fails to enforce *its own* intended model.
 | M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
-| L2 | Low | Core REST monitor defaults to `0.0.0.0:8081` | core | **Open** |
+| L2 | Low | Monitor bind address + optional IP allowlist | all services | **Fixed** (C++ tier); Python binds loopback, allowlist follow-up |
 | L3 | Low | Audit fail-**open** when disabled; OAuth/refresh unaudited | http_bridge | **Open** |
-| L4 | Low | Dead-code LDAP injection in unused digest/getUserInfo | http_bridge | **Open** |
+| L4 | Low | Dead-code LDAP injection in unused digest/getUserInfo | both bridges | **Fixed** (bridges `security/hardening`) |
 
 Fixes live on the `security/hardening` branch in each affected repo (unmerged).
 
@@ -214,15 +214,25 @@ This is a design proposal for review — **not yet implemented.**
   `FileSystem::validate_user_permissions` (`filesystem.cpp`) now return **deny**
   when `acl_manager_` is null (the root-READ carve-out is preserved). Test
   harnesses that construct these without an ACL manager must now inject one.
-- **L2 — monitor bind:** core REST monitor defaults to `0.0.0.0:8081`, violating
-  the loopback-only monitoring convention the bridges follow (they bind
-  `127.0.0.1`). Bind loopback by default.
+- **L2 — monitor bind + IP allowlist — FIXED (C++ tier):** the core REST monitor
+  now defaults to **`127.0.0.1`** (was `0.0.0.0`) and gained an optional
+  exact-match client-IP allowlist (`FILEENGINE_HTTP_METRICS_ALLOW_IPS`) enforced
+  before routing. Both bridges (already loopback) gained the same allowlist
+  (`HTTP_MONITORING_ALLOW_IPS`, `WEBDAV_MONITORING_ALLOW_IPS`). **Python tier:**
+  all Python services already bind their monitoring/health to `127.0.0.1` by
+  default (config `monitoring_host` / `api_host` / `http_host`), so the L2 bind
+  requirement is met deployment-wide. Adding an IP allowlist there is a scoped
+  follow-up: `ldap_manager` has a dedicated monitor app (clean middleware), while
+  `audit-api` / `csai` / `discussion` expose `/healthz` on their main
+  authenticated app, so the allowlist must be **route-scoped** to the monitoring
+  paths (not a blanket middleware) to avoid gating real API traffic.
 - **L3 — audit fail-open:** `http_bridge/src/audit_publisher.cpp:52` returns
   success when auditing is disabled/built without hiredis, so logins succeed with
   no trail; OAuth (`http_server.cpp:1150`) and refresh logins emit no audit event.
-- **L4 — dead-code injection:** `http_bridge/src/ldap_authenticator.cpp:228`
-  (unused `authenticateDigest`/`getUserInfo`) builds an unescaped filter. Delete
-  or escape before it is ever wired up.
+- **L4 — dead-code injection — FIXED:** removed the unused `authenticateDigest`
+  and `getUserInfo` from **both** bridges (each built raw, unescaped LDAP filters
+  and had no callers). The live paths (`getUserInfoByEmail`, `authenticateUser`)
+  are retained and already escape.
 
 ## SDK trust boundary (by design)
 `python_interface` / `javascript_interface` pass `user`/`roles`/`tenant`
