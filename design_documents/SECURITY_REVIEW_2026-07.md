@@ -34,7 +34,7 @@ the system fails to enforce *its own* intended model.
 | M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
-| L2 | Low | Monitor bind address + optional IP allowlist | all services | **Fixed** (C++ tier); Python binds loopback, allowlist follow-up |
+| L2 | Low | Monitor bind address + optional IP allowlist | all services | **Fixed** (C++ + Python tiers) |
 | L3 | Low | Audit fail-**open** when disabled; OAuth/refresh unaudited | http_bridge | **Open** |
 | L4 | Low | Dead-code LDAP injection in unused digest/getUserInfo | both bridges | **Fixed** (bridges `security/hardening`) |
 
@@ -226,6 +226,12 @@ This is a design proposal for review — **not yet implemented.**
   `audit-api` / `csai` / `discussion` expose `/healthz` on their main
   authenticated app, so the allowlist must be **route-scoped** to the monitoring
   paths (not a blanket middleware) to avoid gating real API traffic.
+  **Python tier now done:** a route-scoped FastAPI middleware guards
+  `/healthz|/readyz|/poolz` with the shared `FILEENGINE_MONITORING_ALLOW_IPS`
+  (exact-match; empty = allow any) in `ldap_manager`, `convert_search_ai`,
+  `discussion`, and `audit-api`. Non-monitoring paths are never gated.
+  TestClient regression tests (discussion, csai) assert block/permit/route-scope/
+  no-op. `mcp` exposes no HTTP monitoring endpoint, so it is out of scope.
 - **L3 — audit fail-open:** `http_bridge/src/audit_publisher.cpp:52` returns
   success when auditing is disabled/built without hiredis, so logins succeed with
   no trail; OAuth (`http_server.cpp:1150`) and refresh logins emit no audit event.
