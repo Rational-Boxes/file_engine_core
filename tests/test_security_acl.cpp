@@ -12,11 +12,11 @@
 //   * CLAIM (ABAC) rules match only the exact key=value presented
 //   * strict mode (default_read=false) denies principals with no matching rule
 //
-// It also DOCUMENTS one debated behavior (finding M1): cross-tier, a higher-tier
-// ALLOW settles a bit before a lower-tier DENY is considered, so a USER-level
-// ALLOW overrides a ROLE-level DENY. The header advertises "a matching DENY
-// always wins"; today that holds only within a tier. The test captures the
-// CURRENT behavior with a prominent note so any change is a conscious decision.
+// It also pins the hierarchical resolution order (finding M1, resolved as an
+// intended identity hierarchy): the most specific tier that touches a bit
+// settles it — USER > CLAIM > ROLE/GROUP > OTHER — then read-only default. DENY
+// is absolute only within a tier, so a more specific ALLOW overrides a less
+// specific DENY.
 //
 // Hermetic: links fileengine_core + mock DB; run via `ctest -R test_security_acl`.
 
@@ -271,24 +271,46 @@ void test_default_read_toggle() {
           "read-by-default grants READ on undecided bits");
 }
 
-// DOCUMENTED BEHAVIOR — finding M1 (cross-tier DENY precedence).
-// A USER-tier ALLOW settles the bit before the ROLE-tier DENY is evaluated, so
-// the DENY does NOT win across tiers. The header says "a matching DENY always
-// wins"; today that holds only within a tier. We assert the CURRENT behavior so
-// the discrepancy is visible and a future fix is a conscious flip of this
-// expectation (ALLOW -> would become denied).
-void test_cross_tier_deny_current_behavior() {
-    std::cout << "test_cross_tier_deny_current_behavior  [documents finding M1]\n";
+// Hierarchical precedence (finding M1, resolved as an intended identity
+// hierarchy): the most specific tier that touches a bit settles it —
+// USER > CLAIM > ROLE/GROUP > OTHER — then read-only default. DENY is absolute
+// only within a tier, so a more specific ALLOW overrides a less specific DENY.
+// Each sub-case uses a distinct resource uid so grants don't accumulate.
+void test_hierarchical_precedence() {
+    std::cout << "test_hierarchical_precedence\n";
     auto db = std::make_shared<MockDatabase>();
-    db->add_node("F", "", false);
     AclManager acl(db);
     acl.set_default_read(false);
-    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE, "", "", AclEffect::ALLOW);
-    acl.grant_permission("F", "contractors", PrincipalType::ROLE, P_WRITE, "", "", AclEffect::DENY);
-    bool allowed = can(acl, "F", "alice", {"contractors"}, P_WRITE);
-    CHECK(allowed,
-          "CURRENT: USER-tier ALLOW overrides ROLE-tier DENY (M1). "
-          "If cross-tier DENY-wins is adopted, flip this to expect denial.");
+
+    // USER ALLOW overrides ROLE DENY (USER tier 0 settles before ROLE tier 2).
+    db->add_node("u_over_r", "", false);
+    acl.grant_permission("u_over_r", "alice", PrincipalType::USER, P_WRITE, "", "", AclEffect::ALLOW);
+    acl.grant_permission("u_over_r", "contractors", PrincipalType::ROLE, P_WRITE, "", "", AclEffect::DENY);
+    CHECK(can(acl, "u_over_r", "alice", {"contractors"}, P_WRITE),
+          "USER ALLOW overrides ROLE DENY");
+
+    // CLAIM ALLOW overrides ROLE DENY (CLAIM tier 1 more specific than ROLE tier 2).
+    db->add_node("c_over_r", "", false);
+    acl.grant_permission("c_over_r", "dept=eng", PrincipalType::CLAIM, P_WRITE, "", "", AclEffect::ALLOW);
+    acl.grant_permission("c_over_r", "contractors", PrincipalType::ROLE, P_WRITE, "", "", AclEffect::DENY);
+    CHECK(can(acl, "c_over_r", "bob", {"contractors"}, P_WRITE, {{"dept", "eng"}}),
+          "CLAIM ALLOW overrides ROLE DENY");
+
+    // USER DENY overrides CLAIM ALLOW (USER is the most specific tier).
+    db->add_node("u_deny", "", false);
+    acl.grant_permission("u_deny", "carol", PrincipalType::USER, P_WRITE, "", "", AclEffect::DENY);
+    acl.grant_permission("u_deny", "dept=eng", PrincipalType::CLAIM, P_WRITE, "", "", AclEffect::ALLOW);
+    CHECK(!can(acl, "u_deny", "carol", {}, P_WRITE, {{"dept", "eng"}}),
+          "USER DENY overrides CLAIM ALLOW");
+
+    // ROLE ALLOW overrides everyone(OTHER) DENY; a user without the role is still denied.
+    db->add_node("r_over_o", "", false);
+    acl.grant_permission("r_over_o", "staff", PrincipalType::ROLE, P_READ, "", "", AclEffect::ALLOW);
+    acl.grant_permission("r_over_o", "everyone", PrincipalType::OTHER, P_READ, "", "", AclEffect::DENY);
+    CHECK(can(acl, "r_over_o", "dave", {"staff"}, P_READ),
+          "ROLE ALLOW overrides everyone(OTHER) DENY");
+    CHECK(!can(acl, "r_over_o", "eve", {}, P_READ),
+          "a user without the role is denied by everyone DENY");
 }
 
 int main() {
@@ -300,7 +322,7 @@ int main() {
     test_system_admin_is_role_scoped();
     test_claim_abac_exact_match();
     test_default_read_toggle();
-    test_cross_tier_deny_current_behavior();
+    test_hierarchical_precedence();
     std::cout << "\nAll " << g_checks << " checks passed.\n";
     return 0;
 }

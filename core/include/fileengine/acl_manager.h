@@ -71,9 +71,12 @@ enum class PrincipalType {
                // stripped at the gRPC boundary). See plan §6.4.
 };
 
-// ALLOW (default) contributes bits; DENY subtracts them at evaluation time so
-// a matching DENY always wins. The integer values are wire-stable — they map
-// directly to the DB `effect` column and the proto AclEffect enum.
+// ALLOW (default) contributes bits; DENY subtracts them at evaluation time.
+// Resolution is hierarchical (USER > CLAIM > ROLE/GROUP > OTHER > read-default):
+// DENY is absolute *within its tier*, but a more specific tier that settles a
+// bit wins over a less specific DENY (see calculate_effective_permissions). The
+// integer values are wire-stable — they map directly to the DB `effect` column
+// and the proto AclEffect enum.
 enum class AclEffect {
     ALLOW = 0,
     DENY  = 1
@@ -100,7 +103,8 @@ inline constexpr const char* kSystemAdminRole = "system_admin";
 // so a rule on this name targets all users. Grant DENY READ to
 // {kEveryoneGroup, PrincipalType::OTHER} to hide a resource (and, via parent
 // traversal, its whole subtree) from everyone — overriding the read-by-default
-// baseline, since a matching DENY always wins. See plan §2.4.
+// baseline. Note a more specific tier (USER/CLAIM/ROLE ALLOW) still resolves
+// before this everyone-tier DENY. See plan §2.4.
 inline constexpr const char* kEveryoneGroup = "everyone";
 
 class AclManager {
@@ -149,7 +153,7 @@ public:
     // Grant permission to a user/group on a resource. performed_by is the
     // last arg so legacy positional callers that pass `tenant` as the 5th
     // argument still bind to the right slot. effect defaults to ALLOW; pass
-    // DENY to add bits to the deny set instead (a matching DENY always wins).
+    // DENY to add bits to the deny set instead (DENY wins within its tier).
     Result<void> grant_permission(const std::string& resource_uid,
                                   const std::string& principal,
                                   PrincipalType type,

@@ -301,8 +301,9 @@ private:
         }
 
         if (!acl_manager_) {
-            // Fallback for unusual init paths (test harnesses, etc.).
-            return true;
+            // Fail closed: without an ACL manager we cannot authorize, so deny.
+            // (Security review L1.) The root-READ carve-out above still applies.
+            return false;
         }
 
         std::vector<std::string> roles = get_roles_from_auth_context(auth_ctx);

@@ -2047,11 +2047,6 @@ Result<bool> FileSystem::validate_user_permissions(const std::string& resource_u
                                                   const std::vector<std::string>& roles,
                                                   int required_permissions,
                                                   const std::string& tenant) {
-    if (!acl_manager_) {
-        // If no ACL manager, default to allowing access for basic implementation
-        return Result<bool>::ok(true);
-    }
-
     // Special rule: The filesystem root (empty UID) is always readable by all users
     // This allows users to list the root directory contents regardless of specific ACLs
     if (resource_uid.empty() && (required_permissions & static_cast<int>(Permission::READ))) {
@@ -2059,6 +2054,12 @@ Result<bool> FileSystem::validate_user_permissions(const std::string& resource_u
                          ServerLogger::getInstance().detailed_log_prefix() +
                          "Allowing READ access to filesystem root for user: " + user);
         return Result<bool>::ok(true);
+    }
+
+    if (!acl_manager_) {
+        // Fail closed: without an ACL manager we cannot authorize, so deny.
+        // (Security review L1.)
+        return Result<bool>::ok(false);
     }
 
     auto result = acl_manager_->check_permission(resource_uid, user, roles,

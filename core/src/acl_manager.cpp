@@ -337,31 +337,31 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
                                                const std::string& user,
                                                const std::vector<std::string>& roles,
                                                const std::map<std::string, std::string>& claims) {
-    // Tiered, most-specific-wins evaluation. For each permission bit the first
-    // tier that has a matching rule decides it; within a tier a DENY beats an
-    // ALLOW. Tiers, highest precedence first:
+    // Hierarchical, most-specific-wins evaluation. For each permission bit the
+    // most specific tier that has a matching rule decides it; a less specific
+    // tier can never override a bit a more specific tier already settled. Within
+    // a single tier a DENY beats an ALLOW. Tiers, most specific first:
     //   [0] USER          — a rule for this exact user
-    //   [1] ROLE / CLAIM  — a matching role, a matching claim, or a group
-    //   [2] OTHER         — explicit "everyone" rules
+    //   [1] CLAIM         — a matching ABAC claim (key=value)
+    //   [2] ROLE / GROUP  — a matching role or group membership
+    //   [3] OTHER         — explicit "everyone" rules (e.g. world-readable)
     //   fall-through      — READ allowed (read-by-default), everything else denied
     //
-    // This lets a more-specific ALLOW override a less-specific DENY, which the
-    // old flat "allow & ~deny" model could not express: e.g. a private home
-    // folder (everyone DENY, owner ALLOW) or a role-gated section (everyone DENY
-    // read, role ALLOW) — the user/role resolves before the everyone-DENY.
-    // Read-by-default is the terminal fall-through; disable via
-    // set_default_read(false) for strict private-by-default. See plan §6.1.
+    // Rationale (finding M1): resolution is a deliberate identity hierarchy —
+    // USER, then CLAIM, then GROUP/ROLE, then the everyone tier, then the
+    // read-only default. A more-specific ALLOW overrides a less-specific DENY
+    // (e.g. a private home folder: everyone DENY + owner ALLOW), and a specific
+    // claim resolves before a broader group. DENY is absolute only *within* a
+    // tier — it does not leap across tiers. Read-by-default is the terminal
+    // fall-through; disable via set_default_read(false) for strict
+    // private-by-default. See plan §6.1.
 
-    // Classify a rule: 0=user tier, 1=role/claim tier, 2=everyone tier, -1=no match.
+    // Classify a rule into its specificity tier (lower = more specific), or -1
+    // for no match.
     auto tier_of = [&](const ACLRule& rule) -> int {
         switch (rule.type) {
             case PrincipalType::USER:
                 return rule.principal == user ? 0 : -1;
-            case PrincipalType::ROLE:
-                for (const auto& role : roles) {
-                    if (rule.principal == role) return 1;
-                }
-                return -1;
             case PrincipalType::CLAIM: {
                 // ABAC: principal is "key=value"; matches iff that exact claim is
                 // presented. Malformed (no '=') or absent/mismatched never matches.
@@ -372,18 +372,24 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
                 auto it = claims.find(key);
                 return (it != claims.end() && it->second == value) ? 1 : -1;
             }
+            case PrincipalType::ROLE:
+                for (const auto& role : roles) {
+                    if (rule.principal == role) return 2;
+                }
+                return -1;
             case PrincipalType::GROUP:
                 // GROUP membership is not yet modeled (plan §2.3); treat as a
-                // global match in the role/claim tier.
-                return 1;
-            case PrincipalType::OTHER:
+                // global match in the role/group tier.
                 return 2;
+            case PrincipalType::OTHER:
+                return 3;
         }
         return -1;
     };
 
-    int allow[3] = {0, 0, 0};
-    int deny[3] = {0, 0, 0};
+    constexpr int kTiers = 4;  // USER, CLAIM, ROLE/GROUP, OTHER
+    int allow[kTiers] = {0, 0, 0, 0};
+    int deny[kTiers] = {0, 0, 0, 0};
     for (const auto& rule : rules) {
         int t = tier_of(rule);
         if (t < 0) continue;
@@ -392,8 +398,8 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
     }
 
     int result = 0;
-    int undecided = ~0;  // permission bits not yet settled by a higher tier
-    for (int t = 0; t < 3; ++t) {
+    int undecided = ~0;  // permission bits not yet settled by a more specific tier
+    for (int t = 0; t < kTiers; ++t) {
         result |= (allow[t] & ~deny[t]) & undecided;  // grant this tier's allows (deny wins in-tier)
         undecided &= ~(allow[t] | deny[t]);            // any bit this tier touched is now settled
     }

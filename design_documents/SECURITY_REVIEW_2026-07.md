@@ -28,12 +28,12 @@ the system fails to enforce *its own* intended model.
 | C4 | Critical | Plaintext credentials logged at default level | webdav_bridge | **Fixed** (`165e814`) |
 | H1 | High | Destructive ops gated on `WRITE`, not their dedicated bits | core | **Fixed** (core `security/hardening`) |
 | H2 | High | Any `cn=administrators` group maps to `system_admin` | both bridges | **Proposed** (tenant-scoped superuser — design below) |
-| M1 | Medium | "DENY always wins" only holds within a tier | core | **Open** (documented) |
+| M1 | Medium | ALLOW/DENY precedence — hierarchical resolution | core | **Fixed** (core `security/hardening`) |
 | M2 | Medium | `GROUP`-type ACL matches every principal | core | **Open** (latent) |
 | M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Open** |
 | M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Open** |
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Open** |
-| L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Open** |
+| L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
 | L2 | Low | Core REST monitor defaults to `0.0.0.0:8081` | core | **Open** |
 | L3 | Low | Audit fail-**open** when disabled; OAuth/refresh unaudited | http_bridge | **Open** |
 | L4 | Low | Dead-code LDAP injection in unused digest/getUserInfo | http_bridge | **Open** |
@@ -174,14 +174,15 @@ This is a design proposal for review — **not yet implemented.**
 
 ## Medium findings (open)
 
-- **M1 — cross-tier DENY:** `core/src/acl_manager.cpp:394–399`. A higher-tier
-  (USER) ALLOW settles a bit before a lower-tier (ROLE) DENY is evaluated
-  (`undecided &= ~(allow[t]|deny[t])`), so a USER ALLOW overrides a ROLE DENY.
-  The header (`acl_manager.h:76`) advertises "a matching DENY always wins" — true
-  only within a tier. Since the creator gets a USER-level ALLOW by default,
-  role-level DENYs are easily defeated. **Decide:** make DENY win across tiers
-  (aggregate all denies first) *or* correct the documented contract. The core
-  test documents current behavior and flips on decision.
+- **M1 — ALLOW/DENY precedence — FIXED (hierarchical resolution):**
+  `core/src/acl_manager.cpp` `calculate_effective_permissions`. Resolved as a
+  deliberate identity hierarchy rather than a bug: the most specific tier that
+  touches a bit settles it, and DENY is absolute only *within* a tier. The
+  previously-lumped role/claim tier is now split so claims outrank groups:
+  **USER > CLAIM > ROLE/GROUP > OTHER(everyone) > read-only default.** Header
+  comments corrected (no more "a matching DENY always wins"). `test_security_acl`
+  gained `test_hierarchical_precedence` covering USER>ROLE, CLAIM>ROLE, USER-DENY
+  over CLAIM-ALLOW, and ROLE-ALLOW over everyone-DENY.
 - **M2 — GROUP matches everyone:** `acl_manager.cpp:375` returns a match for any
   principal. Latent (no gRPC path creates GROUP rows today) but a foot-gun the
   moment GROUP is wired.
@@ -200,9 +201,10 @@ This is a design proposal for review — **not yet implemented.**
 
 ## Low findings (open)
 
-- **L1 — fail-open gate:** `grpc_service.h:303` (`FileSystem::validate_user_permissions`,
-  `filesystem.cpp:2050`) returns `true` when `acl_manager_` is null. Wrong default
-  for the central gate even as a test fallback.
+- **L1 — fail-open gate — FIXED:** `grpc_service.h` and
+  `FileSystem::validate_user_permissions` (`filesystem.cpp`) now return **deny**
+  when `acl_manager_` is null (the root-READ carve-out is preserved). Test
+  harnesses that construct these without an ACL manager must now inject one.
 - **L2 — monitor bind:** core REST monitor defaults to `0.0.0.0:8081`, violating
   the loopback-only monitoring convention the bridges follow (they bind
   `127.0.0.1`). Bind loopback by default.
