@@ -191,6 +191,15 @@ downgrade to tenant-scoped (a *tightening*, not a break). Add tests: a
   role distinctness (`tenant_admin` is not `system_admin`), full within-tenant
   bypass for both roles, plain-user denial, and structural per-manager isolation
   (36 checks total, all passing).
+- **E2E verification (2026-07, live stack)**: a tenant admin of `filenginetest`
+  only was confirmed blocked (403) from `default` on **both** the Basic and
+  Bearer paths, while a member of both tenants still reached each — see
+  `http_bridge/tests/test_e2e_tenant_boundary.sh` (8/8). This surfaced and fixed
+  two implementation gaps the unit tests missed: (a) http_bridge's LDAP layer
+  (`extractRolesFromGroups`) still aliased `administrators` → global
+  `system_admin` (now `tenant_admin`); (b) the M3 bearer check trusted the
+  token's active `tenant` claim as membership proof — it now relies solely on the
+  `{tenant:[roles]}` map. (http_bridge `1878241`.)
 
 ---
 
