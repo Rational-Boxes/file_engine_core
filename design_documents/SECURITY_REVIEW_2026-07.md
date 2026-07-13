@@ -30,7 +30,7 @@ the system fails to enforce *its own* intended model.
 | H2 | High | Any `cn=administrators` group maps to `system_admin` | both bridges | **Proposed** (tenant-scoped superuser — design below) |
 | M1 | Medium | ALLOW/DENY precedence — hierarchical resolution | core | **Fixed** (core `security/hardening`) |
 | M2 | Medium | `GROUP`-type ACL matches every principal | core | **Open** (latent) |
-| M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Open** |
+| M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Fixed** (http_bridge `security/hardening`) |
 | M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Open** |
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Open** |
 | L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
@@ -186,11 +186,15 @@ This is a design proposal for review — **not yet implemented.**
 - **M2 — GROUP matches everyone:** `acl_manager.cpp:375` returns a match for any
   principal. Latent (no gRPC path creates GROUP rows today) but a foot-gun the
   moment GROUP is wired.
-- **M3 — tenant not membership-checked:** `http_server.cpp:1176` /
-  webdav Host resolution take the tenant verbatim. Bearer path is bounded (empty
-  roles in a foreign tenant), but the Basic path stamps real roles into an
-  arbitrary tenant; cross-tenant exposure then rides on core read-by-default ACLs.
-  **Recommendation:** reject an `X-Tenant` not in the caller's known tenants.
+- **M3 — tenant not membership-checked — FIXED (http_bridge):** `authenticate()`
+  now rejects a selected tenant the caller is not a member of. Bearer: the active
+  tenant must be the token's issued tenant or a key in its `{tenant:[roles]}`
+  map, else **403**. Basic: when the client explicitly sets `X-Tenant` (the
+  attacker-controlled vector), LDAP membership (`getTenantsForUser`) is verified,
+  else **403**. Host/subdomain routing (set by the trusted nginx proxy) is left
+  intact. **webdav:** its tenant is host-derived only (`extractTenantFromHostname`)
+  with no client `X-Tenant` override, so the header-injection vector does not
+  exist there; Host is set by the proxy. No change made in webdav.
 - **M4 — webdav COPY/MOVE:** `webdav_server.cpp:861, 1025` ignore the
   `Destination` authority and the `Overwrite` header (silent clobber, contract
   violation).
