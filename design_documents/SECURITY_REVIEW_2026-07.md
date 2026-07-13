@@ -27,7 +27,7 @@ the system fails to enforce *its own* intended model.
 | C3 | Critical | LDAP filter injection on webdav live auth path | webdav_bridge | **Fixed** (`165e814`) |
 | C4 | Critical | Plaintext credentials logged at default level | webdav_bridge | **Fixed** (`165e814`) |
 | H1 | High | Destructive ops gated on `WRITE`, not their dedicated bits | core | **Fixed** (core `security/hardening`) |
-| H2 | High | Any `cn=administrators` group maps to `system_admin` | both bridges | **Proposed** (tenant-scoped superuser — design below) |
+| H2 | High | Any `cn=administrators` group maps to `system_admin` | core + both bridges | **Fixed** (tenant-scoped superuser) |
 | M1 | Medium | ALLOW/DENY precedence — hierarchical resolution | core | **Fixed** (core `security/hardening`) |
 | M2 | Medium | `GROUP`-type ACL matches every principal | core | **Open** (latent) |
 | M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Fixed** (http_bridge `security/hardening`) |
@@ -117,7 +117,7 @@ VIEW_VERSIONS / RESTORE bits were grantable/deniable but **never enforced** — 
   which is the intended effect. `test_security_acl.cpp` proves the bits are
   independent at the ACL layer.
 
-### H2 — Any `cn=administrators` group maps to `system_admin` — **PROPOSAL**
+### H2 — Any `cn=administrators` group maps to `system_admin` — **FIXED (tenant-scoped superuser)**
 `http_bridge/src/ldap_authenticator.cpp:1148–1152`,
 `webdav_bridge/src/ldap_authenticator.cpp:794–798`. The Basic-auth role
 resolution searches domain-wide bases, case-insensitively; membership in *any*
@@ -168,7 +168,29 @@ downgrade to tenant-scoped (a *tightening*, not a break). Add tests: a
 `tenant_admin` bypasses within-tenant but is denied cross-tenant; the bridge maps
 `administrators` only from the tenant OU.
 
-This is a design proposal for review — **not yet implemented.**
+#### Implemented
+
+- **Core** (`acl_manager.h/.cpp`): added `kTenantAdminRole = "tenant_admin"`
+  alongside `kSystemAdminRole`. The ACL bypass in `check_permission` and
+  `get_effective_permissions` now honors **either** role; `is_system_admin`
+  (global only) is joined by `is_tenant_admin` and `is_admin` (either). The
+  in-tenant admin gates in `filesystem.cpp` (root-directory creation, superuser
+  visibility) use `is_admin`, so a `tenant_admin` fully administers their own
+  tenant. `tenant_admin`'s scope is structural — each tenant has its own
+  `AclManager`/schema (`db_`), so its bypass can never reach another tenant, and
+  it is *not* `system_admin`, so it inherits no global-operator capability.
+- **Bridges**: the per-tenant `administrators` group now maps to `tenant_admin`,
+  not `system_admin` (`http_bridge` `addRolesAliased`, `webdav_bridge`
+  `extractRolesFromGroups`). The global `system_admin` is granted only to a
+  member of a group literally named `system_admin` (carried through verbatim).
+  The C1 admin gate accepts `administrators`/`tenant_admin`/`system_admin`.
+- **Defense in depth with M3**: M3 already prevents the bridge from stamping a
+  tenant the caller isn't a member of, so a `tenant_admin` request is only ever
+  routed to their own tenant's manager.
+- **Tests**: `test_security_acl.cpp` gains a tenant-boundary group —
+  role distinctness (`tenant_admin` is not `system_admin`), full within-tenant
+  bypass for both roles, plain-user denial, and structural per-manager isolation
+  (36 checks total, all passing).
 
 ---
 

@@ -104,11 +104,13 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
                                           const std::map<std::string, std::string>& claims) {
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
 
-    // System-admin bypass: holding kSystemAdminRole grants all permissions.
-    // No server-side enable flag — upstream is trusted to only attach this
-    // role to legitimately admin requests (see plan §4 / kSystemAdminRole doc).
-    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
-            != effective_roles.end()) {
+    // Admin bypass: kSystemAdminRole (global operator) OR kTenantAdminRole
+    // (admin of THIS tenant). tenant_admin's scope is structural — this
+    // AclManager resolves against a single tenant's schema (db_), so it can
+    // never reach another tenant. No server-side enable flag — upstream is
+    // trusted to attach these only to legitimately admin requests. (Finding H2.)
+    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()
+        || std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
         return Result<bool>::ok(true);
     }
 
@@ -139,6 +141,22 @@ bool AclManager::is_system_admin(const std::string& user,
     auto effective_roles = resolve_effective_roles(user, request_roles, tenant);
     return std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
            != effective_roles.end();
+}
+
+bool AclManager::is_tenant_admin(const std::string& user,
+                                 const std::vector<std::string>& request_roles,
+                                 const std::string& tenant) {
+    auto effective_roles = resolve_effective_roles(user, request_roles, tenant);
+    return std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole)
+           != effective_roles.end();
+}
+
+bool AclManager::is_admin(const std::string& user,
+                          const std::vector<std::string>& request_roles,
+                          const std::string& tenant) {
+    auto effective_roles = resolve_effective_roles(user, request_roles, tenant);
+    return std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()
+        || std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
 }
 
 Result<std::vector<ACLRule>> AclManager::get_acls_for_resource(const std::string& resource_uid,
@@ -178,12 +196,12 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
                                                  const std::map<std::string, std::string>& claims) {
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
 
-    // system_admin bypasses all ACL checks, so its effective permission set is
-    // every bit — mirroring check_permission. Resolved before any ACL/parent
-    // lookup so an admin's answer never depends on (or is collapsed by) the
-    // resource's ACLs or an unreadable ancestor.
-    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole)
-            != effective_roles.end()) {
+    // Admin bypass (system_admin OR tenant_admin) grants every bit — mirroring
+    // check_permission. Resolved before any ACL/parent lookup so an admin's
+    // answer never depends on (or is collapsed by) the resource's ACLs or an
+    // unreadable ancestor. tenant_admin is tenant-scoped by db_. (Finding H2.)
+    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()
+        || std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
         return Result<int>::ok(kAllPermissions);
     }
 

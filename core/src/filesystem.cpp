@@ -84,10 +84,10 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
     if (parent_uid.empty()) {
         SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                   "Attempting root directory creation - only allowed for system_admin role");
-        if (!acl_manager_ || !acl_manager_->is_system_admin(user, roles, tenant)) {
+        if (!acl_manager_ || !acl_manager_->is_admin(user, roles, tenant)) {
             SERVER_LOG_ERROR("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
                       "Non-admin user attempting to create in root directory");
-            return Result<std::string>::err("Only system_admin can create in root directory");
+            return Result<std::string>::err("Only an admin (system_admin or tenant_admin) can create in the root directory");
         }
     } else {
         auto perm_result = validate_user_permissions(parent_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
@@ -196,7 +196,7 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
     // folder even though it's hidden from its parent's listing. The hardcoded
     // system_admin bypasses this (and all ACL/reachability hiding) so a superuser
     // is never locked out of inspecting or recovering a deleted subtree.
-    if (!acl_manager_ || !acl_manager_->is_system_admin(user, roles, tenant)) {
+    if (!acl_manager_ || !acl_manager_->is_admin(user, roles, tenant)) {
         auto dir_info = context->db->get_file_by_uid_include_deleted(dir_uid, tenant);
         if (dir_info.success && dir_info.value.has_value() && dir_info.value->deleted) {
             return Result<std::vector<DirectoryEntry>>::err("Directory does not exist");
@@ -293,8 +293,8 @@ Result<std::string> FileSystem::touch(const std::string& parent_uid, const std::
     // Check permissions - the user needs write permission on the parent directory.
     // Creating directly under the filesystem root is restricted to system admins.
     if (parent_uid.empty()) {
-        if (!acl_manager_ || !acl_manager_->is_system_admin(user, roles, tenant)) {
-            return Result<std::string>::err("Only system_admin can create in root directory");
+        if (!acl_manager_ || !acl_manager_->is_admin(user, roles, tenant)) {
+            return Result<std::string>::err("Only an admin (system_admin or tenant_admin) can create in the root directory");
         }
     } else {
         auto perm_result = validate_user_permissions(parent_uid, user, roles, static_cast<int>(Permission::WRITE), tenant);
