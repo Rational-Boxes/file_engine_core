@@ -415,14 +415,17 @@ void test_priority_group_only() {
     AclManager acl(db);
     std::string res = "res-003";
 
-    acl.grant_permission(res, "developers", PrincipalType::GROUP, PERM_READ | PERM_WRITE);
+    // Roles ARE the group mechanism (LDAP groups resolve to role names), so a
+    // "group" grant is a ROLE grant applied to users who hold that role.
+    acl.grant_permission(res, "developers", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
 
-    // GROUP rules apply to ALL users who don't have user-specific or role-specific ACLs
-    // Note: the GROUP check doesn't match against the roles vector - it applies universally
-    auto result = acl.get_effective_permissions(res, "charlie", {});
+    auto result = acl.get_effective_permissions(res, "charlie", {"developers"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
-    TEST_ASSERT(has_perm(result.value, PERM_READ), "charlie should have READ from group");
-    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "charlie should have WRITE from group");
+    TEST_ASSERT(has_perm(result.value, PERM_READ), "charlie (group/role member) should have READ");
+    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "charlie (group/role member) should have WRITE");
+    // A non-member must NOT receive the group/role grant.
+    auto nonmember = acl.get_effective_permissions(res, "charlie", {});
+    TEST_ASSERT(!has_perm(nonmember.value, PERM_WRITE), "non-member must NOT get the group/role WRITE");
 }
 
 void test_priority_other_only() {
@@ -460,14 +463,15 @@ void test_priority_user_group_union() {
     AclManager acl(db);
     std::string res = "res-006";
 
-    acl.grant_permission(res, "devs", PrincipalType::GROUP, PERM_READ | PERM_WRITE | PERM_DELETE);
+    // "group" grant == ROLE grant; alice holds the devs role.
+    acl.grant_permission(res, "devs", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
 
-    auto result = acl.get_effective_permissions(res, "alice", {});
+    auto result = acl.get_effective_permissions(res, "alice", {"devs"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
     TEST_ASSERT(has_perm(result.value, PERM_READ), "alice should have READ");
-    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "alice should have WRITE from group");
-    TEST_ASSERT(has_perm(result.value, PERM_DELETE), "alice should have DELETE from group");
+    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "alice should have WRITE from her group/role");
+    TEST_ASSERT(has_perm(result.value, PERM_DELETE), "alice should have DELETE from her group/role");
 }
 
 void test_priority_user_other_union() {
@@ -489,14 +493,15 @@ void test_priority_role_group_union() {
     AclManager acl(db);
     std::string res = "res-008";
 
-    acl.grant_permission(res, "devs", PrincipalType::GROUP, PERM_READ | PERM_WRITE | PERM_DELETE);
+    // Two group/role grants union for a user who holds both roles.
+    acl.grant_permission(res, "devs", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE);
     acl.grant_permission(res, "viewer", PrincipalType::ROLE, PERM_READ);
 
-    auto result = acl.get_effective_permissions(res, "bob", {"viewer"});
+    auto result = acl.get_effective_permissions(res, "bob", {"viewer", "devs"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
     TEST_ASSERT(has_perm(result.value, PERM_READ), "bob should have READ");
-    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "bob should have WRITE from group");
-    TEST_ASSERT(has_perm(result.value, PERM_DELETE), "bob should have DELETE from group");
+    TEST_ASSERT(has_perm(result.value, PERM_WRITE), "bob should have WRITE from the devs group/role");
+    TEST_ASSERT(has_perm(result.value, PERM_DELETE), "bob should have DELETE from the devs group/role");
 }
 
 void test_priority_role_other_union() {
@@ -1668,14 +1673,14 @@ void test_multiple_group_acls_cumulative() {
     AclManager acl(db);
     std::string res = "res-multi-group";
 
-    // Multiple GROUP ACLs accumulate (no principal matching for groups)
-    acl.grant_permission(res, "group-a", PrincipalType::GROUP, PERM_READ);
-    acl.grant_permission(res, "group-b", PrincipalType::GROUP, PERM_WRITE);
+    // Multiple group/role ACLs accumulate for a user who holds those roles
+    // (roles are the group mechanism).
+    acl.grant_permission(res, "group-a", PrincipalType::ROLE, PERM_READ);
+    acl.grant_permission(res, "group-b", PrincipalType::ROLE, PERM_WRITE);
 
-    // User with no user/role ACLs falls through to group
-    auto perms = acl.get_effective_permissions(res, "user1", {});
-    TEST_ASSERT(has_perm(perms.value, PERM_READ), "should have READ from group-a");
-    TEST_ASSERT(has_perm(perms.value, PERM_WRITE), "should have WRITE from group-b");
+    auto perms = acl.get_effective_permissions(res, "user1", {"group-a", "group-b"});
+    TEST_ASSERT(has_perm(perms.value, PERM_READ), "should have READ from group-a role");
+    TEST_ASSERT(has_perm(perms.value, PERM_WRITE), "should have WRITE from group-b role");
 }
 
 void test_multiple_other_acls_cumulative() {
@@ -1884,7 +1889,7 @@ void test_everyone_deny_blocks_read() {
 
     // DENY READ to everyone (OTHER) hides the resource entirely, overriding the
     // read-by-default baseline.
-    acl.grant_permission(res, kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission(res, kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions(res, "anyone", {});
@@ -1903,7 +1908,7 @@ void test_user_allow_beats_everyone_deny() {
     // tier resolves before the everyone tier, so alice's ALLOW wins over the
     // everyone DENY — while a non-owner still falls through to that DENY.
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
-    acl.grant_permission(res, kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission(res, kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions(res, "alice", {});
@@ -1922,7 +1927,7 @@ void test_role_allow_beats_everyone_deny() {
     // resolves at the role/claim tier (before the everyone DENY); a non-member
     // falls through to the everyone DENY.
     acl.grant_permission(res, "engineering", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
-    acl.grant_permission(res, kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission(res, kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto member = acl.get_effective_permissions(res, "alice", {"engineering"});
@@ -2000,7 +2005,7 @@ void test_parent_deny_blocks_child_subtree() {
 
     // DENY READ to everyone on the FOLDER. The file itself has no ACL (baseline
     // readable), but it must become unreachable because its parent is hidden.
-    acl.grant_permission("folder", kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     // Effective permissions reflect traversal: an unreadable parent collapses
@@ -2042,7 +2047,7 @@ void test_effective_permissions_reflect_system_admin() {
     // Subtree hidden from everyone — would collapse a normal user's effective
     // perms to zero. A system_admin bypasses ACLs entirely, so its effective
     // set is every permission regardless of ACLs or traversal.
-    acl.grant_permission("folder", kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions("file", "root", {kSystemAdminRole});
@@ -2065,7 +2070,7 @@ void test_parent_deny_blocks_grandchild() {
     db->set_file("leaf", "mid");
 
     // DENY READ to everyone at the TOP level blocks the whole subtree.
-    acl.grant_permission("top", kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission("top", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto leaf = acl.check_permission("leaf", "nobody", {}, PERM_READ);
@@ -2081,7 +2086,7 @@ void test_child_allow_cannot_override_ancestor_deny() {
     // Parent hidden from everyone, but the child explicitly grants alice READ.
     // Path semantics: alice still cannot reach the file through a folder she
     // cannot read.
-    acl.grant_permission("folder", kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
     acl.grant_permission("file", "alice", PrincipalType::USER, PERM_READ);
 
@@ -2096,7 +2101,7 @@ void test_system_admin_bypasses_parent_deny() {
     db->set_file("folder", "");
     db->set_file("file", "folder");
 
-    acl.grant_permission("folder", kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     // system_admin bypasses ACLs entirely, including path traversal.
@@ -2172,7 +2177,7 @@ void test_cull_versions_blocked_by_everyone_deny_and_traversal() {
     // archivist holds CULL_VERSIONS on the file, but the parent folder is hidden
     // from everyone — path traversal still blocks the destroy-data op.
     acl.grant_permission("file", "archivist", PrincipalType::USER, PERM_CULL_VERSIONS);
-    acl.grant_permission("folder", kEveryoneGroup, PrincipalType::OTHER, PERM_READ,
+    acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
 
     auto check = acl.check_permission("file", "archivist", {}, PERM_CULL_VERSIONS);

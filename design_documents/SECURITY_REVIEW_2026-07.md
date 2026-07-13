@@ -29,7 +29,7 @@ the system fails to enforce *its own* intended model.
 | H1 | High | Destructive ops gated on `WRITE`, not their dedicated bits | core | **Fixed** (core `security/hardening`) |
 | H2 | High | Any `cn=administrators` group maps to `system_admin` | core + both bridges | **Fixed** (tenant-scoped superuser) |
 | M1 | Medium | ALLOW/DENY precedence — hierarchical resolution | core | **Fixed** (core `security/hardening`) |
-| M2 | Medium | `GROUP`-type ACL matches every principal | core | **Open** (latent) |
+| M2 | Medium | `GROUP`-type ACL matched every principal (redundant type) | core | **Fixed** (reserved/fail-closed; roles are groups) |
 | M3 | Medium | `X-Tenant`/Host tenant trusted with no membership check | bridges | **Fixed** (http_bridge `security/hardening`) |
 | M4 | Medium | webdav COPY/MOVE ignore `Destination` authority + `Overwrite` | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Fixed** (webdav `security/hardening`) |
@@ -210,13 +210,19 @@ downgrade to tenant-scoped (a *tightening*, not a break). Add tests: a
   deliberate identity hierarchy rather than a bug: the most specific tier that
   touches a bit settles it, and DENY is absolute only *within* a tier. The
   previously-lumped role/claim tier is now split so claims outrank groups:
-  **USER > CLAIM > ROLE/GROUP > OTHER(everyone) > read-only default.** Header
+  **USER > CLAIM > ROLE > OTHER(everyone) > read-only default.** Header
   comments corrected (no more "a matching DENY always wins"). `test_security_acl`
   gained `test_hierarchical_precedence` covering USER>ROLE, CLAIM>ROLE, USER-DENY
   over CLAIM-ALLOW, and ROLE-ALLOW over everyone-DENY.
-- **M2 — GROUP matches everyone:** `acl_manager.cpp:375` returns a match for any
-  principal. Latent (no gRPC path creates GROUP rows today) but a foot-gun the
-  moment GROUP is wired.
+- **M2 — `GROUP`-type ACL matched every principal — FIXED:** the `GROUP`
+  principal type was **redundant** — roles ARE the group mechanism (LDAP groups
+  resolve to ROLE principals), and no code path ever creates a GROUP row. Its
+  evaluator previously matched *everyone* (fail-open); it now matches **nobody**
+  (fail-closed) and is documented as a reserved/unused enum slot retained only
+  for wire/DB numbering stability. Confusing terminology was cleaned up
+  (`kEveryoneGroup` → `kEveryonePrincipal`; enum/proto/comment fixes). Added
+  `test_group_type_matches_nobody`; the 4 legacy GROUP tests were converted to
+  ROLE (the real group mechanism). No behavior change for real deployments.
 - **M3 — tenant not membership-checked — FIXED (http_bridge):** `authenticate()`
   now rejects a selected tenant the caller is not a member of. Bearer: the active
   tenant must be the token's issued tenant or a key in its `{tenant:[roles]}`

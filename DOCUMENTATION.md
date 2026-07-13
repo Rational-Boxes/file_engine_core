@@ -68,8 +68,8 @@ The system is composed of several key components that work together:
 - Offline access to locally cached files
 
 ### Advanced Access Control
-- Unix-style permissions (owner/group/other with rwx bits)
-- Role-based access control with configurable roles
+- Per-principal ACLs (user / role / claim-ABAC / everyone) with ALLOW and DENY effects
+- Role-based access control with configurable roles (roles are the group mechanism)
 - File-level ACLs for granular permission control
 - Permission inheritance from parent to child resources
 

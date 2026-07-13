@@ -66,6 +66,13 @@ The function sets `user_found = true` as soon as *any* USER-typed rule matches, 
 
 `PrincipalType::GROUP` is recognized in `calculate_effective_permissions` but there is no DB or RPC path to (a) define a group, (b) record group memberships, or (c) populate the `roles`/groups list at request time. Effectively, only USER and OTHER rules are actionable.
 
+> **Resolution (2026-07):** DENY semantics and ROLE grants are now implemented,
+> and **roles ARE the group mechanism** — LDAP groups resolve to ROLE principals
+> upstream — so `PrincipalType::GROUP` is redundant and will not be plumbed. It is
+> now a reserved/unused enum slot (kept only for wire/DB numbering stability) that
+> the evaluator treats as **no-match (fail-closed)**. See
+> `design_documents/SECURITY_REVIEW_2026-07.md` (M2).
+
 ### 3. The `RoleManager` is a stub
 
 `core/src/role_manager.cpp` and the `Database::*role*` methods (`database.cpp:2269-2324`) are **all no-ops** that return success without touching the database. Yet the gRPC service exposes `CreateRole`, `DeleteRole`, `AssignUserToRole`, `RemoveUserFromRole`, `GetRolesForUser`, `GetUsersForRole`, `GetAllRoles`. All of these:

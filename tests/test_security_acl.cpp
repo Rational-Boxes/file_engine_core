@@ -383,6 +383,30 @@ void test_tenant_admin_boundary_is_per_manager() {
           "tenant B's manager does hold its own node's ACL");
 }
 
+// GROUP is a reserved/unused principal type — roles are the group mechanism, so
+// no code path creates a GROUP row. Should a stray one appear (e.g. a manual DB
+// insert), it must match NOBODY (fail-closed), never everyone. (M2 + cleanup.)
+void test_group_type_matches_nobody() {
+    std::cout << "test_group_type_matches_nobody\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+    acl.set_default_read(false);
+    const int GROUP = static_cast<int>(PrincipalType::GROUP);
+    const int USER  = static_cast<int>(PrincipalType::USER);
+
+    // A GROUP ALLOW READ injected directly must grant no one.
+    db->add_acl("F", "anygroup", GROUP, P_READ, "", "", 0 /*ALLOW*/);
+    CHECK(!can(acl, "F", "alice", {}, P_READ), "GROUP ALLOW grants nobody (fail-closed)");
+    CHECK(!can(acl, "F", "bob", {"anygroup"}, P_READ),
+          "GROUP ALLOW grants nobody even when a role of the same name is held");
+
+    // A GROUP DENY must affect no one — a legitimately granted user still passes.
+    db->add_acl("F", "carol", USER,  P_READ, "", "", 0 /*ALLOW*/);
+    db->add_acl("F", "anygrp", GROUP, P_READ, "", "", 1 /*DENY*/);
+    CHECK(can(acl, "F", "carol", {}, P_READ), "GROUP DENY affects nobody; USER ALLOW stands");
+}
+
 int main() {
     std::cout << "=== AclManager security semantics ===\n";
     test_write_does_not_imply_destructive();
@@ -396,6 +420,7 @@ int main() {
     test_tenant_admin_is_scoped_not_global();
     test_admin_roles_bypass_within_tenant();
     test_tenant_admin_boundary_is_per_manager();
+    test_group_type_matches_nobody();
     std::cout << "\nAll " << g_checks << " checks passed.\n";
     return 0;
 }

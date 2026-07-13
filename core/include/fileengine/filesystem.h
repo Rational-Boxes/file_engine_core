@@ -217,7 +217,7 @@ public:
     }
 
     // Emit an acl.changed event from an external ACL path. The gRPC layer calls
-    // AclManager directly (it supports GROUP/ROLE principals and DENY effects
+    // AclManager directly (it supports ROLE/CLAIM principals and DENY effects
     // that FileSystem::grant_permission doesn't model), so it uses this hook to
     // publish the event. No-op when events are disabled.
     void publish_acl_change(const std::string& tenant, const std::string& resource_uid,

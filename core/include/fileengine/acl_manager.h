@@ -62,8 +62,14 @@ inline constexpr int kAllPermissions =
 
 enum class PrincipalType {
     USER,
-    ROLE,      // For role-based permissions
-    GROUP,
+    ROLE,      // Role-based permissions. Roles ARE the group mechanism —
+               // LDAP groups are resolved to role names upstream, so a "group"
+               // grant is just a ROLE grant. There is no separate group type.
+    GROUP,     // RESERVED / UNUSED. Kept only so the enum's integer values stay
+               // wire/DB-stable (USER=0, ROLE=1, GROUP=2, OTHER=3, CLAIM=4);
+               // removing it would renumber OTHER/CLAIM and corrupt stored rows.
+               // Redundant with ROLE (roles are groups); no code path creates it,
+               // and the evaluator treats it as no-match (fail-closed).
     OTHER,
     CLAIM      // ABAC: matches a principal whose auth claims contain a
                // specific key=value pair. The stored `principal` is the
@@ -72,7 +78,7 @@ enum class PrincipalType {
 };
 
 // ALLOW (default) contributes bits; DENY subtracts them at evaluation time.
-// Resolution is hierarchical (USER > CLAIM > ROLE/GROUP > OTHER > read-default):
+// Resolution is hierarchical (USER > CLAIM > ROLE > OTHER > read-default):
 // DENY is absolute *within its tier*, but a more specific tier that settles a
 // bit wins over a less specific DENY (see calculate_effective_permissions). The
 // integer values are wire-stable — they map directly to the DB `effect` column
@@ -83,8 +89,8 @@ enum class AclEffect {
 };
 
 struct ACLRule {
-    std::string principal;      // User or group name
-    PrincipalType type;         // User, group, or other
+    std::string principal;      // user id, role name, "key=value" claim, or "everyone"
+    PrincipalType type;         // USER, ROLE, CLAIM, or OTHER (GROUP is reserved/unused)
     int permissions;            // Bitmask of permissions
     std::string resource_uid;   // Resource this ACL applies to
     AclEffect effect = AclEffect::ALLOW;
@@ -114,11 +120,11 @@ inline constexpr const char* kTenantAdminRole = "tenant_admin";
 // Human-facing name for the "everyone" principal. A rule whose PrincipalType
 // is OTHER matches every principal regardless of the stored principal string,
 // so a rule on this name targets all users. Grant DENY READ to
-// {kEveryoneGroup, PrincipalType::OTHER} to hide a resource (and, via parent
+// {kEveryonePrincipal, PrincipalType::OTHER} to hide a resource (and, via parent
 // traversal, its whole subtree) from everyone — overriding the read-by-default
 // baseline. Note a more specific tier (USER/CLAIM/ROLE ALLOW) still resolves
 // before this everyone-tier DENY. See plan §2.4.
-inline constexpr const char* kEveryoneGroup = "everyone";
+inline constexpr const char* kEveryonePrincipal = "everyone";
 
 class AclManager {
 public:
@@ -175,7 +181,8 @@ public:
         AclManager* mgr_;
     };
     
-    // Grant permission to a user/group on a resource. performed_by is the
+    // Grant permission to a principal (user/role/claim/everyone) on a resource.
+    // performed_by is the
     // last arg so legacy positional callers that pass `tenant` as the 5th
     // argument still bind to the right slot. effect defaults to ALLOW; pass
     // DENY to add bits to the deny set instead (DENY wins within its tier).
@@ -187,7 +194,8 @@ public:
                                   const std::string& performed_by = "",
                                   AclEffect effect = AclEffect::ALLOW);
 
-    // Revoke permission from a user/group on a resource. The effect arg
+    // Revoke permission from a principal (user/role/claim/everyone) on a
+    // resource. The effect arg
     // selects which row (ALLOW or DENY) the bits come out of.
     Result<void> revoke_permission(const std::string& resource_uid,
                                    const std::string& principal,

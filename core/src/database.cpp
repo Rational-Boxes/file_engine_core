@@ -3047,7 +3047,7 @@ Result<std::vector<IDatabase::AclEntry>> Database::get_user_acls(const std::stri
     // Get tenant-specific schema prefix
     std::string schema = get_schema_prefix(tenant);
 
-    // Filter by principal_type so user/role/group names in the same namespace
+    // Filter by principal_type so user/role/claim names in the same namespace
     // are not conflated (e.g. a user "alice" and a role "alice").
     std::string query_sql =
         "SELECT resource_uid, principal, principal_type, permissions, effect "

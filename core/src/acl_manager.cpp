@@ -327,7 +327,7 @@ Result<std::vector<ACLRule>> AclManager::get_user_acls(const std::string& resour
                                                        const std::string& tenant) {
     // Query dedicated ACL tables directly for user-specific ACLs.
     // The AclManager API treats `user` as a USER principal, so scope the DB
-    // lookup to USER-typed rows to avoid conflating role/group names.
+    // lookup to USER-typed rows to avoid conflating user and role names.
     auto user_acl_result = db_->get_user_acls(resource_uid, user,
                                               static_cast<int>(PrincipalType::USER), tenant);
     if (!user_acl_result.success) {
@@ -361,18 +361,19 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
     // a single tier a DENY beats an ALLOW. Tiers, most specific first:
     //   [0] USER          — a rule for this exact user
     //   [1] CLAIM         — a matching ABAC claim (key=value)
-    //   [2] ROLE / GROUP  — a matching role or group membership
+    //   [2] ROLE          — a matching role (roles ARE the group mechanism:
+    //                       LDAP groups are resolved to role names upstream)
     //   [3] OTHER         — explicit "everyone" rules (e.g. world-readable)
     //   fall-through      — READ allowed (read-by-default), everything else denied
     //
     // Rationale (finding M1): resolution is a deliberate identity hierarchy —
-    // USER, then CLAIM, then GROUP/ROLE, then the everyone tier, then the
-    // read-only default. A more-specific ALLOW overrides a less-specific DENY
-    // (e.g. a private home folder: everyone DENY + owner ALLOW), and a specific
-    // claim resolves before a broader group. DENY is absolute only *within* a
-    // tier — it does not leap across tiers. Read-by-default is the terminal
-    // fall-through; disable via set_default_read(false) for strict
-    // private-by-default. See plan §6.1.
+    // USER, then CLAIM, then ROLE, then the everyone tier, then the read-only
+    // default. A more-specific ALLOW overrides a less-specific DENY (e.g. a
+    // private home folder: everyone DENY + owner ALLOW), and a specific claim
+    // resolves before a broader role. DENY is absolute only *within* a tier — it
+    // does not leap across tiers. Read-by-default is the terminal fall-through;
+    // disable via set_default_read(false) for strict private-by-default. See
+    // plan §6.1.
 
     // Classify a rule into its specificity tier (lower = more specific), or -1
     // for no match.
@@ -396,16 +397,21 @@ int AclManager::calculate_effective_permissions(const std::vector<ACLRule>& rule
                 }
                 return -1;
             case PrincipalType::GROUP:
-                // GROUP membership is not yet modeled (plan §2.3); treat as a
-                // global match in the role/group tier.
-                return 2;
+                // Reserved/legacy slot — NOT a usable principal. Roles ARE the
+                // group mechanism (LDAP groups resolve to ROLE principals), so
+                // GROUP is redundant and no code path ever creates one. The enum
+                // value is retained only for wire/DB numbering stability (see
+                // acl_manager.h). Match nobody (fail-closed) so a stray row —
+                // e.g. a manual DB insert — grants/denies no one rather than
+                // everyone. (Findings M2 + "roles are groups" cleanup.)
+                return -1;
             case PrincipalType::OTHER:
                 return 3;
         }
         return -1;
     };
 
-    constexpr int kTiers = 4;  // USER, CLAIM, ROLE/GROUP, OTHER
+    constexpr int kTiers = 4;  // USER, CLAIM, ROLE, OTHER
     int allow[kTiers] = {0, 0, 0, 0};
     int deny[kTiers] = {0, 0, 0, 0};
     for (const auto& rule : rules) {

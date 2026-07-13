@@ -1339,7 +1339,7 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     } else if (principal.rfind("claim:", 0) == 0) {
         principal_type = PrincipalType::CLAIM;
         principal = principal.substr(6);
-    } else if (principal == kEveryoneGroup || principal == "other") {
+    } else if (principal == kEveryonePrincipal || principal == "other") {
         // The "everyone" group (legacy alias "other") targets the OTHER catch-all
         // principal — a rule that applies to every user regardless of identity
         // (e.g. a DENY READ to hide a resource from everyone). The principal
@@ -1514,7 +1514,7 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     } else if (principal.rfind("claim:", 0) == 0) {
         principal_type = PrincipalType::CLAIM;
         principal = principal.substr(6);
-    } else if (principal == kEveryoneGroup || principal == "other") {
+    } else if (principal == kEveryonePrincipal || principal == "other") {
         // The "everyone" group (legacy alias "other") targets the OTHER catch-all
         // principal — a rule that applies to every user regardless of identity
         // (e.g. a DENY READ to hide a resource from everyone). The principal
