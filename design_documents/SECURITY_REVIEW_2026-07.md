@@ -35,7 +35,7 @@ the system fails to enforce *its own* intended model.
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
 | L2 | Low | Monitor bind address + optional IP allowlist | all services | **Fixed** (C++ + Python tiers) |
-| L3 | Low | Audit fail-**open** when disabled; OAuth/refresh unaudited | http_bridge | **Open** |
+| L3 | Low | Audit coverage gaps (OAuth/refresh/revoke) + fail-open when disabled | http_bridge | **Fixed (B)**: coverage closed + refresh re-validates LDAP; (A) posture unchanged by choice |
 | L4 | Low | Dead-code LDAP injection in unused digest/getUserInfo | both bridges | **Fixed** (bridges `security/hardening`) |
 
 Fixes live on the `security/hardening` branch in each affected repo (unmerged).
@@ -269,9 +269,23 @@ downgrade to tenant-scoped (a *tightening*, not a break). Add tests: a
   `discussion`, and `audit-api`. Non-monitoring paths are never gated.
   TestClient regression tests (discussion, csai) assert block/permit/route-scope/
   no-op. `mcp` exposes no HTTP monitoring endpoint, so it is out of scope.
-- **L3 — audit fail-open:** `http_bridge/src/audit_publisher.cpp:52` returns
-  success when auditing is disabled/built without hiredis, so logins succeed with
-  no trail; OAuth (`http_server.cpp:1150`) and refresh logins emit no audit event.
+- **L3 — audit coverage + fail-open — (B) FIXED:** every session-minting path
+  now emits an audit event, matching the Basic-login path:
+  - **OAuth callback** — `login_failure` (best-effort) on no-match; fail-closed
+    `login_success` before minting.
+  - **Token refresh** — now **re-validates the user against LDAP** (`getTenantsForUser`)
+    so a deactivated/removed account cannot extend its session (→ 401), keeps a
+    still-valid active tenant (never stamps a stale one), and re-reads roles live
+    (`getRolesByTenant`) so the new token is **non-stale**; emits a fail-closed
+    `token_refresh` event.
+  - **Revoke** — emits a best-effort `logout` event.
+  Verified live: `login_success`, `token_refresh`, `logout`, `login_failure`
+  events land in the `fileengine:audit` Redis stream; a valid refresh returns a
+  fresh token with live roles.
+  **(A) fail-open when audit is *disabled* / built without hiredis is unchanged**
+  (audit remains optional by design; the user chose coverage-only). Remaining
+  options if desired: a startup assertion when `audit_enabled=true` but the build
+  can't publish (A-i), and surfacing audit health in `/readyz` (A-ii).
 - **L4 — dead-code injection — FIXED:** removed the unused `authenticateDigest`
   and `getUserInfo` from **both** bridges (each built raw, unescaped LDAP filters
   and had no callers). The live paths (`getUserInfoByEmail`, `authenticateUser`)
