@@ -28,6 +28,12 @@ password**:
    session **from the same egress IP** — a strong, pragmatic second factor for a
    protocol that can't prompt.
 
+**Hybrid availability goal.** These controls must **degrade gracefully**: in a
+hybrid deployment, when the upstream/cloud link is lost, **LAN users must keep
+READ access to WebDAV.** The hardening therefore must never make the *loss of the
+cloud* the thing that blocks on-prem access — the LAN path stays entirely local
+(§5.7). This is an explicit design constraint, not an afterthought.
+
 **Threat model.** Adversary has a valid username + password (phished, reused,
 brute-forced, or leaked) but does **not** control the user's authenticator device
 **and** is not operating from the user's current network egress IP.
@@ -240,15 +246,21 @@ bind succeeds:
 Result: a correct-but-leaked WebDAV password is refused unless the attacker also
 has a live, 2FA'd Web session from the **same** IP within the TTL.
 
-### 5.3 Redis-unavailable posture (decision) — recommend **fail-closed** for enabled tenants
+### 5.3 Redis-unavailable posture — fail-closed for EXTERNAL, unaffected for LAN
 
-If Redis is unreachable, webdav_bridge cannot verify the binding. For a control
-whose purpose is to *prevent exfiltration*, **fail-closed** (deny WebDAV when the
-binding can't be checked) is the safe default — but it couples WebDAV availability
-to Redis. Make it configurable (`WEBDAV_IP_BINDING_FAIL_OPEN`, default false) and
-surface Redis reachability in webdav's `/readyz` (mirror the L3 A-ii pattern) so
-an outage drains the instance and alerts. (Auth-audit already sets the precedent
-that a security-critical dependency may fail the operation.)
+If Redis is unreachable, webdav_bridge cannot verify a binding — but this only
+matters for **external** requests. **LAN/internal requests are resolved by the
+local, cloud-independent trusted-CIDR path (§5.6) *before* any Redis lookup**, so a
+Redis (or full upstream) outage never blocks them. This is precisely what makes
+degraded-mode LAN read access work (§5.7) — the availability goal (§1) and the
+security control do not conflict once the LAN path is local.
+
+For **external** requests — whose security *depends on* the Redis binding —
+**fail-closed** (deny when the binding can't be checked) is the safe default;
+denying an unknown external client during an outage is the conservative choice.
+Configurable via `WEBDAV_IP_BINDING_FAIL_OPEN` (default false), with Redis
+reachability surfaced in webdav's `/readyz` (mirror L3 A-ii). Net: an outage
+drains *external* readiness while LAN reads continue uninterrupted.
 
 ### 5.4 Self-service visibility (frontend + ldap_manager)
 
@@ -321,6 +333,45 @@ internally for regulated / BYOD tenants.
   exemption is traceable.
 - Per-tenant, so one tenant can relax it while a regulated tenant keeps the binding
   on even for LAN.
+- **Evaluated *before and independently of* the Redis binding lookup, from static
+  config only** — it needs no cloud connectivity, so it doubles as the
+  degraded-mode / outage-survival path (§5.7).
+
+### 5.7 Degraded-mode / offline LAN read access (hybrid resilience)
+
+The hybrid availability goal (§1): **when the upstream/cloud link is lost, LAN
+users keep READ access to WebDAV.** The hardening in this proposal must degrade
+gracefully — LAN reads must not depend on the cloud services that are down. Three
+local dependencies must be satisfied, and the platform already supports all three:
+
+1. **Auth locally** — an **on-prem read-only LDAP replica**. Both bridges already
+   have replica failover (`FILEENGINE_LDAP_ENDPOINT_REPLICA` + the `failover.h`
+   circuit-breaker), so password binds continue against the local replica when the
+   master is unreachable.
+2. **Serving locally** — an **on-prem core engine + local storage/cache**. The core
+   already keeps a local-FS store + `CacheManager` and does async S3 sync, and
+   `ConnectionPoolManager` supports read-only DB failover — so cached/local files
+   are served without the cloud.
+3. **A gate that needs no cloud** — the §5.6 trusted-CIDR exemption is a purely
+   local decision (static config + authoritative peer IP, no Redis), so LAN users
+   are unaffected by a Redis/cloud outage.
+
+**Read-only downgrade.** During a detected upstream degradation (core / object-store
+sync unreachable), LAN WebDAV should downgrade to **read-only** — serve `GET` /
+`PROPFIND` / `OPTIONS`, but refuse `PUT` / `DELETE` / `MKCOL` / `MOVE` / `COPY`
+(`503`/`423` with a clear message) — so no un-syncable writes are created and there
+is no split-brain to reconcile when the link returns. (Full offline read-write with
+later reconciliation is a much larger, separate effort — **out of scope for v1**.)
+
+- Config: `WEBDAV_OFFLINE_READONLY` (`auto` | `on` | `off`) + a degradation signal
+  (core `/readyz` / S3-sync health) that flips the mode.
+- Audit: `webdav_degraded_mode` transitions; and any write refused while degraded.
+
+**Requirement summary:** outage-surviving LAN reads require the site to deploy the
+on-prem replicas above; the IP-binding / 2FA additions are deliberately designed to
+be **inert on the LAN path** so they never become the thing that breaks
+availability. 2FA is unaffected — it is a Web-UI concern; LAN WebDAV takes the
+trusted-CIDR path and never prompts.
 
 ---
 
@@ -371,6 +422,8 @@ davfs → nginx (X-Real-IP=X) → webdav_bridge  PROPFIND /...
 | `WEBDAV_IP_BIND_TTL_SECONDS` | http_bridge | 43200 (12h) |
 | `WEBDAV_IP_BINDING_FAIL_OPEN` | webdav_bridge | false |
 | `WEBDAV_IP_BIND_TRUSTED_CIDRS` (per-tenant; internal/LAN exemption, §5.6) | webdav_bridge | ∅ |
+| `WEBDAV_OFFLINE_READONLY` (`auto`/`on`/`off`; degraded-mode LAN reads, §5.7) | webdav_bridge | auto |
+| `FILEENGINE_LDAP_ENDPOINT_REPLICA` (on-prem read replica; already exists) | both bridges | ∅ |
 | `FILEENGINE_REDIS_*` | webdav_bridge (NEW — add hiredis like http_bridge) | shared |
 
 All default **off** → the change is inert until a deployment opts in; fully
@@ -445,6 +498,12 @@ backward compatible.
    `WEBDAV_IP_BIND_TRUSTED_CIDRS` (skip the binding for internal/VPN ranges) — and
    accept the insider/lateral-movement trade-off it implies? If yes, confirm the
    authoritative-IP source per the deployment topology, and keep it allow-but-audit.
+9. **Degraded-mode LAN reads (§5.7) — read-only is confirmed spec.** Remaining:
+   confirm the on-prem replica topology (LDAP read replica + local core/cache) is
+   deployed at hybrid sites, and the degradation signal that flips read-only mode.
+   Offline read-**write** with reconciliation is explicitly **out of scope for v1**
+   — the no-corruption / conflict-reconciliation guarantees make it a much larger,
+   separate effort.
 5. **OAuth + 2FA:** trust IdP MFA (recommended) vs always require our TOTP.
 6. **Email fallback:** on by default vs tenant opt-in; allow disabling per tenant.
 7. **Binding TTL** (default 12h) and whether `refreshToken` should extend it.
