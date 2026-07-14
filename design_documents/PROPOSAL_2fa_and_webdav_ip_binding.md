@@ -229,9 +229,11 @@ In `authenticateUser` (the single choke point for all 8 handlers), after the LDA
 bind succeeds:
 
 1. Derive the **trusted client IP** (§3).
-2. `EXISTS webdav:ipbind:{tenant}:{uid}:{ip}` → if present, allow; else **403**
-   with a clear body: *"WebDAV access requires a recent Web UI sign-in from this
-   network (IP a.b.c.d). Sign in at <url>, then retry."*
+2. **Allow if** the binding exists **or** the client IP is in the tenant's trusted
+   internal CIDRs (§5.6): `EXISTS webdav:ipbind:{tenant}:{uid}:{ip}  OR  ip ∈
+   WEBDAV_IP_BIND_TRUSTED_CIDRS`. Otherwise **403** with a clear body: *"WebDAV
+   access requires a recent Web UI sign-in from this network (IP a.b.c.d). Sign in
+   at <url>, then retry."*
 3. Gate behind `WEBDAV_IP_BINDING_ENABLED` (default **off** for backward compat;
    per-tenant enablement via a Redis/`config` flag).
 
@@ -269,9 +271,56 @@ that a security-critical dependency may fail the operation.)
 - **Carrier-grade NAT / roaming mobile:** IP changes frequently → WebDAV breaks
   until the next Web sign-in. This is *by design* (the security goal), but note the
   UX cost; the SPA can surface "re-bind this connection."
-- **Corporate proxy pools:** the egress IP may rotate across a pool → consider a
-  per-tenant CIDR allowlist as an escape hatch (`WEBDAV_IP_BIND_ALLOW_CIDRS`).
-- **XFF spoofing:** neutralized by §3 (trusted-IP derivation) — critical here.
+- **Corporate proxy pools:** the egress IP may rotate across a pool → use the
+  per-tenant trusted-CIDR exemption (§5.6) for the internal ranges.
+- **XFF spoofing:** neutralized by §3 (trusted-IP derivation) — critical here, and
+  doubly so for the LAN exemption (§5.6).
+
+### 5.6 Same-LAN / internal-network exemption (hybrid deployments)
+
+Hybrid deployments (some users on the corporate LAN / site VPN, some remote) can
+exempt **internal** traffic from the binding while still enforcing it for external
+requests, via a per-tenant trusted-CIDR set. The enforcement (§5.2) becomes an OR:
+
+```
+allow WebDAV if:
+    EXISTS webdav:ipbind:{tenant}:{uid}:{ip}       # a recent 2FA'd Web session at this IP
+    OR  client_ip ∈ WEBDAV_IP_BIND_TRUSTED_CIDRS   # on the LAN / VPN → skip the binding
+```
+
+**Hard requirement — the CIDR match MUST use the *authoritative* client IP, never
+a client-supplied header.** This is §3 inverted and *more* dangerous: if the LAN
+check reads a spoofable `X-Forwarded-For` hop, an external attacker sends
+`X-Forwarded-For: 10.0.0.5` and exempts themselves *into* the trusted zone with
+just the leaked password — strictly worse than having no exemption. Use the real
+TCP peer (`request.clientAddress()`) when internal clients reach webdav over a
+distinct trusted path, or a proxy header **only** if that proxy provably
+strips/overrides any client-supplied value.
+
+**Feasibility is topology-dependent.** Cleanest and safest when internal traffic
+has a **separate, trusted ingress whose source IP is genuine** (internal
+VLAN/ingress, not the public edge). A single public hairpin ingress — or a CDN/LB
+in front of nginx — may not preserve a reliable LAN-vs-external distinction (NAT
+can make LAN clients appear as the public IP); validate per deployment before
+relying on it.
+
+**Security trade-off (be deliberate).** The exemption *keeps* protection against
+external leak-and-exfiltrate but *gives up* protection on the exempted network: a
+leaked WebDAV password becomes exploitable by an insider, a compromised internal
+host, lateral-movement malware, or any device that joins that LAN — the "trusted
+internal network" assumption that zero-trust rejects. Reasonable when the primary
+threat is external exfiltration and the LAN is trusted; keep the binding on
+internally for regulated / BYOD tenants.
+
+**Recommended shape:**
+- `WEBDAV_IP_BIND_TRUSTED_CIDRS` — **per-tenant, default empty** (opt-in); nothing
+  is exempted until a deployment declares its trusted ranges.
+- Matched against the **authoritative** IP only (the Phase-0 §3 primitive).
+- **Allow-but-audit:** a LAN request that bypasses the binding still emits a
+  `webdav_access` event with `via:"trusted_cidr"` — never a silent allow, so the
+  exemption is traceable.
+- Per-tenant, so one tenant can relax it while a regulated tenant keeps the binding
+  on even for LAN.
 
 ---
 
@@ -321,7 +370,7 @@ davfs → nginx (X-Real-IP=X) → webdav_bridge  PROPFIND /...
 | `WEBDAV_IP_BINDING_ENABLED` | webdav_bridge (+http_bridge writes) | false |
 | `WEBDAV_IP_BIND_TTL_SECONDS` | http_bridge | 43200 (12h) |
 | `WEBDAV_IP_BINDING_FAIL_OPEN` | webdav_bridge | false |
-| `WEBDAV_IP_BIND_ALLOW_CIDRS` | webdav_bridge | ∅ |
+| `WEBDAV_IP_BIND_TRUSTED_CIDRS` (per-tenant; internal/LAN exemption, §5.6) | webdav_bridge | ∅ |
 | `FILEENGINE_REDIS_*` | webdav_bridge (NEW — add hiredis like http_bridge) | shared |
 
 All default **off** → the change is inert until a deployment opts in; fully
@@ -390,8 +439,12 @@ backward compatible.
 2. **Coordination:** P1 (ldap_manager verifies, http_bridge mints — recommended)
    vs P2 (bridge verifies TOTP).
 3. **WebDAV Redis-down posture:** fail-closed (recommended) vs fail-open.
-4. **IP-binding granularity:** exact IP (recommended) vs IPv6 /64 prefix vs
-   optional per-tenant CIDR allowlist; how to handle IPv4/IPv6 dual-stack at login.
+4. **IP-binding granularity:** exact IP (recommended) vs IPv6 /64 prefix; how to
+   handle IPv4/IPv6 dual-stack at login.
+   4b. **Same-LAN / internal exemption (§5.6):** enable the per-tenant
+   `WEBDAV_IP_BIND_TRUSTED_CIDRS` (skip the binding for internal/VPN ranges) — and
+   accept the insider/lateral-movement trade-off it implies? If yes, confirm the
+   authoritative-IP source per the deployment topology, and keep it allow-but-audit.
 5. **OAuth + 2FA:** trust IdP MFA (recommended) vs always require our TOTP.
 6. **Email fallback:** on by default vs tenant opt-in; allow disabling per tenant.
 7. **Binding TTL** (default 12h) and whether `refreshToken` should extend it.
