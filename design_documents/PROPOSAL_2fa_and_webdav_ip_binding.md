@@ -209,6 +209,37 @@ else **(b)**.
 `2fa_verify` (ok/denied, method, attempt#), `2fa_recovery_used`. All fail-closed
 where they mint a session (consistent with L3).
 
+### 4.8 Method-availability policy (configurable; disable weak email for critical tenants)
+
+Which 2FA methods are *offered* is configurable, so weaker methods — notably the
+**email fallback** — can be disabled for critical-security tenants and deployments.
+
+- **Deployment cap** `MFA_ALLOWED_METHODS` (e.g. `totp,email` [,`webauthn` in V2]) —
+  the hard maximum for the whole deployment. A regulated / air-gapped deployment
+  sets `totp` (or `totp,webauthn`) to forbid email **everywhere**, regardless of
+  tenant settings.
+- **Per-tenant** `mfa_allowed_methods` (ldap_manager Settings / tenant config) — a
+  subset a tenant admin may further restrict but **never exceed** the cap. A
+  high-security tenant sets `totp` only even if the deployment permits email.
+- **Effective set = deployment_cap ∩ tenant_allowed.** A method is available only if
+  present in **both**.
+
+Enforcement:
+- The login challenge (§4.3) returns `methods` = the **effective set** only, so a
+  critical tenant's users are never offered "use an email code".
+- **Defense-in-depth:** `POST /v1/auth/2fa` and the email-challenge endpoint
+  **reject** any method not in the effective set — never trust the client to honor
+  the offered list.
+- Enrollment (§4.1) hides/blocks disabled methods.
+
+**Recovery trade-off (surface to admins).** Disabling email hardens against
+mailbox compromise (email is the weakest factor — §9) but removes a *self-service*
+recovery path: with email off, a user who loses their TOTP authenticator recovers
+only via **one-time recovery codes** or an **admin-assisted reset** (tenant admin
+re-issues enrollment / recovery codes, audited). Critical tenants should therefore
+**mandate recovery-code generation at enrollment** and document the admin-reset
+runbook.
+
 ---
 
 ## 5. Feature B — WebDAV IP-binding
@@ -419,6 +450,8 @@ davfs → nginx (X-Real-IP=X) → webdav_bridge  PROPFIND /...
 | `MFA_ENABLED` | http_bridge + ldap_manager | false |
 | `TOTP_SECRET_KEY` (base64, AES-GCM) | ldap_manager | (required if MFA on) |
 | `MFA_TOKEN_TTL_SECONDS` | http_bridge | 300 |
+| `MFA_ALLOWED_METHODS` (deployment cap; e.g. `totp,email`, §4.8) | http_bridge + ldap_manager | `totp,email` |
+| `mfa_allowed_methods` (per-tenant subset; disable email for critical tenants) | ldap_manager | = deployment cap |
 | `totp_required_tenants` | ldap_manager | ∅ |
 | `WEBDAV_IP_BINDING_ENABLED` | webdav_bridge (+http_bridge writes) | false |
 | `WEBDAV_IP_BIND_TTL_SECONDS` | http_bridge | 43200 (12h) |
@@ -453,7 +486,8 @@ backward compatible.
 - `TotpChallengeView.vue` (TOTP + "use email code" tabs) — mirrors ResetPassword
 - `TotpEnrollmentView.vue` (QR + verify + recovery codes) — mirrors SetPassword
 - `ProfileView.vue`: 2FA section + WebDAV IP section
-- `TenantAdminView.vue`: "Security" tab (require-2FA toggle, per-user 2FA status)
+- `TenantAdminView.vue`: "Security" tab (require-2FA toggle, per-user 2FA status,
+  allowed-methods policy incl. an "allow email recovery" toggle — §4.8)
 - `stores/auth.ts` `ldapLogin`: branch on `mfa_required`; new `submit2fa()`
 
 ---
@@ -464,9 +498,10 @@ backward compatible.
   logged, never returned after enrollment; recovery codes stored **hashed**.
 - **MFA-pending token** cannot reach data (§4.4); IP-bound + 5-min TTL limits
   replay; single-use exchange.
-- **Email fallback** is weaker than TOTP (mailbox compromise) — rate-limit, short
-  TTL, audit, and allow tenants to disable the email fallback
-  (`MFA_EMAIL_FALLBACK_ENABLED`).
+- **Email fallback** is the weakest factor (mailbox compromise) — rate-limit, short
+  TTL, audit; and it is **disable-able per tenant and capped per deployment** via
+  the method-availability policy (§4.8), so critical tenants/deployments can forbid
+  it outright (falling back to recovery codes + admin reset).
 - **IP source integrity** is the linchpin (§3) — without it, the binding is
   bypassable by header spoofing.
 - **No new bypass of ACLs** — both features sit *in front of* the existing
@@ -507,7 +542,9 @@ backward compatible.
    — the no-corruption / conflict-reconciliation guarantees make it a much larger,
    separate effort.
 5. **OAuth + 2FA:** trust IdP MFA (recommended) vs always require our TOTP.
-6. **Email fallback:** on by default vs tenant opt-in; allow disabling per tenant.
+6. **Email fallback:** now specified as configurable — disable-able per tenant with
+   a deployment-wide cap (§4.8). Remaining call: the **default** (email allowed by
+   default vs off), and whether high-security *deployments* ship with it off.
 7. **Binding TTL** (default 12h) and whether `refreshToken` should extend it.
 8. **TOTP library** for ldap_manager (`pyotp`) and QR rendering (server-side SVG).
 
