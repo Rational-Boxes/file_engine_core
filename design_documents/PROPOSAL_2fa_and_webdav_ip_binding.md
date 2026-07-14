@@ -44,7 +44,9 @@ brute-forced, or leaked) but does **not** control the user's authenticator devic
 **Non-goals.** Not replacing LDAP passwords; not adding 2FA *inside* the WebDAV
 protocol (clients can't do it); not protecting against a fully-compromised client
 device sharing the victim's egress IP (out of scope — that adversary already has
-the browser session). Not FIDO2/WebAuthn in v1 (noted as a future extension).
+the browser session). Not FIDO2/WebAuthn in v1 — that is a **V2** extension (needs security-key /
+platform-authenticator hardware to build & test); the full design + plan is in
+**§13**.
 
 ---
 
@@ -528,3 +530,119 @@ backward compatible.
   frontend repo per project convention), audit dashboards for the new events.
 
 Each phase is behind a default-off flag and independently shippable.
+
+---
+
+## 13. Future extension (V2): FIDO2 / WebAuthn
+
+Deferred to **V2** — needs security-key / platform-authenticator hardware to build
+and test the ceremonies end-to-end. Captured here so the design is ready to pick up
+when that hardware is on hand.
+
+### 13.1 Background — what it is and why it's stronger
+
+**FIDO2** = **WebAuthn** (the W3C browser API `navigator.credentials.create()` /
+`.get()`, supported by every modern browser) + **CTAP2** (how the browser talks to
+the authenticator device). Instead of a *shared secret* (a password, a TOTP seed),
+the authenticator generates a **public/private key pair per website**; the
+**private key never leaves the device**, and the server stores only the **public
+key**. Login is a challenge-response: the server sends a random challenge, the
+authenticator signs it, the server verifies the signature against the stored public
+key.
+
+Two properties that beat passwords **and TOTP**:
+
+1. **Phishing-resistant (the big one).** The signature is bound to the **origin**
+   (the "RP ID" = the domain). A credential for `app.example.com` cannot sign for a
+   look-alike phishing domain — the browser enforces it. A phished TOTP code can be
+   relayed in real time within its 30-second window; a WebAuthn assertion cannot be
+   replayed to another site at all.
+2. **No server-side secret.** A database breach yields only public keys — useless.
+   (Contrast TOTP, where a leaked seed store forges valid codes forever.)
+
+Plus a genuine possession factor (you must hold the device) and, optionally, a
+biometric/PIN ("user verification") for inherence.
+
+**Vocabulary.**
+- *Authenticator*: **platform** (Touch ID / Face ID / Windows Hello / Android
+  biometrics) or **roaming** (a YubiKey / security key, or a phone acting as a key
+  over "hybrid" Bluetooth transport).
+- *Passkey*: the consumer name for a WebAuthn credential — usually a **discoverable,
+  synced** one (iCloud Keychain / Google Password Manager). Can be a 2nd factor or
+  replace the password entirely (**passwordless**). Device-bound passkeys (on a
+  security key) don't sync.
+- *RP (Relying Party)*: your service, identified by an **RP ID** (a domain);
+  credentials are scoped to it (see §13.3).
+- *Ceremonies*: **registration/attestation** (`create()` → store {public key,
+  credential ID}) and **authentication/assertion** (`get()` → sign challenge →
+  verify).
+- *Attestation* (optional): cryptographic proof of the authenticator's make/model —
+  `"none"` for consumer/privacy; **require** it for an enterprise "issued-keys-only"
+  policy.
+- *Sign counter* (optional): monotonic counter to detect cloned authenticators.
+
+### 13.2 How it maps onto the stack (same roles as the V1 TOTP design)
+
+| Role | Component |
+|---|---|
+| **Relying-Party server** (challenge gen, assertion/attestation verify) | **ldap_manager** (Python `py_webauthn`) — same "P1" split as TOTP; the C++ bridge does **not** parse CBOR/COSE |
+| **JWT minting / orchestration** | **http_bridge** — starts the ceremony, mints on success (`amr` includes `webauthn`) |
+| **WebAuthn client** | **frontend** — `navigator.credentials.create()/get()` via `@simplewebauthn/browser` |
+| **Credential store** | **ldap_manager Postgres** — `user_webauthn_credentials(tenant, uid, credential_id, public_key, sign_count, transports, aaguid, nickname, created_at, last_used)`; a user may register several authenticators |
+| **Challenge store** | **Redis** — single-use, short-TTL challenges (reuse the `TokenStore` pattern from V1) |
+
+### 13.3 RP-ID vs per-tenant subdomains (the one architectural decision)
+
+WebAuthn credentials bind to an **RP ID** (a registrable domain), but the
+deployment uses per-tenant subdomains (`acme.example.com`):
+- **RP ID = the registrable parent** (`example.com`) → one passkey spans every
+  tenant subdomain + the apex (cleanest for one org's users; the login origin must
+  be under it).
+- **RP ID = the tenant subdomain** → credentials isolated per tenant; a multi-tenant
+  user enrolls per tenant. More isolation, more friction.
+
+Recommendation: RP ID = the domain the SPA is served from; document the subdomain
+implications per deployment.
+
+### 13.4 Two integration modes
+
+- **(A) WebAuthn as a 2FA method — drop-in.** Reuses the V1 `mfa_token` →
+  `POST /v1/auth/2fa {method, ...}` exchange, adding `method:"webauthn"` alongside
+  `totp`/`email`. Password first, then an assertion; mint with
+  `amr:["pwd","webauthn"]`. Minimal flow change.
+- **(B) Passwordless / passkey first-factor.** The user logs in with a passkey, no
+  password — username-less or username-first, then the assertion mints the session.
+  Best UX, but reworks the login screen, enrollment, and recovery.
+
+### 13.5 WebDAV relationship
+
+WebAuthn is a **browser** mechanism — **WebDAV clients cannot do WebAuthn** (Basic
+auth only), exactly like TOTP. So WebAuthn does **not** protect WebDAV directly; the
+**IP-binding (§5) remains the bridge** that carries the Web-UI assurance to WebDAV.
+Synergy: a phishing-resistant, hardware-backed Web login makes the session that
+authorizes an IP-binding much stronger, so WebDAV inherits that strength.
+
+### 13.6 Trade-offs & recovery
+
+- Needs HTTPS + a stable RP-ID / origin (already in place via nginx TLS).
+- **Recovery is the hard part:** losing your only authenticator = lockout. Mitigate
+  by requiring **≥2 registered authenticators** and keeping the V1 **email /
+  recovery-code fallback** — which then becomes the weakest link, so gate it
+  carefully.
+- Enterprise device policy via **attestation** (optional).
+- Libraries: `py_webauthn` (server), `@simplewebauthn/browser` (client) — **no
+  custom crypto**. The LDAP password (used by WebDAV) stays.
+
+### 13.7 V2 plan
+
+- **Prerequisite:** security key(s) (e.g. YubiKey) and/or a platform authenticator
+  (Touch ID / Windows Hello / Android) to develop and verify the ceremonies.
+- **V2 Phase A — WebAuthn as an additional 2FA method.** `user_webauthn_credentials`
+  table; enroll/verify endpoints in ldap_manager; `method:"webauthn"` in the
+  http_bridge challenge exchange; enrollment + "manage security keys" in
+  `ProfileView`; per-tenant "allow / require WebAuthn". Low flow risk — reuses the
+  V1 MFA plumbing.
+- **V2 Phase B — passwordless passkey login.** First-factor passkeys; reworked
+  login / enrollment / recovery UX. Do **after** Phase A proves the plumbing.
+
+*Status: parked pending hardware; revisit to begin V2 Phase A.*
