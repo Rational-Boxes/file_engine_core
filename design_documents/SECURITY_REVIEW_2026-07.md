@@ -35,7 +35,7 @@ the system fails to enforce *its own* intended model.
 | M5 | Medium | Unescaped path/name reflected into PROPFIND/PROPPATCH XML | webdav_bridge | **Fixed** (webdav `security/hardening`) |
 | L1 | Low | `validate_user_permissions` fails **open** when ACL mgr is null | core | **Fixed** (core `security/hardening`) |
 | L2 | Low | Monitor bind address + optional IP allowlist | all services | **Fixed** (C++ + Python tiers) |
-| L3 | Low | Audit coverage gaps (OAuth/refresh/revoke) + fail-open when disabled | http_bridge | **Fixed (B)**: coverage closed + refresh re-validates LDAP; (A) posture unchanged by choice |
+| L3 | Low | Audit coverage gaps + silent fail-open when enabled-but-broken | http_bridge | **Fixed**: B (coverage + refresh re-validation) + A-i (startup gate) + A-ii (audit health in /readyz) |
 | L4 | Low | Dead-code LDAP injection in unused digest/getUserInfo | both bridges | **Fixed** (bridges `security/hardening`) |
 
 Fixes live on the `security/hardening` branch in each affected repo (unmerged).
@@ -282,10 +282,17 @@ downgrade to tenant-scoped (a *tightening*, not a break). Add tests: a
   Verified live: `login_success`, `token_refresh`, `logout`, `login_failure`
   events land in the `fileengine:audit` Redis stream; a valid refresh returns a
   fresh token with live roles.
-  **(A) fail-open when audit is *disabled* / built without hiredis is unchanged**
-  (audit remains optional by design; the user chose coverage-only). Remaining
-  options if desired: a startup assertion when `audit_enabled=true` but the build
-  can't publish (A-i), and surfacing audit health in `/readyz` (A-ii).
+  **(A) hardened against the silent-off case:**
+  - **A-i (startup gate):** the bridge now **refuses to start** (FATAL, exit 1)
+    when `audit_enabled=true` but it cannot publish — built without hiredis, or
+    Redis unreachable at boot. "Enabled but unable to record" is loud, not a
+    silent fail-open. (`AuditPublisher::healthy()` + `HttpBridgeServer::auditReady()`.)
+  - **A-ii (readiness):** the deep `/readyz` reports `audit` reachability and
+    returns **503** when auditing is enabled but Redis is down, so an audit outage
+    drains the instance.
+  Auditing that is *deliberately disabled* remains fail-open by design. Verified
+  live: `/readyz` → `{...,"audit":true}`; a bridge started with audit enabled +
+  unreachable Redis exits 1 and does not bind.
 - **L4 — dead-code injection — FIXED:** removed the unused `authenticateDigest`
   and `getUserInfo` from **both** bridges (each built raw, unescaped LDAP filters
   and had no callers). The live paths (`getUserInfoByEmail`, `authenticateUser`)
