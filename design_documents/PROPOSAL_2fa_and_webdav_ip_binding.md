@@ -9,6 +9,13 @@
 > the current code and calls out the decisions that need your sign-off (see
 > **§11 Open decisions**).
 
+> **Amendment 2026-07-15 (§14).** Feature B (§5) is amended by **§14**, which
+> reframes the WebDAV gate as a single **origin-aware** policy — *LAN trust
+> boundary* vs *Internet* — and upgrades the external branch from IP-**pinning**
+> (a 12 h TTL that outlives logout) to session-**liveness** (revoked the moment the
+> Web-UI session ends). Read §5 for the mechanism and §14 for the amended
+> semantics; where they differ, **§14 wins**.
+
 ---
 
 ## 1. Goals & threat model
@@ -531,22 +538,27 @@ backward compatible.
 3. **WebDAV Redis-down posture:** fail-closed (recommended) vs fail-open.
 4. **IP-binding granularity:** exact IP (recommended) vs IPv6 /64 prefix; how to
    handle IPv4/IPv6 dual-stack at login.
-   4b. **Same-LAN / internal exemption (§5.6):** enable the per-tenant
+5. **Same-LAN / internal exemption (§5.6):** enable the per-tenant
    `WEBDAV_IP_BIND_TRUSTED_CIDRS` (skip the binding for internal/VPN ranges) — and
    accept the insider/lateral-movement trade-off it implies? If yes, confirm the
    authoritative-IP source per the deployment topology, and keep it allow-but-audit.
-9. **Degraded-mode LAN reads (§5.7) — read-only is confirmed spec.** Remaining:
+6. **Degraded-mode LAN reads (§5.7) — read-only is confirmed spec.** Remaining:
    confirm the on-prem replica topology (LDAP read replica + local core/cache) is
    deployed at hybrid sites, and the degradation signal that flips read-only mode.
    Offline read-**write** with reconciliation is explicitly **out of scope for v1**
    — the no-corruption / conflict-reconciliation guarantees make it a much larger,
    separate effort.
-5. **OAuth + 2FA:** trust IdP MFA (recommended) vs always require our TOTP.
-6. **Email fallback:** now specified as configurable — disable-able per tenant with
+7. **OAuth + 2FA:** trust IdP MFA (recommended) vs always require our TOTP.
+8. **Email fallback:** now specified as configurable — disable-able per tenant with
    a deployment-wide cap (§4.8). Remaining call: the **default** (email allowed by
    default vs off), and whether high-security *deployments* ship with it off.
-7. **Binding TTL** (default 12h) and whether `refreshToken` should extend it.
-8. **TOTP library** for ldap_manager (`pyotp`) and QR rendering (server-side SVG).
+9. **Binding TTL** (default 12h) and whether `refreshToken` should extend it.
+   Under the §14 session modes this TTL becomes the crash/no-logout **backstop**
+   rather than the working lifetime — see §11.13 (revised).
+10. **TOTP library** for ldap_manager (`pyotp`) and QR rendering (server-side SVG).
+
+*Items 11–13 are added by the §14 amendment (origin-aware gate + session-liveness);
+they are stated in **§14.7** to keep the amendment self-contained.*
 
 ## 12. Phased implementation plan
 
@@ -683,3 +695,206 @@ authorizes an IP-binding much stronger, so WebDAV inherits that strength.
   login / enrollment / recovery UX. Do **after** Phase A proves the plumbing.
 
 *Status: parked pending hardware; revisit to begin V2 Phase A.*
+
+---
+
+## 14. Amendment (2026-07-15): origin-aware gate + session-liveness
+
+**Status:** Draft / for review — amends **§5** (Feature B). 2FA (§4) and V2 (§13)
+are untouched.
+
+**Why this amendment.** §5 as written binds WebDAV to an **IP** for a fixed TTL
+(`SET webdav:ipbind:{tenant}:{uid}:{ip} EX 12h`, §5.1). That is *IP-pinning*: the
+key survives an explicit Web-UI **logout** and only lapses when the TTL expires — so
+a user who signs out of the browser still has up to 12 h of WebDAV access from that
+IP. The requirement this amendment captures is stronger and simpler to reason about:
+
+> WebDAV access from the Internet is allowed **only while the user has a live
+> Web-UI session**, and is cut the instant they log out. Access from inside the
+> **LAN trust boundary** is allowed independently (and keeps working when the cloud
+> link is down).
+
+This is the same two-control structure as §5, re-expressed as **one origin-aware
+predicate with two branches**, plus a semantic upgrade of the external branch from
+*TTL-expiry* to *logout-revoked liveness*.
+
+### 14.1 The unified policy
+
+Evaluated per request in `authenticateUser` (the single choke point for all 8
+handlers, `webdav_server.cpp`), **after** the LDAP bind succeeds:
+
+```
+allow WebDAV iff  authenticated (Basic → LDAP)  AND
+  ┌─ authoritative_ip ∈ WEBDAV_IP_BIND_TRUSTED_CIDRS      → ALLOW   (LAN branch)
+  │     • static config, NO Redis, evaluated FIRST
+  │     • audited via:"trusted_cidr"  (§5.6)
+  │     • survives cloud/Redis outage; read-only when degraded (§5.7)
+  └─ else (Internet branch)                                → ALLOW only if
+        a LIVE Web-UI session exists for this user          (§14.2)
+        • cloud-authoritative; created on login, destroyed on logout
+        • Redis-unavailable → fail-closed by default (WEBDAV_IP_BINDING_FAIL_OPEN)
+     else → 403
+```
+
+The **LAN branch is the §5.6 trusted-CIDR exemption, unchanged** — it is still
+evaluated first, from static config, needs no Redis, and is therefore still the
+degraded-mode / outage-survival path (§5.7). The amendment only changes what the
+**Internet branch** checks.
+
+### 14.2 External branch: session-*liveness*, not IP-*pinning*
+
+Replace the flat, TTL-expiring per-IP key (§5.1) with a **session-presence
+registry** that is written on login and **deleted on logout**. The JWT already
+carries the two identifiers we need — `sub` (uid) and a unique `jti` per session
+(`http_bridge/src/http_server.cpp:1346`), plus `tenant`.
+
+**Redis structure** — one sorted set per user, members = live sessions:
+
+```
+key    webdav:session:{tenant}:{uid}
+member {jti}|{ip}            # ip = the trusted client IP at login (§3)
+score  {session_exp_epoch}   # = the JWT's exp
+```
+
+- **Login / refresh** (`issueToken` post-2FA, `oauthCallback`, `refreshToken`):
+  `ZADD webdav:session:{tenant}:{uid} {exp} {jti}|{ip}`. Refresh re-scores the
+  member (or adds the new `jti` and `ZREM`s the old), keeping the session live for
+  as long as the browser is active — same "refresh keeps it alive" property as §5.1.
+- **Logout** (`revokeToken`, `http_bridge/src/http_server.cpp:1769` — today it only
+  emits an audit event and returns 204): additionally
+  `ZREM webdav:session:{tenant}:{uid} {jti}|{ip}`. **This is the new behavior** that
+  makes logout actually cut WebDAV. It already decodes+verifies the bearer and has
+  `jti`/`sub`/`tenant` in hand, so the data is present.
+- **Enforcement** (webdav_bridge, per request): derive the trusted IP (§3), then
+  ```
+  ZREMRANGEBYSCORE webdav:session:{tenant}:{uid} 0 {now}   # purge expired sessions
+  ```
+  then, depending on granularity mode (§14.3), test for a live member. The
+  `ZREMRANGEBYSCORE` step makes the **TTL a crash/backstop only** — the primary
+  lifetime is now "until logout," not "until 12 h elapses." (Sessions whose browser
+  was closed without an explicit logout still age out at `exp`, so nothing leaks
+  indefinitely if `revokeToken` is never called.)
+
+**Why a sorted set instead of the §5.1 flat keys.** Logout must revoke **one
+session** without collateral damage: a user with two browser sessions from the same
+IP who logs out of one must keep WebDAV while the other is live. Per-IP flat keys
+can't express that (deleting the IP key kills both); per-session members with an
+independent expiry score can. It also gives multi-device support and per-session
+expiry for free — the same goals §5.1 listed, now correct under revocation.
+
+### 14.3 Granularity: `session` vs `session_ip` (new open decision)
+
+The Internet branch can require, for the authenticated uid:
+
+- **`session`** — *any* live Web-UI session exists (`ZCARD > 0` after the purge).
+  Friendlier to roaming/mobile and to IPv4/IPv6 dual-stack (sidesteps the §5.5
+  mismatch), because the WebDAV client's IP need not match the browser's.
+- **`session_ip`** — a live session exists **whose member IP equals the request
+  IP** (`session` **and** the §5-style IP pin). Strictest: a leaked password from a
+  new IP is refused even during an active session — this is §5's original threat
+  model **plus** logout-revocation.
+
+Recommendation: **`session_ip`** for parity with §5's threat model, with `session`
+available for deployments where dual-stack / roaming friction outweighs the
+same-IP assurance. Selected via `WEBDAV_EXTERNAL_GATE` (§14.5).
+
+### 14.4 Hybrid / disconnected operation is unchanged — and this is why the gate must NOT replicate to the edge
+
+The origin split makes the disconnected story fall out exactly as §5.7 already
+specifies, with one clarification worth stating explicitly (it was the question
+that motivated this amendment):
+
+- **The LAN branch already carries disconnected operation.** It is local
+  (static CIDR + authoritative peer IP), evaluated before any Redis call, so a
+  severed cloud link does not affect it. LAN users keep read access, downgraded to
+  read-only per §5.7. **Unchanged.**
+- **The session-liveness (Internet) branch is inherently cloud-authoritative and
+  must stay cloud-only.** Unlike LDAP (`FILEENGINE_LDAP_ENDPOINT_REPLICA`) and
+  Postgres (`FILEENGINE_PG_REPLICA_*`), **Redis has no edge-replica story in this
+  platform, and this gate should not create one.** A logout is a cloud-side event;
+  a disconnected edge cannot learn of it, so a stale edge replica of
+  `webdav:session:*` would **fail toward allow** — silently defeating the exact
+  revocation this amendment adds. Async replication would buy availability the LAN
+  branch already provides, at the cost of the gate's correctness. **Decision:** do
+  **not** replicate the session registry to the edge; a partitioned site serves LAN
+  users via the trusted-CIDR branch (read-only), and the Internet branch is simply
+  unavailable while the site is cut off — which is the correct posture, since
+  "Internet access without a verifiable live session" is precisely what we mean to
+  deny.
+
+### 14.5 Config delta (amends §7)
+
+| Var | Where | Default | Note |
+|---|---|---|---|
+| `WEBDAV_EXTERNAL_GATE` | webdav_bridge (+http_bridge writes) | `ip_ttl` | `ip_ttl` = legacy §5 IP-pin; `session` = liveness, any IP (§14.3); `session_ip` = liveness + IP pin (**recommended**) |
+
+- **Backward compatibility:** default `ip_ttl` preserves §5 exactly, so this
+  amendment is inert until a deployment opts into `session`/`session_ip`. All other
+  §7 vars are unchanged; `WEBDAV_IP_BIND_TTL_SECONDS` becomes the **backstop** TTL
+  (crash / no-explicit-logout) under the session modes rather than the primary
+  lifetime.
+- **No new secret, no new service.** Reuses the webdav_bridge hiredis addition
+  already required by §5 and the shared Redis. http_bridge already links hiredis.
+
+### 14.6 Sequences (amend §6)
+
+**Logout now cuts WebDAV**
+```
+Browser → http_bridge  POST /v1/auth/logout (Bearer)
+  revokeToken: verify JWT → audit logout (fail-closed as today)
+             → Redis ZREM webdav:session:{tenant}:{uid}  {jti}|{ip}   # NEW
+  → 204
+Next WebDAV request from that IP with the still-valid password:
+  webdav_bridge: not in a trusted CIDR → Internet branch
+    → ZREMRANGEBYSCORE purge; no live member for uid[/ip] → 403
+```
+
+**Internet WebDAV while logged in (session_ip mode)**
+```
+davfs → nginx (X-Real-IP=X) → webdav_bridge  PROPFIND /...
+  authenticateUser: LDAP bind ok (empty-pw guard)
+    → derive trusted IP = X; X ∉ WEBDAV_IP_BIND_TRUSTED_CIDRS → Internet branch
+    → ZREMRANGEBYSCORE webdav:session:{t}:{uid} 0 now
+    → any live member with ip==X?  yes → allow   (attacker from Y → none → 403)
+```
+
+**LAN WebDAV (any cloud state, incl. disconnected)** — unchanged from §5.6/§5.7:
+```
+davfs → internal ingress (authoritative src ∈ trusted CIDR) → webdav_bridge
+  authenticateUser: LDAP bind ok (local replica if master down)
+    → LAN branch: allow, audit via:"trusted_cidr"; read-only if degraded
+    → no Redis consulted
+```
+
+### 14.7 Open decisions this amendment adds (extends §11)
+
+- **§11.11 — External-branch semantics:** `session_ip` (recommended) vs `session`
+  vs keep `ip_ttl` (legacy §5). Governs `WEBDAV_EXTERNAL_GATE` default.
+- **§11.12 — Logout revocation is immediate:** confirm `revokeToken` should `ZREM`
+  the session member (recommended — it is the point of the amendment). Note the
+  minor coupling: logout now performs a best-effort Redis write; keep it
+  **best-effort / non-blocking** (a failed `ZREM` must not fail the logout — the
+  member still ages out at `exp`).
+- **§11.13 (revises §11.9) — TTL role:** under session modes,
+  `WEBDAV_IP_BIND_TTL_SECONDS` is the crash/no-logout **backstop**, not the working
+  lifetime; confirm the value (12 h is fine as a backstop).
+
+### 14.8 Testing delta (amends §10)
+
+- **Unit (webdav):** sorted-set presence check — expired members purged; `session`
+  vs `session_ip` matching; multi-session same-IP (logout of one keeps the other).
+- **E2E:** login → WebDAV allowed → **logout → same-IP WebDAV now 403** (the core
+  new assertion); second concurrent session survives the first's logout; browser
+  closed without logout → access lapses at backstop TTL; LAN branch unaffected by
+  Redis-down and by logout.
+
+### 14.9 Implementation touch-points (amends §12, Phase 3)
+
+- **http_bridge:** on login/refresh, `ZADD` the session member (replaces/augments
+  the §5.1 `SET`); in `revokeToken` (`http_server.cpp:1769`), add the best-effort
+  `ZREM`. Carry `jti`/`ip` through (already available).
+- **webdav_bridge:** the §5.2 enforcement becomes the §14.2 purge-then-presence
+  check under `session`/`session_ip`; the LAN branch and `/readyz` health are
+  unchanged.
+- Still behind `WEBDAV_IP_BINDING_ENABLED` and default-off via
+  `WEBDAV_EXTERNAL_GATE=ip_ttl`; independently shippable.
