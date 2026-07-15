@@ -908,7 +908,8 @@ resolved by `rotate`, not retrieval.
 **frontend**
 - `ProfileView.vue`: "WebDAV credentials" panel — create (secret shown once), list
   (metadata), **regenerate/force-recreate**, revoke; replaces the "set a directory
-  password" copy; keep the §5.4 bound-IP view when §14 is also on.
+  password" copy; keep the §5.4 bound-IP view when §14 is also on. Optional
+  **mount-setup script generator** per §15.13.
 
 ### 15.10 Security considerations (extends §9)
 
@@ -954,6 +955,45 @@ resolved by `rotate`, not retrieval.
   + `/v1/me/webdav-credentials` + internal verify; webdav_bridge key path + verify
   cache + `WEBDAV_AUTH_MODE`; ProfileView panel. Default `both`, independently
   shippable, and orthogonal to the §14 gate work.
+
+### 15.13 QOL: OS mount-setup script generator (optional)
+
+A usability nicety on the §15 credentials panel. Mounting a WebDAV share by hand
+(exact URL, `https`/`@SSL`, per-OS driver quirks) is the fiddly part of onboarding,
+and the panel already knows the precise URL and `key_id` — so it can emit a
+ready-to-run helper. **Explicitly out of the core security scope; purely convenience.**
+
+**Behavior.**
+- After create/rotate (or from any listed credential), a **"Download setup script"**
+  control offers a **Bash** (Linux/macOS) and a **PowerShell** (Windows) variant.
+- Generated **entirely client-side in the SPA** — no server round-trip — so the
+  one-time secret is never re-transmitted anywhere to build it.
+- The script embeds only **non-secret** parameters: the HTTPS WebDAV URL (tenant host +
+  path), a suggested mount point / drive letter, and the `key_id` as the pre-filled
+  **username** (a public identifier, §15.2).
+
+**The secret is never written into the script — the user supplies it at run time via
+the OS's own prompt/dialog:**
+- **macOS:** `open 'https://host/path'` raises Finder's native "Connect to Server"
+  dialog (prompts for name/password); or `mount_webdav`, which prompts.
+- **Windows (PowerShell):** `net use <drive> \\host@SSL\path /user:<key_id>` prompts for
+  the password at the console; or `Get-Credential` → `New-PSDrive` (native credential
+  dialog). Nothing persisted to disk.
+- **Linux:** `sudo mount -t davfs https://host/path <mountpoint>` prompts interactively
+  for the credentials; or a `gio mount` one-liner. The script deliberately **does not**
+  write `/etc/davfs2/secrets`.
+
+**Security.**
+- Secret never in the file, never to disk, never over the wire to build the script;
+  only the public URL + `key_id` are embedded.
+- **HTTPS only.** If the deployment uses a private CA, include a *commented* trust note;
+  never default to `-o insecure` / `-SkipCertificateCheck`.
+- **Persistent auto-mount across reboot is out of scope** — that needs a stored secret;
+  the helper is for interactive setup, and the copy should point users at their OS
+  keychain if they want persistence (their choice, not baked in).
+
+**Placement.** Part of the Phase 5 ProfileView panel (§15.12); additive and
+independently shippable. No blocking open decision.
 
 ---
 
