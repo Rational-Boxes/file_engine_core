@@ -1013,14 +1013,22 @@ hardening to the **MCP door**; does not change §4/§13/§14.
 
 ### 16.1 Same weakness, higher stakes
 
-The MCP HTTP door (`mcp/`, `:8096`, `/mcp` + `POST /auth/token`) authenticates exactly
-like WebDAV: `Authorization: Basic user:pass` → a **live LDAP bind on the user's
-directory password** (`http_auth.resolve_identity` → `ldap_auth.authenticate`), and
-`POST /auth/token` merely caches that bind into an opaque bearer (`TokenStore`, in-mem
-TTL). So the same reusable directory password that §15 removed from the WebDAV door is
-still the entry credential for MCP — and MCP is an **LLM-agent door onto the whole
-filesystem**, so a leaked/weak password there is at least as damaging. The §15
-`key:secret` is the right fix here too.
+Both MCP modes present a **reusable LDAP directory password** as the entry credential:
+
+- **HTTP** (`mcp/`, `:8096`, `/mcp` + `POST /auth/token`) authenticates exactly like
+  WebDAV: `Authorization: Basic user:pass` → a **live LDAP bind on the user's directory
+  password** (`http_auth.resolve_identity` → `ldap_auth.authenticate`), and
+  `POST /auth/token` merely caches that bind into an opaque bearer (`TokenStore`, in-mem
+  TTL).
+- **stdio** (local agent process) binds **once at startup** as the agent account using
+  `FILEENGINE_MCP_USER` / `FILEENGINE_MCP_PASSWORD` (`server.py` →
+  `authenticate(config, agent_user, agent_password)`) — i.e. the agent's LDAP directory
+  password sitting in an env var / config.
+
+Either way the credential is the same reusable directory password §15 removed from the
+WebDAV door — and MCP is an **LLM-agent door onto the whole filesystem**, so a leaked or
+weak password there is at least as damaging. The §15 `key:secret` is the right fix for
+**both** modes.
 
 ### 16.2 Generalize §15 → scoped **service credentials**
 
@@ -1053,11 +1061,15 @@ MCP already has the two pieces this needs:
    user-bind with a `key:secret` verify** and keeps the existing service-search role
    resolution (incl. the `administrators → system_admin` mapping). Identity forwarded to
    the gRPC core is unchanged.
-2. **The bearer cache already exists.** Verify the `key:secret` **once** at the Basic
-   step / `POST /auth/token`, then issue the normal `TokenStore` bearer — so unlike
+2. **The bearer cache already exists (HTTP).** Verify the `key:secret` **once** at the
+   Basic step / `POST /auth/token`, then issue the normal `TokenStore` bearer — so unlike
    WebDAV's chatty per-request model, **there is no per-request credential check** and
    no new cache to build. A direct-Basic-every-request client would verify per request
    (add a short TTL cache), but the documented flow is token-then-bearer.
+3. **stdio verifies once at startup.** The startup LDAP user-bind is replaced by a
+   single `key:secret` verify; the resolved `(tenant, uid)` + service-search roles then
+   scope the whole process exactly as today. No `TokenStore`, no per-call cost — the
+   process holds the identity for its lifetime.
 
 **Where verification runs.** MCP has **no Postgres client today** (LDAP + gRPC +
 in-memory tokens only), so the §15.7 **option A (internal ldap_manager verify
@@ -1065,14 +1077,21 @@ endpoint)** is the natural choice here — generalize it to
 `POST /internal/service-cred/verify {key_id, secret, tenant, scope:"mcp"}` →
 `{uid}` | 401. Direct-PG (§15.7 B) would add a dependency MCP doesn't otherwise carry.
 
-### 16.4 `key:secret` is the only MCP-HTTP credential
+### 16.4 `key:secret` is the only MCP credential — HTTP **and** stdio
 
-Like WebDAV (§15.4) and for the same "no legacy" reason, the directory-password path on
-the **MCP HTTP door is removed** — a `key:secret` service key (scope `mcp`) is the only
-credential a remote agent may present, at Basic / `POST /auth/token`; anything else is
-rejected. There is no `MCP_AUTH_MODE`. (The **stdio** MCP mode — a local agent process
-authenticating via `FILEENGINE_MCP_USER`/`PASSWORD` — is a separate, local concern and
-is out of scope for this change.)
+Like WebDAV (§15.4) and for the same "no legacy" reason, the directory-password path is
+removed from **both** MCP modes — a `key:secret` service key (scope `mcp`) is the only
+credential either mode accepts. There is no `MCP_AUTH_MODE`.
+
+- **HTTP:** the only credential a remote agent may present at Basic / `POST /auth/token`;
+  anything else (including a real directory password) is rejected.
+- **stdio:** the agent account is provisioned with a service key (scope `mcp`) supplied
+  via env — `FILEENGINE_MCP_KEY` (key_id) + `FILEENGINE_MCP_SECRET`, **replacing**
+  `FILEENGINE_MCP_USER` / `FILEENGINE_MCP_PASSWORD`. Verified once at startup (§16.3).
+  It's still a secret on the host, but a strictly better one than the account password:
+  **scoped to MCP only, individually revocable without touching the LDAP account, and
+  grants no other door.** Protect it like any host secret (file perms / a secrets
+  manager); that's a deployment concern, unchanged by this design.
 
 ### 16.5 Why the §14 origin/session gate does **not** apply to MCP
 
@@ -1108,8 +1127,10 @@ a live session would break the primary use case. Therefore:
 |---|---|---|---|
 | `service_credential.scopes` (data, not env) | ldap_manager | `{webdav}` | per-credential door scope (§16.2) |
 | `service_credential.allowed_cidrs` (optional, §16.5) | ldap_manager | ∅ | optional per-key IP pin for agents |
+| `FILEENGINE_MCP_KEY` / `FILEENGINE_MCP_SECRET` | mcp (stdio) | — | stdio agent's service key, **replaces** `FILEENGINE_MCP_USER`/`PASSWORD` (§16.4) |
 
-No `MCP_AUTH_MODE`: `key:secret` (scope `mcp`) is the only MCP-HTTP credential (§16.4).
+No `MCP_AUTH_MODE`: `key:secret` (scope `mcp`) is the only MCP credential on **both**
+HTTP and stdio (§16.4).
 
 **API (amends §8 / §15.9):**
 - `POST /v1/me/webdav-credentials` → **`POST /v1/me/service-credentials {label, scopes}`**
@@ -1119,8 +1140,9 @@ No `MCP_AUTH_MODE`: `key:secret` (scope `mcp`) is the only MCP-HTTP credential (
   / shared secret) — used by webdav_bridge (`scope:"webdav"`) and mcp (`scope:"mcp"`).
 
 **Open decisions (extends §11):**
-- **§11.19 — RESOLVED (no legacy):** `key:secret` is the only MCP-HTTP credential; no
-  `MCP_AUTH_MODE`, no directory-password path.
+- **§11.19 — RESOLVED (no legacy):** `key:secret` is the only MCP credential on **both**
+  HTTP and stdio; no `MCP_AUTH_MODE`, no directory-password path (`FILEENGINE_MCP_KEY`/
+  `_SECRET` replace `FILEENGINE_MCP_USER`/`PASSWORD` for stdio).
 - **§11.20 — Per-credential IP allowlist for agent keys (§16.5):** offer it (recommended,
   opt-in) vs omit for v1.
 - (Inherits §11.15/§11.16 — verify split defaults to internal-endpoint for MCP; at-rest
@@ -1132,6 +1154,9 @@ No `MCP_AUTH_MODE`: `key:secret` (scope `mcp`) is the only MCP-HTTP credential (
   directory password (or any non-key Basic credential) is **always rejected** on the MCP
   HTTP door; `/auth/token` issues a bearer after a key verify; optional `allowed_cidrs`
   enforced.
+- **stdio:** startup with `FILEENGINE_MCP_KEY`/`_SECRET` verifies and scopes the process;
+  a directory password in the old `FILEENGINE_MCP_USER`/`PASSWORD` vars no longer
+  authenticates; a revoked key fails startup.
 
 **Phasing:** folds into the §15 credential work (proposal Phase 5) — same store, same
 management UI — plus the small MCP-side verify change. Independently shippable.
