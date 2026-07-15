@@ -31,6 +31,15 @@
 > **not** apply to MCP (headless agents have no browser session), so for MCP the strong
 > credential *is* the hardening.
 
+> **Decision 2026-07-15 (no legacy).** There are **no live deployments yet**, so the
+> design drops every backward-compat hedge for the WebDAV/MCP **auth mechanism**:
+> the LDAP **directory-password** path on the non-interactive doors is **removed**, and
+> `key:secret` is the **only** WebDAV/MCP credential — `WEBDAV_AUTH_MODE` /
+> `MCP_AUTH_MODE` (and their `ldap_password` / `both` modes) are gone. For the same
+> reason the §14 gate drops the legacy `ip_ttl` mode and defaults to `session_ip`. This
+> note supersedes any "default `both` / backward compatible / migration" language left
+> in §14–§16 below.
+
 ---
 
 ## 1. Goals & threat model
@@ -476,7 +485,7 @@ davfs → nginx (X-Real-IP=X) → webdav_bridge  PROPFIND /...
 | `mfa_allowed_methods` (per-tenant subset; disable email for critical tenants) | ldap_manager | = deployment cap |
 | `totp_required_tenants` | ldap_manager | ∅ |
 | `WEBDAV_IP_BINDING_ENABLED` | webdav_bridge (+http_bridge writes) | false |
-| `WEBDAV_IP_BIND_TTL_SECONDS` | http_bridge | 43200 (12h) |
+| `WEBDAV_IP_BIND_TTL_SECONDS` (deployment default; **per-tenant override** `webdav_session_ttl_seconds`, §14.10) | http_bridge + ldap_manager | 43200 (12h) |
 | `WEBDAV_IP_BINDING_FAIL_OPEN` | webdav_bridge | false |
 | `WEBDAV_IP_BIND_TRUSTED_CIDRS` (per-tenant; internal/LAN exemption, §5.6) | webdav_bridge | ∅ |
 | `WEBDAV_OFFLINE_READONLY` (`auto`/`on`/`off`; degraded-mode LAN reads, §5.7) | webdav_bridge | auto |
@@ -805,34 +814,25 @@ Managed from `ProfileView.vue` (extends the §5.4 "WebDAV access" section, and
 - Audit: `webdav_cred_create`, `webdav_cred_rotate`, `webdav_cred_revoke`,
   `webdav_cred_use` (first use), `webdav_cred_auth_fail`.
 
-### 15.4 Auth mode — "force strong credentials"
+### 15.4 `key:secret` is the only WebDAV credential
 
-Per-tenant / per-deployment `WEBDAV_AUTH_MODE`:
-
-| Mode | Directory password on WebDAV? | `key:secret`? |
-|---|---|---|
-| `ldap_password` | ✅ (today's behavior) | ✗ |
-| `both` (**default**, migration) | ✅ | ✅ |
-| `key_secret` (**hardened**) | **✗ rejected** | ✅ only |
-
-`key_secret` is the "force very strong credentials" posture: the directory password
-no longer authenticates WebDAV at all — a user **must** generate a `key:secret`. Ship
-`both` for backward compatibility; a tenant/deployment opts into `key_secret` once its
-users have migrated. A deployment cap can forbid `ldap_password` fleet-wide (mirrors
-the §4.8 method-cap pattern).
+There are no live deployments (see the top "no legacy" decision), so the LDAP
+**directory-password path on WebDAV is removed** — `key:secret` is the sole WebDAV
+credential, always. A user **must** generate one to use WebDAV; a directory password is
+**always rejected** on the WebDAV door. There is no `WEBDAV_AUTH_MODE` and no
+`ldap_password`/`both` mode to configure.
 
 ### 15.5 Identity & authorization (no user password-bind needed)
 
 In `authenticateUser` (the single choke point for all 8 handlers):
 
-1. If the Basic username matches the key prefix (`wdav_`) **and** the mode allows
-   `key_secret` → **key path**: verify `key:secret` (§15.7), resolve `(tenant, uid)`,
-   and **cross-check** the key's tenant against the host-derived tenant (reject a
-   mismatch — a key is bound to its tenant).
-2. Else if the mode allows `ldap_password` → today's LDAP user-bind path. Under
-   `key_secret`, this path is refused with a clear body pointing at
-   ProfileView → "Add WebDAV credential".
-3. **Roles** come from LDAP exactly as today, but via the **existing service-bind
+1. **Key path (the only path):** verify the Basic `key:secret` (§15.7), resolve
+   `(tenant, uid)`, and **cross-check** the key's tenant against the host-derived tenant
+   (reject a mismatch — a key is bound to its tenant).
+2. Anything that is **not** a valid `key:secret` (including a real LDAP directory
+   password) is refused with a clear body pointing at ProfileView → "Add WebDAV
+   credential". There is no directory-password fallback.
+3. **Roles** come from LDAP, but via the **existing service-bind
    search** — `LDAPAuthenticator::searchUser` + `extractRolesFromGroups` already run
    on the service connection (`bind_dn_`/`bind_password_`), so the key path fetches
    roles **without** the user's password. Authorization (the core's ACL/RBAC) is
@@ -844,13 +844,13 @@ credential store is directly reachable if the direct-PG verify option is chosen.
 
 ### 15.6 How it composes with §14 (origin gate) and §4 (2FA)
 
-`WEBDAV_AUTH_MODE` (§15, the *credential*) and `WEBDAV_EXTERNAL_GATE` (§14, *origin &
-liveness*) are **independent, multiplying** layers. A deployment picks a posture:
+The **credential** (§15, always `key_secret`) and the **origin/session gate** (§14,
+`WEBDAV_EXTERNAL_GATE`) are **independent, multiplying** layers. The credential is
+fixed; a deployment tunes the gate:
 
 | Credential (§15) | Origin/session gate (§14) | Result |
 |---|---|---|
-| `ldap_password` | `session_ip` | today + logout-revocation (the §14 baseline) |
-| `key_secret` | off (`ip_ttl` disabled / no gate) | strong revocable credential, any origin — **kills the reuse/weak-password root cause**, but a key works with no live Web session (by design) |
+| `key_secret` | gate off | strong revocable credential, any origin — **kills the reuse/weak-password root cause**, but a key works with no live Web session (by design) |
 | `key_secret` | `session_ip` or LAN-exempt | **strongest**: strong credential **AND** (LAN origin **or** live 2FA'd session) |
 
 Key point: they solve *different* halves of §1. `key_secret` makes the credential
@@ -888,15 +888,15 @@ document the ≤`cache_ttl` window for `key_secret`.
 
 | Var | Where | Default | Note |
 |---|---|---|---|
-| `WEBDAV_AUTH_MODE` (`ldap_password`/`both`/`key_secret`) | webdav_bridge (+ldap_manager issues) | `both` | `key_secret` forces generated creds (§15.4) |
 | `WEBDAV_CRED_VERIFY` (`ldap_manager`/`direct_pg`) | webdav_bridge | `ldap_manager` | verify split (§15.7) |
-| `WEBDAV_CRED_HASH_PEPPER` (base64) | wherever verify runs | (required if enabled) | server pepper for the HMAC (hash-only, shown once) |
+| `WEBDAV_CRED_HASH_PEPPER` (base64) | wherever verify runs | (required) | server pepper for the HMAC (hash-only, shown once) |
 | `WEBDAV_CRED_VERIFY_CACHE_TTL_SECONDS` | webdav_bridge | 60 | bounds revocation staleness |
 | `WEBDAV_CRED_MAX_PER_USER` | ldap_manager | 10 | per-user credential cap |
 | `WEBDAV_CRED_EXPIRY_DAYS` | ldap_manager | ∅ (no expiry) | optional forced rotation |
 
-All default to preserving today's behavior (`both`, no expiry), so the amendment is
-inert until a deployment opts into `key_secret`.
+There is no `WEBDAV_AUTH_MODE`: `key:secret` is the only WebDAV credential (see §15.4
+and the top "no legacy" decision). `WEBDAV_CRED_HASH_PEPPER` is required wherever
+verification runs.
 
 ### 15.9 API additions (amends §8)
 
@@ -930,13 +930,13 @@ resolved by `rotate`, not retrieval.
 - **Still fronts the same ACLs** — like §4/§5, this sits in front of the core's
   unchanged authn→authz; roles/ACLs are untouched.
 - **Interaction with §3** — the trusted-IP derivation and §14 gate still apply on the
-  external branch; `key_secret` does not bypass them when both are enabled.
+  external branch; `key_secret` does not bypass them when the gate is enabled.
 
 ### 15.11 Open decisions (extends §11)
 
-- **§11.14 — Auth-mode default & rollout:** ship `both` (recommended) and let
-  tenants/deployments move to `key_secret`; confirm whether any deployment ships
-  `key_secret` from day one.
+- **§11.14 — RESOLVED (no legacy):** `key:secret` is the only WebDAV credential; the
+  directory-password path and `WEBDAV_AUTH_MODE` are removed (no live deployments to
+  migrate). Nothing left to decide.
 - **§11.15 — Verify split:** internal ldap_manager endpoint (recommended, §2
   principle) vs direct-Postgres in webdav_bridge (lower latency; bridge already links
   libpq).
@@ -947,22 +947,23 @@ resolved by `rotate`, not retrieval.
   recommended for full-entropy secrets — vs a slow KDF as belt-and-suspenders.)
 - **§11.17 — Revocation immediacy:** accept the ≤`cache_ttl` staleness (simplest) vs
   push-invalidate via the Redis event stream for instant revocation.
-- **§11.18 — Deprecate the WebDAV directory password?** once `key_secret` is adopted,
-  retire the directory-password concept (ProfileView copy, §5.4) — timeline TBD.
+- **§11.18 — RESOLVED (no legacy):** the WebDAV directory password is not deprecated
+  over time — it is **removed outright** (§15.4). ProfileView's "set a directory
+  password" copy is replaced by the credentials panel.
 
 ### 15.12 Testing & phasing (amends §10, §12)
 
 - **Unit:** secret generation entropy/format; HMAC verify + constant-time compare;
   key→(tenant,uid) resolution incl. tenant-mismatch reject; cache TTL + event
-  invalidation; `WEBDAV_AUTH_MODE` gating (password refused under `key_secret`).
+  invalidation.
 - **E2E:** mount with a generated key → allowed; **revoke → denied within cache TTL
-  (and immediately with push-invalidation)**; directory password **rejected** under
-  `key_secret`, accepted under `both`; roles resolved via service-search match the
-  LDAP-bind path.
+  (and immediately with push-invalidation)**; a directory password (or any non-key
+  Basic credential) is **always rejected** on WebDAV; roles resolved via service-search
+  match the historical LDAP-bind path.
 - **Phasing (new Phase 5, after §12 Phase 3):** ldap_manager `webdav_credential` table
   + `/v1/me/webdav-credentials` + internal verify; webdav_bridge key path + verify
-  cache + `WEBDAV_AUTH_MODE`; ProfileView panel. Default `both`, independently
-  shippable, and orthogonal to the §14 gate work.
+  cache; ProfileView panel. Independently shippable, and orthogonal to the §14 gate
+  work.
 
 ### 15.13 QOL: OS mount-setup script generator (optional)
 
@@ -1064,12 +1065,14 @@ endpoint)** is the natural choice here — generalize it to
 `POST /internal/service-cred/verify {key_id, secret, tenant, scope:"mcp"}` →
 `{uid}` | 401. Direct-PG (§15.7 B) would add a dependency MCP doesn't otherwise carry.
 
-### 16.4 Auth mode — force strong MCP credentials
+### 16.4 `key:secret` is the only MCP-HTTP credential
 
-Mirror §15.4 with `MCP_AUTH_MODE` (`ldap_password` | `both` (default) | `key_secret`).
-`key_secret` disables the directory-password path on MCP entirely — an agent **must**
-present a generated service key. Ship `both` for migration; a deployment/tenant opts
-into `key_secret`. A deployment cap can forbid `ldap_password` fleet-wide.
+Like WebDAV (§15.4) and for the same "no legacy" reason, the directory-password path on
+the **MCP HTTP door is removed** — a `key:secret` service key (scope `mcp`) is the only
+credential a remote agent may present, at Basic / `POST /auth/token`; anything else is
+rejected. There is no `MCP_AUTH_MODE`. (The **stdio** MCP mode — a local agent process
+authenticating via `FILEENGINE_MCP_USER`/`PASSWORD` — is a separate, local concern and
+is out of scope for this change.)
 
 ### 16.5 Why the §14 origin/session gate does **not** apply to MCP
 
@@ -1103,34 +1106,35 @@ a live session would break the primary use case. Therefore:
 
 | Var | Where | Default | Note |
 |---|---|---|---|
-| `MCP_AUTH_MODE` (`ldap_password`/`both`/`key_secret`) | mcp (+ldap_manager issues) | `both` | `key_secret` forces service keys on MCP |
 | `service_credential.scopes` (data, not env) | ldap_manager | `{webdav}` | per-credential door scope (§16.2) |
 | `service_credential.allowed_cidrs` (optional, §16.5) | ldap_manager | ∅ | optional per-key IP pin for agents |
 
+No `MCP_AUTH_MODE`: `key:secret` (scope `mcp`) is the only MCP-HTTP credential (§16.4).
+
 **API (amends §8 / §15.9):**
 - `POST /v1/me/webdav-credentials` → **`POST /v1/me/service-credentials {label, scopes}`**
-  (rename; `scopes ⊆ {webdav,mcp}`); list/rotate/revoke likewise renamed. Keep the old
-  path as an alias defaulting `scopes:["webdav"]` for compatibility.
+  (rename; `scopes ⊆ {webdav,mcp}`); list/rotate/revoke likewise renamed. (No legacy
+  alias needed — no live deployments.)
 - internal: `POST /internal/service-cred/verify {key_id, secret, tenant, scope}` (loopback
   / shared secret) — used by webdav_bridge (`scope:"webdav"`) and mcp (`scope:"mcp"`).
 
 **Open decisions (extends §11):**
-- **§11.19 — MCP auth-mode default & rollout:** `both` (recommended) then move to
-  `key_secret`; confirm whether any deployment ships `key_secret` on MCP from day one.
+- **§11.19 — RESOLVED (no legacy):** `key:secret` is the only MCP-HTTP credential; no
+  `MCP_AUTH_MODE`, no directory-password path.
 - **§11.20 — Per-credential IP allowlist for agent keys (§16.5):** offer it (recommended,
   opt-in) vs omit for v1.
 - (Inherits §11.15/§11.16 — verify split defaults to internal-endpoint for MCP; at-rest
   stays hash-only shown-once.)
 
 **Testing (amends §10):**
-- MCP key path resolves identity+roles via service-search (matches the user-bind path);
-  scope mismatch rejected (MCP key refused on WebDAV and vice-versa); `MCP_AUTH_MODE`
-  gating (directory password refused under `key_secret`); `/auth/token` issues a bearer
-  after a key verify; optional `allowed_cidrs` enforced.
+- MCP key path resolves identity+roles via service-search (matches the historical
+  user-bind path); scope mismatch rejected (MCP key refused on WebDAV and vice-versa); a
+  directory password (or any non-key Basic credential) is **always rejected** on the MCP
+  HTTP door; `/auth/token` issues a bearer after a key verify; optional `allowed_cidrs`
+  enforced.
 
 **Phasing:** folds into the §15 credential work (proposal Phase 5) — same store, same
-management UI — plus the small MCP-side verify + `MCP_AUTH_MODE` change. Independently
-shippable, default `both`.
+management UI — plus the small MCP-side verify change. Independently shippable.
 
 ---
 
@@ -1262,13 +1266,11 @@ that motivated this amendment):
 
 | Var | Where | Default | Note |
 |---|---|---|---|
-| `WEBDAV_EXTERNAL_GATE` | webdav_bridge (+http_bridge writes) | `ip_ttl` | `ip_ttl` = legacy §5 IP-pin; `session` = liveness, any IP (§14.3); `session_ip` = liveness + IP pin (**recommended**) |
+| `WEBDAV_EXTERNAL_GATE` | webdav_bridge (+http_bridge writes) | `session_ip` | `session` = liveness, any IP (§14.3); `session_ip` = liveness + IP pin (**default/recommended**). The legacy §5 `ip_ttl` IP-pin mode is dropped (no live deployments). |
 
-- **Backward compatibility:** default `ip_ttl` preserves §5 exactly, so this
-  amendment is inert until a deployment opts into `session`/`session_ip`. All other
-  §7 vars are unchanged; `WEBDAV_IP_BIND_TTL_SECONDS` becomes the **backstop** TTL
-  (crash / no-explicit-logout) under the session modes rather than the primary
-  lifetime.
+- **No legacy `ip_ttl`.** With no deployments to preserve, the TTL-expiry IP-pin mode
+  is removed; the gate is session-liveness only. `WEBDAV_IP_BIND_TTL_SECONDS` is now
+  purely the **backstop** TTL (crash / no-explicit-logout), not a primary lifetime.
 - **No new secret, no new service.** Reuses the webdav_bridge hiredis addition
   already required by §5 and the shared Redis. http_bridge already links hiredis.
 
@@ -1304,8 +1306,8 @@ davfs → internal ingress (authoritative src ∈ trusted CIDR) → webdav_bridg
 
 ### 14.7 Open decisions this amendment adds (extends §11)
 
-- **§11.11 — External-branch semantics:** `session_ip` (recommended) vs `session`
-  vs keep `ip_ttl` (legacy §5). Governs `WEBDAV_EXTERNAL_GATE` default.
+- **§11.11 — External-branch semantics:** `session_ip` (default/recommended) vs
+  `session` (any-IP). The legacy §5 `ip_ttl` mode is dropped (no live deployments).
 - **§11.12 — Logout revocation is immediate:** confirm `revokeToken` should `ZREM`
   the session member (recommended — it is the point of the amendment). Note the
   minor coupling: logout now performs a best-effort Redis write; keep it
@@ -1332,5 +1334,38 @@ davfs → internal ingress (authoritative src ∈ trusted CIDR) → webdav_bridg
 - **webdav_bridge:** the §5.2 enforcement becomes the §14.2 purge-then-presence
   check under `session`/`session_ip`; the LAN branch and `/readyz` health are
   unchanged.
-- Still behind `WEBDAV_IP_BINDING_ENABLED` and default-off via
-  `WEBDAV_EXTERNAL_GATE=ip_ttl`; independently shippable.
+- Gate enablement is still per-tenant via `WEBDAV_IP_BINDING_ENABLED`; when on it runs
+  in `session_ip` mode (the only session mode besides any-IP `session`). Independently
+  shippable.
+
+### 14.10 Per-tenant session TTL (each tenant's security stance)
+
+How long a WebDAV-authorizing session-presence entry survives is the main tuning knob
+for a tenant's WebDAV security posture: a short TTL means a mount stops working soon
+after the browser session would lapse (tighter; more re-sign-ins), a longer TTL favors
+uninterrupted work. That stance is **per tenant**, not per deployment.
+
+- **Setting.** `webdav_session_ttl_seconds` in **ldap_manager** tenant settings
+  (alongside `mfa_allowed_methods` / `totp_required_tenants`), overriding the deployment
+  default `WEBDAV_IP_BIND_TTL_SECONDS` (§7). Unset → inherit the deployment default.
+- **Where it applies.** It sets the **score** (expiry epoch) of the session member
+  http_bridge writes on login/refresh — `ZADD webdav:session:{tenant}:{uid} {now +
+  tenant_ttl} {jti}|{ip}` (§14.2). Enforcement is unchanged: `ZREMRANGEBYSCORE … 0 now`
+  purges expired members, so a shorter tenant TTL simply expires WebDAV presence sooner.
+  Because it's read at write time (login/refresh), a changed TTL takes effect on the
+  next login/refresh; existing members keep the score they were written with.
+- **Bounds.** Optional deployment guardrails `WEBDAV_SESSION_TTL_MIN/MAX_SECONDS` clamp
+  what a tenant admin may choose (e.g. floor 5 min, ceiling 24 h), so a tenant can't set
+  a pathologically long-lived WebDAV session. A regulated tenant sets, say, 3600 (1 h);
+  a convenience-oriented tenant keeps 12 h.
+- **Lookup cost.** http_bridge resolves the tenant TTL only at login/refresh (infrequent,
+  and already the moment it does per-tenant policy lookups for 2FA), so no per-request or
+  per-WebDAV-method cost. `refreshToken` re-scores the member with the current tenant
+  TTL, so lowering a tenant's TTL shortens live sessions on their next refresh.
+- **Surface.** Exposed in `TenantAdminView.vue`'s "Security" tab (with the 2FA policy
+  controls, §8), and audited as a tenant-admin security change (`webdav_session_ttl_set`),
+  flowing into the Phase 1.5 log like every other security-relevant change.
+
+Open decision **§11.21 — session-TTL bounds:** confirm the `MIN/MAX` clamp values (and
+whether a hard deployment ceiling should override even a deployment that wants to allow
+longer).
