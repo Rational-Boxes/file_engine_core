@@ -16,6 +16,13 @@
 > Web-UI session ends). Read §5 for the mechanism and §14 for the amended
 > semantics; where they differ, **§14 wins**.
 
+> **Amendment 2026-07-15 (§15).** **§15** hardens the WebDAV *credential itself*:
+> replace the reusable LDAP **directory password** on the WebDAV door with a
+> **backend-generated, high-entropy `key:secret`** — individually named, revocable,
+> shown once, WebDAV-scoped — and let a deployment **force** it (disable
+> password-based WebDAV auth). This composes with, and is orthogonal to, the §14
+> origin/session gate: §14 governs *origin & liveness*, §15 governs *the credential*.
+
 ---
 
 ## 1. Goals & threat model
@@ -695,6 +702,258 @@ authorizes an IP-binding much stronger, so WebDAV inherits that strength.
   login / enrollment / recovery UX. Do **after** Phase A proves the plumbing.
 
 *Status: parked pending hardware; revisit to begin V2 Phase A.*
+
+---
+
+## 15. Amendment (2026-07-15): backend-generated WebDAV credentials (`key:secret`)
+
+**Status:** Draft / for review — further hardens Feature B. **Composes with** §5/§14
+(does not replace them). 2FA (§4) and V2 (§13) are untouched.
+
+### 15.1 Motivation — harden the credential, not just the gate
+
+§5/§14 gate WebDAV by *origin* and *session liveness*, but the credential presented
+is still the user's **LDAP directory password** — the exact thing that is weak,
+reused, phishable, and (because it is the account password) high-blast-radius. §14
+revokes access on logout; it does not make the credential itself strong, nor let a
+user revoke *one* WebDAV client without changing their account password.
+
+This amendment replaces the directory password on the WebDAV door with a
+**backend-generated `key:secret`** — an app-password / access-key pattern:
+
+- **Strong by construction** — a 256-bit random secret; the user never chooses it,
+  so it can't be weak or reused.
+- **WebDAV-scoped** — it authenticates *only* the WebDAV door, never the Web UI, API,
+  or LDAP itself. A leaked WebDAV key can't sign into anything else.
+- **Individually revocable** — one per client/device, named, revoked independently
+  and instantly, without touching the account password or other clients.
+- **Basic-auth compatible** — the client still sends HTTP Basic (`username=key_id`,
+  `password=secret`), so Finder / Windows Explorer / `davfs` need no changes.
+
+This is the most direct answer to the §1 premise "*WebDAV can't do 2FA*": a 256-bit,
+non-phishable, instantly-revocable credential is a far stronger stand-in for a second
+factor than a user-chosen password, and it addresses the **root cause** (password
+reuse/weakness) that motivated the whole IP-binding design.
+
+### 15.2 Credential model
+
+- **`key_id`** — public identifier, carried in the Basic **username**. Prefixed for
+  secret-scanning / leak detection, e.g. `wdav_<random>`. Globally unique; resolves
+  to `(tenant, uid)`.
+- **`secret`** — 256-bit CSPRNG value, base32/base64url-encoded, carried in the Basic
+  **password**. **Shown to the user exactly once** at creation, never retrievable.
+- **At rest — hash-only, shown once.** Store only
+  `HMAC-SHA256(secret, WEBDAV_CRED_HASH_PEPPER)` (a fast MAC is sufficient because the
+  secret is full-entropy — a slow KDF protects *low*-entropy inputs and isn't needed
+  here; the server pepper defends a bare DB read). Verify with a constant-time compare.
+  **The plaintext secret is displayed exactly once, at creation, and is never stored in
+  a recoverable form and never re-displayed.** If a secret is lost, the user
+  **regenerates** on demand (§15.3) — there is no reveal path, so a DB read never yields
+  a usable secret.
+
+**The credential is a pure relational-DB record — it never touches LDAP.** No
+directory schema change, no `totpSecret`-style attribute, no directory ACL grant.
+LDAP stays the source of truth for **identity and roles (authorization) only**; the
+`key:secret` (authentication material) lives entirely in Postgres. This mirrors the
+§4.2 decision to keep the TOTP secret out of the directory, and for the same reasons:
+a compromised LDAP read (e.g. the broad service bind) leaks no WebDAV credentials, and
+the store carries the secret hash + label + usage/expiry/revocation together.
+
+**Postgres (ldap_manager, mirrors the §4.2 `user_2fa` pattern):**
+
+```sql
+CREATE TABLE webdav_credential (
+  key_id        TEXT PRIMARY KEY,        -- 'wdav_...'; the Basic username
+  tenant        TEXT NOT NULL,
+  uid           TEXT NOT NULL,
+  secret_hash   BYTEA NOT NULL,          -- HMAC-SHA256(secret, pepper)
+  label         TEXT,                    -- user-facing, e.g. 'MacBook Finder'
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ,
+  expires_at    TIMESTAMPTZ,             -- optional (WEBDAV_CRED_EXPIRY_DAYS)
+  revoked_at    TIMESTAMPTZ
+);
+CREATE INDEX ON webdav_credential (tenant, uid);
+```
+
+### 15.3 Lifecycle (self-service; supersedes the "directory password" for WebDAV)
+
+Managed from `ProfileView.vue` (extends the §5.4 "WebDAV access" section, and
+**replaces** the current *"set a directory password for WebDAV"* copy):
+
+- **Create** — "Add WebDAV credential" `{label}` → returns `{key_id, secret}`,
+  displayed **once** with copy-to-clipboard and a mount-string hint. The secret is
+  never shown again. Cap per user via `WEBDAV_CRED_MAX_PER_USER`.
+- **List** — name, created, last-used, expiry, status. **Metadata only — never the
+  secret.**
+- **Regenerate / force-recreate on demand (anytime)** — rotate a credential: mint a new
+  `secret` for the same `key_id` (so an existing mount only needs its password updated)
+  **or** issue a new `key_id` and revoke the old — a per-call choice. The new secret is,
+  again, shown once; the old secret stops working immediately (bounded by the verify
+  cache TTL, §15.7). This is both the routine rotation path and the recovery path when a
+  secret is lost — since secrets are never re-displayable, "I lost it" is always
+  resolved by regenerating.
+- **Revoke** — delete a `key_id` (immediate, bounded by the verify cache TTL, §15.7).
+- Audit: `webdav_cred_create`, `webdav_cred_rotate`, `webdav_cred_revoke`,
+  `webdav_cred_use` (first use), `webdav_cred_auth_fail`.
+
+### 15.4 Auth mode — "force strong credentials"
+
+Per-tenant / per-deployment `WEBDAV_AUTH_MODE`:
+
+| Mode | Directory password on WebDAV? | `key:secret`? |
+|---|---|---|
+| `ldap_password` | ✅ (today's behavior) | ✗ |
+| `both` (**default**, migration) | ✅ | ✅ |
+| `key_secret` (**hardened**) | **✗ rejected** | ✅ only |
+
+`key_secret` is the "force very strong credentials" posture: the directory password
+no longer authenticates WebDAV at all — a user **must** generate a `key:secret`. Ship
+`both` for backward compatibility; a tenant/deployment opts into `key_secret` once its
+users have migrated. A deployment cap can forbid `ldap_password` fleet-wide (mirrors
+the §4.8 method-cap pattern).
+
+### 15.5 Identity & authorization (no user password-bind needed)
+
+In `authenticateUser` (the single choke point for all 8 handlers):
+
+1. If the Basic username matches the key prefix (`wdav_`) **and** the mode allows
+   `key_secret` → **key path**: verify `key:secret` (§15.7), resolve `(tenant, uid)`,
+   and **cross-check** the key's tenant against the host-derived tenant (reject a
+   mismatch — a key is bound to its tenant).
+2. Else if the mode allows `ldap_password` → today's LDAP user-bind path. Under
+   `key_secret`, this path is refused with a clear body pointing at
+   ProfileView → "Add WebDAV credential".
+3. **Roles** come from LDAP exactly as today, but via the **existing service-bind
+   search** — `LDAPAuthenticator::searchUser` + `extractRolesFromGroups` already run
+   on the service connection (`bind_dn_`/`bind_password_`), so the key path fetches
+   roles **without** the user's password. Authorization (the core's ACL/RBAC) is
+   unchanged.
+
+The §14 origin/session gate still applies **after** this on the external branch (see
+§15.6). `webdav_bridge` already links **libpq/pqxx** (the path→UUID resolver), so the
+credential store is directly reachable if the direct-PG verify option is chosen.
+
+### 15.6 How it composes with §14 (origin gate) and §4 (2FA)
+
+`WEBDAV_AUTH_MODE` (§15, the *credential*) and `WEBDAV_EXTERNAL_GATE` (§14, *origin &
+liveness*) are **independent, multiplying** layers. A deployment picks a posture:
+
+| Credential (§15) | Origin/session gate (§14) | Result |
+|---|---|---|
+| `ldap_password` | `session_ip` | today + logout-revocation (the §14 baseline) |
+| `key_secret` | off (`ip_ttl` disabled / no gate) | strong revocable credential, any origin — **kills the reuse/weak-password root cause**, but a key works with no live Web session (by design) |
+| `key_secret` | `session_ip` or LAN-exempt | **strongest**: strong credential **AND** (LAN origin **or** live 2FA'd session) |
+
+Key point: they solve *different* halves of §1. `key_secret` makes the credential
+strong and scoped (so a leak is low-value and instantly revocable); §14 ties WebDAV to
+Web-UI **liveness** (revoke on logout) and **origin**. `key_secret` alone does *not*
+give logout-coupling — a generated key is meant to keep working while mounted,
+independent of any browser session — so a deployment that specifically wants
+"WebDAV dies when I log out of the browser" still needs §14. Most deployments should
+adopt **`key_secret` first** (root-cause fix, minimal UX cost) and layer §14 where the
+liveness coupling is required.
+
+### 15.7 Verification path & caching (chatty-safe)
+
+WebDAV is method-heavy (PROPFIND storms), so per-request verification must not hammer
+a store. Two options (open decision §11.15):
+
+- **(A, recommended — §2 principle) internal ldap_manager endpoint.** `POST
+  /internal/webdav/verify {key_id, secret, tenant}` → `{uid}` | 401 (server-to-server,
+  loopback / shared secret). Keeps the secret hash + pepper in the identity service;
+  the C++ bridge never holds the pepper. `webdav_bridge` caches a **successful**
+  result keyed by `(key_id, sha256(secret))` → `{uid, roles}` for
+  `WEBDAV_CRED_VERIFY_CACHE_TTL_SECONDS` (default 60), so a PROPFIND burst is one
+  verify. Never cache the plaintext secret; cache a salted hash → result.
+- **(B) direct Postgres.** `webdav_bridge` reads `webdav_credential` itself (it already
+  links libpq). Lowest latency, no internal hop, but spreads the pepper + HMAC into the
+  C++ bridge.
+
+**Revocation staleness.** Revoke is immediate at the store; the bridge honors it within
+the cache TTL. For instant revocation, push-invalidate the cache via the existing Redis
+event stream (a `webdav_cred_revoke` event), mirroring the core's cache-invalidation
+pattern. Note the contrast with §14, whose logout revocation is immediate by design;
+document the ≤`cache_ttl` window for `key_secret`.
+
+### 15.8 Config delta (amends §7)
+
+| Var | Where | Default | Note |
+|---|---|---|---|
+| `WEBDAV_AUTH_MODE` (`ldap_password`/`both`/`key_secret`) | webdav_bridge (+ldap_manager issues) | `both` | `key_secret` forces generated creds (§15.4) |
+| `WEBDAV_CRED_VERIFY` (`ldap_manager`/`direct_pg`) | webdav_bridge | `ldap_manager` | verify split (§15.7) |
+| `WEBDAV_CRED_HASH_PEPPER` (base64) | wherever verify runs | (required if enabled) | server pepper for the HMAC (hash-only, shown once) |
+| `WEBDAV_CRED_VERIFY_CACHE_TTL_SECONDS` | webdav_bridge | 60 | bounds revocation staleness |
+| `WEBDAV_CRED_MAX_PER_USER` | ldap_manager | 10 | per-user credential cap |
+| `WEBDAV_CRED_EXPIRY_DAYS` | ldap_manager | ∅ (no expiry) | optional forced rotation |
+
+All default to preserving today's behavior (`both`, no expiry), so the amendment is
+inert until a deployment opts into `key_secret`.
+
+### 15.9 API additions (amends §8)
+
+**ldap_manager**
+- `GET    /v1/me/webdav-credentials` → list metadata (key_id, label, timestamps, status);
+  **never the secret**
+- `POST   /v1/me/webdav-credentials {label}` → `201 {key_id, secret}` (secret shown once)
+- `POST   /v1/me/webdav-credentials/{key_id}/rotate {new_key_id?: bool}` →
+  `{key_id, secret}` — regenerate on demand (§15.3), old secret invalidated, new one
+  shown once
+- `DELETE /v1/me/webdav-credentials/{key_id}` → revoke (audited)
+- internal: `POST /internal/webdav/verify` (§15.7 option A; loopback / shared secret)
+
+There is intentionally **no endpoint to read back a secret** — lost secrets are
+resolved by `rotate`, not retrieval.
+
+**frontend**
+- `ProfileView.vue`: "WebDAV credentials" panel — create (secret shown once), list
+  (metadata), **regenerate/force-recreate**, revoke; replaces the "set a directory
+  password" copy; keep the §5.4 bound-IP view when §14 is also on.
+
+### 15.10 Security considerations (extends §9)
+
+- **Blast radius** — the WebDAV credential no longer *is* the account password; a leak
+  is WebDAV-only and revocable without an account-wide password reset.
+- **Entropy** — 256-bit CSPRNG; the user cannot weaken it. HMAC-with-pepper at rest; a
+  bare DB read yields neither usable secrets nor an offline-crackable low-entropy hash.
+- **Prefix for detection** — the `wdav_` prefix lets secret scanners and leaked-cred
+  monitors flag exposure.
+- **Still fronts the same ACLs** — like §4/§5, this sits in front of the core's
+  unchanged authn→authz; roles/ACLs are untouched.
+- **Interaction with §3** — the trusted-IP derivation and §14 gate still apply on the
+  external branch; `key_secret` does not bypass them when both are enabled.
+
+### 15.11 Open decisions (extends §11)
+
+- **§11.14 — Auth-mode default & rollout:** ship `both` (recommended) and let
+  tenants/deployments move to `key_secret`; confirm whether any deployment ships
+  `key_secret` from day one.
+- **§11.15 — Verify split:** internal ldap_manager endpoint (recommended, §2
+  principle) vs direct-Postgres in webdav_bridge (lower latency; bridge already links
+  libpq).
+- **§11.16 — At-rest scheme: DECIDED — hash-only, shown once.** Store
+  `HMAC-SHA256(secret, pepper)`; the secret is displayed only at creation and is never
+  recoverable. Lost secrets are resolved by **regenerate/force-recreate on demand**
+  (§15.3), not by a reveal path. (Remaining sub-choice, minor: HMAC-SHA256 + pepper —
+  recommended for full-entropy secrets — vs a slow KDF as belt-and-suspenders.)
+- **§11.17 — Revocation immediacy:** accept the ≤`cache_ttl` staleness (simplest) vs
+  push-invalidate via the Redis event stream for instant revocation.
+- **§11.18 — Deprecate the WebDAV directory password?** once `key_secret` is adopted,
+  retire the directory-password concept (ProfileView copy, §5.4) — timeline TBD.
+
+### 15.12 Testing & phasing (amends §10, §12)
+
+- **Unit:** secret generation entropy/format; HMAC verify + constant-time compare;
+  key→(tenant,uid) resolution incl. tenant-mismatch reject; cache TTL + event
+  invalidation; `WEBDAV_AUTH_MODE` gating (password refused under `key_secret`).
+- **E2E:** mount with a generated key → allowed; **revoke → denied within cache TTL
+  (and immediately with push-invalidation)**; directory password **rejected** under
+  `key_secret`, accepted under `both`; roles resolved via service-search match the
+  LDAP-bind path.
+- **Phasing (new Phase 5, after §12 Phase 3):** ldap_manager `webdav_credential` table
+  + `/v1/me/webdav-credentials` + internal verify; webdav_bridge key path + verify
+  cache + `WEBDAV_AUTH_MODE`; ProfileView panel. Default `both`, independently
+  shippable, and orthogonal to the §14 gate work.
 
 ---
 
