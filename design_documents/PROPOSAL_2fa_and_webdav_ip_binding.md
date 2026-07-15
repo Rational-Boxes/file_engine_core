@@ -23,6 +23,14 @@
 > password-based WebDAV auth). This composes with, and is orthogonal to, the §14
 > origin/session gate: §14 governs *origin & liveness*, §15 governs *the credential*.
 
+> **Amendment 2026-07-15 (§16).** **§16** generalizes the §15 `key:secret` credential
+> to the **MCP door** — the other non-interactive, Basic-auth-bearing door onto the
+> core — for the same reasons (an LLM-agent door riding on the reusable LDAP directory
+> password is the same weakness, arguably higher stakes). The §15 credential becomes a
+> scoped **service credential** (`webdav` and/or `mcp`); the §14 session gate does
+> **not** apply to MCP (headless agents have no browser session), so for MCP the strong
+> credential *is* the hardening.
+
 ---
 
 ## 1. Goals & threat model
@@ -994,6 +1002,135 @@ the OS's own prompt/dialog:**
 
 **Placement.** Part of the Phase 5 ProfileView panel (§15.12); additive and
 independently shippable. No blocking open decision.
+
+---
+
+## 16. Amendment (2026-07-15): extend `key:secret` to the MCP door (service credentials)
+
+**Status:** Draft / for review — generalizes §15. Applies the same credential
+hardening to the **MCP door**; does not change §4/§13/§14.
+
+### 16.1 Same weakness, higher stakes
+
+The MCP HTTP door (`mcp/`, `:8096`, `/mcp` + `POST /auth/token`) authenticates exactly
+like WebDAV: `Authorization: Basic user:pass` → a **live LDAP bind on the user's
+directory password** (`http_auth.resolve_identity` → `ldap_auth.authenticate`), and
+`POST /auth/token` merely caches that bind into an opaque bearer (`TokenStore`, in-mem
+TTL). So the same reusable directory password that §15 removed from the WebDAV door is
+still the entry credential for MCP — and MCP is an **LLM-agent door onto the whole
+filesystem**, so a leaked/weak password there is at least as damaging. The §15
+`key:secret` is the right fix here too.
+
+### 16.2 Generalize §15 → scoped **service credentials**
+
+Promote the §15 `webdav_credential` to a door-agnostic **service credential** with an
+explicit **scope set**, so one mechanism (one store, one management UI, one verify
+path) serves both non-interactive doors under least privilege:
+
+```sql
+-- §15.2 table, generalized: add scopes; a key is valid only on the door(s) it lists.
+ALTER TABLE webdav_credential RENAME TO service_credential;
+ALTER TABLE service_credential ADD COLUMN scopes TEXT[] NOT NULL DEFAULT '{webdav}';
+-- scopes ⊆ {'webdav','mcp'}; key_id prefix stays cosmetic (e.g. wdav_ / mcp_),
+-- the scopes column is the authoritative control.
+```
+
+- Everything else from §15 is unchanged: 256-bit secret, **HMAC-SHA256 + pepper at
+  rest, shown once, never retrievable, regenerate/force-recreate on demand**, stored in
+  **Postgres, not LDAP**, roles resolved from LDAP by service-search.
+- A credential may carry one scope or both; enforcement checks the presented key's
+  `scopes` against the door it arrived on and **rejects a scope mismatch** (an
+  MCP-only key can't mount WebDAV, and vice-versa).
+
+### 16.3 MCP verification & token flow (cheaper than WebDAV — no per-request chatter)
+
+MCP already has the two pieces this needs:
+
+1. **Role resolution without a user bind is already there.** `ldap_auth.authenticate`
+   already does a **service bind** (`ldap_bind_dn`) to resolve the user DN + group roles
+   and *then* a user-bind for authentication. The key path simply **replaces the
+   user-bind with a `key:secret` verify** and keeps the existing service-search role
+   resolution (incl. the `administrators → system_admin` mapping). Identity forwarded to
+   the gRPC core is unchanged.
+2. **The bearer cache already exists.** Verify the `key:secret` **once** at the Basic
+   step / `POST /auth/token`, then issue the normal `TokenStore` bearer — so unlike
+   WebDAV's chatty per-request model, **there is no per-request credential check** and
+   no new cache to build. A direct-Basic-every-request client would verify per request
+   (add a short TTL cache), but the documented flow is token-then-bearer.
+
+**Where verification runs.** MCP has **no Postgres client today** (LDAP + gRPC +
+in-memory tokens only), so the §15.7 **option A (internal ldap_manager verify
+endpoint)** is the natural choice here — generalize it to
+`POST /internal/service-cred/verify {key_id, secret, tenant, scope:"mcp"}` →
+`{uid}` | 401. Direct-PG (§15.7 B) would add a dependency MCP doesn't otherwise carry.
+
+### 16.4 Auth mode — force strong MCP credentials
+
+Mirror §15.4 with `MCP_AUTH_MODE` (`ldap_password` | `both` (default) | `key_secret`).
+`key_secret` disables the directory-password path on MCP entirely — an agent **must**
+present a generated service key. Ship `both` for migration; a deployment/tenant opts
+into `key_secret`. A deployment cap can forbid `ldap_password` fleet-wide.
+
+### 16.5 Why the §14 origin/session gate does **not** apply to MCP
+
+§14 ties WebDAV to a **live Web-UI session** (revoke on logout) and an origin split.
+MCP agents are **headless and long-running by design** — they have no browser session
+to be live, and often run remote/unattended (e.g. Claude Code from anywhere). Requiring
+a live session would break the primary use case. Therefore:
+
+- **For MCP, the `key:secret` credential is the hardening** — strong, WebDAV/MCP-scoped,
+  individually revocable, instantly killable when an agent is decommissioned. That
+  directly addresses the §1 threat for a door that can't carry a second factor and
+  shouldn't depend on a browser session.
+- **Optional, not required:** a per-credential **IP allowlist** (`allowed_cidrs` on the
+  `service_credential` row) can pin an agent key to known egress ranges — the static,
+  cloud-independent analog of §14's trusted-CIDR branch, without any session concept.
+  Recommend offering it; leave it empty (unrestricted) by default.
+
+### 16.6 Lifecycle & UI (extends §15.3 / §15.9)
+
+- The ProfileView "credentials" panel (§15.9) now shows each credential's **scopes**
+  (WebDAV, MCP) and lets the user pick scope(s) at create time. Create / list-metadata /
+  regenerate / revoke are unchanged (secret still shown once).
+- **QOL analog of §15.13 for MCP:** offer a copy-paste **client-config snippet** — e.g.
+  the `claude mcp add --transport http fileengine <https-url>/mcp --header ...` command —
+  with the URL and `key_id` filled in and the **secret left as a placeholder the user
+  pastes locally**. Same rule as §15.13: the generated text never contains the secret.
+
+### 16.7 Config / API / decisions / testing deltas
+
+**Config (amends §7 / §15.8):**
+
+| Var | Where | Default | Note |
+|---|---|---|---|
+| `MCP_AUTH_MODE` (`ldap_password`/`both`/`key_secret`) | mcp (+ldap_manager issues) | `both` | `key_secret` forces service keys on MCP |
+| `service_credential.scopes` (data, not env) | ldap_manager | `{webdav}` | per-credential door scope (§16.2) |
+| `service_credential.allowed_cidrs` (optional, §16.5) | ldap_manager | ∅ | optional per-key IP pin for agents |
+
+**API (amends §8 / §15.9):**
+- `POST /v1/me/webdav-credentials` → **`POST /v1/me/service-credentials {label, scopes}`**
+  (rename; `scopes ⊆ {webdav,mcp}`); list/rotate/revoke likewise renamed. Keep the old
+  path as an alias defaulting `scopes:["webdav"]` for compatibility.
+- internal: `POST /internal/service-cred/verify {key_id, secret, tenant, scope}` (loopback
+  / shared secret) — used by webdav_bridge (`scope:"webdav"`) and mcp (`scope:"mcp"`).
+
+**Open decisions (extends §11):**
+- **§11.19 — MCP auth-mode default & rollout:** `both` (recommended) then move to
+  `key_secret`; confirm whether any deployment ships `key_secret` on MCP from day one.
+- **§11.20 — Per-credential IP allowlist for agent keys (§16.5):** offer it (recommended,
+  opt-in) vs omit for v1.
+- (Inherits §11.15/§11.16 — verify split defaults to internal-endpoint for MCP; at-rest
+  stays hash-only shown-once.)
+
+**Testing (amends §10):**
+- MCP key path resolves identity+roles via service-search (matches the user-bind path);
+  scope mismatch rejected (MCP key refused on WebDAV and vice-versa); `MCP_AUTH_MODE`
+  gating (directory password refused under `key_secret`); `/auth/token` issues a bearer
+  after a key verify; optional `allowed_cidrs` enforced.
+
+**Phasing:** folds into the §15 credential work (proposal Phase 5) — same store, same
+management UI — plus the small MCP-side verify + `MCP_AUTH_MODE` change. Independently
+shippable, default `both`.
 
 ---
 
