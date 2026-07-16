@@ -11,6 +11,8 @@
 
 namespace fileengine {
 
+thread_local std::string GRPCFileService::t_audit_source_;
+
 namespace {
 // The filesystem root may be referenced either as the empty string or as the
 // all-zeros UUID. Internally the storage/database layers use the empty string,
@@ -67,7 +69,8 @@ bool GRPCFileService::emit_permission_audit(const std::string& tenant, const std
     e.actor_roles = roles;
     e.target_uid = resource_uid;
     e.target_type = AuditTargetType::Acl;
-    e.source_iface = "grpc";  // source_addr/request_id await bridge plumbing (§13)
+    e.source_iface = "grpc";
+    e.source_addr = t_audit_source_;  // client IP forwarded by the bridge (§13)
     nlohmann::json d;
     d["principal"] = principal;
     d["principal_type"] = principal_type;
@@ -109,6 +112,7 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
     e.target_name = resolved_name;
     e.target_type = target_type;
     e.source_iface = "grpc";
+    e.source_addr = t_audit_source_;
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));  // best-effort; the mutation proceeds regardless (§6)
 }
@@ -150,6 +154,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
             agg.outcome = AuditOutcome::Ok;
             agg.actor = actor;
             agg.source_iface = "grpc";
+    agg.source_addr = t_audit_source_;
             agg.detail = nlohmann::json({{"aggregated", access_interval_}, {"mode", "count"}}).dump();
             audit_sink_->publish(std::move(agg));
             return;
@@ -169,6 +174,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
     e.target_name = resolved_name;
     e.target_type = target_type;
     e.source_iface = "grpc";
+    e.source_addr = t_audit_source_;
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));
 }

@@ -256,8 +256,15 @@ private:
     // security signal. Set FILEENGINE_AUDIT_HIDDEN_CHILDREN=true to record them.
     bool audit_hidden_children_ = false;
 
+    // The client IP forwarded by the bridge for THIS request (thread-local, since
+    // gRPC dispatches each call on its own thread). Set by get_tenant_from_auth_context
+    // — which every audited handler calls before emitting — and read by the emit_*
+    // helpers so audit rows carry source_addr across all protocols (REST/WebDAV/…).
+    static thread_local std::string t_audit_source_;
+
     // Helper function to extract tenant from auth context
     inline std::string get_tenant_from_auth_context(const fileengine_rpc::AuthenticationContext& auth_ctx) {
+        t_audit_source_ = auth_ctx.source_addr();  // remember for this request's audit
         return auth_ctx.tenant().empty() ? "default" : auth_ctx.tenant();
     }
 
