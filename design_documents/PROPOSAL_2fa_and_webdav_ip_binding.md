@@ -36,7 +36,8 @@
 > the LDAP **directory-password** path on the non-interactive doors is **removed**, and
 > `key:secret` is the **only** WebDAV/MCP credential — `WEBDAV_AUTH_MODE` /
 > `MCP_AUTH_MODE` (and their `ldap_password` / `both` modes) are gone. For the same
-> reason the §14 gate drops the legacy `ip_ttl` mode and defaults to `session_ip`. This
+> reason the §14 gate drops the legacy `ip_ttl` mode and defaults to `session` (§14.3
+> — `session_ip` proved impractical for real WebDAV clients). This
 > note supersedes any "default `both` / backward compatible / migration" language left
 > in §14–§16 below.
 
@@ -850,8 +851,9 @@ fixed; a deployment tunes the gate:
 
 | Credential (§15) | Origin/session gate (§14) | Result |
 |---|---|---|
-| `key_secret` | gate off | strong revocable credential, any origin — **kills the reuse/weak-password root cause**, but a key works with no live Web session (by design) |
-| `key_secret` | `session_ip` or LAN-exempt | **strongest**: strong credential **AND** (LAN origin **or** live 2FA'd session) |
+| `key_secret` | gate off | strong revocable credential, any origin — **kills the reuse/weak-password root cause**, but a key works with no live Web session (by design). Use when WebDAV mounts must run unattended (no browser session). |
+| `key_secret` | `session` (default) or LAN-exempt | **recommended**: strong credential **AND** (LAN origin **or** any live 2FA'd session) — WebDAV is cut on logout; usable by real clients |
+| `key_secret` | `session_ip` | strictest, but denies dual-stack / separate-device / proxied WebDAV clients (§14.3) — only where same-egress-IP is guaranteed |
 
 Key point: they solve *different* halves of §1. `key_secret` makes the credential
 strong and scoped (so a leak is low-value and instantly revocable); §14 ties WebDAV to
@@ -1252,16 +1254,21 @@ expiry for free — the same goals §5.1 listed, now correct under revocation.
 The Internet branch can require, for the authenticated uid:
 
 - **`session`** — *any* live Web-UI session exists (`ZCARD > 0` after the purge).
-  Friendlier to roaming/mobile and to IPv4/IPv6 dual-stack (sidesteps the §5.5
-  mismatch), because the WebDAV client's IP need not match the browser's.
+  The WebDAV client's IP need not match the browser's.
 - **`session_ip`** — a live session exists **whose member IP equals the request
   IP** (`session` **and** the §5-style IP pin). Strictest: a leaked password from a
   new IP is refused even during an active session — this is §5's original threat
   model **plus** logout-revocation.
 
-Recommendation: **`session_ip`** for parity with §5's threat model, with `session`
-available for deployments where dual-stack / roaming friction outweighs the
-same-IP assurance. Selected via `WEBDAV_EXTERNAL_GATE` (§14.5).
+Recommendation: **`session`** (the default). `session_ip` is theoretically
+stronger, but it proved **impractical for real WebDAV clients in testing** — a
+davfs/Windows mount rarely shares the browser session's exact egress IP
+(IPv4/IPv6 dual-stack, a separate device, or a reverse proxy that changes the
+observed source), so `session_ip` denies the mount **even while the user is logged
+in**. `session` keeps the meaningful §14 guarantee (WebDAV is cut on logout) without
+that friction. Reserve `session_ip` for deployments that can *guarantee* the WebDAV
+client and the browser egress from the same address. Selected via
+`WEBDAV_EXTERNAL_GATE` (§14.5).
 
 ### 14.4 Hybrid / disconnected operation is unchanged — and this is why the gate must NOT replicate to the edge
 
@@ -1291,7 +1298,7 @@ that motivated this amendment):
 
 | Var | Where | Default | Note |
 |---|---|---|---|
-| `WEBDAV_EXTERNAL_GATE` | webdav_bridge (+http_bridge writes) | `session_ip` | `session` = liveness, any IP (§14.3); `session_ip` = liveness + IP pin (**default/recommended**). The legacy §5 `ip_ttl` IP-pin mode is dropped (no live deployments). |
+| `WEBDAV_EXTERNAL_GATE` | webdav_bridge (+http_bridge writes) | `session` | `session` = liveness, any IP (**default/recommended** — real clients rarely share the browser's egress IP, §14.3); `session_ip` = liveness + IP pin (opt-in, strict). The legacy §5 `ip_ttl` IP-pin mode is dropped (no live deployments). |
 
 - **No legacy `ip_ttl`.** With no deployments to preserve, the TTL-expiry IP-pin mode
   is removed; the gate is session-liveness only. `WEBDAV_IP_BIND_TTL_SECONDS` is now
@@ -1312,13 +1319,15 @@ Next WebDAV request from that IP with the still-valid password:
     → ZREMRANGEBYSCORE purge; no live member for uid[/ip] → 403
 ```
 
-**Internet WebDAV while logged in (session_ip mode)**
+**Internet WebDAV while logged in (`session` default — any live session)**
 ```
-davfs → nginx (X-Real-IP=X) → webdav_bridge  PROPFIND /...
-  authenticateUser: LDAP bind ok (empty-pw guard)
-    → derive trusted IP = X; X ∉ WEBDAV_IP_BIND_TRUSTED_CIDRS → Internet branch
-    → ZREMRANGEBYSCORE webdav:session:{t}:{uid} 0 now
-    → any live member with ip==X?  yes → allow   (attacker from Y → none → 403)
+davfs → nginx → webdav_bridge  PROPFIND /...
+  authenticateUser: key:secret verified (§15); roles via service-search
+    → derive trusted IP; not in WEBDAV_IP_BIND_TRUSTED_CIDRS → Internet branch
+    → ZREMRANGEBYSCORE webdav:session:{tenant}:{uid} 0 now
+    → any live member?  yes → allow   (none / logged out → 403)
+  # session_ip variant: additionally require a live member whose IP == the client's
+  # — stricter, but denies dual-stack / separate-device / proxied clients (§14.3).
 ```
 
 **LAN WebDAV (any cloud state, incl. disconnected)** — unchanged from §5.6/§5.7:
@@ -1331,8 +1340,11 @@ davfs → internal ingress (authoritative src ∈ trusted CIDR) → webdav_bridg
 
 ### 14.7 Open decisions this amendment adds (extends §11)
 
-- **§11.11 — External-branch semantics:** `session_ip` (default/recommended) vs
-  `session` (any-IP). The legacy §5 `ip_ttl` mode is dropped (no live deployments).
+- **§11.11 — External-branch semantics: DECIDED — `session` (any-IP) is the
+  default.** Live testing showed `session_ip` denies real WebDAV clients (davfs/
+  Windows) that don't share the browser's exact egress IP, even while logged in;
+  `session_ip` stays an opt-in for same-egress-IP deployments. The legacy §5
+  `ip_ttl` mode is dropped (no live deployments).
 - **§11.12 — Logout revocation is immediate:** confirm `revokeToken` should `ZREM`
   the session member (recommended — it is the point of the amendment). Note the
   minor coupling: logout now performs a best-effort Redis write; keep it
