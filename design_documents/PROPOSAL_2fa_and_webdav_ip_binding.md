@@ -1258,7 +1258,13 @@ The Internet branch can require, for the authenticated uid:
 - **`session_ip`** — a live session exists **whose member IP equals the request
   IP** (`session` **and** the §5-style IP pin). Strictest: a leaked password from a
   new IP is refused even during an active session — this is §5's original threat
-  model **plus** logout-revocation.
+  model **plus** logout-revocation. IPv4 is matched exactly; **IPv6 is matched on
+  the leading `WEBDAV_SESSION_IP6_PREFIX` bits (default 128 = exact; set 64)** so a
+  client whose IPv6 rotates within its /64 (SLAAC privacy extensions) still matches
+  its session. This only rescues the *IPv6-rotation* case — it does **not** bridge
+  IPv4↔IPv6 (there is no correlation between a host's v4 and v6 addresses), so a
+  dual-stack client whose browser and mount land on different families still won't
+  match; that case needs `session`.
 
 Recommendation: **`session`** (the default). `session_ip` is theoretically
 stronger, but it proved **impractical for real WebDAV clients in testing** — a
