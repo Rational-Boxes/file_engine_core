@@ -367,6 +367,13 @@ Result<bool> Database::undelete_file(const std::string& uid, const std::string& 
     }
 }
 
+// Defined below (with the listing queries); forward-declared so the single-file
+// lookups above can share the exact same timestamp/provenance derivation.
+static void apply_listing_provenance(FileInfo& info,
+                                     int64_t files_created_epoch, int64_t files_updated_epoch,
+                                     const char* first_vts, const char* first_by,
+                                     const char* last_vts, const char* last_by);
+
 Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid, const std::string& tenant) {
     auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
@@ -388,9 +395,21 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
         return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
     }
 
-    std::string query_sql = "SELECT name, parent_uid, size, owner, permission_map, is_container, deleted "
-                            "FROM \"" + schema_name + "\".files "
-                            "WHERE uid = $1 AND deleted = FALSE "
+    // created/modified are derived from the file's version-name timestamps (first
+    // = ctime, latest = mtime), falling back to files.created_at/updated_at — the
+    // SAME provenance the directory listing uses (apply_listing_provenance), so a
+    // single-file Stat and the parent's listing report identical timestamps for
+    // the same file. Emitting a fresh now() here made every PROPFIND look freshly
+    // modified, which drove WebDAV editors into a "file changed on disk" loop.
+    std::string query_sql = "SELECT f.name, f.parent_uid, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
+                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
+                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
+                            "FROM \"" + schema_name + "\".files f "
+                            "WHERE f.uid = $1 AND f.deleted = FALSE "
                             "LIMIT 1;";
     const char* param_values[1] = {uid.c_str()};
 
@@ -410,6 +429,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
             int permissions = std::stoi(PQgetvalue(res, 0, 4));
             bool is_container = (strcmp(PQgetvalue(res, 0, 5), "t") == 0 || strcmp(PQgetvalue(res, 0, 5), "1") == 0);
             bool is_deleted = (strcmp(PQgetvalue(res, 0, 6), "t") == 0 || strcmp(PQgetvalue(res, 0, 6), "1") == 0);
+            (void)is_deleted;  // row is already filtered to deleted = FALSE
 
             FileInfo info;
             info.uid = uid;
@@ -420,22 +440,22 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
             info.size = size;
             info.owner = owner;
             info.permissions = permissions;
-            // Use current time for timestamps since we don't have these in the schema
-            auto now = std::chrono::system_clock::now();
-            info.created_at = now;
-            info.modified_at = now;
-            // Get the latest version from the versions table
-            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
-            const char* version_param_values[1] = {info.uid.c_str()};
-
-            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
-            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
-                info.version = PQgetvalue(version_res, 0, 0);
-            } else {
-                // If no version is found in the versions table, use a default
-                info.version = "";
-            }
-            PQclear(version_res);
+            // Timestamps + provenance from version names, DB columns as fallback —
+            // identical to the directory-listing path so Stat and ListDirectory
+            // agree (owner is set above so the created_by/modified_by fallback
+            // resolves). Never now() (see the query comment above): a fresh now()
+            // made every PROPFIND report a new mtime, driving WebDAV editors into a
+            // "file changed on disk" loop.
+            const char* last_vts = PQgetisnull(res, 0, 11) ? nullptr : PQgetvalue(res, 0, 11);
+            apply_listing_provenance(info,
+                std::stoll(PQgetvalue(res, 0, 7)), std::stoll(PQgetvalue(res, 0, 8)),
+                PQgetisnull(res, 0, 9)  ? nullptr : PQgetvalue(res, 0, 9),
+                PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10),
+                last_vts,
+                PQgetisnull(res, 0, 12) ? nullptr : PQgetvalue(res, 0, 12));
+            // Current version = the latest version-name timestamp (empty if the
+            // file has no versions yet, e.g. a freshly touched 0-byte file).
+            info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
             // Hidden child renditions (files only; a directory's children are
@@ -884,9 +904,17 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
         return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
     }
 
-    std::string query_sql = "SELECT uid, size, owner, permission_map, is_container "
-                            "FROM \"" + schema_name + "\".files "
-                            "WHERE name = $1 AND parent_uid = $2 AND deleted = FALSE "
+    // Timestamps/provenance from version names (DB columns as fallback), matching
+    // the listing + get_file_by_uid paths — never now() (see get_file_by_uid).
+    std::string query_sql = "SELECT f.uid, f.size, f.owner, f.permission_map, f.is_container, "
+                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
+                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
+                            "FROM \"" + schema_name + "\".files f "
+                            "WHERE f.name = $1 AND f.parent_uid = $2 AND f.deleted = FALSE "
                             "LIMIT 1;";
     const char* param_values[2] = {name.c_str(), parent_uid.c_str()};
 
@@ -924,22 +952,15 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
             info.size = size;
             info.owner = owner;
             info.permissions = permissions;
-            // Use current time for timestamps since we don't have these in the schema
-            auto now = std::chrono::system_clock::now();
-            info.created_at = now;
-            info.modified_at = now;
-            // Get the latest version from the versions table
-            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
-            const char* version_param_values[1] = {info.uid.c_str()};
-
-            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
-            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
-                info.version = PQgetvalue(version_res, 0, 0);
-            } else {
-                // If no version is found in the versions table, use a default
-                info.version = "";
-            }
-            PQclear(version_res);
+            // Version-name/DB-derived timestamps + provenance (never now()).
+            const char* last_vts = PQgetisnull(res, 0, 9) ? nullptr : PQgetvalue(res, 0, 9);
+            apply_listing_provenance(info,
+                std::stoll(PQgetvalue(res, 0, 5)), std::stoll(PQgetvalue(res, 0, 6)),
+                PQgetisnull(res, 0, 7)  ? nullptr : PQgetvalue(res, 0, 7),
+                PQgetisnull(res, 0, 8)  ? nullptr : PQgetvalue(res, 0, 8),
+                last_vts,
+                PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10));
+            info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
             // Hidden child renditions (files only; a directory's children are
@@ -999,9 +1020,17 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
         return Result<std::optional<FileInfo>>::err("Invalid parameter: schema_name is empty");
     }
 
-    std::string query_sql = "SELECT uid, size, owner, permission_map, is_container "
-                            "FROM \"" + schema_name + "\".files "
-                            "WHERE name = $1 AND parent_uid = $2 "
+    // Timestamps/provenance from version names (DB columns as fallback), matching
+    // the listing + get_file_by_uid paths — never now() (see get_file_by_uid).
+    std::string query_sql = "SELECT f.uid, f.size, f.owner, f.permission_map, f.is_container, "
+                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
+                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
+                            "FROM \"" + schema_name + "\".files f "
+                            "WHERE f.name = $1 AND f.parent_uid = $2 "
                             "LIMIT 1;";
     const char* param_values[2] = {name.c_str(), parent_uid.c_str()};
 
@@ -1039,22 +1068,15 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
             info.size = size;
             info.owner = owner;
             info.permissions = permissions;
-            // Use current time for timestamps since we don't have these in the schema
-            auto now = std::chrono::system_clock::now();
-            info.created_at = now;
-            info.modified_at = now;
-            // Get the latest version from the versions table
-            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
-            const char* version_param_values[1] = {info.uid.c_str()};
-
-            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
-            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
-                info.version = PQgetvalue(version_res, 0, 0);
-            } else {
-                // If no version is found in the versions table, use a default
-                info.version = "";
-            }
-            PQclear(version_res);
+            // Version-name/DB-derived timestamps + provenance (never now()).
+            const char* last_vts = PQgetisnull(res, 0, 9) ? nullptr : PQgetvalue(res, 0, 9);
+            apply_listing_provenance(info,
+                std::stoll(PQgetvalue(res, 0, 5)), std::stoll(PQgetvalue(res, 0, 6)),
+                PQgetisnull(res, 0, 7)  ? nullptr : PQgetvalue(res, 0, 7),
+                PQgetisnull(res, 0, 8)  ? nullptr : PQgetvalue(res, 0, 8),
+                last_vts,
+                PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10));
+            info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
             // Hidden child renditions (files only; a directory's children are
@@ -1171,9 +1193,17 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
     // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
-    std::string query_sql = "SELECT name, parent_uid, size, owner, permission_map, is_container, deleted "
-                            "FROM \"" + schema_name + "\".files "
-                            "WHERE uid = $1 "
+    // Timestamps/provenance from version names (DB columns as fallback), matching
+    // the listing + get_file_by_uid paths — never now() (see get_file_by_uid).
+    std::string query_sql = "SELECT f.name, f.parent_uid, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
+                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
+                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
+                            "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
+                            "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
+                            "FROM \"" + schema_name + "\".files f "
+                            "WHERE f.uid = $1 "
                             "LIMIT 1;";
     const char* param_values[1] = {uid.c_str()};
 
@@ -1205,22 +1235,15 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
             info.owner = owner;
             info.permissions = permissions;
             info.deleted = is_deleted;
-            // Use current time for timestamps since we don't have these in the schema
-            auto now = std::chrono::system_clock::now();
-            info.created_at = now;
-            info.modified_at = now;
-            // Get the latest version from the versions table
-            std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
-            const char* version_param_values[1] = {info.uid.c_str()};
-
-            PGresult* version_res = PQexecParams(pg_conn, version_query.c_str(), 1, nullptr, version_param_values, nullptr, nullptr, 0);
-            if (PQresultStatus(version_res) == PGRES_TUPLES_OK && PQntuples(version_res) > 0) {
-                info.version = PQgetvalue(version_res, 0, 0);
-            } else {
-                // If no version is found in the versions table, use a default
-                info.version = "";
-            }
-            PQclear(version_res);
+            // Version-name/DB-derived timestamps + provenance (never now()).
+            const char* last_vts = PQgetisnull(res, 0, 11) ? nullptr : PQgetvalue(res, 0, 11);
+            apply_listing_provenance(info,
+                std::stoll(PQgetvalue(res, 0, 7)), std::stoll(PQgetvalue(res, 0, 8)),
+                PQgetisnull(res, 0, 9)  ? nullptr : PQgetvalue(res, 0, 9),
+                PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10),
+                last_vts,
+                PQgetisnull(res, 0, 12) ? nullptr : PQgetvalue(res, 0, 12));
+            info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
             // Hidden child renditions (files only; a directory's children are
