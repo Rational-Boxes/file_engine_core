@@ -402,8 +402,8 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
     // the same file. Emitting a fresh now() here made every PROPFIND look freshly
     // modified, which drove WebDAV editors into a "file changed on disk" loop.
     std::string query_sql = "SELECT f.name, f.parent_uid, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
-                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
-                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
@@ -564,6 +564,13 @@ Result<void> Database::update_file_size(const std::string& uid, int64_t size, co
 
 // Parse a version_timestamp ("YYYYMMDD_HHMMSS.mmm", UTC — see Utils::get_timestamp_string)
 // into epoch seconds. Returns false for null/empty/unparseable values.
+// NOTE: this TRUNCATES the sub-second part (strptime stops at %S). The DB-column
+// fallback (files.created_at/updated_at) MUST match that convention, so those
+// queries use FLOOR(EXTRACT(EPOCH ...)) — a plain ::bigint cast ROUNDS, which
+// would make a just-touched 0-byte file (mtime = rounded updated_at) and its
+// first revision (mtime = truncated version) differ by up to a second, and the
+// mtime could even move backwards across the first save — a "changed/modified on
+// disk" trigger for WebDAV editors.
 static bool parse_vts_epoch(const char* vts, int64_t& out) {
     if (vts == nullptr || vts[0] == '\0') return false;
     std::tm tm{};
@@ -618,8 +625,8 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
                             "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
-                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
-                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
@@ -720,8 +727,8 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
                             "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
-                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
-                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
@@ -907,8 +914,8 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
     // Timestamps/provenance from version names (DB columns as fallback), matching
     // the listing + get_file_by_uid paths — never now() (see get_file_by_uid).
     std::string query_sql = "SELECT f.uid, f.size, f.owner, f.permission_map, f.is_container, "
-                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
-                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
@@ -1023,8 +1030,8 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
     // Timestamps/provenance from version names (DB columns as fallback), matching
     // the listing + get_file_by_uid paths — never now() (see get_file_by_uid).
     std::string query_sql = "SELECT f.uid, f.size, f.owner, f.permission_map, f.is_container, "
-                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
-                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
@@ -1196,8 +1203,8 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
     // Timestamps/provenance from version names (DB columns as fallback), matching
     // the listing + get_file_by_uid paths — never now() (see get_file_by_uid).
     std::string query_sql = "SELECT f.name, f.parent_uid, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
-                            "EXTRACT(EPOCH FROM f.created_at)::bigint AS created_epoch, "
-                            "EXTRACT(EPOCH FROM f.updated_at)::bigint AS updated_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
+                            "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_by, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
