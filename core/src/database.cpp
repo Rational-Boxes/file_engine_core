@@ -591,10 +591,17 @@ static bool parse_vts_epoch(const char* vts, int64_t& out) {
 // "" when the subtree has no versioned files.
 static std::string subtree_newest_vts(PGconn* conn, const std::string& schema,
                                       const std::string& dir_uid) {
+    // UNION (not UNION ALL) on the folder UID: dedups so the recursion TERMINATES
+    // even if the folder graph has a cycle (a corrupt parent_uid pointing back into
+    // the subtree) — a revisited uid is a duplicate and adds no new rows, so the
+    // walk stops. UNION ALL recurses forever on a cycle; and because that SELECT
+    // holds an ACCESS SHARE lock on `files`, the runaway blocks the ACCESS EXCLUSIVE
+    // `ALTER TABLE` a new core runs during tenant init — hanging startup. Folder
+    // UIDs are unique, so UNION yields the same set as UNION ALL for a valid tree.
     const std::string sql =
         "WITH RECURSIVE folders(uid) AS ("
         "  SELECT $1::text"
-        "  UNION ALL"
+        "  UNION"
         "  SELECT f.uid FROM \"" + schema + "\".files f"
         "    JOIN folders fo ON f.parent_uid = fo.uid"
         "    WHERE f.is_container = TRUE AND f.deleted = FALSE"
