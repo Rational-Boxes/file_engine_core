@@ -589,8 +589,11 @@ static bool parse_vts_epoch(const char* vts, int64_t& out) {
 // collects files that live under a folder but never descends into a file — hence
 // renditions (hidden children of files) can never bump a folder's mtime. Returns
 // "" when the subtree has no versioned files.
-static std::string subtree_newest_vts(PGconn* conn, const std::string& schema,
-                                      const std::string& dir_uid) {
+static std::pair<std::string, std::string> subtree_newest_version(
+        PGconn* conn, const std::string& schema, const std::string& dir_uid) {
+    // The single newest version across all non-rendition descendant files: returns
+    // (version_timestamp, revised_by) so a folder can report BOTH the newest file's
+    // mtime AND who made that change (modified_by), consistently with the timestamp.
     // UNION (not UNION ALL) on the folder UID: dedups so the recursion TERMINATES
     // even if the folder graph has a cycle (a corrupt parent_uid pointing back into
     // the subtree) — a revisited uid is a duplicate and adds no new rows, so the
@@ -606,16 +609,19 @@ static std::string subtree_newest_vts(PGconn* conn, const std::string& schema,
         "    JOIN folders fo ON f.parent_uid = fo.uid"
         "    WHERE f.is_container = TRUE AND f.deleted = FALSE"
         ") "
-        "SELECT MAX(v.version_timestamp)"
+        "SELECT v.version_timestamp, v.revised_by"
         "  FROM \"" + schema + "\".files fi"
         "  JOIN folders fo ON fi.parent_uid = fo.uid"
         "  JOIN \"" + schema + "\".versions v ON v.file_uid = fi.uid"
-        " WHERE fi.is_container = FALSE AND fi.deleted = FALSE;";
+        " WHERE fi.is_container = FALSE AND fi.deleted = FALSE"
+        " ORDER BY v.version_timestamp DESC LIMIT 1;";
     const char* params[1] = { dir_uid.c_str() };
     PGresult* res = PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
-    std::string out;
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
-        out = PQgetvalue(res, 0, 0);
+    std::pair<std::string, std::string> out;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        if (!PQgetisnull(res, 0, 0)) out.first = PQgetvalue(res, 0, 0);   // version_timestamp
+        if (!PQgetisnull(res, 0, 1)) out.second = PQgetvalue(res, 0, 1);  // revised_by
+    }
     PQclear(res);
     return out;
 }
@@ -627,9 +633,14 @@ static std::string subtree_newest_vts(PGconn* conn, const std::string& schema,
 // file that set its mtime report the identical second on every surface.
 static void apply_folder_recursive_mtime(FileInfo& info, PGconn* conn, const std::string& schema) {
     if (info.type != FileType::DIRECTORY) return;
+    auto nv = subtree_newest_version(conn, schema, info.uid);   // (version_timestamp, revised_by)
     int64_t e;
-    if (parse_vts_epoch(subtree_newest_vts(conn, schema, info.uid).c_str(), e))
+    if (parse_vts_epoch(nv.first.c_str(), e)) {
+        // A folder's mtime AND its "modified by" both come from the newest file in
+        // its subtree — the file that set the timestamp and who last revised it.
         info.modified_at = std::chrono::system_clock::time_point(std::chrono::seconds(e));
+        if (!nv.second.empty()) info.modified_by = nv.second;
+    }
 }
 
 // Provenance from the revision history: ctime + creator = first revision,
