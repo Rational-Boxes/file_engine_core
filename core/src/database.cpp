@@ -373,6 +373,9 @@ static void apply_listing_provenance(FileInfo& info,
                                      int64_t files_created_epoch, int64_t files_updated_epoch,
                                      const char* first_vts, const char* first_by,
                                      const char* last_vts, const char* last_by);
+// A folder's mtime = the newest file anywhere beneath it (recursive). Forward-
+// declared so builders above the definition can apply it to directory rows.
+static void apply_folder_recursive_mtime(FileInfo& info, PGconn* conn, const std::string& schema);
 
 Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid, const std::string& tenant) {
     auto conn = acquire(DbOp::Read);
@@ -453,6 +456,8 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid(const std::string& uid
                 PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10),
                 last_vts,
                 PQgetisnull(res, 0, 12) ? nullptr : PQgetvalue(res, 0, 12));
+            // For a folder, override mtime with the newest file anywhere beneath it.
+            apply_folder_recursive_mtime(info, pg_conn, schema_name);
             // Current version = the latest version-name timestamp (empty if the
             // file has no versions yet, e.g. a freshly touched 0-byte file).
             info.version = last_vts ? std::string(last_vts) : "";
@@ -579,6 +584,47 @@ static bool parse_vts_epoch(const char* vts, int64_t& out) {
     return true;
 }
 
+// Newest version_timestamp among all NON-rendition descendant files of a folder,
+// recursively. The CTE walks only through sub*folders* (is_container), so it
+// collects files that live under a folder but never descends into a file — hence
+// renditions (hidden children of files) can never bump a folder's mtime. Returns
+// "" when the subtree has no versioned files.
+static std::string subtree_newest_vts(PGconn* conn, const std::string& schema,
+                                      const std::string& dir_uid) {
+    const std::string sql =
+        "WITH RECURSIVE folders(uid) AS ("
+        "  SELECT $1::text"
+        "  UNION ALL"
+        "  SELECT f.uid FROM \"" + schema + "\".files f"
+        "    JOIN folders fo ON f.parent_uid = fo.uid"
+        "    WHERE f.is_container = TRUE AND f.deleted = FALSE"
+        ") "
+        "SELECT MAX(v.version_timestamp)"
+        "  FROM \"" + schema + "\".files fi"
+        "  JOIN folders fo ON fi.parent_uid = fo.uid"
+        "  JOIN \"" + schema + "\".versions v ON v.file_uid = fi.uid"
+        " WHERE fi.is_container = FALSE AND fi.deleted = FALSE;";
+    const char* params[1] = { dir_uid.c_str() };
+    PGresult* res = PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    std::string out;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
+        out = PQgetvalue(res, 0, 0);
+    PQclear(res);
+    return out;
+}
+
+// A directory's mtime is the newest file anywhere in its subtree (recursively),
+// per the "folder mtime = newest contained file" rule. No-op for non-directories
+// or a file-less subtree (an empty folder keeps its own updated_at from
+// apply_listing_provenance). Truncated via parse_vts_epoch so a folder and the
+// file that set its mtime report the identical second on every surface.
+static void apply_folder_recursive_mtime(FileInfo& info, PGconn* conn, const std::string& schema) {
+    if (info.type != FileType::DIRECTORY) return;
+    int64_t e;
+    if (parse_vts_epoch(subtree_newest_vts(conn, schema, info.uid).c_str(), e))
+        info.modified_at = std::chrono::system_clock::time_point(std::chrono::seconds(e));
+}
+
 // Provenance from the revision history: ctime + creator = first revision,
 // mtime + last reviser = latest revision (per the versioning model). Falls back
 // to the metadata-DB files.created_at/updated_at + files.owner for rows with no
@@ -675,6 +721,8 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
                 PQgetisnull(res, i, 10) ? nullptr : PQgetvalue(res, i, 10),
                 PQgetisnull(res, i, 11) ? nullptr : PQgetvalue(res, i, 11),
                 PQgetisnull(res, i, 12) ? nullptr : PQgetvalue(res, i, 12));
+            // A folder entry's mtime = the newest file anywhere in its subtree.
+            apply_folder_recursive_mtime(info, pg_conn, schema_name);
             // Get the latest version from the versions table
             std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
             const char* version_param_values[1] = {info.uid.c_str()};
@@ -779,6 +827,8 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
                 PQgetisnull(res, i, 11) ? nullptr : PQgetvalue(res, i, 11),
                 PQgetisnull(res, i, 12) ? nullptr : PQgetvalue(res, i, 12),
                 PQgetisnull(res, i, 13) ? nullptr : PQgetvalue(res, i, 13));
+            // A folder entry's mtime = the newest file anywhere in its subtree.
+            apply_folder_recursive_mtime(info, pg_conn, schema_name);
             // Get the latest version from the versions table
             std::string version_query = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC LIMIT 1;";
             const char* version_param_values[1] = {info.uid.c_str()};
@@ -967,6 +1017,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent(const std:
                 PQgetisnull(res, 0, 8)  ? nullptr : PQgetvalue(res, 0, 8),
                 last_vts,
                 PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10));
+            apply_folder_recursive_mtime(info, pg_conn, schema_name);  // folder mtime = newest descendant file
             info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
@@ -1083,6 +1134,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_name_and_parent_include_de
                 PQgetisnull(res, 0, 8)  ? nullptr : PQgetvalue(res, 0, 8),
                 last_vts,
                 PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10));
+            apply_folder_recursive_mtime(info, pg_conn, schema_name);  // folder mtime = newest descendant file
             info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
@@ -1250,6 +1302,7 @@ Result<std::optional<FileInfo>> Database::get_file_by_uid_include_deleted(const 
                 PQgetisnull(res, 0, 10) ? nullptr : PQgetvalue(res, 0, 10),
                 last_vts,
                 PQgetisnull(res, 0, 12) ? nullptr : PQgetvalue(res, 0, 12));
+            apply_folder_recursive_mtime(info, pg_conn, schema_name);  // folder mtime = newest descendant file
             info.version = last_vts ? std::string(last_vts) : "";
             info.version_count = 1; // For this implementation, use 1
 
