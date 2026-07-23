@@ -136,8 +136,21 @@ public:
     virtual Result<void> backup_to_object_store_with_version(const std::string& file_uid,
                                                              const std::string& tenant,
                                                              const std::string& version_timestamp);
+    // Permanently destroys every version older than the newest `keep_count`.
+    // This is the one genuine destroy-data operation, so it requires the
+    // dedicated CULL_VERSIONS permission (validated here as defense-in-depth,
+    // in addition to the gRPC boundary) — WRITE is deliberately insufficient.
     virtual Result<void> purge_old_versions(const std::string& file_uid, int keep_count,
+                                            const std::string& user,
+                                            const std::vector<std::string>& roles = {},
                                             const std::string& tenant = "");
+
+    // Given a file's version timestamps ordered newest-first (exactly as
+    // Database::list_versions returns them — ORDER BY version_timestamp DESC),
+    // return the current/newest version, or "" when there are none. Centralizes
+    // the "newest == front()" contract so callers never reintroduce the
+    // .back() (== oldest) selection bug.
+    static std::string newest_version(const std::vector<std::string>& versions_newest_first);
 
     // Cache management operations
     virtual void update_cache_threshold(double threshold, const std::string& tenant = "");

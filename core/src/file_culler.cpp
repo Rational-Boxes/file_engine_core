@@ -215,14 +215,45 @@ std::vector<std::string> FileCuller::get_culling_candidates(int limit, const std
 }
 
 Result<bool> FileCuller::verify_file_in_object_store(const std::string& file_path, const std::string& tenant) const {
+    // Culling deletes the LOCAL copy of a payload. That is only safe when the
+    // payload is durably present in the object store; otherwise we would be
+    // destroying the sole copy of the data, violating the never-destroy-data
+    // invariant. This check therefore FAILS CLOSED: unless we can positively
+    // confirm the object exists in the store, we refuse to cull (return false).
     if (!object_store_) {
-        return Result<bool>::ok(false);  // If no object store, we can't verify
+        return Result<bool>::ok(false);  // no backend to verify against -> never cull
     }
-    
-    // This is a simplified check - in reality, we'd need to map the file path
-    // back to a uid and version to check the object store
-    // For this implementation, assume verification passes
-    return Result<bool>::ok(true);
+
+    // Local layout (Storage::get_storage_path):
+    //   <base>/[<tenant>/]<l1>/<l2>/<l3>/<uid>/<version_timestamp>
+    // Recover (uid, version) from the trailing two path components.
+    std::filesystem::path p(file_path);
+    std::string version = p.filename().string();
+    std::filesystem::path uid_dir = p.parent_path();
+    std::string uid = uid_dir.filename().string();
+    if (version.empty() || uid.empty()) {
+        return Result<bool>::ok(false);  // unparseable path -> never cull
+    }
+
+    // Candidates are gathered host-wide, so the caller often has no tenant.
+    // Recover it from the path: five levels up from the version file
+    // (<tenant>/<l1>/<l2>/<l3>/<uid>/<version>). A wrong guess only makes the
+    // existence check miss, which still fails closed (no cull).
+    std::string effective_tenant = tenant;
+    if (effective_tenant.empty()) {
+        std::filesystem::path t =
+            uid_dir.parent_path().parent_path().parent_path().parent_path();
+        if (!t.empty()) {
+            effective_tenant = t.filename().string();
+        }
+    }
+
+    std::string object_key = object_store_->get_storage_path(uid, version, effective_tenant);
+    auto exists = object_store_->file_exists(object_key, effective_tenant);
+    if (!exists.success) {
+        return Result<bool>::ok(false);  // could not verify (store error) -> never cull
+    }
+    return Result<bool>::ok(exists.value);
 }
 
 bool FileCuller::should_trigger_culling() const {

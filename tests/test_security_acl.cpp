@@ -211,6 +211,34 @@ void test_cull_never_default() {
           "a non-creator must NOT have CULL_VERSIONS");
 }
 
+// FileSystem::purge_old_versions (and the PurgeOldVersions RPC) validate the
+// dedicated CULL_VERSIONS bit at the FileSystem layer, not just the gRPC edge,
+// so no in-process caller can bypass the destroy-history gate. This pins the
+// authorization that guard relies on: a fully-privileged resource creator
+// (apply_default_acls grants WRITE/DELETE/RESTORE_TO_VERSION/VIEW_VERSIONS/...)
+// is still denied the purge, and only an explicit CULL_VERSIONS grant authorizes
+// it.
+void test_purge_requires_cull_versions() {
+    std::cout << "test_purge_requires_cull_versions\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+    acl.apply_default_acls("F", "owner");
+
+    // The owner holds the full default set of non-history-destroying bits...
+    CHECK(can(acl, "F", "owner", {}, P_WRITE),   "owner has WRITE");
+    CHECK(can(acl, "F", "owner", {}, P_DELETE),  "owner has DELETE");
+    CHECK(can(acl, "F", "owner", {}, P_RESTORE), "owner has RESTORE_TO_VERSION");
+    // ...but the FS-layer purge guard still denies CULL_VERSIONS.
+    CHECK(!can(acl, "F", "owner", {}, P_CULL),
+          "owner must NOT be able to purge without CULL_VERSIONS");
+
+    // The dedicated grant is necessary and sufficient to authorize purge.
+    acl.grant_permission("F", "owner", PrincipalType::USER, P_CULL);
+    CHECK(can(acl, "F", "owner", {}, P_CULL),
+          "explicit CULL_VERSIONS grant authorizes purge");
+}
+
 // Within one tier, a DENY overrides an ALLOW for the same bit ("deny wins
 // in-tier"). This is the property the ACL model leans on for lockdowns.
 void test_deny_wins_within_tier() {
@@ -412,6 +440,7 @@ int main() {
     test_write_does_not_imply_destructive();
     test_write_does_not_imply_manage_acl();
     test_cull_never_default();
+    test_purge_requires_cull_versions();
     test_deny_wins_within_tier();
     test_system_admin_is_role_scoped();
     test_claim_abac_exact_match();
