@@ -9,3 +9,6 @@
 build/
 build_*/
 *_build/
+
+# Generated RPM/dist tarballs — rebuilt by `make dist` / rpm packaging.
+/fileengine-core-*.tar.gz
