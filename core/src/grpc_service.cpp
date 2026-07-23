@@ -1921,7 +1921,7 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->purge_old_versions(file_uid, keep_count, tenant);
+    auto result = filesystem_->purge_old_versions(file_uid, keep_count, user, roles, tenant);
 
     response->set_success(result.success);
     if (!result.success) {

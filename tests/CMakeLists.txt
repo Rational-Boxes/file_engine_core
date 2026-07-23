@@ -189,6 +189,56 @@ target_include_directories(test_deleted_reachability PRIVATE
     ${GRPCPP_INCLUDE_DIRS}
 )
 
+# File culler data-loss regression (mock IStorage/IObjectStore; no live DB).
+# Proves culling fails closed: a local payload is never deleted unless the
+# object store confirms a durable copy.
+add_executable(file_culler_tests file_culler_tests.cpp)
+target_link_libraries(file_culler_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(file_culler_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(file_culler_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
+# Version-selection regression (FileSystem::newest_version; no live DB).
+add_executable(test_version_selection test_version_selection.cpp)
+target_link_libraries(test_version_selection
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(test_version_selection ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(test_version_selection PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
 # ACL security semantics unit test (AclManager + mock DB; no live DB).
 add_executable(test_security_acl test_security_acl.cpp)
 target_link_libraries(test_security_acl

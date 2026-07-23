@@ -1459,9 +1459,10 @@ Result<void> FileSystem::backup_to_object_store(const std::string& file_uid,
         return Result<void>::err("No versions found for file: " + file_uid);
     }
 
-    // Get the most recent version (list_versions returns versions sorted by timestamp)
-    // The last element in the list should be the most recent
-    std::string current_version = versions_result.value.back();
+    // list_versions returns newest-first (ORDER BY version_timestamp DESC), so
+    // the CURRENT version is the front element. (Using .back() here archived the
+    // OLDEST version instead of the current one.)
+    std::string current_version = newest_version(versions_result.value);
     if (current_version.empty()) {
         return Result<void>::err("Version timestamp is empty for file: " + file_uid);
     }
@@ -1514,11 +1515,30 @@ Result<void> FileSystem::backup_to_object_store_with_version(const std::string& 
     return Result<void>::ok();
 }
 
+std::string FileSystem::newest_version(const std::vector<std::string>& versions_newest_first) {
+    // Database::list_versions yields timestamps ORDER BY version_timestamp DESC,
+    // so the newest/current version is the first element.
+    return versions_newest_first.empty() ? std::string() : versions_newest_first.front();
+}
+
 Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int keep_count,
+                                            const std::string& user,
+                                            const std::vector<std::string>& roles,
                                             const std::string& tenant) {
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<void>::err("Database not available for tenant: " + tenant);
+    }
+
+    // Purging permanently destroys version history — the single destroy-data
+    // operation — so it requires the dedicated CULL_VERSIONS permission, never
+    // WRITE. Enforced here (not just at the gRPC boundary) so no in-process
+    // caller can bypass the gate. system_admin bypass is applied inside
+    // validate_user_permissions.
+    auto perm_result = validate_user_permissions(file_uid, user, roles,
+                                                 static_cast<int>(fileengine::Permission::CULL_VERSIONS), tenant);
+    if (!perm_result.success || !perm_result.value) {
+        return Result<void>::err("User does not have permission to purge old versions (requires CULL_VERSIONS)");
     }
 
     // Always retain at least the current (newest) version so the file stays

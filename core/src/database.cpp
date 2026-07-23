@@ -1598,7 +1598,10 @@ Result<bool> Database::restore_to_version(const std::string& file_uid, const std
     // timestamp pointing at the requested version's storage_path. The
     // existing payload is reused (no re-encrypt / re-compress) and the new
     // row's timestamp wins on read.
-    (void)user; // accepted for API parity; the FS layer already enforced WRITE permission
+    // `user` is the acting principal (FS layer already enforced RESTORE_TO_VERSION);
+    // it is recorded as revised_by on the new head so the restore is attributed
+    // to whoever performed it rather than falling back to the 'unknown' default.
+    std::string revised_by = user.empty() ? "unknown" : user;
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<bool>::err("Failed to acquire database connection for restore operation");
@@ -1645,12 +1648,12 @@ Result<bool> Database::restore_to_version(const std::string& file_uid, const std
     std::string new_ts = ts_buf;
 
     std::string insert_sql = "INSERT INTO \"" + schema + "\".versions "
-                             "(file_uid, version_timestamp, size, storage_path) "
-                             "VALUES ($1, $2, $3, $4);";
-    const char* insert_params[4] = {
-        file_uid.c_str(), new_ts.c_str(), size_str.c_str(), source_path.c_str()
+                             "(file_uid, version_timestamp, size, storage_path, revised_by) "
+                             "VALUES ($1, $2, $3, $4, $5);";
+    const char* insert_params[5] = {
+        file_uid.c_str(), new_ts.c_str(), size_str.c_str(), source_path.c_str(), revised_by.c_str()
     };
-    PGresult* ins = PQexecParams(pg_conn, insert_sql.c_str(), 4, nullptr, insert_params, nullptr, nullptr, 0);
+    PGresult* ins = PQexecParams(pg_conn, insert_sql.c_str(), 5, nullptr, insert_params, nullptr, nullptr, 0);
     if (PQresultStatus(ins) != PGRES_COMMAND_OK) {
         std::string error = "Failed to insert restored version: " + std::string(PQerrorMessage(pg_conn));
         PQclear(ins);
