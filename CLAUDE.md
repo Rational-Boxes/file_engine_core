@@ -39,7 +39,6 @@ the **audit_service** drains into a tamper-evident, hash-chained log.
 | **python_interface** / **javascript_interface** | Python / TS | Client SDKs speaking gRPC to the core | — | Trusted upstream (identity passed verbatim) |
 | **scripts** | Bash/Ansible | Dev launcher + centralized deploy (Ansible → Podman/Quadlet) | — | SSH / Ansible Vault |
 | **docker_unified** | Compose | Single-host container stack (nginx TLS edge, per-tenant subdomains) | nginx **80/443** | — |
-| **DEPRICATED_file_engine_cpp** | C++ | **Deprecated** predecessor of the core — do not modify | — | — |
 
 **Shared infra (dev):** PostgreSQL `:5434`, OpenLDAP `:1389`, MinIO `:9000`, Redis `:6379`.
 
