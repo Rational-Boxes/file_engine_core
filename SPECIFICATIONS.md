@@ -1,6 +1,7 @@
 # File Engine core and Commandline interface
 
-This project is a simplification and refactor of the project in ../file_engine_cpp
+This project is a simplification and refactor of the original C++ FileEngine
+implementation, which it supersedes and which has since been retired.
 
 The functionality is the core distributed virtual-filesystem supporting
 horizontal scaling and hybrid cloud and on-premises deployment options.
