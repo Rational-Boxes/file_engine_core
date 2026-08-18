@@ -471,6 +471,31 @@ Config ConfigLoader::load_from_cmd_args(int argc, char* argv[]) {
     return config;
 }
 
+
+namespace {
+
+// Is this setting PRESENT in the process environment?
+//
+// Presence is what makes something an override — not its value. The merge below
+// used to infer "the operator set this" by comparing the parsed value against the
+// built-in default, which quietly broke two whole classes of setting:
+//
+//   * any value that HAPPENS TO EQUAL the default could not override a .env
+//     entry. FILEENGINE_HTTP_THREAD_POOL=10 was indistinguishable from unset, so
+//     a file saying 4 won and the environment was ignored.
+//   * booleans became one-way switches. `if (env.encrypt_data)` can turn
+//     encryption on but never off; `if (!env.sync_enabled)` can turn sync off but
+//     never on. Setting the other value was accepted and silently dropped.
+//
+// Reading getenv again here is cheap and keeps the fix local: load_from_env()
+// already parses correctly, it just had no way to say what it had seen.
+bool env_has(const char* key) {
+    const char* v = std::getenv(key);
+    return v != nullptr && *v != '\0';
+}
+
+} // namespace
+
 Config ConfigLoader::load_config(int argc, char* argv[]) {
     Config config;
 
@@ -742,41 +767,48 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (!env_config.db_name.empty() && env_config.db_name != "fileengine") config.db_name = env_config.db_name;
     if (!env_config.db_user.empty() && env_config.db_user != "fileengine_user") config.db_user = env_config.db_user;
     if (!env_config.db_password.empty() && env_config.db_password != "fileengine_password") config.db_password = env_config.db_password;
-    if (!env_config.storage_base_path.empty() && env_config.storage_base_path != "/tmp/fileengine_storage") config.storage_base_path = env_config.storage_base_path;
-    if (env_config.encrypt_data) config.encrypt_data = env_config.encrypt_data;
-    if (env_config.compress_data) config.compress_data = env_config.compress_data;
-    if (!env_config.encryption_key.empty()) config.encryption_key = env_config.encryption_key;
-    if (!env_config.s3_endpoint.empty() && env_config.s3_endpoint != "http://localhost:9000") config.s3_endpoint = env_config.s3_endpoint;
-    if (!env_config.s3_region.empty() && env_config.s3_region != "us-east-1") config.s3_region = env_config.s3_region;
-    if (!env_config.s3_bucket.empty() && env_config.s3_bucket != "fileengine") config.s3_bucket = env_config.s3_bucket;
-    if (!env_config.s3_access_key.empty() && env_config.s3_access_key != "minioadmin") config.s3_access_key = env_config.s3_access_key;
-    if (!env_config.s3_secret_key.empty() && env_config.s3_secret_key != "minioadmin") config.s3_secret_key = env_config.s3_secret_key;
-    if (!env_config.s3_path_style) config.s3_path_style = env_config.s3_path_style;
-    if (env_config.cache_threshold != 0.8) config.cache_threshold = env_config.cache_threshold;
-    if (env_config.max_cache_size_mb != 1024) config.max_cache_size_mb = env_config.max_cache_size_mb;
-    if (!env_config.multi_tenant_enabled) config.multi_tenant_enabled = env_config.multi_tenant_enabled;
-    if (!env_config.server_address.empty() && env_config.server_address != "0.0.0.0") config.server_address = env_config.server_address;
-    if (env_config.server_port != 50051) config.server_port = env_config.server_port;
-    if (env_config.thread_pool_size != 10) config.thread_pool_size = env_config.thread_pool_size;
-    if (env_config.root_user_enabled) config.root_user_enabled = env_config.root_user_enabled;
-    if (!env_config.sync_enabled) config.sync_enabled = env_config.sync_enabled;
-    if (env_config.sync_retry_seconds != 60) config.sync_retry_seconds = env_config.sync_retry_seconds;
-    if (!env_config.sync_on_startup) config.sync_on_startup = env_config.sync_on_startup;
-    if (!env_config.sync_on_demand) config.sync_on_demand = env_config.sync_on_demand;
-    if (!env_config.sync_pattern.empty() && env_config.sync_pattern != "all") config.sync_pattern = env_config.sync_pattern;
-    if (!env_config.sync_bidirectional) config.sync_bidirectional = env_config.sync_bidirectional;
+    // Process environment overrides the files. PRESENCE decides, so a value that
+    // equals the default still overrides, and a boolean can be set either way.
+    // (Precedence overall: command line > environment > .env > /etc > built-in.)
+    if (env_has("FILEENGINE_PG_HOST")) config.db_host = env_config.db_host;
+    if (env_has("FILEENGINE_PG_PORT")) config.db_port = env_config.db_port;
+    if (env_has("FILEENGINE_PG_DATABASE")) config.db_name = env_config.db_name;
+    if (env_has("FILEENGINE_PG_USER")) config.db_user = env_config.db_user;
+    if (env_has("FILEENGINE_PG_PASSWORD")) config.db_password = env_config.db_password;
+    if (env_has("FILEENGINE_STORAGE_BASE")) config.storage_base_path = env_config.storage_base_path;
+    if (env_has("FILEENGINE_ENCRYPT_DATA")) config.encrypt_data = env_config.encrypt_data;
+    if (env_has("FILEENGINE_COMPRESS_DATA")) config.compress_data = env_config.compress_data;
+    if (env_has("AT_REST_KEY")) config.encryption_key = env_config.encryption_key;
+    if (env_has("FILEENGINE_CACHE_THRESHOLD")) config.cache_threshold = env_config.cache_threshold;
+    if (env_has("FILEENGINE_MAX_CACHE_SIZE_MB")) config.max_cache_size_mb = env_config.max_cache_size_mb;
+    if (env_has("FILEENGINE_MULTI_TENANT_ENABLED")) config.multi_tenant_enabled = env_config.multi_tenant_enabled;
+    if (env_has("FILEENGINE_GRPC_HOST")) config.server_address = env_config.server_address;
+    if (env_has("FILEENGINE_GRPC_PORT")) config.server_port = env_config.server_port;
+    if (env_has("FILEENGINE_HTTP_THREAD_POOL")) config.thread_pool_size = env_config.thread_pool_size;
+    if (env_has("FILEENGINE_ROOT_USER")) config.root_user_enabled = env_config.root_user_enabled;
+    if (env_has("FILEENGINE_LOG_LEVEL")) config.log_level = env_config.log_level;
+    if (env_has("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = env_config.log_file_path;
+    if (env_has("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = env_config.log_to_console;
+    if (env_has("FILEENGINE_LOG_TO_FILE")) config.log_to_file = env_config.log_to_file;
+    if (env_has("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
+    if (env_has("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = env_config.log_retention_days;
+    if (env_has("FILEENGINE_S3_ENDPOINT")) config.s3_endpoint = env_config.s3_endpoint;
+    if (env_has("FILEENGINE_S3_REGION")) config.s3_region = env_config.s3_region;
+    if (env_has("FILEENGINE_S3_BUCKET")) config.s3_bucket = env_config.s3_bucket;
+    if (env_has("FILEENGINE_S3_ACCESS_KEY")) config.s3_access_key = env_config.s3_access_key;
+    if (env_has("FILEENGINE_S3_SECRET_KEY")) config.s3_secret_key = env_config.s3_secret_key;
+    if (env_has("FILEENGINE_S3_PATH_STYLE")) config.s3_path_style = env_config.s3_path_style;
+    if (env_has("FILEENGINE_S3_SYNC_SUPPORT")) config.sync_enabled = env_config.sync_enabled;
+    if (env_has("FILEENGINE_S3_RETRY_SECONDS")) config.sync_retry_seconds = env_config.sync_retry_seconds;
+    if (env_has("FILEENGINE_S3_SYNC_ON_STARTUP")) config.sync_on_startup = env_config.sync_on_startup;
+    if (env_has("FILEENGINE_S3_SYNC_ON_DEMAND")) config.sync_on_demand = env_config.sync_on_demand;
+    if (env_has("FILEENGINE_S3_SYNC_PATTERN")) config.sync_pattern = env_config.sync_pattern;
+    if (env_has("FILEENGINE_S3_SYNC_BIDIRECTIONAL")) config.sync_bidirectional = env_config.sync_bidirectional;
     if (!env_config.secondary_db_host.empty()) config.secondary_db_host = env_config.secondary_db_host;
     if (env_config.secondary_db_port != 5432) config.secondary_db_port = env_config.secondary_db_port;
     if (!env_config.secondary_db_name.empty() && env_config.secondary_db_name != "fileengine_local") config.secondary_db_name = env_config.secondary_db_name;
     if (!env_config.secondary_db_user.empty() && env_config.secondary_db_user != "fileengine_user") config.secondary_db_user = env_config.secondary_db_user;
     if (!env_config.secondary_db_password.empty() && env_config.secondary_db_password != "fileengine_password") config.secondary_db_password = env_config.secondary_db_password;
-    if (env_config.log_level != "INFO") config.log_level = env_config.log_level;
-    if (env_config.log_file_path != "/tmp/fileengine.log") config.log_file_path = env_config.log_file_path;
-    if (!env_config.log_to_console) config.log_to_console = env_config.log_to_console;
-    if (env_config.log_to_file) config.log_to_file = env_config.log_to_file;
-    if (env_config.log_rotation_size_mb != 10) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
-    if (env_config.log_retention_days != 7) config.log_retention_days = env_config.log_retention_days;
-
     // Event queueing — process-env overrides files (compared against defaults)
     if (env_config.events_enabled) config.events_enabled = true;
     if (env_config.events_redis_host != "localhost") config.events_redis_host = env_config.events_redis_host;

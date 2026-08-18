@@ -345,3 +345,11 @@ add_test(NAME load_stress
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/load_stress.py
                  --target core --requests 200 --concurrency 32)
 set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600)
+
+# Configuration precedence: environment > .env > .conf > built-in default.
+# Uses a temporary working directory, so the repository's own .env is untouched.
+add_executable(test_config_precedence test_config_precedence.cpp)
+target_include_directories(test_config_precedence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)
+target_link_libraries(test_config_precedence fileengine_core ${LIBPQ_LIBRARIES})
+add_test(NAME test_config_precedence COMMAND test_config_precedence)
+set_tests_properties(test_config_precedence PROPERTIES LABELS "unit" TIMEOUT 60)

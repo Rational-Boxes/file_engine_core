@@ -1175,12 +1175,24 @@ std::map<std::string, std::string> load_config(const std::string& config_file = 
         file.close();
     }
 
-    // Override with environment variables (they take precedence)
-    const char* server_env = std::getenv("FILEENGINE_SERVER");
-    if (server_env) config["FILEENGINE_SERVER"] = std::string(server_env);
+    // The environment overrides the file — the same precedence the server uses
+    // (environment > .env > .conf > built-in), so a quick override works the same
+    // way whichever binary you are pointing at.
+    //
+    // Generic rather than a hand-listed pair: any key the file mentions can be
+    // overridden. Naming them one by one meant a setting added later silently had
+    // no environment override until somebody remembered to add one here.
+    for (auto& entry : config) {
+        const char* from_env = std::getenv(entry.first.c_str());
+        if (from_env && *from_env) entry.second = from_env;
+    }
 
-    const char* default_user_env = std::getenv("FILEENGINE_DEFAULT_USER");
-    if (default_user_env) config["FILEENGINE_DEFAULT_USER"] = std::string(default_user_env);
+    // ...and keys the file did not mention at all, so the environment alone is
+    // enough to configure the CLI with no file present.
+    for (const char* key : {"FILEENGINE_SERVER", "FILEENGINE_DEFAULT_USER"}) {
+        const char* from_env = std::getenv(key);
+        if (from_env && *from_env) config[key] = from_env;
+    }
 
     return config;
 }
