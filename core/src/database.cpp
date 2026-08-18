@@ -2639,34 +2639,61 @@ void Database::start_connection_monitoring() {
     }
 
     monitoring_active_.store(true);
-    
+
     connection_monitor_thread_ = std::thread([this]() {
+        SERVER_LOG_INFO("Database",
+                        "connection watchdog started (probe every " +
+                        std::to_string(retry_interval_seconds_) + "s)");
         while (monitoring_active_.load()) {
             // Probe the primary: a cheap health check while up, a reconnect attempt
             // while down. The disconnect/recovery transition is the pure, unit-tested
             // next_failover_state() (REPLICATION_FAILOVER.md).
+            const auto probe_start = std::chrono::steady_clock::now();
+            monitor_probe_in_flight_.store(true);
             const bool was_up = primary_available_.load();
             const bool reachable = was_up ? is_connected() : connect();
+            monitor_probe_in_flight_.store(false);
 
             ConnectionPoolManager& mgr = ConnectionPoolManager::get_instance();
             FailoverState cur{was_up, using_secondary_.load(), mgr.is_server_in_readonly_mode()};
             FailoverState next = next_failover_state(cur, reachable, !secondary_conn_info_.empty());
 
             if (next != cur) {
+                monitor_transitions_.fetch_add(1);
                 primary_available_.store(next.primary_available);
                 using_secondary_.store(next.using_secondary);
                 mgr.set_server_in_readonly_mode(next.readonly_mode);
                 if (!next.primary_available) {
+                    SERVER_LOG_ERROR("Database",
+                                     "primary unavailable; entering read-only fallback mode");
                     std::cerr << "Database primary unavailable; entering read-only fallback mode."
                               << std::endl;
                 } else {
+                    SERVER_LOG_INFO("Database",
+                                    "primary restored; resuming normal operation");
                     std::cout << "Database connection to primary restored; resuming normal operation."
                               << std::endl;
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::seconds(retry_interval_seconds_));
+            // Record the probe AFTER acting on it, so a consumer that sees a fresh
+            // timestamp knows the whole iteration completed rather than just started.
+            monitor_last_probe_ms_.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - probe_start).count());
+            monitor_last_probe_epoch_.store(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            monitor_probes_.fetch_add(1);
+
+            // Sleep until the next probe — but wake immediately if asked to stop.
+            // The poll interval is the design; an uninterruptible sleep was not.
+            std::unique_lock<std::mutex> wait_lock(monitor_wait_mutex_);
+            monitor_wait_cv_.wait_for(wait_lock,
+                                      std::chrono::seconds(retry_interval_seconds_),
+                                      [this]() { return !monitoring_active_.load(); });
         }
+        SERVER_LOG_INFO("Database", "connection watchdog stopped");
     });
 }
 
@@ -2675,11 +2702,44 @@ void Database::stop_connection_monitoring() {
         return;
     }
 
-    monitoring_active_.store(false);
+    {
+        // Flip the flag under the wait mutex so the watchdog cannot miss the
+        // wakeup in the window between testing it and blocking on the CV.
+        std::lock_guard<std::mutex> wait_lock(monitor_wait_mutex_);
+        monitoring_active_.store(false);
+    }
+    monitor_wait_cv_.notify_all();
 
     if (connection_monitor_thread_.joinable()) {
         connection_monitor_thread_.join();
     }
+}
+
+ConnectionPoolStats Database::pool_stats() const {
+    return connection_pool_ ? connection_pool_->stats() : ConnectionPoolStats{};
+}
+
+ConnectionPoolStats Database::secondary_pool_stats() const {
+    return secondary_pool_ ? secondary_pool_->stats() : ConnectionPoolStats{};
+}
+
+Database::WatchdogStats Database::watchdog_stats() const {
+    WatchdogStats w;
+    w.running                = monitoring_active_.load();
+    w.probe_in_flight        = monitor_probe_in_flight_.load();
+    w.primary_available      = primary_available_.load();
+    w.using_secondary        = using_secondary_.load();
+    w.interval_seconds       = retry_interval_seconds_;
+    w.probes_total           = monitor_probes_.load();
+    w.transitions_total      = monitor_transitions_.load();
+    w.last_probe_epoch       = monitor_last_probe_epoch_.load();
+    w.last_probe_duration_ms = monitor_last_probe_ms_.load();
+    if (w.last_probe_epoch > 0) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        w.last_probe_age_seconds = now - w.last_probe_epoch;
+    }
+    return w;
 }
 
 std::string Database::get_connection_info() const {

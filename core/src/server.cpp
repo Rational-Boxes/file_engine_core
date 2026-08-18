@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include "fileengine/rpc_interceptor.h"
 #include <signal.h>
 #include <csignal>
 #include <cstdlib>
@@ -265,6 +266,16 @@ int main(int argc, char** argv) {
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::NUM_CQS, num_threads);
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, num_threads);
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, num_threads);
+
+    // In-flight RPC tracking. One interceptor is built per RPC and destroyed
+    // when it ends, so this counts request lifetimes exactly — including the
+    // paths a handler never returns from normally — without touching any of the
+    // 41 handlers. It observes only; every hook proceeds untouched.
+    std::vector<std::unique_ptr<grpc::experimental::ServerInterceptorFactoryInterface>>
+        interceptors;
+    interceptors.push_back(
+        std::make_unique<fileengine::RpcLifetimeInterceptorFactory>());
+    builder.experimental().SetInterceptorCreators(std::move(interceptors));
 
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
     if (!server) {

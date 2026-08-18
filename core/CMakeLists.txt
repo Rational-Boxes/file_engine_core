@@ -157,6 +157,8 @@ add_library(fileengine_core SHARED
     src/server_logger.cpp      # Add server logger source file
     src/crypto_utils.cpp       # Add crypto utilities source file
     src/rest_server.cpp        # Monitoring HTTP listener (Phase A)
+    src/thread_stats.cpp       # Per-thread kernel state, for stuck-thread detection
+    src/rpc_tracker.cpp        # In-flight RPC register (driven by the interceptor)
     src/event.cpp              # File-activity event model + JSON envelope
     src/event_sink.cpp         # Async bounded-outbox sink base
     src/event_sink_factory.cpp # Builds the configured sink (or none)

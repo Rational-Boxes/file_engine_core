@@ -262,3 +262,15 @@ target_include_directories(test_security_acl PRIVATE
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
 )
+
+# Connection-pool lifecycle: proves a returned connection wakes a waiting caller.
+# Needs a live Postgres (FE_TEST_PG_*); skips cleanly when there isn't one.
+add_executable(test_pool_lifecycle test_pool_lifecycle.cpp)
+target_include_directories(test_pool_lifecycle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+)
+target_link_libraries(test_pool_lifecycle
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+)
+add_test(NAME pool_lifecycle COMMAND test_pool_lifecycle)
