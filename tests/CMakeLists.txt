@@ -336,3 +336,12 @@ endforeach()
 add_test(NAME test_s3_integration COMMAND test_s3_integration)
 set_tests_properties(test_s3_integration PROPERTIES
     LABELS "integration" TIMEOUT 120)
+
+# Broader stress than thread_lifecycle_stress: this one hunts crashes and
+# soft-locks (restart detection, monitoring answerable under load, descriptor
+# and thread growth) rather than the request/connection lifecycle specifically.
+# Same harness the bridges use, pointed at the core.
+add_test(NAME load_stress
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/load_stress.py
+                 --target core --requests 200 --concurrency 32)
+set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600)
