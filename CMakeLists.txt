@@ -35,6 +35,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cli/CMakeLists.txt")
 endif()
 
 # Add tests
+#
+# enable_testing() has to come BEFORE the subdirectory, and was missing: without
+# it CMake accepts every add_test() call and registers none, so `ctest` reported
+# "Total Tests: 0" and any test wired up this way silently never ran.
+enable_testing()
 add_subdirectory(tests)
 
 # Set default installation prefix to /opt/file_engine_core
