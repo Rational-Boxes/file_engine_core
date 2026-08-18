@@ -1545,39 +1545,61 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
     }
 }
 
-Result<std::vector<std::string>> Database::list_versions(const std::string& file_uid, const std::string& tenant) {
+Result<std::vector<VersionInfo>> Database::list_versions_detailed(const std::string& file_uid, const std::string& tenant) {
     auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
-        return Result<std::vector<std::string>>::err("Failed to acquire database connection");
+        return Result<std::vector<VersionInfo>>::err("Failed to acquire database connection");
     }
 
     PGconn* pg_conn = conn->get_connection();
-
-    // Get the schema name for this tenant
     std::string schema_name = get_schema_prefix(tenant);
 
-    // Query the versions table to get all versions for this file
-    std::string query_sql = "SELECT version_timestamp FROM \"" + schema_name + "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC;";
+    // revised_by has always been stored; it simply was never returned here.
+    std::string query_sql = "SELECT version_timestamp, revised_by FROM \"" + schema_name +
+                            "\".versions WHERE file_uid = $1 ORDER BY version_timestamp DESC;";
     const char* param_values[1] = {file_uid.c_str()};
 
     PGresult* res = PQexecParams(pg_conn, query_sql.c_str(), 1, nullptr, param_values, nullptr, nullptr, 0);
 
-    std::vector<std::string> versions;
+    std::vector<VersionInfo> versions;
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
         int nrows = PQntuples(res);
+        versions.reserve(static_cast<size_t>(nrows));
         for (int i = 0; i < nrows; ++i) {
-            std::string version_timestamp = PQgetvalue(res, i, 0);
-            versions.push_back(version_timestamp);
+            VersionInfo v;
+            v.version_timestamp = PQgetvalue(res, i, 0);
+            // Rows written before the column was populated are NULL. An empty
+            // uploader is honest; inventing one would be worse than admitting it
+            // is unknown.
+            if (!PQgetisnull(res, i, 1)) {
+                v.revised_by = PQgetvalue(res, i, 1);
+            }
+            versions.push_back(std::move(v));
         }
         PQclear(res);
         connection_pool_->release(conn);
-        return Result<std::vector<std::string>>::ok(versions);
-    } else {
-        std::string error = PQerrorMessage(pg_conn);
-        PQclear(res);
-        connection_pool_->release(conn);
-        return Result<std::vector<std::string>>::err("Failed to list versions: " + error);
+        return Result<std::vector<VersionInfo>>::ok(versions);
     }
+
+    std::string error = PQerrorMessage(pg_conn);
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<VersionInfo>>::err("Failed to list versions: " + error);
+}
+
+// Timestamp-only form, kept for callers that do not need the uploader. Delegates
+// so there is one query and one ordering to reason about.
+Result<std::vector<std::string>> Database::list_versions(const std::string& file_uid, const std::string& tenant) {
+    auto detailed = list_versions_detailed(file_uid, tenant);
+    if (!detailed.success) {
+        return Result<std::vector<std::string>>::err(detailed.error);
+    }
+    std::vector<std::string> timestamps;
+    timestamps.reserve(detailed.value.size());
+    for (const auto& v : detailed.value) {
+        timestamps.push_back(v.version_timestamp);
+    }
+    return Result<std::vector<std::string>>::ok(timestamps);
 }
 
 Result<bool> Database::delete_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) {

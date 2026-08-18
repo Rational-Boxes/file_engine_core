@@ -1335,27 +1335,45 @@ Result<void> FileSystem::rename(const std::string& uid, const std::string& new_n
     return Result<void>::ok();
 }
 
+Result<std::vector<VersionInfo>> FileSystem::list_versions_detailed(const std::string& file_uid,
+                                                                    const std::string& user,
+                                                                    const std::vector<std::string>& roles,
+                                                                    const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<std::vector<VersionInfo>>::err("Database not available for tenant: " + tenant);
+    }
+
+    // Same gate as the timestamp-only form: knowing WHO uploaded a version is
+    // part of the version history, so it is guarded by the same VIEW_VERSIONS
+    // permission rather than being readable one step more cheaply.
+    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::VIEW_VERSIONS), tenant); // dedicated VIEW_VERSIONS bit (H1)
+    if (!perm_result.success || !perm_result.value) {
+        return Result<std::vector<VersionInfo>>::err("User does not have permission to list versions");
+    }
+
+    auto db_result = context->db->list_versions_detailed(file_uid, tenant);
+    if (!db_result.success) {
+        return Result<std::vector<VersionInfo>>::err("Failed to list versions: " + db_result.error);
+    }
+
+    return Result<std::vector<VersionInfo>>::ok(db_result.value);
+}
+
 Result<std::vector<std::string>> FileSystem::list_versions(const std::string& file_uid,
                                                            const std::string& user,
                                                            const std::vector<std::string>& roles,
                                                            const std::string& tenant) {
-    auto context = get_tenant_context(tenant);
-    if (!context || !context->db) {
-        return Result<std::vector<std::string>>::err("Database not available for tenant: " + tenant);
+    auto detailed = list_versions_detailed(file_uid, user, roles, tenant);
+    if (!detailed.success) {
+        return Result<std::vector<std::string>>::err(detailed.error);
     }
-    
-    // Check permissions - the user needs read permission on the file
-    auto perm_result = validate_user_permissions(file_uid, user, roles, static_cast<int>(Permission::VIEW_VERSIONS), tenant); // dedicated VIEW_VERSIONS bit (H1)
-    if (!perm_result.success || !perm_result.value) {
-        return Result<std::vector<std::string>>::err("User does not have permission to list versions");
+    std::vector<std::string> timestamps;
+    timestamps.reserve(detailed.value.size());
+    for (const auto& v : detailed.value) {
+        timestamps.push_back(v.version_timestamp);
     }
-    
-    auto db_result = context->db->list_versions(file_uid, tenant);
-    if (!db_result.success) {
-        return Result<std::vector<std::string>>::err("Failed to list versions: " + db_result.error);
-    }
-    
-    return Result<std::vector<std::string>>::ok(db_result.value);
+    return Result<std::vector<std::string>>::ok(timestamps);
 }
 
 Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid,

@@ -1012,12 +1012,18 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->list_versions(file_uid, user, roles, tenant);
+    auto result = filesystem_->list_versions_detailed(file_uid, user, roles, tenant);
 
     response->set_success(result.success);
     if (result.success) {
         for (const auto& version : result.value) {
-            response->add_versions(version);
+            // `versions` is the deprecated timestamp-only field, still filled so
+            // clients built against the old contract keep working; `entries`
+            // carries the uploader alongside it. Same order, same count.
+            response->add_versions(version.version_timestamp);
+            auto* entry = response->add_entries();
+            entry->set_version_timestamp(version.version_timestamp);
+            entry->set_revised_by(version.revised_by);
         }
         SERVER_LOG_INFO("GRPCService", "ListVersions successful for uid: " + file_uid);
     } else {

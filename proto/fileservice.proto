@@ -295,10 +295,23 @@ message ListVersionsRequest {
     AuthenticationContext auth = 2;     // Authentication information
 }
 
+// One stored version of a file.
+//
+// Added because `versions` carried only timestamps, so no caller could learn WHO
+// uploaded a given version — the data was already being read out of the versions
+// table for other queries, just never returned here.
+message VersionEntry {
+    string version_timestamp = 1;       // The version's identifier (a timestamp)
+    string revised_by = 2;              // The user who uploaded it; empty if unrecorded
+}
+
 message ListVersionsResponse {
     bool success = 1;
     string error = 2;
+    // DEPRECATED in favour of `entries`, and still populated so existing clients
+    // keep working. Same order and count as `entries`.
     repeated string versions = 3;       // List of version timestamps
+    repeated VersionEntry entries = 4;  // Timestamp + uploader, newest first
 }
 
 message GetVersionRequest {

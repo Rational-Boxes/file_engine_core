@@ -133,6 +133,12 @@ public:
                                                            const std::string& user,
                                                            const std::vector<std::string>& roles = {},
                                                            const std::string& tenant = "");
+
+    // Timestamp AND uploader, same ordering and the same VIEW_VERSIONS check.
+    virtual Result<std::vector<VersionInfo>> list_versions_detailed(const std::string& file_uid,
+                                                                    const std::string& user,
+                                                                    const std::vector<std::string>& roles,
+                                                                    const std::string& tenant = "");
     virtual Result<std::vector<uint8_t>> get_version(const std::string& file_uid,
                                                      const std::string& version_timestamp,
                                                      const std::string& user,

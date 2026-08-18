@@ -96,6 +96,7 @@ public:
                                     const std::string& revised_by, const std::string& tenant) override;
     Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) override;
     Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant) override;
+    Result<std::vector<VersionInfo>> list_versions_detailed(const std::string& file_uid, const std::string& tenant) override;
     Result<bool> delete_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") override;
 
     // Version restoration operations

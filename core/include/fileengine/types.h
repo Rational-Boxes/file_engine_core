@@ -29,6 +29,16 @@ enum class FileType {
     SYMLINK
 };
 
+// One stored version of a file: its identifier and who put it there.
+//
+// The uploader was always in the versions table (`revised_by`) and already read
+// by other queries, but list_versions returned bare timestamps, so no caller —
+// bridge, SDK or UI — could say who uploaded a given version.
+struct VersionInfo {
+    std::string version_timestamp;
+    std::string revised_by;   // empty when the row predates the column being set
+};
+
 // File metadata - updated to use UUID instead of path for file identification
 struct FileInfo {
     std::string uid;              // UUID of the file/directory (primary identifier)

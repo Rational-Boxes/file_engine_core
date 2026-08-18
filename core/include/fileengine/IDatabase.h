@@ -77,6 +77,9 @@ public:
                                             const std::string& revised_by = "", const std::string& tenant = "") = 0;
     virtual Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
     virtual Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant = "") = 0;
+    // Timestamp AND uploader. list_versions() above is the timestamp-only form,
+    // kept so existing callers and mocks are unaffected.
+    virtual Result<std::vector<VersionInfo>> list_versions_detailed(const std::string& file_uid, const std::string& tenant = "") = 0;
     // Remove a single version row for a file. Non-pure so existing mocks need
     // no update; the concrete Database overrides it.
     virtual Result<bool> delete_version(const std::string& /*file_uid*/, const std::string& /*version_timestamp*/, const std::string& /*tenant*/ = "") {
