@@ -262,3 +262,31 @@ target_include_directories(test_security_acl PRIVATE
     ${PROTOBUF_INCLUDE_DIRS}
     ${GRPCPP_INCLUDE_DIRS}
 )
+
+# Connection-pool lifecycle: proves a returned connection wakes a waiting caller.
+# Needs a live Postgres (FE_TEST_PG_*); skips cleanly when there isn't one.
+add_executable(test_pool_lifecycle test_pool_lifecycle.cpp)
+target_include_directories(test_pool_lifecycle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+)
+target_link_libraries(test_pool_lifecycle
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+)
+add_test(NAME pool_lifecycle COMMAND test_pool_lifecycle)
+# Needs a database; skips cleanly without one, so it is safe in any environment.
+set_tests_properties(pool_lifecycle PROPERTIES LABELS "lifecycle" TIMEOUT 120)
+
+# Production-shaped stress: real uploads through the HTTP bridge while sampling
+# the core's monitoring endpoint, asserting every request completed, every
+# database connection came back, and the workers returned to waiting.
+#
+# Labelled `stress` because it needs the whole stack up
+# (scripts/start_backend_services.sh) rather than just a database. Run the
+# always-safe tests with:  ctest -L lifecycle
+# and this one with:       ctest -L stress
+add_test(NAME thread_lifecycle_stress
+         COMMAND ${CMAKE_COMMAND} -E env
+                 python3 ${CMAKE_CURRENT_SOURCE_DIR}/thread_lifecycle_probe.py
+                 --files 200 --concurrency 32)
+set_tests_properties(thread_lifecycle_stress PROPERTIES LABELS "stress;lifecycle" TIMEOUT 600)

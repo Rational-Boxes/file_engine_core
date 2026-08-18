@@ -29,7 +29,9 @@
 #include <regex>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
+#include <condition_variable>
 
 namespace fileengine {
 
@@ -167,6 +169,34 @@ public:
     void start_connection_monitoring();
     void stop_connection_monitoring();
 
+    // Watchdog state for the monitoring listener. `last_probe_age_seconds` is the
+    // one to alert on: a watchdog that has not completed a probe in well over its
+    // interval is stuck, and a stuck watchdog means an outage would never be
+    // noticed or recovered from.
+    struct WatchdogStats {
+        bool          running                 = false;
+        bool          probe_in_flight         = false;
+        bool          primary_available       = true;
+        bool          using_secondary         = false;
+        int           interval_seconds        = 0;
+        std::uint64_t probes_total            = 0;
+        std::uint64_t transitions_total       = 0;
+        std::int64_t  last_probe_epoch        = 0;
+        std::int64_t  last_probe_duration_ms  = 0;
+        std::int64_t  last_probe_age_seconds  = -1;
+    };
+    WatchdogStats watchdog_stats() const;
+
+    // Live pool telemetry. Read from the pool this Database owns rather than from
+    // ConnectionPoolManager: despite its name and comment, the manager's pool is
+    // never initialized anywhere in the tree — every Database constructs its own
+    // ConnectionPool directly — so the manager is only a holder for the read-only
+    // flag. Going to the owner is the only way to see the pool that is actually
+    // serving traffic.
+    ConnectionPoolStats pool_stats() const;
+    ConnectionPoolStats secondary_pool_stats() const;
+    bool has_secondary_pool() const { return secondary_pool_ != nullptr; }
+
 private:
     // Primary connection pool (main database)
     std::shared_ptr<ConnectionPool> connection_pool_;
@@ -190,6 +220,21 @@ private:
     std::thread connection_monitor_thread_;
     std::mutex connection_mutex_;
     int retry_interval_seconds_{30}; // Default retry interval
+
+    // The watchdog polls, so it spends nearly all its life asleep. That sleep has
+    // to be interruptible: a plain sleep_for() means stop_connection_monitoring()
+    // joins a thread that will not look at the stop flag until its full interval
+    // has elapsed, which held shutdown for up to retry_interval_seconds_.
+    std::mutex              monitor_wait_mutex_;
+    std::condition_variable monitor_wait_cv_;
+
+    // Watchdog telemetry, so "is the recovery thread alive and doing its job?" is
+    // answerable from the monitoring endpoint instead of by inference.
+    std::atomic<std::uint64_t> monitor_probes_{0};        // completed probes
+    std::atomic<std::uint64_t> monitor_transitions_{0};   // up<->down changes acted on
+    std::atomic<std::int64_t>  monitor_last_probe_epoch_{0};
+    std::atomic<std::int64_t>  monitor_last_probe_ms_{0}; // how long the last probe took
+    std::atomic<bool>          monitor_probe_in_flight_{false};
 
     Result<void> check_connection() const;
     std::string escape_string(const std::string& str, PGconn* conn) const;

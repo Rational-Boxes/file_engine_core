@@ -47,7 +47,7 @@ the **audit_service** drains into a tamper-evident, hash-chained log.
 - **`system_admin` role bypasses all ACL checks** in the core. The SDKs pass roles verbatim, so an untrusted SDK caller can forge it — SDKs are safe only server-side.
 - **Bridges are the security boundary:** LDAP bind → JWT (HS256, `FILEENGINE_JWT_SECRET` shared across services for local verification), tenant resolution, request-size caps, CORS scoping.
 - **Feature services fail-closed:** permission cache (TTL ≤ 5 min, event-invalidated); core unreachable ⇒ deny.
-- **Monitoring endpoints** (`/healthz` `/readyz` `/poolz`) are unauthenticated and **must bind loopback-only** (the core's REST monitor defaults to `0.0.0.0:8081` — that is a known exposure to verify per deployment).
+- **Monitoring endpoints** (`/healthz` `/readyz` `/poolz` `/metrics` `/v1/status` `/v1/version`) are unauthenticated and **must bind loopback-only** (the core's REST monitor defaults to `0.0.0.0:8081` — that is a known exposure to verify per deployment).
 - **Audit is tamper-evident** (SHA-256 hash chain) and, for auth events, **fail-closed** (login refused if the audit stream is unreachable).
 
 ### Where to look first
@@ -117,7 +117,7 @@ The codebase uses abstract interfaces for dependency injection and testability:
 | `GRPCFileService` | grpc_service.h | gRPC server implementing all FileService RPCs including streaming upload/download. |
 | `ConfigLoader` | config_loader.h | Loads config from environment variables, config files, and CLI arguments. |
 | `ConnectionPool` | connection_pool.h | Reusable PostgreSQL connection pool. |
-| `ConnectionPoolManager` | connection_pool_manager.h | Singleton ensuring all DB instances share one pool. Supports read-only failover mode. |
+| `ConnectionPoolManager` | connection_pool_manager.h | **Holds the read-only failover flag.** Despite the name, it does NOT share a pool: `initialize_pool()` is never called anywhere, and every `Database` constructs its own `ConnectionPool`. Read pool telemetry via `Database::pool_stats()`. |
 | `QueryBuilder` | query_builder.h | Fluent SQL query builder (SELECT, INSERT, UPDATE, DELETE with typed conditions). |
 | `Logger` | logger.h | Singleton logger with rotation. Levels: DEBUG, INFO, WARN, ERROR, FATAL. |
 | `ServerLogger` | server_logger.h | Dedicated gRPC server logger with thread ID tracking. |
@@ -156,11 +156,44 @@ make -j$(nproc)
 **Dependencies:** PostgreSQL (libpq), OpenSSL, zlib, gRPC++, Protobuf, libcurl, libuuid, AWS SDK for C++ (optional). Managed via pkg-config and CMake find_package.
 
 ## Testing
+
+### The validation suite (ctest)
+```bash
+cmake -S . -B build && cmake --build build -j$(nproc)
+cd build
+ctest -L lifecycle          # everything; skips cleanly without infrastructure
+ctest -L stress             # production-shaped load only (needs the stack up)
+ctest --output-on-failure   # everything registered
+```
+
+Registered tests:
+
+| Test | Needs | What it proves |
+|---|---|---|
+| `pool_lifecycle` | a database | 8 callers over a pool of 2, so the queueing path is forced. A returned connection wakes a waiting caller, releases balance acquires, nobody is stranded. |
+| `thread_lifecycle_stress` | the full stack | Real uploads through the HTTP bridge while sampling the core's `/poolz`: every request completes, every connection comes back, workers return to waiting, the recovery watchdog keeps probing under load. |
+
+`enable_testing()` in the root `CMakeLists.txt` is what makes these visible —
+without it CMake accepts `add_test()` and registers nothing, and `ctest` reports
+zero tests while appearing to work.
+
+**Forcing real contention.** A default core finishes operations faster than
+clients can stack up, so the pool never drains and the queueing path goes
+untested. Shrink the core rather than pushing harder — `FILEENGINE_HTTP_THREAD_POOL`
+sets BOTH the gRPC worker count and the database pool size:
+```bash
+FILEENGINE_HTTP_THREAD_POOL=2 ./build/core/fileengine_server &
+CORE_THREAD_POOL=2 python3 tests/thread_lifecycle_probe.py --files 300 --concurrency 32
+```
+
+### The older standalone binaries
 ```bash
 cd build_test   # or build/tests/
 cmake .. && make -j$(nproc)
 ./basic_tests   # or other test binaries
 ```
+Most `tests/*.cpp` suites are still run this way and are NOT registered with
+ctest; folding them in is outstanding work.
 
 Key test suites (in `tests/`):
 - `test_acl_rbac_comprehensive.cpp` — Newest comprehensive ACL+RBAC suite (~1255 lines, currently untracked)
@@ -190,7 +223,7 @@ Numerous ad-hoc `test_*.cpp` files at the project root are standalone integratio
 - S3 objects are immutable by design — deletion is not supported in the object store
 - All file operations use UUIDs, not paths, for distributed handling
 - ACL tables live in tenant-specific schemas (not PUBLIC) to prevent data leakage
-- All tenants share one `ConnectionPool` — do not create per-tenant pools
+- Do not create per-tenant connection pools. (Note the intended "all tenants share one pool" invariant is not actually implemented — see `ConnectionPoolManager` above.)
 - PUT operations return immediately after local storage; S3 backup is async via background worker thread
 
 ## Current Development State
