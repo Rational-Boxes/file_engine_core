@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include <mutex>
 #include "fileengine/s3_storage.h"
 #include "fileengine/server_logger.h"  // Explicitly include the core logger header
 #include <sstream>
@@ -65,20 +66,75 @@ S3Storage::S3Storage(const std::string& endpoint,
 
 S3Storage::~S3Storage() {
 #ifdef USE_AWS_SDK
-    // Clean up AWS SDK resources if needed
-    // Note: In a real application, you'd want to be careful about when to call Aws::ShutdownAPI
-    // as it should only be called once when the application shuts down, not per instance
-    // For this implementation, we'll just reset the client
+    // Order matters: the client holds SDK resources, so it has to go first. The
+    // guard is released second, and only the LAST one released actually shuts
+    // the SDK down (AwsSdkGuard above) — so this is safe with any number of
+    // S3Storage instances, which is why ShutdownAPI is not called here directly.
     s3_client_.reset();
-    // Do NOT call Aws::ShutdownAPI here - that should be called once at application shutdown
+    sdk_guard_.reset();
 #endif
 }
 
+#ifdef USE_AWS_SDK
+namespace {
+
+// AWS SDK process lifecycle.
+//
+// Three things were wrong here, and together they crashed the process on exit
+// with a jump to address 0:
+//
+//   1. `Aws::SDKOptions` was a STACK LOCAL passed to InitAPI and destroyed on
+//      the next line. The struct carries std::function hooks (logging and HTTP
+//      client factories); the SDK keeps hold of them, and calling one after its
+//      target is gone is precisely a jump to address 0. The options must outlive
+//      the SDK, and the SAME object must be handed to ShutdownAPI.
+//   2. InitAPI ran on every initialize() call rather than once per process.
+//   3. ShutdownAPI was never called at all, so whatever survived was torn down
+//      by the C++ runtime in an undefined order.
+//
+// This owns all three. The guard is reference-counted and handed to every
+// S3Storage, so the SDK is initialized on first use and shut down exactly once,
+// when the last user is destroyed — which is necessarily BEFORE static
+// destruction, and after every S3 client has already gone.
+class AwsSdkGuard {
+public:
+    static std::shared_ptr<AwsSdkGuard> acquire() {
+        static std::mutex mu;
+        static std::weak_ptr<AwsSdkGuard> existing;
+        std::lock_guard<std::mutex> lock(mu);
+        if (auto live = existing.lock()) {
+            return live;   // already initialized; join the existing lifetime
+        }
+        std::shared_ptr<AwsSdkGuard> fresh(new AwsSdkGuard());
+        existing = fresh;
+        return fresh;
+    }
+
+    ~AwsSdkGuard() {
+        Aws::ShutdownAPI(options_);
+    }
+
+    AwsSdkGuard(const AwsSdkGuard&) = delete;
+    AwsSdkGuard& operator=(const AwsSdkGuard&) = delete;
+
+private:
+    AwsSdkGuard() {
+        Aws::InitAPI(options_);
+    }
+
+    // A member, not a local: the SDK holds references into it for its whole
+    // lifetime, and ShutdownAPI must receive the same object InitAPI got.
+    Aws::SDKOptions options_;
+};
+
+} // namespace
+#endif
+
 Result<void> S3Storage::initialize() {
 #ifdef USE_AWS_SDK
-    // Initialize AWS SDK if not already initialized
-    Aws::SDKOptions options;
-    Aws::InitAPI(options);
+    // Initialize the SDK once per process and hold it up for as long as this
+    // object could use it. See AwsSdkGuard above.
+    sdk_guard_ = AwsSdkGuard::acquire();
 
     // Create AWS credentials provider
     auto credentialsProvider = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(

@@ -86,7 +86,11 @@ private:
     SyncConfig config_;
 
     std::thread sync_thread_;
-    std::thread recovery_thread_;
+    std::thread recovery_thread_;   // declared and joined, but never started
+    // The startup backlog sync. A member so it can be JOINED: it used to be
+    // detached, which meant it kept calling methods on `this` — and using the
+    // AWS SDK — while shutdown destroyed both underneath it.
+    std::thread startup_sync_thread_;
     std::atomic<bool> running_;
     std::atomic<bool> sync_in_progress_;
     mutable std::mutex sync_mutex_;

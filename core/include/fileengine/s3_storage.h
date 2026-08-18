@@ -100,6 +100,11 @@ private:
 
 #ifdef USE_AWS_SDK
     std::shared_ptr<Aws::S3::S3Client> s3_client_;
+    // Keeps the AWS SDK initialized for as long as this object might use it.
+    // Held as an opaque handle so the header does not have to expose the guard;
+    // see the lifecycle note at the top of s3_storage.cpp for why the SDK cannot
+    // simply be initialized and left.
+    std::shared_ptr<void> sdk_guard_;
 #endif
 
     // Helper to generate storage key from path

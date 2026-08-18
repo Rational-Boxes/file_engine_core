@@ -50,15 +50,21 @@ Result<void> ObjectStoreSync::start_sync_service() {
     // Start the monitoring thread
     sync_thread_ = std::thread(&ObjectStoreSync::monitoring_loop, this);
     
-    // If sync on startup is enabled, perform it in a background thread to not delay service initialization
+    // If sync on startup is enabled, perform it in a background thread so it does
+    // not delay service initialization.
+    //
+    // JOINABLE, not detached. Detaching it meant nothing waited for it: on
+    // shutdown, `object_store_sync.reset()` destroyed the very object the thread
+    // was still calling methods on, and the S3 SDK was torn down while it was
+    // mid-upload. With a real backlog to work through — which is exactly when it
+    // runs long — that reliably corrupted the heap on exit.
     if (config_.sync_on_startup) {
-        std::thread startup_sync_thread([this]() {
+        startup_sync_thread_ = std::thread([this]() {
             auto result = perform_startup_sync();
             if (!result.success) {
                 // Log error but don't affect the main service startup
             }
         });
-        startup_sync_thread.detach(); // Detach the thread to run independently
     }
     
     return Result<void>::ok();
@@ -80,6 +86,13 @@ void ObjectStoreSync::stop_sync_service() {
 
         if (recovery_thread_.joinable()) {
             recovery_thread_.join();
+        }
+
+        // Wait for the startup backlog sync too. `running_` is already false, so
+        // its loops below stop at the next file rather than working through the
+        // whole backlog before noticing.
+        if (startup_sync_thread_.joinable()) {
+            startup_sync_thread_.join();
         }
     }
 }
@@ -135,6 +148,11 @@ Result<void> ObjectStoreSync::perform_startup_sync() {
     auto tenant_result = get_tenant_list();
     if (tenant_result.success) {
         for (const auto& tenant : tenant_result.value) {
+            // Give up promptly when the service is stopping: a backlog can be
+            // thousands of files, and shutdown now waits for this thread.
+            if (!running_.load()) {
+                return Result<void>::ok();
+            }
             auto result = perform_tenant_sync(tenant);
             if (!result.success) {
                 return result;  // Return the first error
@@ -153,6 +171,11 @@ Result<void> ObjectStoreSync::perform_startup_sync() {
     // For multi-tenant systems, we need to sync each tenant separately
     if (tenant_result.success) {
         for (const auto& tenant : tenant_result.value) {
+            // Same stop check as the first phase: without it, shutdown waited for
+            // the whole comprehensive pass over every tenant's local files.
+            if (!running_.load()) {
+                return Result<void>::ok();
+            }
             auto comprehensive_result = perform_comprehensive_local_sync(tenant);
             if (!comprehensive_result.success) {
                 // Log the error but don't fail the entire startup sync
@@ -190,6 +213,7 @@ Result<void> ObjectStoreSync::perform_comprehensive_local_sync(const std::string
 
     // Process each local file to check if it needs to be synced
     for (const auto& path : local_paths_result.value) {
+        if (!running_.load()) break;  // stop promptly on shutdown
         // Parse the path to extract tenant, uid, and version timestamp
         // Path format: base_path/tenant/xx/yy/zz/uid/version_timestamp
         size_t base_pos = path.find(actual_tenant);
@@ -390,6 +414,11 @@ Result<void> ObjectStoreSync::sync_files(const std::string& tenant) {
     int failed_files = 0;
     
     for (const auto& [uid, version_timestamp] : files_result.value) {
+        // Same reason as perform_startup_sync: stop at the next file rather than
+        // holding shutdown open for the rest of the backlog.
+        if (!running_.load()) {
+            break;
+        }
         auto sync_result = sync_file(uid, version_timestamp, tenant);
         if (sync_result.success) {
             synced_files++;
@@ -448,6 +477,7 @@ Result<std::vector<std::pair<std::string, std::string>>> ObjectStoreSync::get_fi
     }
 
     for (const auto& file_info : all_files_result.value) {
+        if (!running_.load()) break;  // stop promptly on shutdown
         // Skip directories since they don't have content to sync
         if (file_info.type == FileType::DIRECTORY) {
             continue;

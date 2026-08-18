@@ -89,7 +89,13 @@ endif()
 find_package(AWSSDK QUIET COMPONENTS s3 core)
 if(AWSSDK_FOUND)
     message(STATUS "AWS SDK found, enabling S3 support")
-    add_compile_definitions(USE_AWS_SDK=1)
+    # NOTE: applied as a PUBLIC property on the target below, not here.
+    # add_compile_definitions() is DIRECTORY-scoped, so it reached core/ and not
+    # tests/ — which meant the library compiled S3Storage WITH its AWS members
+    # while every test compiled the same header WITHOUT them. Different
+    # sizeof(S3Storage) in different translation units is an ODR violation: a
+    # test allocated the smaller object and library code wrote past the end of
+    # it, corrupting memory and crashing the process on exit.
 else()
     message(WARNING "AWS SDK not found, S3 functionality will be limited")
 endif()
@@ -192,6 +198,9 @@ target_link_libraries(fileengine_core
 )
 if(AWSSDK_FOUND)
     target_link_libraries(fileengine_core ${AWSSDK_LINK_LIBRARIES})
+    # PUBLIC so anything including fileengine's headers — tests included — sees
+    # the same S3Storage layout the library was built with.
+    target_compile_definitions(fileengine_core PUBLIC USE_AWS_SDK=1)
 endif()
 
 # Compiler definitions

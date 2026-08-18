@@ -324,16 +324,15 @@ foreach(t
   set_tests_properties(${t} PROPERTIES LABELS "unit" TIMEOUT 120)
 endforeach()
 
-# S3 integration. DISABLED rather than dropped, so it stays visible in the
-# listing as something that needs fixing instead of quietly not existing.
+# S3 integration. Was DISABLED for segfaulting on exit; the cause turned out to
+# be an ODR violation rather than anything in the test — USE_AWS_SDK was set with
+# directory-scoped add_compile_definitions(), so the library compiled S3Storage
+# WITH its AWS members and the tests compiled the same header WITHOUT them. The
+# test allocated the smaller object and library code wrote past the end of it.
+# The define is now PUBLIC on the fileengine_core target, so every consumer of
+# the header agrees on the layout.
 #
-# Its assertions all PASS — it prints "S3 Integration tests completed." — and
-# then the process segfaults during exit, jumping to address 0 with a smashed
-# stack. S3Storage::initialize() calls Aws::InitAPI() and nothing calls the
-# matching ShutdownAPI (s3_storage.cpp says so deliberately: that belongs to the
-# application, once). Adding the shutdown to the test, with the S3Storage scoped
-# to die first, did NOT fix it, so the fault is deeper in the SDK teardown than
-# the missing call. Re-enable once that is understood.
+# Needs an S3 endpoint reachable at localhost:9000 (MinIO in dev).
 add_test(NAME test_s3_integration COMMAND test_s3_integration)
 set_tests_properties(test_s3_integration PROPERTIES
-    LABELS "integration" TIMEOUT 120 DISABLED TRUE)
+    LABELS "integration" TIMEOUT 120)

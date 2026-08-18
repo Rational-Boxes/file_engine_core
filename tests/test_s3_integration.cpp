@@ -19,15 +19,12 @@
 #include <string>
 #include "fileengine/s3_storage.h"
 #include "fileengine/object_store_sync.h"
-#ifdef USE_AWS_SDK
-#include <aws/core/Aws.h>
-#endif
 
 int main() {
     std::cout << "Testing S3 Integration..." << std::endl;
 
-  {   // scope: the S3Storage (and its SDK-owning client) must be destroyed
-      // before Aws::ShutdownAPI runs at the end of main.
+  {   // Scope the S3Storage so it is destroyed — and with it the SDK guard it
+      // holds — before main returns, rather than during static destruction.
 
     // Create S3Storage instance with mock parameters
     // In a real test, these would come from environment variables or config
@@ -81,20 +78,6 @@ int main() {
     std::cout << "S3 Integration tests completed." << std::endl;
   }
 
-#ifdef USE_AWS_SDK
-    // Every assertion above passed and then the process segfaulted on the way
-    // out. S3Storage::initialize() calls Aws::InitAPI() and — by design, see the
-    // note in s3_storage.cpp — never calls the matching ShutdownAPI, because that
-    // belongs to the application, once, at exit. Nothing was playing that part
-    // here, so the SDK's globals were torn down by the C++ runtime in an
-    // undefined order.
-    //
-    // The S3Storage must be destroyed BEFORE the SDK is shut down, hence the
-    // scope: its client holds SDK resources.
-    {
-        Aws::SDKOptions options;
-        Aws::ShutdownAPI(options);
-    }
-#endif
+    std::cerr << "[probe] end of main" << std::endl;
     return 0;
 }
