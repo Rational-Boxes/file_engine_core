@@ -161,17 +161,27 @@ make -j$(nproc)
 ```bash
 cmake -S . -B build && cmake --build build -j$(nproc)
 cd build
-ctest -L lifecycle          # everything; skips cleanly without infrastructure
-ctest -L stress             # production-shaped load only (needs the stack up)
+ctest -L unit               # 10 tests, no infrastructure at all. Safe anywhere.
+ctest -L lifecycle          # needs a database (skips cleanly without one)
+ctest -L stress             # production-shaped load (needs the whole stack up)
 ctest --output-on-failure   # everything registered
 ```
 
-Registered tests:
+Labels select by what a test NEEDS, so a developer with no infrastructure can
+still run a meaningful suite.
 
-| Test | Needs | What it proves |
+| Test | Label | What it proves |
 |---|---|---|
-| `pool_lifecycle` | a database | 8 callers over a pool of 2, so the queueing path is forced. A returned connection wakes a waiting caller, releases balance acquires, nobody is stranded. |
-| `thread_lifecycle_stress` | the full stack | Real uploads through the HTTP bridge while sampling the core's `/poolz`: every request completes, every connection comes back, workers return to waiting, the recovery watchdog keeps probing under load. |
+| `test_acl_group_role_permissions`, `test_role_based_access_scenarios`, `test_comprehensive_acl_roles`, `test_acl_rbac_comprehensive`, `test_security_acl`, `test_deleted_reachability` | unit | ACL/RBAC behaviour against mocks |
+| `test_connection_router` | unit | failover state transitions |
+| `test_version_selection` | unit | newest-version selection ordering |
+| `file_culler_tests`, `crypto_stream_tests` | unit | culling strategy; streaming crypto |
+| `pool_lifecycle` | lifecycle | 8 callers over a pool of 2, so the queueing path is forced. A returned connection wakes a waiting caller, releases balance acquires, nobody is stranded. |
+| `thread_lifecycle_stress` | lifecycle, stress | Real uploads through the HTTP bridge while sampling `/poolz`: every request completes, every connection comes back, workers return to waiting, the watchdog keeps probing under load. |
+| `test_s3_integration` | integration | **DISABLED.** Its assertions pass, then the process segfaults on exit — see the note in `tests/CMakeLists.txt`. |
+
+Registering these turned up two things that hand-running had hidden: a mock that
+no longer compiled against `IDatabase`, and a test that segfaults on exit.
 
 `enable_testing()` in the root `CMakeLists.txt` is what makes these visible —
 without it CMake accepts `add_test()` and registers nothing, and `ctest` reports

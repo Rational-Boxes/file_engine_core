@@ -290,3 +290,50 @@ add_test(NAME thread_lifecycle_stress
                  python3 ${CMAKE_CURRENT_SOURCE_DIR}/thread_lifecycle_probe.py
                  --files 200 --concurrency 32)
 set_tests_properties(thread_lifecycle_stress PROPERTIES LABELS "stress;lifecycle" TIMEOUT 600)
+
+
+# ---------------------------------------------------------------------------
+# ctest registration
+#
+# These executables all existed and none were registered, so `ctest` ran nothing
+# and every one of them was only ever run by hand — which is how a mock that no
+# longer compiled, and a test that segfaults on exit, both went unnoticed.
+#
+# Labels select by what a test NEEDS, so a developer with no infrastructure can
+# still run a meaningful suite:
+#
+#   ctest -L unit           no infrastructure; mocks only. Safe anywhere.
+#   ctest -L lifecycle      needs a database (skips cleanly without one)
+#   ctest -L stress         needs the whole stack up
+#   ctest                   everything registered
+# ---------------------------------------------------------------------------
+
+# Pure unit tests — mocks and in-process logic, no database, no object store.
+foreach(t
+    test_acl_group_role_permissions
+    test_role_based_access_scenarios
+    test_comprehensive_acl_roles
+    test_acl_rbac_comprehensive
+    test_security_acl
+    test_deleted_reachability
+    test_connection_router
+    test_version_selection
+    file_culler_tests
+    crypto_stream_tests)
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES LABELS "unit" TIMEOUT 120)
+endforeach()
+
+# S3 integration. DISABLED rather than dropped, so it stays visible in the
+# listing as something that needs fixing instead of quietly not existing.
+#
+# Its assertions all PASS — it prints "S3 Integration tests completed." — and
+# then the process segfaults during exit, jumping to address 0 with a smashed
+# stack. S3Storage::initialize() calls Aws::InitAPI() and nothing calls the
+# matching ShutdownAPI (s3_storage.cpp says so deliberately: that belongs to the
+# application, once). Adding the shutdown to the test, with the S3Storage scoped
+# to die first, did NOT fix it, so the fault is deeper in the SDK teardown than
+# the missing call. Re-enable once that is understood.
+add_test(NAME test_s3_integration COMMAND test_s3_integration)
+set_tests_properties(test_s3_integration PROPERTIES
+    LABELS "integration" TIMEOUT 120 DISABLED TRUE)

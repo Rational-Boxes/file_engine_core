@@ -121,6 +121,7 @@ public:
     Result<int64_t> insert_version(const std::string&, const std::string&, int64_t, const std::string&, const std::string& = "", const std::string& = "") override { return Result<int64_t>::ok(0); }
     Result<std::optional<std::string>> get_version_storage_path(const std::string&, const std::string&, const std::string& = "") override { return Result<std::optional<std::string>>::ok(std::nullopt); }
     Result<std::vector<std::string>> list_versions(const std::string&, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
+    Result<std::vector<VersionInfo>> list_versions_detailed(const std::string&, const std::string& = "") override { return Result<std::vector<VersionInfo>>::ok({}); }
     Result<bool> restore_to_version(const std::string&, const std::string&, const std::string&, const std::string& = "") override { return Result<bool>::ok(true); }
     Result<void> set_metadata(const std::string&, const std::string&, const std::string&, const std::string&, const std::string& = "") override { return Result<void>::ok(); }
     Result<std::optional<std::string>> get_metadata(const std::string&, const std::string&, const std::string&, const std::string& = "") override { return Result<std::optional<std::string>>::ok(std::nullopt); }

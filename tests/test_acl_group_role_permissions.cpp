@@ -116,6 +116,15 @@ public:
     Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") override {
         return Result<std::optional<std::string>>::ok(std::nullopt);
     }
+    // Timestamp + uploader. Mirrors list_versions here; the mock has no
+    // per-version uploader to report.
+    Result<std::vector<VersionInfo>> list_versions_detailed(const std::string& file_uid, const std::string& tenant = "") override {
+        auto base = list_versions(file_uid, tenant);
+        if (!base.success) return Result<std::vector<VersionInfo>>::err(base.error);
+        std::vector<VersionInfo> out;
+        for (const auto& ts : base.value) out.push_back(VersionInfo{ts, ""});
+        return Result<std::vector<VersionInfo>>::ok(out);
+    }
     Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant = "") override {
         return Result<std::vector<std::string>>::ok(std::vector<std::string>{});
     }
