@@ -70,7 +70,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 BRIDGE = os.environ.get("BRIDGE_URL", "http://localhost:8090")
 MONITOR = os.environ.get("CORE_MONITOR_URL", "http://localhost:8081")
 USER = os.environ.get("FE_USER", "testuser@rationalboxes.com")
-PASSWORD = os.environ.get("FE_PASSWORD", "P@ssword1234567890*")
+#: REQUIRED, no fallback — a hardcoded test password is a credential in git.
+#: Missing means SKIP rather than fail (see load_stress.py).
+PASSWORD = os.environ.get("FE_PASSWORD", "")
 TENANT = os.environ.get("FE_TENANT", "default")
 
 # The core's configured gRPC worker count (FILEENGINE_HTTP_THREAD_POOL). The
@@ -175,6 +177,11 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=3.0,
                     help="seconds to wait after the load before the final read")
     args = ap.parse_args()
+
+    if not PASSWORD:
+        print("FE_PASSWORD is not set (the LDAP test-user password); skipping.",
+              file=sys.stderr)
+        return 77   # ctest SKIP_RETURN_CODE
 
     if args.concurrency <= CORE_THREAD_POOL:
         print(f"refusing to run: concurrency {args.concurrency} does not exceed the core's "

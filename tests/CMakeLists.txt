@@ -289,7 +289,7 @@ add_test(NAME thread_lifecycle_stress
          COMMAND ${CMAKE_COMMAND} -E env
                  python3 ${CMAKE_CURRENT_SOURCE_DIR}/thread_lifecycle_probe.py
                  --files 200 --concurrency 32)
-set_tests_properties(thread_lifecycle_stress PROPERTIES LABELS "stress;lifecycle" TIMEOUT 600)
+set_tests_properties(thread_lifecycle_stress PROPERTIES LABELS "stress;lifecycle" TIMEOUT 600 SKIP_RETURN_CODE 77)
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +344,7 @@ set_tests_properties(test_s3_integration PROPERTIES
 add_test(NAME load_stress
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/load_stress.py
                  --target core --requests 200 --concurrency 32)
-set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600)
+set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600 SKIP_RETURN_CODE 77)
 
 # Configuration precedence: environment > .env > .conf > built-in default.
 # Uses a temporary working directory, so the repository's own .env is untouched.
