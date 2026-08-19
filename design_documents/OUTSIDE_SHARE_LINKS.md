@@ -582,6 +582,26 @@ Two consequences, both intended:
    (`share.otp_ttl_seconds`, §9) and the mail states the deadline, since a code
    that has quietly gone stale is otherwise indistinguishable to the recipient
    from one they mistyped. Uniform response either way.
+   **Re-posting `/identify` is the resend path** — there is no separate route.
+   A recipient whose code expired, never arrived, or arrived after the mail was
+   delayed asks for another by submitting the same address again, bounded only
+   by the send limit (`3 / 15 min` per `(link, email)`, §9). The landing page
+   offers this as an explicit *"Didn't get a code? Send another"* control rather
+   than making the recipient guess that re-entering their address is safe
+   (§10.4), and shows the remaining wait when throttled instead of silently
+   doing nothing.
+
+   Two consequences of `issue_code`'s semantics that the UI has to carry, because
+   both are otherwise experienced as "the code doesn't work":
+   - **A new code invalidates the previous one.** `TokenStore.issue_code` keeps
+     one live code per `(kind, uid)` — a new challenge replaces the old
+     (`tokens.py:106–111`). That is the right behaviour (two live codes doubles
+     the guessing surface and the confusion), but it produces a sharp edge:
+     request a resend, then the *first, delayed* mail lands, type that code, and
+     it fails. The copy must say **"use the most recent code"**, and the mail
+     itself should carry its send time so two mails can be told apart.
+   - **A resend does not buy fresh attempts** — see §8.4. Otherwise "request a
+     new code" is an unlimited reset on the 5-attempt guess budget.
 3. `POST …/{link_uid}/verify` `{email, code}` — on success, issue a
    **recipient token** (256-bit, hashed at rest, TTL
    `share.recipient_ttl_seconds`, bound to link + email). Consumes nothing.
@@ -668,8 +688,12 @@ config key, and no **Invited / Invite failed** rungs on the recipient roster
   **not** in bridge process memory: the bridge is horizontally scaled, and a
   per-process counter would give an attacker one fresh allowance per replica —
   the same trap `ReplayGuard`'s own header calls out ("a multi-bridge deployment
-  would back this with a shared store"). Five failures burn the challenge (not
-  the link); the failures also feed the link's `failed_attempts` (§8.4).
+  would back this with a shared store"). Five failures lock **that address out
+  of this link** for the window (not the link itself, and not the address's
+  ability to request a fresh code once the window passes); the failures also
+  feed the link's `failed_attempts` (§8.4). The bucket key
+  `share_otp:{link}:{email}` is what makes this survive a resend — it is scoped
+  to the address, not to the challenge the resend replaces (§8.4).
 
 ---
 
@@ -703,7 +727,7 @@ prefix that nginx, CORS, and the rate limiter can target as a unit.
 |---|---|---|
 | `GET` | `/v1/public/shares/{link_uid}` | **Peek.** Consumes nothing. Returns `kind`, display name, `expires_at`, `uses_remaining`, and either size + content-type (`kind = 0`) or member count + `archive_bytes` (`kind = 2`) or the remaining file/byte budget (`kind = 1`). |
 | `POST` | `/v1/public/shares/{link_uid}/identify` | `{email}` → mails a 6-digit code **iff** the address is on the link's allowlist. Uniform response either way (§6.9). Consumes nothing. |
-| `POST` | `/v1/public/shares/{link_uid}/verify` | `{email, code}` → the **recipient token** (TTL `share.recipient_ttl_seconds`). Consumes nothing; 5 failures burn the challenge. |
+| `POST` | `/v1/public/shares/{link_uid}/verify` | `{email, code}` → the **recipient token** (TTL `share.recipient_ttl_seconds`). Consumes nothing; 5 failures per `(link, email)` per window lock that address out — a resend does **not** reset the count (§8.4). |
 | `POST` | `/v1/public/shares/{link_uid}/session` | Open a redemption session (**this is the use-consuming call**). Requires the recipient token. Returns `redemption_uid` + TTL, and writes `verified_email` onto the ledger row. |
 | `GET` | `/v1/public/shares/{link_uid}/content` | Stream the payload. `kind = 0`: the file, Range-capable, reusing the existing `streamFileDownload` path (`src/http_server.cpp:562`). `kind = 2`: the zip, `Content-Length: archive_bytes`, `Accept-Ranges: none`, assembled member-by-member (§7.3). Requires an open session. |
 | `POST` | `/v1/public/shares/{link_uid}/files` | Drop a file (raw body + `X-File-Name`, streamed through `StreamFileUpload`). Requires an open session. |
@@ -842,7 +866,8 @@ already in the wild.
 | Replaying a session or recipient token | Both are random 256-bit values, hashed at rest, bound to `link_uid` (and the recipient token also to the verified address); neither survives its TTL. |
 | **Using the OTP endpoint as a mail relay** | Structurally impossible: the destination set is closed at creation (§6.9). There is no mode in which an outside caller chooses an address. |
 | **Mail-flooding a listed recipient** | `rate_ok` buckets per `(link, email)` (3 / 15 min) and per link (20 / day) — `tokens.py:128`. |
-| **OTP brute force** | 6 digits, 5 attempts per challenge, challenge burned on exhaustion, failures also feed the link's `failed_attempts`. `consume_code` does not delete on a wrong code, so the counter is an explicit `rate_ok` bucket in `ldap_manager`'s Redis — **shared across bridge replicas**, never per-process (§6.9). |
+| **OTP brute force** | 6 digits, **5 attempts per `(link, email)` per rolling window — not per challenge**, failures also feed the link's `failed_attempts`. `consume_code` does not delete on a wrong code, so the counter is an explicit `rate_ok` bucket in `ldap_manager`'s Redis — **shared across bridge replicas**, never per-process (§6.9). |
+| **Resetting the guess budget by requesting a new code** | The reason the bucket above is keyed per `(link, email)` and not per challenge. A per-challenge counter is defeated by the resend the recipient is explicitly offered (§6.9): burn 5 guesses, request a fresh code, get 5 more — 3 resends per 15 min turns a 10⁻⁶ guess into a steady 15 attempts per quarter-hour against a 6-digit space, indefinitely. Keying the attempt bucket to the address rather than the challenge closes it while leaving the resend freely available, since resending is what a stuck recipient legitimately needs and guessing is not. |
 | **Enumerating the recipient list** | `/identify` returns the identical response for listed and unlisted addresses (§6.9, §8.5). |
 | Confused deputy via MCP | The share RPCs are simply not exposed on the MCP door (§11). |
 
@@ -875,7 +900,7 @@ recipient list (§6.9).
 | `share.max_sessions_per_hour` | `20` | Sessions one link may open per hour, independent of the use cap (§8.4). |
 | `share.max_recipients` | `20` | Addresses one link may be minted for. |
 | `share.otp_ttl_seconds` | `600` | Code lifetime — **10 minutes** (§6.9). Long enough to survive mail-delivery latency and a recipient who switches devices to read it; short enough that a code sitting in an unattended inbox is not a standing credential. Note it is deliberately *shorter* than the `3 / 15 min` send window below, so a recipient whose code expires can always request another without being rate-limited for it. |
-| `share.otp_max_attempts` | `5` | Wrong codes before the challenge is burned. |
+| `share.otp_max_attempts` | `5` | Wrong codes per `(link, email)` per window before that address is locked out. Counted against the **address**, not the challenge, so requesting a fresh code does not restore attempts (§8.4). |
 | `share.otp_send_limit` | `3 / 15 min` per `(link, email)`, `20 / day` per link | `rate_ok` buckets. |
 | `share.recipient_ttl_seconds` | `86400` | Recipient-token lifetime — how long a verified recipient can open further sessions without a new code. |
 | `share.attention_events` | `drop_received, otp_send_failed, link_dead, first_redemption` | Which share events raise a creator attention item (§10.6). `budget_exhausted` / `expiry_soon` are available and off by default — they are the two most likely to become noise. |
@@ -1070,8 +1095,46 @@ The view peeks (§6.4), then runs the **verification step first, before any of t
 kind-specific UI**: an email field, then a 6-digit code field, then the payload
 screen. The copy has to carry the uniform-response rule without sounding evasive
 — *"If that address is on this link, a code is on its way"* — and must not hint
-at how many recipients exist or who they are. Resend is available once the send
-rate limit allows, with the remaining wait shown.
+at how many recipients exist or who they are.
+
+**The code-entry screen must assume the code did not arrive.** Mail is delayed,
+filtered, and sometimes silently dropped, and the recipient has no account, no
+support channel, and no way to tell a slow relay from a link that never worked.
+So that screen carries, visibly and without the user having to ask:
+
+- a **countdown** to the code's 10-minute expiry (`share.otp_ttl_seconds`, §9),
+  so a stale code is self-evident rather than a mysterious rejection;
+- **"Didn't get a code? Send another"**, enabled the moment the send limit
+  allows and showing the remaining wait when it does not (never a dead button
+  and never a silent no-op) — this re-posts `/identify` (§6.9);
+- after a resend, **"use the code from the newest email"**, because the previous
+  code is now invalid and a delayed first mail will otherwise be tried first;
+- on a wrong code, how many attempts remain, and on lockout **when it lifts** —
+  the recipient must be able to distinguish "wait 15 minutes" from "this link is
+  broken".
+
+**But all of that is pre-verification, so it must be identical for a listed and
+an unlisted address.** Everything on this screen is shown to a caller who has
+proved nothing yet — anyone holding the URL can type an address and reach it. If
+a listed address produced a countdown and an attempt counter while an unlisted
+one produced anything else, the screen would be exactly the recipient-list oracle
+§6.9 closed at `/identify`. Two rules follow, and they are cheap:
+
+1. The countdown and the "code sent" state are rendered from the **uniform**
+   `/identify` response — the page always shows them, whether or not a code was
+   really minted.
+2. The attempt bucket is keyed on the **submitted** address
+   (`share_otp:{link}:{email}`) whether or not it is on the allowlist, so an
+   unlisted address burns and reports the same budget, hits the same lockout,
+   and sees the same words. Uniformity here costs one Redis key per probed
+   address — bounded by the same per-IP rate limit as everything else on the
+   public prefix (§8.4).
+
+The §8.5 uniform-failure rule therefore holds all the way through verification.
+It relaxes only *after* a recipient token exists: a caller who has proved control
+of a listed address may be told plainly that their session expired or their link
+is exhausted, because at that point they are a known recipient and the disclosure
+is to the person the link was minted for.
 
 After verification the view shows one of:
 
