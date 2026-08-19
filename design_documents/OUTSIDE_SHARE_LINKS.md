@@ -10,12 +10,17 @@
 **Scope (cross-repo):** `file_engine_core` (owner of the record + enforcement),
 `http_bridge` (public + owner-side REST routes, orchestration), `ldap_manager`
 (recipient OTP: delivery, verification, rate limits), `frontend` (drawer tab +
-public landing view + help), `audit_service` (new action codes),
-`docker_unified` (rate-limit zone). No change to `webdav_bridge`.
+public landing view + dashboard items + help), `audit_service` (new action
+codes), `discussion_threaded_communication` (owner of the Dashboard attention
+feed the creator's share notifications land in — §10.6), `docker_unified`
+(rate-limit zone). No change to `webdav_bridge`.
 
 > Expanded from the original one-paragraph sketch (kept verbatim as §1). Every
-> decision is grounded in current code; what has been settled and what is still
-> open are collected in **§13**.
+> decision is grounded in current code; what has been settled is collected in
+> **§13**, where **R7–R10 (2026-08-19) closed the last open questions** — the URL
+> form, one-resource-per-link, folder size reporting, and creator notifications.
+> No design questions remain open; §13 notes the one scope reading (R8) awaiting
+> a yes/no.
 
 ---
 
@@ -105,6 +110,10 @@ ids, guessing codes, and probing the recipient list from many IPs (§8.4).
 | Upload versioning | An upload link **never** creates a new version of an existing file. Name collisions get a de-duplicating suffix (§6.7). |
 | Upload ownership | Dropped files are **owned by the link creator**; the outside origin — including the verified sender address — is recorded in metadata and audit (§6.8). |
 | Recipient verification | **Mandatory.** Email + one-time code before any session opens, for downloads and drops alike. Recipients are an **allowlist fixed at creation**; there is no open-email mode (§6.9). |
+| Link granularity | **One link addresses one resource** — a file, or a folder. No arbitrary multi-file sets in v1 (§13-R8). |
+| Delivering the URL | **The creator composes their own email.** v1 sends no invite mail; the system's only outbound mail is the recipient's OTP (§6.9, §13-R9). |
+| Token in the URL | **Path form** — `/s/{uid}.{secret}`. The OTP is what makes a leaked URL inert, so the fragment form buys little and costs `curl`/QR (§13-R7). |
+| Creator notifications | **The Dashboard attention feed**, not email — share events join the existing "Needs your attention" list (§10.6, §13-R10). |
 | Failure disclosure | Unknown / expired / revoked / exhausted / unlisted-address / wrong-code all return the **same** generic response to the outside caller. The real reason goes to audit only (§8.5). |
 | Bridge routes | New `/v1/public/shares/*` prefix (unauthenticated, explicitly allowlisted) + owner-side `/v1/nodes/{uid}/shares` and `/v1/shares/*` (§7). |
 | Frontend | A **Share** tab in `FileDetailsDrawer.vue`, plus a `requiresAuth: false` route `/s/:token` for the recipient (§10). |
@@ -276,8 +285,12 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_link_recipients (
     invited_by        TEXT        NOT NULL,   -- creator, or whoever added them later
     -- the status ladder the Share tab renders (§10.2) — every rung is a column so
     -- the roster is one query, not a reconstruction from the audit log
-    invite_sent_at    TIMESTAMPTZ,            -- the system mailed the link (§6.9)
-    invite_error      TEXT,                   -- SMTP rejection / bounce, surfaced as "invite failed"
+    invite_sent_at    TIMESTAMPTZ,            -- RESERVED, always NULL in v1: the creator
+    invite_error      TEXT,                   -- mails the link themselves (§13-R9), so the
+                                              -- system never sends an invite and has nothing
+                                              -- to report. Kept in the schema so the v2
+                                              -- "email it for me" option is a behaviour
+                                              -- change, not a migration.
     last_code_sent_at TIMESTAMPTZ,            -- "Opened" — they reached the landing page
     first_verified_at TIMESTAMPTZ,            -- "Verified"
     last_used_at      TIMESTAMPTZ,            -- "Downloaded" / "Dropped"
@@ -605,13 +618,30 @@ happens in `ldap_manager`; the bridge relays it; the core records it and enforce
 that the address is on the link's allowlist — so a bridge bug can misattribute a
 redemption but cannot admit an unlisted recipient.
 
-#### Sending the link
+#### Sending the link — the creator does it, not the system
 
-Because the addresses are known and a mailer is already in hand, creation offers
-**"email the link to these recipients for me"** (default on, template
-`SHARE_INVITE_EMAIL`). It is a convenience, not a security boundary — the URL is
-useless without a code — but it closes the loop that otherwise has the creator
-copying a URL into a mail client by hand.
+**v1 sends no invite mail.** Creation returns the URL once; the creator pastes it
+into whatever they were going to write anyway. The system's *only* outbound mail
+on this feature is the recipient's OTP (§13-R9).
+
+The reasoning is that the invite is a message, not a mechanism. The URL is inert
+without a code, so mailing it conveys no access — while an auto-sent invite
+inherits every hard part of transactional mail (deliverability, per-tenant
+branding, the recipient's "who is this and why", bounce handling) for a body the
+creator would write better themselves. It also means one fewer place where a
+misconfigured SMTP relay silently produces a recipient who never heard anything.
+
+What creation owes the creator instead is a message worth pasting: the URL, the
+expiry, the use budget, and — for a folder link — the **member count and
+estimated archive size** (§13-R9), so the recipient can be told *"38 files, about
+412 MB, link expires 26 Aug"* before they click. §10.1 specifies that block as
+copy-to-clipboard text, not just on-screen labels.
+
+Consequences carried through the rest of this document: no `SHARE_INVITE_EMAIL`
+template, no `send_invite` field on the create call, no `share.send_invite_default`
+config key, and no **Invited / Invite failed** rungs on the recipient roster
+(§10.2) — the system cannot report on mail it did not send. `invite_sent_at` /
+`invite_error` stay in the schema (§5.4) as the v2 seam.
 
 #### New failure modes to plan for
 
@@ -622,9 +652,11 @@ copying a URL into a mail client by hand.
 - **SMTP misconfigured ⇒ every link is unusable**, and the current 2FA handler
   swallows send failures into `sent = False` (`routers/twofa.py:231`). The share
   variant must keep the *recipient's* response uniform while surfacing the
-  failure loudly — audit event, bridge log, and a notification to the link's
-  creator. A silent mail failure here looks identical to a wrong address, which
-  is the worst possible support experience.
+  failure loudly — audit event, bridge log, and an **attention item for the link's
+  creator** (§10.6). A silent mail failure here looks identical to a wrong
+  address, which is the worst possible support experience. Note this is now the
+  *only* mail path (§13-R9), so an SMTP outage takes the whole feature down
+  rather than degrading it — there is no invite mail left to fail separately.
 - **Mail-flooding a listed recipient** by a party who holds the URL: per
   `(link, email)` and per-link send caps via `rate_ok` (§8.4).
 - **OTP brute force:** `consume_code` deliberately does *not* delete on a wrong
@@ -651,7 +683,7 @@ prefix that nginx, CORS, and the rate limiter can target as a unit.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/nodes/{uid}/shares` | Create a link. Body: `kind`, **`recipients[]` (required, ≥1)**, `send_invite?`, `expires_at`\|`ttl`, `max_uses`, `max_uses_per_recipient?`, `max_bytes`, `max_file_bytes`, `follow_latest?`, `follow_folder?`, `include_subdirs?`, `landing_prefix?`, `ext_allowlist?`, `note?`. **201** returns the full URL once, plus `archive_bytes` / member count for `kind = 2`. |
+| `POST` | `/v1/nodes/{uid}/shares` | Create a link. Body: `kind`, **`recipients[]` (required, ≥1)**, `expires_at`\|`ttl`, `max_uses`, `max_uses_per_recipient?`, `max_bytes`, `max_file_bytes`, `follow_latest?`, `follow_folder?`, `include_subdirs?`, `landing_prefix?`, `ext_allowlist?`, `note?`. **201** returns the full URL once, plus `archive_bytes` / member count for `kind = 2` — the numbers §10.1 renders into the copyable summary the creator pastes into their own mail (§13-R9). No `send_invite`: v1 sends no invite. |
 | `GET` | `/v1/nodes/{uid}/shares` | Links on this node (requires `MANAGE_ACL` or being the creator). |
 | `GET` | `/v1/shares` | The caller's own links. `?all=true` (**`tenant_admin` only**) returns the tenant-wide set backing the admin console (§10.3), with `creator`, `recipient`, `subtree`, and `status` filters and `live=true` by default. |
 | `DELETE` | `/v1/shares/{link_uid}` | Revoke. Idempotent. |
@@ -675,8 +707,10 @@ prefix that nginx, CORS, and the rate limiter can target as a unit.
 | `GET` | `/v1/public/shares/{link_uid}/manifest` | `kind = 2`: the snapshot's member list (name, path, size). `kind = 1`: what *this session* dropped — never the folder's contents. |
 
 The secret travels in the `X-Share-Secret` header (SPA) or `?k=` (direct-link
-fallback for `curl`/email clients); §13-Q3 decides whether the plain-URL form
-ships at all. Notes that apply to the whole public family:
+fallback for `curl`/email clients). **R7 settles the URL form as the path**
+(`/s/{uid}.{secret}`), so the plain-URL form ships — which makes the query-string
+scrubbing below load-bearing rather than belt-and-braces. Notes that apply to the
+whole public family:
 
 - **No CORS wildcard.** Same-origin only; the SPA and the public routes are the
   same host under `docker_unified/images/nginx/snippets/tenant.conf`.
@@ -841,7 +875,7 @@ recipient list (§6.9).
 | `share.otp_max_attempts` | `5` | Wrong codes before the challenge is burned. |
 | `share.otp_send_limit` | `3 / 15 min` per `(link, email)`, `20 / day` per link | `rate_ok` buckets. |
 | `share.recipient_ttl_seconds` | `86400` | Recipient-token lifetime — how long a verified recipient can open further sessions without a new code. |
-| `share.send_invite_default` | `true` | Pre-tick "email the link to these recipients". |
+| `share.attention_events` | `drop_received, otp_send_failed, link_dead, first_redemption` | Which share events raise a creator attention item (§10.6). `budget_exhausted` / `expiry_soon` are available and off by default — they are the two most likely to become noise. |
 | `share.upload_max_bytes` | `1 GiB` | Default byte budget for a new upload link. |
 | `share.upload_max_file_bytes` | `256 MiB` | Default per-file cap. |
 | `share.zip_max_bytes` | `2 GiB` | Largest folder snapshot a link may be minted over; refused at creation (§6.1). |
@@ -867,9 +901,13 @@ is "which of our people", Share is "someone outside" — and the empty state lin
 to the Access tab for the common case where the user actually wanted ACLs.
 
 Create form: **recipients** (an email-chip field, at least one, capped at
-`share.max_recipients`) with a pre-ticked *"email the link to them"*; expiry
-(presets + date picker, clamped to `share.max_ttl_days`); max downloads / max
-files and an optional per-recipient cap; optional note; plus per kind:
+`share.max_recipients`); expiry (presets + date picker, clamped to
+`share.max_ttl_days`); max downloads / max files and an optional per-recipient
+cap; optional note; plus per kind. There is **no "email it for me" option** — the
+creator sends the link themselves (§13-R9), and the form should say so plainly
+next to the recipient field, because an address entered there does *not* mail
+anyone: it authorizes them. That is a genuinely surprising distinction and the
+one thing in this form a user can get wrong without noticing.
 
 - **File download** — "always send the newest version" toggle (off = pinned,
   with the current version name shown).
@@ -886,6 +924,20 @@ On success: the URL exactly once, in a copy-to-clipboard field, with the existin
 `QrCode.vue` beside it (a QR of a one-time drop link is genuinely useful on a
 job site) and an unmistakable *"this is the only time this link is shown"*
 notice.
+
+Beside it, a second **copy-the-whole-message** control — the block the creator
+pastes into their own mail (§13-R9):
+
+> *Drawings – Level 3 · 38 files, about 412 MB*
+> `https://acme.example.com/s/9f2c…`
+> *Expires 26 Aug 2026 · 5 downloads · you'll be emailed a code when you open it.*
+
+This exists because v1's hand-off is manual, and a bare URL leaves the creator to
+explain the OTP step themselves — the step their recipient is most likely to
+mistake for phishing. The last clause is the one that must not be dropped: an
+unexpected code request on an unfamiliar domain is exactly what security training
+tells people to ignore. For a folder link the size line is the R9 payload, so the
+recipient is not surprised by 412 MB on a phone.
 
 ### 10.2 Status and history — did they actually get it?
 
@@ -925,8 +977,8 @@ question. One row per address, with a status ladder:
 
 | Status | Reached when |
 |---|---|
-| **Invited** | On the list. Shows whether the system mailed the link, and when. |
-| **⚠ Invite failed** | SMTP rejected or bounced (§6.9) — the creator finds out here, not from silence. |
+| **On the list** | Added to the allowlist, by whom, when. The system has not mailed them — the creator sends the link themselves (§13-R9) — so this rung says nothing about whether they *received* anything. |
+| **⚠ Code send failed** | The OTP mail bounced or SMTP rejected (§6.9). Also raised as an attention item (§10.6) — the creator should not have to be looking at this roster to find out. |
 | **Opened** | A code was requested — proof the person reached the landing page. |
 | **Verified** | Code accepted; they proved control of the address. |
 | **Downloaded** *(or **Dropped 3 files**)* | A session completed with bytes moved. Shows count, timestamp, and size. |
@@ -1042,6 +1094,125 @@ New `frontend/src/help/content/share-links.md` (category *Permissions*,
 project convention end-user docs live in the frontend repo, and this doc is the
 internal counterpart, not a substitute.
 
+### 10.6 The Dashboard — attention items and a Sharing panel
+
+The Share tab (§10.2) answers *"how is this link doing"* for a link the user has
+already navigated to. That is the wrong shape for the two questions that actually
+need answering unprompted: **"something needs me"** and **"what have I got open
+right now"**. Both belong on the Dashboard, and the Dashboard already has the
+two idioms for them — the *"Needs your attention"* feed and the `ReviewsInbox`
+panel (`frontend/src/views/DashboardView.vue`).
+
+#### Share events in the attention feed
+
+Share events join the existing feed rather than growing a parallel one — one
+place a user looks, one unread badge, one seen-state. The feed is owned by
+**`discussion_threaded_communication`** (`src/discussion/notifications.py`,
+surfaced via `discussionService.attention()` on a ~30 s poll), which is why that
+repo is now in this document's scope.
+
+Events raised (subject to `share.attention_events`, §9):
+
+| Item | Raised when | Why it earns an interrupt |
+|---|---|---|
+| **A drop arrived** | An upload session completed with bytes | A drop box nobody watches is useless; this is the feature's only inbound signal. |
+| **⚠ Your link stopped working** | The §6.3 re-check now fails for the creator | Otherwise the creator learns from the recipient, and cannot explain it (§10.2). |
+| **⚠ We could not send a code** | The OTP mail failed (§6.9) | Indistinguishable from a wrong address if it stays silent — and now the only mail path (§13-R9). |
+| **First redemption** | The first session opens on a link | Carries a verified name — *"alice@contractor.example downloaded Drawing-A.pdf"* — which is the confirmation a sender is waiting for having posted the link themselves. |
+
+#### The feed needs divisions by originating system
+
+Today the feed is one undifferentiated list because everything in it comes from
+one system — threads and reviews, both `discussion`'s. Share links are the
+**third** kind of thing to write into it, and a flat list of "someone mentioned
+you", "a review is waiting", "a stranger dropped a file into your folder" reads
+as noise: those items want different reactions, on different timescales, from
+different parts of the user's day.
+
+So the feed renders **grouped by source system**, each division with its own
+heading and unread count, in a fixed order (Comments · Reviews · Sharing), empty
+divisions omitted. The Dashboard's single unread badge stays the total, so
+nothing about the "one place to look" property changes — only the reading of it.
+
+Mechanically this wants a **`source` field returned by the API**, not a prefix
+convention parsed in the SPA: `notifications.py` grows `SOURCES` alongside
+`KINDS` and maps kind → source at write time (`mention`/`reply`/`thread_resolved`
+→ `comments`; `review_*` → `reviews`; `share_*` → `sharing`). Deriving it in the
+frontend by string-matching the kind would put the mapping in the one place that
+does not know when a new kind is added — the same failure mode as constraint 1
+below, one layer up. A source the SPA does not recognize renders under its own
+raw heading rather than disappearing.
+
+This is a change to a **shared surface**: the divisions must land in
+`discussion`'s API and `DashboardView.vue` whether or not share links ship, and
+they improve the existing two systems on their own. Worth sequencing as its own
+small piece of work (§14, M8) rather than smuggling it in as share-link scope —
+it touches a feed users already rely on.
+
+Four integration constraints, from the code as it stands — none hard, all silent
+if missed:
+
+1. **`KINDS` is a closed allowlist and `add()` drops unknown kinds without
+   erroring** (`notifications.py:30,45` — `if … kind not in KINDS: return`). The
+   new share kinds must be appended there or every share notification vanishes
+   with no log line. Cheapest possible bug to write, hardest to notice.
+2. **`add()` suppresses self-notification** (`user_id == actor → return`). Share
+   items are *addressed to the creator*, so `actor` must be the share identity
+   (`share:<link_uid>|<verified_email>`, per §6.8) and never `created_by` —
+   otherwise a creator's own links can never notify them. For the two events with
+   no external actor (link went dead, OTP send failed) the actor is the system;
+   pick a reserved non-user string rather than the creator's name.
+3. **The `notifications` row has nowhere to put a `link_uid`** — the columns are
+   `(user_id, kind, file_uid, thread_id, review_id, actor)`. Add a nullable
+   `share_link_uid`, and branch `attentionLink()` (`DashboardView.vue:96`) on it:
+   share items deep-link to the resource's **Share tab**, not to
+   `/preview/{fileUid}?thread=…`. The existing deep-link is doubly wrong for a
+   folder-download link, since folders have no preview route at all.
+4. **The feed re-checks READ per row on read** (`notifications.py` docstring) —
+   and *"your link stopped working"* is most often raised precisely because the
+   creator lost access to the resource. The one notification that matters most is
+   therefore the one the READ filter would suppress. That row must be exempt from
+   the per-row re-check, or carry enough denormalized text (resource name, link
+   note) to be rendered without resolving the resource at all. **Prefer the
+   second** — it keeps the filter honest and leaks nothing the creator did not
+   already know when they minted the link.
+
+**Where the events come from.** The discussion consumer already does
+`XREADGROUP` over the core's event stream and maps `file.created/updated/…`
+(`src/discussion/consumer.py`), so the seam is: the core emits `share.*` events
+onto the same stream, the consumer grows one branch, and no new transport is
+introduced. A drop additionally arrives as an ordinary `file.created` (§6.7), so
+take care not to raise it twice.
+
+*"Your link stopped working"* is the exception and needs a decision: it is a
+**computed state with no triggering event** — nothing happens when an ACL three
+folders up is edited. Options, cheapest first: evaluate the pre-flight for the
+user's live links when the Dashboard loads (bounded by their link count, no new
+machinery); or have the retention sweeper (§5.5) re-run the pre-flight on live
+links and emit `share.link_dead` on transition. **Recommend the Dashboard-load
+evaluation for v1** — it is the same call §10.2 already makes, and a link that is
+dead but unnoticed costs nothing until someone looks.
+
+#### The Sharing panel
+
+Alongside `ReviewsInbox`, a `SharingInbox` section — the same idiom, the same
+place, the standing answer to *"what have I got open right now"*. Grouped, not a
+flat list:
+
+- **Needs attention** — dead links, failed sends, drops not yet looked at. Empty
+  most days, and that emptiness is the point.
+- **Drop boxes** — open upload links with what has landed in each ("3 of 5 files
+  used, 2 new"), since a drop box is a thing you are *waiting on* and the one
+  share shape with an inbox character.
+- **Active links** — outbound links still live, newest first, with the §10.2
+  status badge, the expiry countdown, and `n / m` used. Expired and revoked links
+  are not shown here; the Share tab is where history lives.
+
+Every row deep-links to the resource's Share tab. The panel is per-user and
+reuses `GET /v1/shares` (§7.1) — no new route — and reuses the status computation
+from M5 rather than re-deriving it. `tenant_admin`'s tenant-wide view stays a
+separate surface (§10.3): this panel is *your* links, not the deployment's.
+
 ---
 
 ## 11. Other doors
@@ -1099,7 +1270,80 @@ query this feature exists to keep answerable.
 
 Identifiers are stable: a question keeps its number when it is answered, so
 **R1–R6** below are the resolved ones (R1 and R2 were originally posed as Q1 and
-Q2) and **Q3–Q6** are what remains.
+Q2).
+
+**Nothing is open as of 2026-08-19.** The last four questions were answered
+together and are recorded as **R7–R10**. Note they could *not* keep their
+original numbers — R3–R6 were already taken by decisions that were never posed
+as questions, so Q3→R7, Q4→R8, Q5→R9, Q6→R10. The mapping is spelled out in each
+heading; the "identifiers are stable" convention above survives only because the
+collision is documented rather than silently renumbered.
+
+### Resolved (2026-08-19)
+
+**R7 (was Q3) — Token in the URL: the path form, `/s/{uid}.{secret}`.**
+The fragment form was the alternative, keeping the secret out of proxy and
+access logs at the cost of `curl`, QR codes, and anyone who copies "the part
+before the #". The decision rests on R4 having already demoted the token: a
+leaked URL is inert without a code mailed to an address fixed at creation, so
+the token is now the *weaker* of two factors and log hygiene is defence in
+depth rather than the control. The compensating measures in §7.2 stand — nginx
+must still strip the query string on the public location, and the bridge still
+logs `link_uid` and never the secret.
+
+**R8 (was Q4) — One link addresses one resource; no multi-file sets in v1.**
+"Share *these six* drawings from across two folders" stays out of v1. A link is
+minted on a file (`kind = 0`), or on a folder (`kind = 1 | 2`) — nothing else.
+The v2 path is unchanged and cheap: `share_link_members` (§5.2) has no folder
+dependency, so an arbitrary uid set is a selection UI plus a creation call that
+takes a uid list, with no schema change.
+
+> **Assumption flagged for confirmation.** This reads "one share link per file"
+> as *scope* — one link addresses one resource — not as a **uniqueness
+> constraint** limiting a resource to one live link at a time. The latter would
+> contradict §10.1 (a folder may carry a download link and a drop link at once)
+> and would break re-issuing a link to a second, later set of recipients without
+> revoking the first. If a uniqueness constraint is what was meant, it is a
+> `UNIQUE` index on `(resource_uid, kind) WHERE revoked_at IS NULL` and a
+> corresponding "you already have a live link on this" path in the Share tab —
+> say so and it goes in.
+
+**R9 (was Q5) — Folder links: no cap change; surface the estimated archive size,
+and the creator sends their own mail.** Two halves:
+
+- **The size is the answer, not a smaller cap.** `share.zip_max_*` stays as the
+  refusal boundary (§6.1). What was missing was not a lower limit but *telling
+  people the number*: the creator sees member count and estimated archive size
+  before committing (§10.1), and the recipient sees it on the landing page from
+  `peek` (§7.2) before starting a download that might be 400 MB on a phone. The
+  "6 000-file project folder" case is handled by the creator seeing the number
+  and choosing a subfolder, not by the system guessing on their behalf.
+- **v1 sends no invite mail.** The creator composes their own email and pastes
+  the link — so creation must hand them a block worth pasting: URL, expiry, use
+  budget, and for a folder the member count and archive size (§6.9, §10.1).
+  This removes `send_invite`, `SHARE_INVITE_EMAIL`, `share.send_invite_default`,
+  and the roster's *Invited / Invite failed* rungs from v1 scope. The OTP mail
+  remains, and remains the only outbound mail — which means SMTP health now
+  takes the feature down entirely rather than degrading it.
+
+**R10 (was Q6) — Creator notifications: the Dashboard, not email.** Important
+share events raise items in the existing *"Needs your attention"* feed, and the
+Dashboard gains a **Sharing panel** beside `ReviewsInbox` for the standing
+"what have I got open" view (§10.6). Three things follow that are decisions in
+their own right:
+
+- **`discussion_threaded_communication` joins the cross-repo scope** — it owns
+  the attention feed and its store, so the new notification kinds, the
+  `share_link_uid` column, and the source grouping land there.
+- **The feed gains divisions by originating system** (Comments · Reviews ·
+  Sharing). Share links are the third system to write into a feed built when
+  there was only one, and a flat list of mentions, review requests, and outside
+  drops reads as noise. The division improves the existing surfaces on its own
+  and is sequenced as its own work (§14, M8).
+- **No email notifications to the creator in v1.** Consistent with R9: the
+  feature's only outbound mail is the recipient's OTP. A creator who wants a
+  mail digest already has one — `discussion`'s digest job — and that is where
+  the follow-on belongs if it is wanted.
 
 ### Resolved (2026-08-17)
 
@@ -1177,43 +1421,16 @@ the console is a different query over the same data plus one route.
 
 ### Still open
 
-**Q3 — Token in the URL path, or in the fragment?**
-`/s/{uid}.{secret}` works everywhere (email, curl, QR) but lands in every proxy
-and access log between here and the recipient. `/s/{uid}#{secret}` never leaves
-the browser — but breaks `curl`, breaks link-preview bots benignly, and confuses
-anyone who copies "the part before the #". Recommend the **path form**, with
-nginx query/path scrubbing on the public location and short TTLs as the
-compensating control.
+**Nothing.** Q3–Q6 were answered on 2026-08-19 and are recorded above as R7–R10;
+Q7 (the tenant-wide admin console) was resolved earlier as R6. The one item
+awaiting a yes/no is the scope reading flagged inside **R8** — whether "one share
+link per file" also means a uniqueness constraint — which changes one index and
+one UI path, not the design.
 
-**R4 largely defuses this question.** A leaked URL — in a proxy log, a
-scrollback, a forwarded mail — is now inert on its own: redemption additionally
-requires a code delivered to an address the creator listed at creation. The token
-went from *the* credential to *one of two*, and the weaker one. Worth deciding,
-no longer worth much.
-
-**Q4 — Multi-file selection → one link?** R2 covers "share this folder". The
-adjacent ask is "share *these six* drawings from across two folders" — an
-arbitrary uid set rather than a folder subtree. `share_link_members` already
-models it (the members table has no folder dependency); what is missing is a
-selection UI in the browser and a creation call that takes a uid list. Cheap
-follow-on, but not in the v1 stages below unless you want it.
-
-**Q5 — Do folder links need a member cap the *creator* can see coming?**
-§6.1 refuses at creation over `share.zip_max_*`, which is correct but blunt for
-a 6 000-file project folder. Options: raise the cap, offer "include only files
-modified since…", or let the UI mint per-subfolder links. Wants a real folder to
-decide against.
-
-**Q6 — Notifications to the creator.** Two are already mandatory under R4: a
-**failed OTP send** (§6.9 — otherwise a mail misconfiguration is indistinguishable
-from a mistyped address, and nobody finds out) and a **drop arriving** (a drop box
-nobody watches is useless). Still open is the optional set — first redemption,
-budget exhausted, expiry approaching. Recommend **first redemption = yes** now
-that the notification carries a verified name (*"alice@contractor.example
-downloaded Drawing-A.pdf"*), which is materially more useful than the anonymous
-version would have been. The mailer and templates are in scope regardless.
-
-*(Q7 — the tenant-wide admin console — is resolved; see **R6**.)*
+Deferred to v2 by the decisions above, collected here so they are not rediscovered
+as gaps: arbitrary multi-file links (R8), system-sent invite mail and its
+`invite_sent_at` / `invite_error` reporting (R9), and email notification of the
+creator (R10).
 
 ---
 
@@ -1250,8 +1467,8 @@ version would have been. The mailer and templates are in scope regardless.
    authenticated caller before any public surface opens.
 4. **M3 — `ldap_manager`: recipient OTP.** `POST /internal/share/email-challenge`
    and `/internal/share/email-verify` behind `require_internal`; `share_otp` token
-   kind keyed by `link_uid|email`; `SHARE_OTP_EMAIL` + `SHARE_INVITE_EMAIL`
-   templates; send/attempt rate-limit buckets; loud failure on SMTP error
+   kind keyed by `link_uid|email`; the `SHARE_OTP_EMAIL` template (**only** — no
+   invite template, R9); send/attempt rate-limit buckets; loud failure on SMTP error
    (unlike the 2FA handler's swallow). Independent of M4 and parallelizable with
    it. **Tests:** code single-use and constant-time (inherited from
    `consume_code`), send limits, SMTP failure surfaced rather than swallowed.
@@ -1265,13 +1482,14 @@ version would have been. The mailer and templates are in scope regardless.
    cap; log scrubbing. **This is the review gate** — it warrants its own
    security-review pass before merge, and it is where an unauthenticated door
    first exists.
-6. **M5 — Frontend: owner side.** Share tab — recipient chips + invite toggle,
-   the file/folder-download/upload forms, member-count and egress preview, QR —
-   plus the **status and history** surface (§10.2): computed link badges
-   including *"not working: you no longer have access"*, the per-recipient
-   roster, the redemption ledger, resend / add / remove-recipient / revoke.
-   The status half is the part users will judge the feature by; it is not
-   trimmable scope.
+6. **M5 — Frontend: owner side.** Share tab — recipient chips (no invite toggle,
+   R9), the file/folder-download/upload forms, member-count and archive-size
+   preview, egress preview, QR, and the **copyable summary block** the creator
+   pastes into their own mail (URL, expiry, budget, folder size — R9) — plus the
+   **status and history** surface (§10.2): computed link badges including *"not
+   working: you no longer have access"*, the per-recipient roster, the redemption
+   ledger, resend code / add / remove-recipient / revoke. The status half is the
+   part users will judge the feature by; it is not trimmable scope.
 7. **M6 — Frontend: recipient side.** `/s/:token` landing, the email → code
    verification step, file download, folder download + manifest, drop flow.
 8. **M7 — Frontend + bridge: admin console.** `/admin/shares` (§10.3) over
@@ -1279,16 +1497,35 @@ version would have been. The mailer and templates are in scope regardless.
    filters, bulk **Revoke all by creator**, and the read-only ledger. Gated on
    `tenant_admin`; reuses the status computation written in M5 rather than
    re-deriving it.
-9. **M8 — Ops & docs.** `audit_service` codes + a rules-engine alert on
+9. **M8 — Dashboard: attention items + Sharing panel** (§10.6, R10). Three
+   separable pieces, in this order:
+   - **M8a — feed divisions.** `source` on the notification API, `SOURCES`
+     alongside `KINDS` in `discussion/notifications.py`, grouped rendering in
+     `DashboardView.vue` (Comments · Reviews · Sharing). **Independent of share
+     links entirely** — it improves the two existing systems and can ship first,
+     which is the argument for doing it first: it is the only piece here that
+     touches a surface users already depend on.
+   - **M8b — share attention items.** New `share_*` kinds appended to `KINDS`;
+     the nullable `share_link_uid` column; the `attentionLink()` branch to the
+     Share tab; the `share.*` events emitted by the core and consumed by
+     `discussion`'s consumer; the Dashboard-load pre-flight that raises *"your
+     link stopped working"*. **Tests:** an unknown kind is rejected loudly rather
+     than silently dropped; a creator's own link notifies them (the
+     `user_id == actor` trap); a *link dead* item survives the per-row READ
+     re-check when the creator has lost access to the resource.
+   - **M8c — Sharing panel.** `SharingInbox` beside `ReviewsInbox` over
+     `GET /v1/shares`, reusing M5's status computation.
+10. **M9 — Ops & docs.** `audit_service` codes + a rules-engine alert on
    `share_link_denied` bursts; retention sweeper; `share-links.md` help page;
    `core.conf` / compose defaults (`share.enabled = false`).
 
-M0–M4 are the security-bearing work; M5–M8 are surface. M2 is deliberately
+M0–M4 are the security-bearing work; M5–M9 are surface. M2 is deliberately
 shippable on its own so the model can be exercised before a public door exists
 anywhere; M1 is separable so the zip arithmetic is proven against fixtures
-rather than debugged through an HTTP stream; and M3 sits in a different repo and
+rather than debugged through an HTTP stream; M3 sits in a different repo and
 language, so it can run in parallel with M2 once the two `/internal/share/*`
-request shapes are agreed.
+request shapes are agreed; and M8a sits in a *third* repo
+(`discussion_threaded_communication`) with no dependency on any of it.
 
 **Ops preconditions before M4 ships** — the unauthenticated door now depends on
 more than the core: **Redis** (OTP storage) and **SMTP** (delivery) must be
