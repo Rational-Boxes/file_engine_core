@@ -578,7 +578,10 @@ Two consequences, both intended:
 1. `GET …/{link_uid}` — **peek**. Consumes nothing, reveals nothing about
    recipients, states that a code will be required.
 2. `POST …/{link_uid}/identify` `{email}` — if the address is on the allowlist,
-   mint a 6-digit code and mail it. Uniform response either way.
+   mint a 6-digit code and mail it. The code **expires after 10 minutes**
+   (`share.otp_ttl_seconds`, §9) and the mail states the deadline, since a code
+   that has quietly gone stale is otherwise indistinguishable to the recipient
+   from one they mistyped. Uniform response either way.
 3. `POST …/{link_uid}/verify` `{email, code}` — on success, issue a
    **recipient token** (256-bit, hashed at rest, TTL
    `share.recipient_ttl_seconds`, bound to link + email). Consumes nothing.
@@ -871,7 +874,7 @@ recipient list (§6.9).
 | `share.session_ttl_seconds` | `3600` | Redemption-session lifetime (§6.4). |
 | `share.max_sessions_per_hour` | `20` | Sessions one link may open per hour, independent of the use cap (§8.4). |
 | `share.max_recipients` | `20` | Addresses one link may be minted for. |
-| `share.otp_ttl_seconds` | `900` | Code lifetime (§6.9). |
+| `share.otp_ttl_seconds` | `600` | Code lifetime — **10 minutes** (§6.9). Long enough to survive mail-delivery latency and a recipient who switches devices to read it; short enough that a code sitting in an unattended inbox is not a standing credential. Note it is deliberately *shorter* than the `3 / 15 min` send window below, so a recipient whose code expires can always request another without being rate-limited for it. |
 | `share.otp_max_attempts` | `5` | Wrong codes before the challenge is burned. |
 | `share.otp_send_limit` | `3 / 15 min` per `(link, email)`, `20 / day` per link | `rate_ok` buckets. |
 | `share.recipient_ttl_seconds` | `86400` | Recipient-token lifetime — how long a verified recipient can open further sessions without a new code. |
