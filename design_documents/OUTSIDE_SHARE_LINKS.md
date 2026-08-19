@@ -177,12 +177,18 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_links (
     revoked_at      TIMESTAMPTZ,
     revoked_by      TEXT,
     -- budgets (0 = unlimited, subject to the deployment cap in §9)
+    -- A "use" is a REDEMPTION SESSION for every kind, without exception (§6.4).
     max_uses        INTEGER      NOT NULL DEFAULT 0,
     uses_consumed   INTEGER      NOT NULL DEFAULT 0,
     max_uses_per_recipient INTEGER NOT NULL DEFAULT 0,  -- 0 = only the shared pool
     max_bytes       BIGINT       NOT NULL DEFAULT 0,
     bytes_consumed  BIGINT       NOT NULL DEFAULT 0,
     max_file_bytes  BIGINT       NOT NULL DEFAULT 0,   -- upload: per-file cap
+    -- upload: how many FILES may be dropped in total, across all sessions.
+    -- Separate from max_uses because a session is not a file: one sender opens
+    -- one session and drops six things (§6.7).
+    max_files       INTEGER      NOT NULL DEFAULT 0,
+    files_consumed  INTEGER      NOT NULL DEFAULT 0,
     -- file-download options
     pinned_version  TEXT,                    -- version name; NULL = follow latest
     -- folder-download options
@@ -231,6 +237,12 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_link_members (
 paths, no leading `/` — so a hostile file name cannot produce a zip-slip archive
 on the recipient's machine.
 
+**There is deliberately no `crc32` column.** Filling one would mean reading every
+member's bytes at creation, and the core stores no digest to copy from; the CRC
+is instead computed as the bytes stream and written into a per-entry data
+descriptor (§6.5). `archive_path` and `size_bytes` are all the archive-length
+arithmetic needs.
+
 ### 5.3 `share_redemptions`
 
 One row per consumed use — simultaneously the counter's ledger and the forensic
@@ -258,22 +270,67 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_redemptions (
 );
 ```
 
-**The atomic consume** — one statement, no races, no serializable retries:
+**The atomic consume** — one statement, one row lock, no serializable retries.
+
+There are **two** counters to move together: the link's shared pool
+(`share_links.uses_consumed`) and, when `max_uses_per_recipient` is set, that
+recipient's own tally (`share_link_recipients.uses_consumed`, §5.4). An earlier
+draft of this section incremented only the first and claimed "one statement, no
+races" — which was true of the pool and false of the pair: two separate
+statements let concurrent sessions from one recipient each pass a per-recipient
+check that neither had yet invalidated, overrunning a personal cap while the
+shared pool stayed perfectly correct.
+
+Both move in one statement, gated on the link row being locked first:
 
 ```sql
-UPDATE "<tenant>".share_links
-   SET uses_consumed = uses_consumed + 1
- WHERE link_uid = $1
-   AND revoked_at IS NULL
-   AND expires_at > now()
-   AND (locked_until IS NULL OR locked_until < now())
-   AND (max_uses = 0 OR uses_consumed < max_uses)
-RETURNING kind, resource_uid, created_by, pinned_version, max_bytes, bytes_consumed, ...;
+WITH lim AS (
+    SELECT max_uses, uses_consumed, max_uses_per_recipient
+      FROM "<tenant>".share_links
+     WHERE link_uid = $1
+       AND revoked_at IS NULL
+       AND expires_at > now()
+       AND (locked_until IS NULL OR locked_until < now())
+       FOR UPDATE                      -- serializes concurrent redemptions of THIS link
+), rcpt AS (
+    UPDATE "<tenant>".share_link_recipients r
+       SET uses_consumed = r.uses_consumed + 1, last_used_at = now()
+      FROM lim
+     WHERE r.link_uid = $1 AND r.email = $2 AND r.removed_at IS NULL
+       AND (lim.max_uses = 0 OR lim.uses_consumed < lim.max_uses)
+       AND (lim.max_uses_per_recipient = 0
+            OR r.uses_consumed < lim.max_uses_per_recipient)
+    RETURNING r.email
+), pool AS (
+    UPDATE "<tenant>".share_links
+       SET uses_consumed = uses_consumed + 1
+     WHERE link_uid = $1 AND EXISTS (SELECT 1 FROM rcpt)
+    RETURNING kind, resource_uid, created_by, pinned_version, max_bytes, bytes_consumed
+)
+SELECT * FROM pool;
 ```
+
+The ordering is the point: the **recipient** update is the gate and the pool
+update is conditional on it, so a recipient at their personal cap consumes
+nothing from the shared pool. Reversing them — the obvious shape — increments the
+pool in the same snapshot and then discovers the recipient was ineligible, having
+already burnt a use that no rollback inside a single statement will return.
+
+`FOR UPDATE` narrows concurrency to one in-flight session *per link*, which is
+not a hot path: redemptions of a single link are a handful of people over days.
+The lock is what a second counter costs, and it is cheaper than the transaction
+retry loop the lock-free version would need.
 
 Zero rows returned ⇒ generic 404 (§8.5). The secret and the recipient's OTP are
 verified *before* this statement, so nothing an unverified caller does can burn a
 use.
+
+**Uploads consume a file slot separately**, by the same shape and for the same
+reason (§6.7): `UPDATE … SET files_consumed = files_consumed + 1 WHERE link_uid = $1
+AND (max_files = 0 OR files_consumed < max_files) RETURNING files_consumed` runs
+per dropped file, before any bytes are stored, and is **released on failure** so
+an aborted upload does not spend the sender's budget. One counter here, so no
+lock is needed.
 
 ### 5.4 `share_link_recipients`
 
@@ -321,8 +378,11 @@ three of them may download twice" is expressed.
 Expired and revoked rows are **kept** (they are audit evidence) and purged by the
 existing background-worker pattern (`FileCuller`) after
 `share.retention_days` (default 365), emitting `share_link_expired` on the way
-out. Nothing about correctness depends on the sweeper — every check is
-evaluated at redemption time.
+out. That emission is **fail-closed** (§12): a row whose purge cannot be recorded
+is not purged, and the sweeper retries on its next pass. Nothing about
+correctness depends on the sweeper — every check is evaluated at redemption
+time — so a stalled sweep costs disk and a little PII retention, never
+enforcement.
 
 ---
 
@@ -449,6 +509,27 @@ exchange in §6.9 — entering an address, receiving a code, entering it — con
 nothing. The use is spent at session open, once a verified recipient has actually
 asked for the payload.
 
+**A use is a session for every kind, uploads included — and that is why uploads
+need a second budget.** An earlier draft said a use was a session (here) and also
+that `max_uses` was "the file count" for drops (§6.7). Both cannot hold: if one
+session admits any number of files, `max_uses` bounds nothing about how much
+arrives; if each file burns a use, the retry-safety this whole section exists to
+provide is gone for exactly the transfers most likely to fail. So the two things
+are counted separately and named separately:
+
+| Budget | Bounds | Applies to |
+|---|---|---|
+| `max_uses` | **Redemption sessions** | all kinds |
+| `max_files` | **Files dropped**, across all sessions | `kind = 1` only |
+| `max_bytes` | Total bytes moved | all kinds |
+
+A drop box minted as "5 files" therefore sets `max_files = 5`, and the sender may
+open as many sessions as `max_uses` allows to deliver them — a phone that drops
+its connection after three files resumes in a new session and still has two files
+left, which is the behaviour anyone would expect and the one the single-counter
+design could not express. §10.1's upload form asks for the file count and sets
+`max_files`; `max_uses` gets a sensible default the creator rarely touches.
+
 ### 6.5 Folder downloads (zip)
 
 Two of R8's three share shapes land here — *the folder's contents*
@@ -467,14 +548,56 @@ plainly ("include anything added later").
 
 **Store-only zip64, with a known length.** The archive is assembled with **no
 compression** (`method 0`), which makes its byte length exactly computable at
-creation from the member sizes plus fixed header/central-directory overhead —
-so `archive_bytes` is stored on the link and served as a real `Content-Length`.
-The recipient gets a progress bar instead of an indefinite chunked stream, and
-the deployment gets an exact number to budget against. Zip64 unconditionally, so
->4 GiB archives and >65 535 members are not a special case. Most of what this
-system holds (PDF, IFC, images, office documents) is already compressed, so the
-forfeited ratio is small; `share.zip_deflate = true` is available for
-text-heavy corpora and trades `Content-Length` for compression.
+creation from the member sizes plus fixed per-entry overhead — so `archive_bytes`
+is stored on the link and served as a real `Content-Length`. The recipient gets a
+progress bar instead of an indefinite chunked stream, and the deployment gets an
+exact number to budget against. Zip64 unconditionally, so >4 GiB archives and
+>65 535 members are not a special case. Most of what this system holds (PDF, IFC,
+images, office documents) is already compressed, so the forfeited ratio is small;
+`share.zip_deflate = true` is available for text-heavy corpora and trades
+`Content-Length` for compression.
+
+**Streaming forces data descriptors, and they must be in the arithmetic.** A
+store-only local file header carries the CRC-32 and both sizes *before* the
+entry's data — but the CRC is only known once the bytes have been read, and the
+core stores no per-file checksum to look it up from (`versions` holds
+`size`/`storage_path`, no digest, `database.cpp:2072`). Precomputing CRCs at
+creation would mean reading every byte of a 2 GiB folder while the creator waits
+in the drawer, which is not acceptable for an interactive action.
+
+So each entry is written with the **general-purpose bit 3** set and its CRC and
+sizes deferred to a **zip64 data descriptor** after the data — CRC-32 computed
+per member as its bytes pass through, exactly as §7.3 says. The descriptor is a
+fixed 24 bytes (signature 4 + CRC 4 + compressed size 8 + uncompressed size 8),
+so the length stays exactly computable; it just has a term the earlier draft
+omitted:
+
+```
+per entry   = 30 + len(archive_path) + 20   (local header + zip64 extra)
+            + size_bytes                    (stored, uncompressed)
+            + 24                            (zip64 data descriptor)
+per central = 46 + len(archive_path) + 28   (central directory + zip64 extra)
+total       = Σ per entry + Σ per central + 56 + 20 + 22
+                                            (zip64 EOCD + locator + EOCD)
+```
+
+Every term is known at creation from `share_link_members` alone — names and sizes
+— which is what keeps `archive_bytes` honest. Empty directories are entries with
+`size_bytes = 0` and count in both sums.
+
+Two consequences worth stating plainly rather than discovering in support:
+
+- **Bit 3 is the one compatibility cost.** Every mainstream extractor handles
+  streamed zips (that is what every "download as zip" on the web produces), but
+  some older Windows-native paths and embedded tools are unhappy with data
+  descriptors. The alternative was worse, and `share.zip_deflate` already exists
+  for anyone who needs to trade the exact length away.
+- **A member whose stored size no longer matches its bytes breaks the
+  `Content-Length` contract.** The size is pinned at creation and the version is
+  pinned with it, so this means the object was culled or corrupted mid-flight. On
+  a mismatch the bridge **aborts the connection** rather than padding or
+  truncating: a short body under a declared length is a silently corrupt archive,
+  and a broken transfer is the honest failure. Audited on the redemption row.
 
 **Per-member authority re-check.** §6.3 runs on the folder *and* on each member
 at redemption. A member the creator can no longer read is **omitted**, not
@@ -519,8 +642,11 @@ children.
   both a data-integrity problem and a plausible attack (poison the "latest" of a
   file someone else trusts).
 - **Budgets** are enforced twice: streaming in the bridge (fail fast, don't buffer
-  a 40 GB body) and authoritatively in the core (`max_file_bytes`,
-  `max_bytes` remaining, `max_uses` as the file count).
+  a 40 GB body) and authoritatively in the core — `max_file_bytes` per file,
+  `max_bytes` remaining across the link, and **`max_files`** as the file count
+  (§6.4; *not* `max_uses`, which counts sessions). The file slot is reserved
+  before bytes are stored and released if the upload fails (§5.3), so a dropped
+  connection costs the sender nothing.
 - **Extension allowlist** is optional and matched on the claimed name only —
   it is a convenience for the sender, never a security control. Content type is
   never trusted; nothing is executed.
@@ -776,7 +902,7 @@ prefix that nginx, CORS, and the rate limiter can target as a unit.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/nodes/{uid}/shares` | Create a link. Body: `kind`, **`recipients[]` (required, ≥1)**, `expires_at`\|`ttl`, `max_uses`, `max_uses_per_recipient?`, `max_bytes`, `max_file_bytes`, `follow_latest?`, `follow_folder?`, `include_subdirs?`, `landing_prefix?`, `ext_allowlist?`, `note?`. **201** returns the full URL once, plus `archive_bytes` / member count for `kind = 2` — the numbers §10.1 renders into the copyable summary the creator pastes into their own mail (§13-R9). No `send_invite`: v1 sends no invite. |
+| `POST` | `/v1/nodes/{uid}/shares` | Create a link. Body: `kind`, **`recipients[]` (required, ≥1)**, `expires_at`\|`ttl`, `max_uses`, `max_uses_per_recipient?`, `max_bytes`, `max_file_bytes`, `max_files?` (upload — the file count, distinct from `max_uses`, §6.4), `follow_latest?`, `follow_folder?`, `include_subdirs?`, `landing_prefix?`, `ext_allowlist?`, `note?`. **201** returns the full URL once, plus `archive_bytes` / member count for `kind = 2` — the numbers §10.1 renders into the copyable summary the creator pastes into their own mail (§13-R9). No `send_invite`: v1 sends no invite. |
 | `GET` | `/v1/nodes/{uid}/shares` | Links on this node (requires `MANAGE_ACL` or being the creator). |
 | `GET` | `/v1/shares` | The caller's own links. `?all=true` (**`tenant_admin` only**) returns the tenant-wide set backing the admin console (§10.3), with `creator`, `recipient`, `subtree`, and `status` filters and `live=true` by default. |
 | `DELETE` | `/v1/shares/{link_uid}` | Revoke. Idempotent. |
@@ -791,7 +917,7 @@ prefix that nginx, CORS, and the rate limiter can target as a unit.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/v1/public/shares/{link_uid}` | **Peek.** Consumes nothing. Returns `kind`, display name, `expires_at`, `uses_remaining`, and either size + content-type (`kind = 0`) or member count + `archive_bytes` (`kind = 2`) or the remaining file/byte budget (`kind = 1`). |
+| `GET` | `/v1/public/shares/{link_uid}` | **Peek.** Consumes nothing. Returns `kind`, display name, `expires_at`, `uses_remaining`, and either size + content-type (`kind = 0`) or member count + `archive_bytes` (`kind = 2`) or the remaining **file** and byte budget — `max_files - files_consumed` and `max_bytes - bytes_consumed` (`kind = 1`). |
 | `POST` | `/v1/public/shares/{link_uid}/identify` | `{email}` → mails a 6-digit code **iff** the address is on the link's allowlist. Uniform response either way (§6.9). Consumes nothing. |
 | `POST` | `/v1/public/shares/{link_uid}/verify` | `{email, code}` → the **recipient token** (TTL `share.recipient_ttl_seconds`). Consumes nothing; 5 failures per `(link, email)` per window lock that address out — a resend does **not** reset the count (§8.4). |
 | `POST` | `/v1/public/shares/{link_uid}/session` | Open a redemption session (**this is the use-consuming call**). Requires the recipient token. Returns `redemption_uid` + TTL, and writes `verified_email` onto the ledger row. |
@@ -925,7 +1051,7 @@ already in the wild.
 |---|---|
 | Guessing secrets for a known `link_uid` | `failed_attempts` on the row; after 10 within the window, `locked_until = now() + 15 min`, and the link's creator is notified. Distributed guessing hits the same per-link counter, so IP rotation does not help. |
 | Enumerating `link_uid`s | 128-bit uid + a per-IP nginx `limit_req` zone on `location /api/v1/public/` + identical 404s (§8.5). |
-| Upload flood / storage exhaustion | Per-link file count, per-file bytes, total bytes; per-IP request rate; the bridge's existing `max_body_bytes` (`src/http_server.cpp:294`) as the outer bound. |
+| Upload flood / storage exhaustion | Per-link file count (`max_files`), per-file bytes (`max_file_bytes`), total bytes (`max_bytes`), and session count (`max_uses`) — four independent bounds, since one sender's single session could otherwise deliver unlimited files (§6.4); per-IP request rate; the bridge's existing `max_body_bytes` (`src/http_server.cpp:294`) as the outer bound. |
 | Bandwidth drain on a download link | `max_uses` is the primary bound; sessions are also capped in count per link per hour. |
 | Zip amplification (a folder link as a bandwidth cannon) | `share.zip_max_bytes` / `share.zip_max_members` refused **at creation** (§6.1); `archive_bytes × max_uses` is the exact worst-case egress of a link and the UI shows it; concurrent zip streams capped per link and per bridge instance. |
 | Zip-slip against the recipient | `archive_path` normalized and validated at creation (§5.2) — no `..`, no absolute paths, no leading separator. |
@@ -1065,6 +1191,7 @@ recipient list (§6.9).
 | `share.otp_send_limit` | `3 / 15 min` per `(link, email)`, `20 / day` per link | `rate_ok` buckets. |
 | `share.recipient_ttl_seconds` | `86400` | Recipient-token lifetime — how long a verified recipient can open further sessions without a new code. |
 | `share.attention_events` | `drop_received, otp_send_failed, link_dead, first_redemption` | Which share events raise a creator attention item (§10.6). `budget_exhausted` / `expiry_soon` are available and off by default — they are the two most likely to become noise. |
+| `share.upload_max_files` | `20` | Default file count for a new upload link (`max_files`). Bounds how many files may be dropped in total; `max_uses` separately bounds sessions (§6.4). |
 | `share.upload_max_bytes` | `1 GiB` | Default byte budget for a new upload link. |
 | `share.upload_max_file_bytes` | `256 MiB` | Default per-file cap. |
 | `share.zip_max_bytes` | `2 GiB` | Largest folder snapshot a link may be minted over; refused at creation (§6.1). |
@@ -1110,8 +1237,12 @@ one thing in this form a user can get wrong without noticing.
   and refuses with a clear count/size when the folder exceeds `share.zip_max_*`.
   Worst-case egress (`archive size × max downloads`) is shown beside the use cap;
   it is the number that surprises people.
-- **Upload** — per-file cap, total byte budget, optional landing subfolder,
-  optional extension allowlist.
+- **Upload** — **how many files** they may send (`max_files`, the number the
+  creator actually thinks in), per-file cap, total byte budget, optional landing
+  subfolder, optional extension allowlist. The session cap (`max_uses`) is not on
+  this form: it defaults from `share.max_uses_cap` and exists so a drop box
+  cannot be reopened indefinitely, not as something a creator should reason about
+  (§6.4).
 
 On success: the URL exactly once, in a copy-to-clipboard field, with the existing
 `QrCode.vue` beside it (a QR of a one-time drop link is genuinely useful on a
@@ -1310,9 +1441,13 @@ After verification the view shows one of:
   list (from `/manifest`), and one Download button producing the zip. The list
   is read-only text — no per-file fetch, no preview, no navigation.
 - **Drop:** a drop zone reusing `UploadTray.vue`, the remaining budget
-  ("4 of 5 files, 780 MB left"), an optional free-text name (`share.claimed_name`
-  — the address is already verified, so there is no email field here), and a list
-  of what *this* session dropped. On completion, a plain confirmation.
+  ("4 of 5 files, 780 MB left" — `max_files` and `max_bytes`, never the session
+  count, which is not the sender's business), an optional free-text name
+  (`share.claimed_name` — the address is already verified, so there is no email
+  field here), and a list of what *this* session dropped. A file that fails
+  mid-upload releases its slot and the counter goes back up (§5.3), so the
+  displayed budget is refreshed from the server after each file rather than
+  decremented locally. On completion, a plain confirmation.
 
 All three render a session-less shell: `AppNav` is not mounted, and no call on
 this page may carry a bearer token even if one is in `localStorage`.
@@ -1484,7 +1619,7 @@ New actions, added to `codes.py` and `audit_entry.h`'s string map in lockstep
 | `share_link_challenge_failed` | `auth` | **yes** | Wrong code, burned challenge, or an unlisted address — `detail.reason` separates them, the recipient's response does not. |
 | `share_provenance_tamper` | `permission` | **yes** | An attempt to write or delete a reserved `share.*` metadata key through the ordinary metadata API (§6.8). Denied regardless of the caller's rights, including admins. Rare enough that any occurrence is worth looking at — it is either a client writing keys it should not know about, or someone trying to re-attribute a dropped file. `detail` carries the key, the attempted value, and the caller. |
 | `share_link_locked` | `permission` | **yes** | **The security alert** (§8.4 rung 2): a publicly reachable link crossed the brute-force threshold and is locked. Distinct from `share_link_denied` because it is an adjudicated conclusion, not a data point — the rules engine should alert on *this* directly rather than inferring it from a burst. `detail` carries the contributing addresses, source IPs, and whether the failures were wrong secrets, wrong codes, or both. Fail-closed for the same reason as the grant events: a lockout the log did not record is a lockout nobody can investigate. |
-| `share_link_expired` | `admin` | no | Emitted by the retention sweeper. Note `is_fail_closed(Admin)` is **`true`** in `audit_entry.cpp:62`, contradicting the "no" here — see the open correction in §12's closing note. |
+| `share_link_expired` | `admin` | **yes** | Emitted by the retention sweeper when a dead row is purged (§5.5). Fail-closed is not a concession to `is_fail_closed(Admin)` being `true` (`audit_entry.cpp:62`) — it is the right behaviour on its own: this event records the **destruction of audit evidence**, so if it cannot be written the purge must not happen. The sweeper skips the row and retries next pass; rows outliving `share.retention_days` during an audit outage is the harmless failure, and purging them unrecorded is not. |
 
 `detail` carries `link_uid`, `resource_uid`, `created_by`, `verified_email`,
 budgets, and `bytes_moved`; `target_uid` / `target_type` are the shared resource, so the
@@ -1691,12 +1826,26 @@ as gaps: the cross-folder file picker and arbitrary multi-file links (R8),
 system-sent invite mail and its `invite_sent_at` / `invite_error` reporting (R9),
 and email notification of the creator (R10).
 
-What remains before implementation is not design but **four corrections carried
-over from review**, all in M0/M1 and none affecting the security model above:
-the use-vs-file-count contradiction for upload links (§6.4 against §6.7), the
-per-recipient counter's atomicity against §5.3's single-statement claim, the zip
-CRC / data-descriptor arithmetic (§5.2 has no `crc32` column, §6.5 promises an
-exact length), and `share_link_expired`'s fail-closed category (§12).
+**R12 — the four review corrections, applied.** All four were internal
+inconsistencies rather than open questions, and all four are now fixed in place:
+
+- **Uploads count files, not sessions.** §6.4 said a use was a session; §6.7 said
+  `max_uses` was the file count. New `max_files` / `files_consumed` columns
+  (§5.1), a use is a session for every kind without exception, and the file slot
+  is reserved before bytes are stored and released on failure.
+- **The per-recipient counter moves with the pool.** §5.3's "one statement, no
+  races" was true of the shared pool and false of the pair. One statement now,
+  with the link row `FOR UPDATE` and the *recipient* update gating the pool
+  update — the ordering matters, since the reverse burns a use before
+  discovering the recipient was ineligible.
+- **The zip length arithmetic has a CRC story.** Store-only headers need the CRC
+  up front, the core stores no digest to look it up from, and computing one at
+  creation means reading every byte while the creator waits. Entries are written
+  with bit 3 and a 24-byte zip64 data descriptor, which is now a term in the
+  `archive_bytes` formula (§6.5) rather than a missing one.
+- **`share_link_expired` is fail-closed.** It records the destruction of audit
+  evidence, so a purge that cannot be recorded does not happen — which is also
+  what `is_fail_closed(Admin)` already does.
 
 ---
 
@@ -1717,7 +1866,11 @@ exact length), and `share_link_expired`'s fail-closed category (§12).
    a `DENY everyone + ALLOW role` gated section redeeming correctly with supplied
    roles and failing without them, `system_admin`/`tenant_admin`/`administrators`
    never granting anything on the share path, atomic use consumption under
-   concurrency, scope containment (a share credential cannot reach a sibling, a
+   concurrency **including the per-recipient cap** (concurrent sessions from one
+   recipient must not overrun `max_uses_per_recipient`, and a recipient refused
+   by their personal cap must not consume from the shared pool — §5.3),
+   `max_files` bounding drops independently of `max_uses` with a failed upload
+   releasing its slot (§6.4/§6.7), scope containment (a share credential cannot reach a sibling, a
    parent, or an ACL), uniform failure, a session refusing to open for an address
    not on the allowlist, and a wrong secret consuming an attempt but not a use.
    Provenance (§6.8): a `share.*` key cannot be written, overwritten, or deleted
@@ -1731,9 +1884,13 @@ exact length), and `share_link_expired`'s fail-closed category (§12).
    the one piece with real algorithmic content (§6.5, §7.3) and it should be
    testable against a fixture tree before any bridge code exists. **Tests:**
    snapshot excludes later additions; a member gaining DENY is omitted and
-   audited, not fatal; archive-length arithmetic matches a real zip byte-for-byte
-   (including zip64 and empty directories); `archive_path` rejects `..` and
-   absolute forms.
+   audited, not fatal; **archive-length arithmetic matches a real zip
+   byte-for-byte** — the term that matters is the 24-byte zip64 data descriptor
+   per entry (§6.5), so the test must extract with a real tool *and* compare the
+   declared `Content-Length` to the produced byte count, including zip64 and
+   empty directories; a member whose stored size no longer matches its bytes
+   aborts the transfer rather than sending a short body; `archive_path` rejects
+   `..` and absolute forms.
 3. **M2 — Bridge: owner-side routes.** `/v1/nodes/{uid}/shares`,
    `/v1/shares/*`; URL assembly from `SHARE_PUBLIC_BASE_URL`; audit passthrough.
    No public surface yet — the model is exercisable end-to-end by an
