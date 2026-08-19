@@ -549,6 +549,62 @@ Audit events for the drop use `actor = "share:<link_uid>|<verified_email>"`,
 shows the door, the verified human who walked through it, and the person
 accountable for opening it.
 
+`share.verified_email` is the load-bearing one. Ownership is a deliberate lie of
+convenience — the file is owned by `created_by` so that ACL inheritance works and
+no orphan principal appears in the ACL tables — and this key is the only thing on
+the file itself that says a stranger put it there. Three properties have to hold
+for it to function as an accounting record rather than a hint.
+
+**1. The `share.*` namespace is reserved and immutable.** `SetMetadata` today
+gates on `WRITE` and validates nothing about the key
+(`core/src/grpc_service.cpp:1119–1137`), so as specified above any user with
+WRITE on the dropped file could rewrite `share.verified_email` — or, worse in the
+other direction, **stamp it onto a file they uploaded themselves** and attribute
+their own document to an outside party. Erasure destroys evidence; forgery
+manufactures it, and forgery is the easier attack and the more damaging one.
+
+So the core refuses `SetMetadata` / `DeleteMetadata` for any key matching
+`share.*` from every ordinary caller, returning `PERMISSION_DENIED` and emitting
+an audit event (`share_provenance_tamper`, category `permission`, fail-closed).
+The keys are writable **only** by the internal drop path that mints them. This
+holds for `system_admin` and `tenant_admin` too: a provenance field an
+administrator can edit is not evidence, and the correction path for a wrong
+record is the audit log, not mutation of the record. It is the same reasoning
+that makes the audit chain append-only.
+
+**2. The provenance belongs to the version, not just the file.** Drops never
+version an existing file (§6.7), but nothing stops an *internal* user adding a
+version to a dropped file afterwards — and at that point file-level metadata
+saying "uploaded by bob@contractor.example" is describing bytes bob never sent.
+The keys are therefore written as **version metadata** on the dropped version
+(the core already carries per-version metadata — `GetVersionMetadata`,
+`proto/fileservice.proto:397`) *and* mirrored to file metadata for
+discoverability. Where they disagree, the version record governs, and the UI
+reads the version's.
+
+**3. It has to be visible where the file is.** Today the drawer renders metadata
+as a flat, editable key/value table (`FileDetailsDrawer.vue:109`, with set and
+delete handlers) beside an `Owner` field — so as things stand this would surface
+as an editable row saying `share.verified_email`, next to an Owner field naming
+someone who never touched the file. That is precisely the accounting confusion
+this key exists to prevent. Instead:
+
+- `share.*` keys are **excluded from the editable metadata table** and rendered
+  as a distinct read-only **Origin** block: *"Received from
+  bob@contractor.example via a share link · 14 Aug 2026 · from 203.0.113.7"*,
+  with the link's note and a deep link to its ledger (§10.2) for anyone holding
+  rights on it.
+- The block states the ownership split in words rather than leaving the reader to
+  infer it — owned by the creator, *sent by* the outside address — because "Owner:
+  Alice" on a file Alice never saw is the single most misleading thing this
+  feature can put on a screen.
+- `share.claimed_name` renders inside that block clearly marked as sender-typed
+  and unverified, never adjacent to the verified address in a way that lets the
+  two be read as equally trustworthy.
+- The file browser marks dropped files with a small origin badge, so "what came
+  in from outside" is answerable by looking rather than by querying the audit
+  service.
+
 ### 6.9 Recipient verification (email + OTP) — required
 
 **Every redemption is gated on a verified recipient.** Before any byte moves, the
@@ -1426,6 +1482,7 @@ New actions, added to `codes.py` and `audit_entry.h`'s string map in lockstep
 | `share_link_challenge_sent` | `auth` | **yes** | An OTP was mailed (§6.9). `is_fail_closed(Auth)` is already `true` — consistent with the platform rule that auth events block the operation if they cannot be recorded. `detail` carries the address; `outcome = error` when SMTP failed, which is the event support will look for. |
 | `share_link_challenge_verified` | `auth` | **yes** | The recipient proved control of the address. This is the event that makes a redemption attributable to a human. |
 | `share_link_challenge_failed` | `auth` | **yes** | Wrong code, burned challenge, or an unlisted address — `detail.reason` separates them, the recipient's response does not. |
+| `share_provenance_tamper` | `permission` | **yes** | An attempt to write or delete a reserved `share.*` metadata key through the ordinary metadata API (§6.8). Denied regardless of the caller's rights, including admins. Rare enough that any occurrence is worth looking at — it is either a client writing keys it should not know about, or someone trying to re-attribute a dropped file. `detail` carries the key, the attempted value, and the caller. |
 | `share_link_locked` | `permission` | **yes** | **The security alert** (§8.4 rung 2): a publicly reachable link crossed the brute-force threshold and is locked. Distinct from `share_link_denied` because it is an adjudicated conclusion, not a data point — the rules engine should alert on *this* directly rather than inferring it from a burst. `detail` carries the contributing addresses, source IPs, and whether the failures were wrong secrets, wrong codes, or both. Fail-closed for the same reason as the grant events: a lockout the log did not record is a lockout nobody can investigate. |
 | `share_link_expired` | `admin` | no | Emitted by the retention sweeper. Note `is_fail_closed(Admin)` is **`true`** in `audit_entry.cpp:62`, contradicting the "no" here — see the open correction in §12's closing note. |
 
@@ -1653,7 +1710,9 @@ exact length), and `share_link_expired`'s fail-closed category (§12).
    `StreamFileUpload`; the §6.3 re-check (taking the creator's roles as an RPC
    argument, admin roles stripped core-side as a second line of defence);
    the creation pre-flight; the recipient allowlist and its enforcement at
-   session open; audit emission.
+   session open; **the reserved `share.*` metadata namespace on `SetMetadata` /
+   `DeleteMetadata`** and the drop path's version-metadata write (§6.8); audit
+   emission.
    **Tests:** the authority re-check (creator loses READ mid-life), a link inside
    a `DENY everyone + ALLOW role` gated section redeeming correctly with supplied
    roles and failing without them, `system_admin`/`tenant_admin`/`administrators`
@@ -1661,6 +1720,11 @@ exact length), and `share_link_expired`'s fail-closed category (§12).
    concurrency, scope containment (a share credential cannot reach a sibling, a
    parent, or an ACL), uniform failure, a session refusing to open for an address
    not on the allowlist, and a wrong secret consuming an attempt but not a use.
+   Provenance (§6.8): a `share.*` key cannot be written, overwritten, or deleted
+   through `SetMetadata` / `DeleteMetadata` **by any caller including
+   `system_admin`** — tested in both directions, erasure *and* forgery onto a
+   file that was never dropped — and a version added to a dropped file afterwards
+   does not inherit the original sender's attribution.
 2. **M1 — Core: folder snapshots.** The creation-time walk and member capture,
    `archive_bytes` computation, the per-member re-check at session open, the
    frozen member list on the redemption row. Kept separate from M0 because it is
@@ -1703,6 +1767,11 @@ exact length), and `share_link_expired`'s fail-closed category (§12).
    working: you no longer have access"*, the per-recipient roster, the redemption
    ledger, resend code / add / remove-recipient / revoke. The status half is the
    part users will judge the feature by; it is not trimmable scope.
+   Also the **Origin block** (§6.8) on any dropped file — `share.*` keys pulled
+   out of the editable metadata table into a read-only provenance panel that
+   states the owned-by / sent-by split in words, plus the browser's origin badge.
+   Small, and the only thing standing between a dropped file and an `Owner` field
+   that names someone who never touched it.
 7. **M6 — Frontend: recipient side.** `/s/:token` landing, the email → code
    verification step, file download, folder download + manifest, drop flow.
 8. **M7 — Frontend + bridge: admin console.** `/admin/shares` (§10.3) over
