@@ -193,8 +193,11 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_links (
     -- upload options
     landing_prefix  TEXT,                    -- optional subfolder name, created lazily
     ext_allowlist   TEXT[],                  -- NULL = any
-    -- abuse
-    failed_attempts INTEGER      NOT NULL DEFAULT 0,
+    -- abuse (§8.4): a ROLLING count, not a lifetime total — counts older than
+    -- share.lockout_window_minutes are discarded and a verified redemption
+    -- clears them, or ordinary typos accumulate into a permanent lockout.
+    failed_attempts    INTEGER   NOT NULL DEFAULT 0,
+    failed_window_start TIMESTAMPTZ,
     locked_until    TIMESTAMPTZ,
     note            TEXT                     -- creator's own label, shown in the UI
 );
@@ -871,6 +874,95 @@ already in the wild.
 | **Enumerating the recipient list** | `/identify` returns the identical response for listed and unlisted addresses (§6.9, §8.5). |
 | Confused deputy via MCP | The share RPCs are simply not exposed on the MCP door (§11). |
 
+#### Exceeding the attempt budget is a brute-force signal, not a user error
+
+A link is a **publicly reachable URL**. One recipient fat-fingering a 6-digit
+code twice is ordinary; a link accumulating wrong codes across addresses, or the
+same address exhausting its budget repeatedly, is someone working on the door.
+The two readings need different responses, so the counters escalate in three
+rungs rather than one:
+
+| Rung | Trigger | Response |
+|---|---|---|
+| **1 — address** | `share.otp_max_attempts` (5) wrong codes for one `(link, email)` in the window | That address cannot verify until the window passes. The link keeps working for everyone else. Nobody is notified — this rung is indistinguishable from a person having a bad day. |
+| **2 — link** | `share.link_lockout_threshold` (default **15**) failed verifications across *any* addresses, or **3** distinct addresses each hitting rung 1, within `share.lockout_window_minutes` (60) | `locked_until = now() + share.lockout_minutes` (15) on the link: **every** redemption path 404s for the duration (§8.5). Audit `share_link_denied` with `detail.reason = brute_force_lockout`; an attention item to the creator (§10.6) reading *"someone is trying codes against your link"*; the **Blocked** badge in the Share tab (§10.2). |
+| **3 — deployment** | Rung 2 recurring on one link, or firing across many links at once | Escalation beyond the tenant: correlated across links by the rules engine, where "many links at once" distinguishes a targeted recipient from someone working through the whole tenant. |
+
+#### Rung 0 — timing: nobody types that fast
+
+Counting attempts alone lets a script spend its whole budget in 200 ms and come
+back the moment the window rolls. **How fast the attempts arrive is itself the
+signal**, and it separates the two populations cleanly: a person reads a code out
+of a mail client and types or pastes it; a script submits as fast as the network
+allows, at metronomic intervals, and often before the mail could plausibly have
+been delivered at all.
+
+Two checks, both cheap, both evaluated in `ldap_manager` alongside the attempt
+bucket (same Redis, same `(link, email)` key, so they are equally
+replica-safe):
+
+| Check | Default | Rationale |
+|---|---|---|
+| **Time since the code was sent** | `share.otp_min_seconds_after_send` = `5` | The strongest of the two, because it is bounded by physics outside the attacker's control: a code cannot be *read* before the mail is delivered. An attempt 300 ms after `/identify` was not typed by someone who received an email. |
+| **Interval between consecutive attempts** | `share.otp_min_submit_interval_ms` = `1500` | A person who mistypes re-reads the code before retrying. Sub-second retries are a loop. |
+
+**A tripped timing check is not rejected differently — it is counted more
+heavily.** The response stays byte-identical to an ordinary wrong code (§8.5);
+what changes is that the attempt contributes to the link-level counter at a
+higher weight (`share.otp_timing_weight`, default `5`), so a script hits rung 2
+almost immediately while a fast-but-real recipient does not. Rejecting with a
+distinct "too fast" response would be the worst of both worlds: it teaches the
+script exactly what to tune, and it tells a legitimate recipient something
+useless.
+
+Two honest caveats, since this is heuristic where the other rungs are not:
+
+- **Paste is fast.** A recipient with the mail open in a second tab can paste a
+  code within a second or two of the page rendering — but not within a second or
+  two of *requesting* it, which is why the send-time check carries more weight
+  than the interval check and why neither denies on its own.
+- **Interval jitter analysis is deliberately out of scope for v1.** Scripts are
+  metronomic and the variance is a strong tell, but building a distribution test
+  on top of a 5-attempt budget is machinery for a population too small to learn
+  from. The two thresholds above catch the unsubtle case, which is the case that
+  actually shows up.
+
+**Rung 2 raises a first-class security alert.** It emits its own audit action —
+`share_link_locked`, category `permission`, fail-closed (§12) — rather than
+leaving the signal to be inferred from a burst of `share_link_denied`. A burst
+threshold is a heuristic that has to be tuned and can be paced under; a lockout
+is a **discrete, already-adjudicated event**: the system has concluded that a
+publicly reachable door is being worked on. That deserves an alert on its own,
+at the moment it happens, with `link_uid`, `resource_uid`, `created_by`, the
+source addresses seen, and which rung-1 addresses contributed. The
+`share_link_denied` burst rule stays as the broader net for everything that
+never reaches a lockout.
+
+Three properties of that ladder are deliberate:
+
+- **Wrong secrets and wrong codes feed the same link-level counter.** They are
+  the same adversary from the link's point of view, and keeping two independent
+  budgets would let an attacker spend both. `detail.reason` still separates them
+  in audit, so the forensic view can tell "guessing the URL" from "holding the
+  URL and guessing the code" — a materially different disclosure, since the
+  latter means the token already leaked.
+- **Lockout is temporary and never auto-revokes.** A link is public: anyone
+  holding the URL can deliberately burn attempts. If exhaustion revoked the
+  link, any recipient — or anyone they forwarded the mail to — could permanently
+  destroy a colleague's share with a few wrong codes, turning an abuse control
+  into a third-party denial of service. Rung 2 therefore expires on its own, and
+  only a human (creator or `tenant_admin`, §10.3) revokes.
+- **`failed_attempts` is a rolling count, not a lifetime total.** It carries
+  `failed_window_start`; counts older than `share.lockout_window_minutes` are
+  discarded, and a **successful verified redemption clears it**. Without that,
+  every long-lived link eventually accumulates its way into a permanent lockout
+  from ordinary typos — the failure mode where a security control quietly
+  becomes an expiry mechanism nobody documented.
+
+The recipient sees none of this beyond the uniform response and their own
+attempt state (§10.4); the distinction between "you are locked out" and "this
+link is blocked" is not disclosed to an unverified caller.
+
 ### 8.5 Uniform failure
 
 Unknown uid, bad secret, expired, revoked, exhausted, locked, resource deleted,
@@ -900,7 +992,13 @@ recipient list (§6.9).
 | `share.max_sessions_per_hour` | `20` | Sessions one link may open per hour, independent of the use cap (§8.4). |
 | `share.max_recipients` | `20` | Addresses one link may be minted for. |
 | `share.otp_ttl_seconds` | `600` | Code lifetime — **10 minutes** (§6.9). Long enough to survive mail-delivery latency and a recipient who switches devices to read it; short enough that a code sitting in an unattended inbox is not a standing credential. Note it is deliberately *shorter* than the `3 / 15 min` send window below, so a recipient whose code expires can always request another without being rate-limited for it. |
-| `share.otp_max_attempts` | `5` | Wrong codes per `(link, email)` per window before that address is locked out. Counted against the **address**, not the challenge, so requesting a fresh code does not restore attempts (§8.4). |
+| `share.otp_max_attempts` | `5` | Wrong codes per `(link, email)` per window before that address is locked out (§8.4 rung 1). Counted against the **address**, not the challenge, so requesting a fresh code does not restore attempts. |
+| `share.otp_min_seconds_after_send` | `5` | Minimum plausible gap between mailing a code and someone submitting it (§8.4 rung 0). |
+| `share.otp_min_submit_interval_ms` | `1500` | Minimum plausible gap between two consecutive code submissions. |
+| `share.otp_timing_weight` | `5` | How much an attempt that trips either timing check counts toward the link-level counter. Never a distinct response — only a heavier count (§8.4). |
+| `share.link_lockout_threshold` | `15` | Failed verifications across any addresses within the window before the **link** locks (§8.4 rung 2). `3` distinct addresses hitting rung 1 trips it too. With the weight above, one scripted burst reaches this in three attempts. |
+| `share.lockout_window_minutes` | `60` | The rolling window `failed_attempts` is counted over. |
+| `share.lockout_minutes` | `15` | How long `locked_until` holds. Temporary by design — a lockout never revokes, or anyone holding the URL could destroy the link (§8.4). |
 | `share.otp_send_limit` | `3 / 15 min` per `(link, email)`, `20 / day` per link | `rate_ok` buckets. |
 | `share.recipient_ttl_seconds` | `86400` | Recipient-token lifetime — how long a verified recipient can open further sessions without a new code. |
 | `share.attention_events` | `drop_received, otp_send_failed, link_dead, first_redemption` | Which share events raise a creator attention item (§10.6). `budget_exhausted` / `expiry_soon` are available and off by default — they are the two most likely to become noise. |
@@ -1317,7 +1415,8 @@ New actions, added to `codes.py` and `audit_entry.h`'s string map in lockstep
 | `share_link_challenge_sent` | `auth` | **yes** | An OTP was mailed (§6.9). `is_fail_closed(Auth)` is already `true` — consistent with the platform rule that auth events block the operation if they cannot be recorded. `detail` carries the address; `outcome = error` when SMTP failed, which is the event support will look for. |
 | `share_link_challenge_verified` | `auth` | **yes** | The recipient proved control of the address. This is the event that makes a redemption attributable to a human. |
 | `share_link_challenge_failed` | `auth` | **yes** | Wrong code, burned challenge, or an unlisted address — `detail.reason` separates them, the recipient's response does not. |
-| `share_link_expired` | `admin` | no | Emitted by the retention sweeper. |
+| `share_link_locked` | `permission` | **yes** | **The security alert** (§8.4 rung 2): a publicly reachable link crossed the brute-force threshold and is locked. Distinct from `share_link_denied` because it is an adjudicated conclusion, not a data point — the rules engine should alert on *this* directly rather than inferring it from a burst. `detail` carries the contributing addresses, source IPs, and whether the failures were wrong secrets, wrong codes, or both. Fail-closed for the same reason as the grant events: a lockout the log did not record is a lockout nobody can investigate. |
+| `share_link_expired` | `admin` | no | Emitted by the retention sweeper. Note `is_fail_closed(Admin)` is **`true`** in `audit_entry.cpp:62`, contradicting the "no" here — see the open correction in §12's closing note. |
 
 `detail` carries `link_uid`, `resource_uid`, `created_by`, `verified_email`,
 budgets, and `bytes_moved`; `target_uid` / `target_type` are the shared resource, so the
@@ -1346,6 +1445,19 @@ heading; the "identifiers are stable" convention above survives only because the
 collision is documented rather than silently renumbered.
 
 ### Resolved (2026-08-19)
+
+**R11 — The OTP gate is a brute-force surface, and says so.** The code is short
+(6 digits) and the door is a public URL, so the attempt budget is not a
+usability detail — it is the control standing between a leaked link and its
+contents. Settled together: a **10-minute** code lifetime; a recipient-driven
+**resend** so a delayed mail is recoverable; the attempt budget keyed to the
+**address, not the challenge**, so the resend does not restore attempts; a
+escalation from a **timing check** that catches scripted submission (rung 0)
+through address lockout and link lockout to a correlated deployment signal
+(§8.4); and a **dedicated `share_link_locked` audit action
+that raises a security alert on its own** rather than waiting for a burst rule
+to infer one. Lockout is always temporary and never auto-revokes — a link is
+public, so anyone holding the URL could otherwise destroy it on purpose.
 
 **R7 (was Q3) — Token in the URL: the path form, `/s/{uid}.{secret}`.**
 The fragment form was the alternative, keeping the secret out of proxy and
@@ -1534,10 +1646,14 @@ creator (R10).
 4. **M3 — `ldap_manager`: recipient OTP.** `POST /internal/share/email-challenge`
    and `/internal/share/email-verify` behind `require_internal`; `share_otp` token
    kind keyed by `link_uid|email`; the `SHARE_OTP_EMAIL` template (**only** — no
-   invite template, R9); send/attempt rate-limit buckets; loud failure on SMTP error
-   (unlike the 2FA handler's swallow). Independent of M4 and parallelizable with
-   it. **Tests:** code single-use and constant-time (inherited from
-   `consume_code`), send limits, SMTP failure surfaced rather than swallowed.
+   invite template, R9) carrying the expiry deadline and send time; send/attempt
+   rate-limit buckets keyed to the **address** (§8.4 rung 1); the **rung 0 timing
+   checks** and their weighted counting; loud failure on SMTP error (unlike the
+   2FA handler's swallow). Independent of M4 and parallelizable with it.
+   **Tests:** code single-use and constant-time (inherited from `consume_code`),
+   send limits, a resend replacing the live code without restoring attempts,
+   the two timing thresholds counting heavily while responding identically,
+   and SMTP failure surfaced rather than swallowed.
 5. **M4 — Bridge: public routes + zip writer.** `/v1/public/shares/*` including
    `identify` / `verify` and the recipient token, the allowlist check delegated
    to the core, the uniform response for unlisted addresses, the per-challenge
@@ -1581,9 +1697,17 @@ creator (R10).
      re-check when the creator has lost access to the resource.
    - **M8c — Sharing panel.** `SharingInbox` beside `ReviewsInbox` over
      `GET /v1/shares`, reusing M5's status computation.
-10. **M9 — Ops & docs.** `audit_service` codes + a rules-engine alert on
-   `share_link_denied` bursts; retention sweeper; `share-links.md` help page;
-   `core.conf` / compose defaults (`share.enabled = false`).
+10. **M9 — Ops & docs.** `audit_service` codes; **a rules-engine alert on
+   `share_link_locked` directly** (the adjudicated brute-force signal, §8.4
+   rung 2) plus the broader `share_link_denied` burst rule; retention sweeper;
+   `share-links.md` help page; `core.conf` / compose defaults
+   (`share.enabled = false`). **Tests:** the three-rung escalation — an address
+   locking out without affecting others, distinct addresses tripping the link
+   lock, `failed_attempts` ageing out of its window and clearing on a verified
+   redemption, and a lockout expiring on its own rather than revoking. Rung 0
+   gets its own: a submission inside `otp_min_seconds_after_send` and a
+   sub-interval retry each return a response **byte-identical** to an ordinary
+   wrong code while counting at `otp_timing_weight`.
 
 M0–M4 are the security-bearing work; M5–M9 are surface. M2 is deliberately
 shippable on its own so the model can be exercised before a public door exists
