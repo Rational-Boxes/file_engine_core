@@ -17,10 +17,9 @@ feed the creator's share notifications land in — §10.6), `docker_unified`
 
 > Expanded from the original one-paragraph sketch (kept verbatim as §1). Every
 > decision is grounded in current code; what has been settled is collected in
-> **§13**, where **R7–R10 (2026-08-19) closed the last open questions** — the URL
-> form, one-resource-per-link, folder size reporting, and creator notifications.
-> No design questions remain open; §13 notes the one scope reading (R8) awaiting
-> a yes/no.
+> **§13**, where **R7–R11 (2026-08-19) closed the last open questions** — the URL
+> form, the three share shapes, folder size reporting, creator notifications, and
+> the brute-force posture of the OTP gate. **No questions remain open.**
 
 ---
 
@@ -110,7 +109,7 @@ ids, guessing codes, and probing the recipient list from many IPs (§8.4).
 | Upload versioning | An upload link **never** creates a new version of an existing file. Name collisions get a de-duplicating suffix (§6.7). |
 | Upload ownership | Dropped files are **owned by the link creator**; the outside origin — including the verified sender address — is recorded in metadata and audit (§6.8). |
 | Recipient verification | **Mandatory.** Email + one-time code before any session opens, for downloads and drops alike. Recipients are an **allowlist fixed at creation**; there is no open-email mode (§6.9). |
-| Link granularity | **One link addresses one resource** — a file, or a folder. No arbitrary multi-file sets in v1 (§13-R8). |
+| Share shapes | **Three, all minted on a node the user is already looking at**: a file; a folder's contents; a folder and its subfolders (both folder shapes as one zip). No cross-folder file picker in v1 — `include_subdirs` is the only control that separates the last two (§13-R8). A node may carry several live links at once. |
 | Delivering the URL | **The creator composes their own email.** v1 sends no invite mail; the system's only outbound mail is the recipient's OTP (§6.9, §13-R9). |
 | Token in the URL | **Path form** — `/s/{uid}.{secret}`. The OTP is what makes a leaked URL inert, so the fragment form buys little and costs `curl`/QR (§13-R7). |
 | Creator notifications | **The Dashboard attention feed**, not email — share events join the existing "Needs your attention" list (§10.6, §13-R10). |
@@ -188,7 +187,10 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_links (
     pinned_version  TEXT,                    -- version name; NULL = follow latest
     -- folder-download options
     follow_folder   BOOLEAN      NOT NULL DEFAULT false,  -- true = live folder, no snapshot
-    include_subdirs BOOLEAN      NOT NULL DEFAULT true,
+    include_subdirs BOOLEAN      NOT NULL DEFAULT true,   -- false = the folder's own
+                                             -- files only. This flag IS the difference
+                                             -- between two of R8's three share shapes,
+                                             -- not a refinement of one (§13-R8).
     archive_bytes   BIGINT,                  -- precomputed zip size at creation (§6.5)
     -- upload options
     landing_prefix  TEXT,                    -- optional subfolder name, created lazily
@@ -448,6 +450,11 @@ nothing. The use is spent at session open, once a verified recipient has actuall
 asked for the payload.
 
 ### 6.5 Folder downloads (zip)
+
+Two of R8's three share shapes land here — *the folder's contents*
+(`include_subdirs = false`) and *the folder with everything under it*
+(`include_subdirs = true`). They differ only in how far the creation-time walk
+descends; everything below applies identically to both.
 
 **Snapshot, not a live walk.** At creation the core walks the folder (respecting
 `include_subdirs`) as the creator and writes `share_link_members` (§5.2): each
@@ -1037,12 +1044,16 @@ one thing in this form a user can get wrong without noticing.
 
 - **File download** — "always send the newest version" toggle (off = pinned,
   with the current version name shown).
-- **Folder download** — "include subfolders", and "include anything added later"
-  (off = snapshot, §6.5). The form shows the resolved **member count and archive
-  size** before the user commits, and refuses with a clear number when the
-  folder exceeds `share.zip_max_*`. Worst-case egress (`archive size × max
-  downloads`) is shown beside the use cap — it is the number that surprises
-  people.
+- **Folder download** — **"include subfolders"** (on by default), which is the
+  entire difference between the two folder shapes in R8: off sends the folder's
+  own files, on mirrors the subtree. Both arrive as one zip, so the toggle should
+  restate what the recipient will get rather than name the flag. Plus "include
+  anything added later" (off = snapshot, §6.5). The form shows the resolved
+  **member count and archive size** before the user commits — recomputed when the
+  subfolders toggle changes, since that is exactly the moment the number moves —
+  and refuses with a clear count/size when the folder exceeds `share.zip_max_*`.
+  Worst-case egress (`archive size × max downloads`) is shown beside the use cap;
+  it is the number that surprises people.
 - **Upload** — per-file cap, total byte budget, optional landing subfolder,
   optional extension allowlist.
 
@@ -1469,22 +1480,37 @@ depth rather than the control. The compensating measures in §7.2 stand — ngin
 must still strip the query string on the public location, and the bridge still
 logs `link_uid` and never the secret.
 
-**R8 (was Q4) — One link addresses one resource; no multi-file sets in v1.**
-"Share *these six* drawings from across two folders" stays out of v1. A link is
-minted on a file (`kind = 0`), or on a folder (`kind = 1 | 2`) — nothing else.
-The v2 path is unchanged and cheap: `share_link_members` (§5.2) has no folder
-dependency, so an arbitrary uid set is a selection UI plus a creation call that
-takes a uid list, with no schema change.
+**R8 (was Q4) — A link is minted on one existing node; there is no file-picker.**
+The decision is about **UI complexity**, not about the record: v1 does not build
+a cross-folder selection surface, so a link is always minted on something the
+user is already looking at. Exactly three download shapes, and they are the three
+the schema already expresses:
 
-> **Assumption flagged for confirmation.** This reads "one share link per file"
-> as *scope* — one link addresses one resource — not as a **uniqueness
-> constraint** limiting a resource to one live link at a time. The latter would
-> contradict §10.1 (a folder may carry a download link and a drop link at once)
-> and would break re-issuing a link to a second, later set of recipients without
-> revoking the first. If a uniqueness constraint is what was meant, it is a
-> `UNIQUE` index on `(resource_uid, kind) WHERE revoked_at IS NULL` and a
-> corresponding "you already have a live link on this" path in the Share tab —
-> say so and it goes in.
+| Shape | How it is expressed | The recipient gets |
+|---|---|---|
+| **A file** | `kind = 0` on the file | that file, at its pinned version (§6.2) |
+| **A folder's contents** | `kind = 2`, `include_subdirs = false` | one zip of the folder's own files |
+| **A folder and everything under it** | `kind = 2`, `include_subdirs = true` (the default) | one zip mirroring the subtree |
+
+Plus `kind = 1`, the drop box, which is minted on a folder and is not a download
+shape at all.
+
+So `include_subdirs` (§5.1) is not an incidental flag — it is the whole
+difference between the second and third shapes, and §10.1's *"include
+subfolders"* checkbox is the only control the creator needs. No new field, no
+new kind, no picker.
+
+**This is a scope decision, not a uniqueness constraint.** A resource may carry
+several live links at once, and must: a folder commonly holds a download link
+*and* a drop box (§10.1), and re-issuing to a second set of recipients later
+must not invalidate the URL the first set already has. Nothing here limits a
+node to one link.
+
+The v2 path — "share *these six* drawings from across two folders" — stays cheap
+and needs no schema change: `share_link_members` (§5.2) has no folder dependency,
+so an arbitrary uid set is a selection UI plus a creation call that takes a uid
+list. It was deferred because that selection UI is the expensive half, and
+because a folder is how people already organize the things they send together.
 
 **R9 (was Q5) — Folder links: no cap change; surface the estimated archive size,
 and the creator sends their own mail.** Two halves:
@@ -1600,15 +1626,20 @@ the console is a different query over the same data plus one route.
 ### Still open
 
 **Nothing.** Q3–Q6 were answered on 2026-08-19 and are recorded above as R7–R10;
-Q7 (the tenant-wide admin console) was resolved earlier as R6. The one item
-awaiting a yes/no is the scope reading flagged inside **R8** — whether "one share
-link per file" also means a uniqueness constraint — which changes one index and
-one UI path, not the design.
+Q7 (the tenant-wide admin console) was resolved earlier as R6; R11 settled the
+OTP gate's abuse posture at the same time.
 
 Deferred to v2 by the decisions above, collected here so they are not rediscovered
-as gaps: arbitrary multi-file links (R8), system-sent invite mail and its
-`invite_sent_at` / `invite_error` reporting (R9), and email notification of the
-creator (R10).
+as gaps: the cross-folder file picker and arbitrary multi-file links (R8),
+system-sent invite mail and its `invite_sent_at` / `invite_error` reporting (R9),
+and email notification of the creator (R10).
+
+What remains before implementation is not design but **four corrections carried
+over from review**, all in M0/M1 and none affecting the security model above:
+the use-vs-file-count contradiction for upload links (§6.4 against §6.7), the
+per-recipient counter's atomicity against §5.3's single-statement claim, the zip
+CRC / data-descriptor arithmetic (§5.2 has no `crc32` column, §6.5 promises an
+exact length), and `share_link_expired`'s fail-closed category (§12).
 
 ---
 
