@@ -323,6 +323,10 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
 #endif
 }
 
+// Bytes pulled from the object store per read. Matches the local storage read
+// size so a restore moves in the same rhythm as a local stream.
+static constexpr size_t kObjectReadChunkBytes = 256 * 1024;
+
 Result<std::vector<uint8_t>> S3Storage::read_file(const std::string& storage_path, const std::string& tenant) {
     if (!initialized_) {
         return Result<std::vector<uint8_t>>::err("S3 storage not initialized");
@@ -357,6 +361,52 @@ Result<std::vector<uint8_t>> S3Storage::read_file(const std::string& storage_pat
 #else
     // For non-AWS SDK builds, return an error indicating the feature is not available
     return Result<std::vector<uint8_t>>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");
+#endif
+}
+
+Result<void> S3Storage::read_file_stream(
+        const std::string& storage_path,
+        const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+        const std::string& tenant) {
+    (void)tenant;
+    if (!initialized_) {
+        return Result<void>::err("S3 storage not initialized");
+    }
+
+#ifdef USE_AWS_SDK
+    if (!s3_client_) {
+        return Result<void>::err("S3 client not initialized");
+    }
+
+    Aws::S3::Model::GetObjectRequest request;
+    request.SetBucket(Aws::String(bucket_));
+    request.SetKey(Aws::String(storage_path));
+
+    auto outcome = s3_client_->GetObject(request);
+    if (!outcome.IsSuccess()) {
+        return Result<void>::err("Failed to download file from S3: " +
+                                 outcome.GetError().GetMessage());
+    }
+
+    // GetBody() is an IOStream, so the payload can be pulled through in pieces.
+    // read_file() instead slurps it into an ostringstream and then copies that
+    // into a vector — two full copies of the object before the caller sees
+    // anything, which for a restored file is the whole point of avoiding.
+    auto& body = outcome.GetResult().GetBody();
+    std::vector<char> buf(kObjectReadChunkBytes);
+    while (body.good()) {
+        body.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        std::streamsize n = body.gcount();
+        if (n <= 0) break;
+        if (!on_chunk(reinterpret_cast<const uint8_t*>(buf.data()),
+                      static_cast<size_t>(n))) {
+            return Result<void>::ok();      // caller aborted; not an error
+        }
+    }
+    return Result<void>::ok();
+#else
+    (void)storage_path; (void)on_chunk;
+    return Result<void>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");
 #endif
 }
 

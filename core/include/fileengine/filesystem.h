@@ -95,11 +95,17 @@ public:
     // `on_chunk` (disk->decrypt->decompress), never buffering the whole file.
     // `on_chunk` returns false to abort early. Falls back to the whole-buffer
     // get() (incl. S3 restore) when the file is not present locally.
+    // `version_timestamp` selects a specific version; empty means the current
+    // one. Without it a caller wanting an older version has only the unary
+    // GetVersion, which materialises the whole file on both sides and is capped
+    // by the message limit -- so a link pinned to a past version would stop
+    // being streamable the moment the file was edited.
     virtual Result<void> get_stream(const std::string& file_uid,
                                     const std::function<bool(const uint8_t*, size_t)>& on_chunk,
                                     const std::string& user,
                                     const std::vector<std::string>& roles = {},
-                                    const std::string& tenant = "");
+                                    const std::string& tenant = "",
+                                    const std::string& version_timestamp = "");
 
     // Metadata operations
     virtual Result<FileInfo> stat(const std::string& file_uid, const std::string& user,

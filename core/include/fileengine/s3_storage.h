@@ -70,6 +70,9 @@ public:
     Result<std::string> store_file_from_path(const std::string& virtual_path, const std::string& version_timestamp,
                                              const std::string& local_path, const std::string& tenant = "") override;
     Result<std::vector<uint8_t>> read_file(const std::string& storage_path, const std::string& tenant = "") override;
+    Result<void> read_file_stream(const std::string& storage_path,
+                                  const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+                                  const std::string& tenant = "") override;
     Result<void> delete_file(const std::string& storage_path, const std::string& tenant = "") override;
     Result<bool> file_exists(const std::string& storage_path, const std::string& tenant = "") override;
 

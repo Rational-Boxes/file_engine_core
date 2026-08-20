@@ -1848,6 +1848,12 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
     // file is never assembled in memory (get_stream re-validates READ access and
     // handles decrypt/decompress + S3 restore). Each chunk is written as it is
     // produced; a Write() failure (client disconnect) aborts early.
+    //
+    // GetFileRequest has always carried an optional version_timestamp; this
+    // honours it. Previously it was accepted and silently ignored, so a caller
+    // asking to stream a past version got the current one — and anything
+    // wanting an older version had to fall back to the unary GetVersion, which
+    // is capped by the message limit.
     auto result = filesystem_->get_stream(
         file_uid,
         [&](const uint8_t* p, size_t n) -> bool {
@@ -1856,7 +1862,7 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
             response.set_data(std::string(reinterpret_cast<const char*>(p), n));
             return writer->Write(response);
         },
-        user, roles, tenant);
+        user, roles, tenant, request->version_timestamp());
 
     if (result.success) {
         SERVER_LOG_INFO("GRPCService", "StreamFileDownload successful for uid: " + file_uid);
