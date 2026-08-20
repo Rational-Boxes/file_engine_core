@@ -855,11 +855,38 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     return Result<void>::ok();
 }
 
+// Largest plaintext run handed to the sink in one call, and therefore the
+// largest gRPC message StreamFileDownload can emit.
+//
+// The size is chosen to be smaller than the SMALLEST default any of our clients
+// applies, not merely smaller than ours: grpc-js defaults to a 4 MiB receive
+// limit, so a JavaScript consumer that never sets channel options still works.
+// A large message also monopolises the connection while it is written, which is
+// the congestion this bound exists to prevent.
+static constexpr size_t kMaxStreamChunkBytes = 1024 * 1024;
+
 Result<void> FileSystem::get_stream(const std::string& file_uid,
-                                    const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+                                    const std::function<bool(const uint8_t*, size_t)>& raw_on_chunk,
                                     const std::string& user,
                                     const std::vector<std::string>& roles,
                                     const std::string& tenant) {
+    // Every emit path below goes through this, so the bound holds regardless of
+    // how much plaintext a given source produces at once. Two sources produce a
+    // lot: the cold path hands over the whole restored file, and decompression
+    // inflates a 256 KiB read into however much plaintext it encodes — for
+    // compressible content that can be the entire file from a single read.
+    // Bounding at the sink covers both, and covers whatever is added later.
+    const auto on_chunk = [&raw_on_chunk](const uint8_t* p, size_t n) -> bool {
+        if (n == 0) return true;
+        size_t offset = 0;
+        while (offset < n) {
+            const size_t take = std::min(kMaxStreamChunkBytes, n - offset);
+            if (!raw_on_chunk(p + offset, take)) return false;
+            offset += take;
+        }
+        return true;
+    };
+
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
         return Result<void>::err("Database not available for tenant: " + tenant);
@@ -897,8 +924,10 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
     }
 
     // Cold path (not on local disk): reuse the whole-buffer get(), which handles
-    // S3 restore + decrypt/decompress, and emit it as a single chunk. This keeps
-    // the rare restore path simple; the common local path below streams.
+    // S3 restore + decrypt/decompress. It is still materialised in memory here —
+    // simplifying the rare restore path — but it is now emitted in bounded
+    // pieces rather than as one chunk, so a restored file large enough to exceed
+    // a client's receive limit is still downloadable.
     if (!file_exists_locally) {
         auto r = get(file_uid, user, roles, tenant);
         if (!r.success) return Result<void>::err(r.error);
