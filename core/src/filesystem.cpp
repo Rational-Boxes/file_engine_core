@@ -927,11 +927,63 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
         if (exists_result.success) file_exists_locally = exists_result.value;
     }
 
-    // Cold path (not on local disk): reuse the whole-buffer get(), which handles
-    // S3 restore + decrypt/decompress. It is still materialised in memory here —
-    // simplifying the rare restore path — but it is now emitted in bounded
-    // pieces rather than as one chunk, so a restored file large enough to exceed
-    // a client's receive limit is still downloadable.
+    // Cold path (not on local disk): restore from the object store FIRST, in
+    // bounded pieces, then fall through to the local streaming path below.
+    //
+    // The obvious shortcut — call the whole-buffer get() and emit its result —
+    // holds the entire file in memory, which is exactly what streaming exists
+    // to avoid, and it is the rare-but-largest case: an archived file is
+    // typically archived because it is big.
+    //
+    // A raw byte-for-byte copy is correct here because the object store and
+    // local storage hold the SAME processed bytes: FileSystem::put encrypts and
+    // compresses before either sees the data, and Storage::store_file writes
+    // what it is given without re-processing. Decrypt/decompress then happens
+    // once, in the local streaming loop below — the same code path a warm read
+    // takes, rather than a second implementation of it.
+    if (!file_exists_locally && context->object_store && context->storage) {
+        const std::string remote_path =
+            context->object_store->get_storage_path(file_uid, current_version, tenant);
+        auto remote_exists = context->object_store->file_exists(remote_path, tenant);
+        if (remote_exists.success && remote_exists.value) {
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(local_storage_path).parent_path(), ec);
+            // Write to a sibling temp file and rename into place, so a restore
+            // interrupted half-way cannot leave a truncated file that later
+            // reads would treat as the whole thing.
+            const std::string tmp_path = local_storage_path + ".restore.tmp";
+            std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+            if (out.is_open()) {
+                bool write_ok = true;
+                auto restore = context->object_store->read_file_stream(
+                    remote_path,
+                    [&](const uint8_t* p, size_t n) -> bool {
+                        out.write(reinterpret_cast<const char*>(p),
+                                  static_cast<std::streamsize>(n));
+                        write_ok = write_ok && out.good();
+                        return write_ok;
+                    },
+                    tenant);
+                out.close();
+                if (restore.success && write_ok && out.good()) {
+                    std::filesystem::rename(tmp_path, local_storage_path, ec);
+                    if (!ec) {
+                        file_exists_locally = true;
+                    } else {
+                        SERVER_LOG_WARN("FileSystem::get_stream",
+                                        "restore rename failed: " + ec.message());
+                        std::filesystem::remove(tmp_path, ec);
+                    }
+                } else {
+                    std::filesystem::remove(tmp_path, ec);
+                }
+            }
+        }
+    }
+
+    // Restore unavailable or unsuccessful: fall back to the whole-buffer read
+    // so the request still succeeds. Bounded emit still applies (see on_chunk).
     if (!file_exists_locally) {
         auto r = version_timestamp.empty()
                      ? get(file_uid, user, roles, tenant)

@@ -17,6 +17,7 @@
 
 #include "types.h"
 #include <string>
+#include <functional>
 #include <vector>
 #include <memory>
 #include <fstream>
@@ -56,6 +57,22 @@ public:
     virtual Result<std::string> store_file(const std::string& virtual_path, const std::string& version_timestamp,
                                            const std::vector<uint8_t>& data, const std::string& tenant = "") = 0;
     virtual Result<std::vector<uint8_t>> read_file(const std::string& storage_path, const std::string& tenant = "") = 0;
+
+    // Read an object in bounded pieces. `on_chunk` returns false to abort.
+    //
+    // NOT pure virtual: the default falls back to read_file() and emits the
+    // whole object once, so an implementation that has no streaming form keeps
+    // working. Overriding it is what makes a restore bounded — read_file holds
+    // the entire object (twice, in the S3 case) before anyone sees a byte.
+    virtual Result<void> read_file_stream(
+            const std::string& storage_path,
+            const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+            const std::string& tenant = "") {
+        auto r = read_file(storage_path, tenant);
+        if (!r.success) return Result<void>::err(r.error);
+        if (!r.value.empty()) on_chunk(r.value.data(), r.value.size());
+        return Result<void>::ok();
+    }
     virtual Result<void> delete_file(const std::string& storage_path, const std::string& tenant = "") = 0;
     virtual Result<bool> file_exists(const std::string& storage_path, const std::string& tenant = "") = 0;
 
