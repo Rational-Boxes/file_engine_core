@@ -7,13 +7,16 @@
 > "unidentified".
 
 **Status:** Design proposal — for review
-**Scope (cross-repo):** `file_engine_core` (owner of the record + enforcement),
-`http_bridge` (public + owner-side REST routes, orchestration), `ldap_manager`
-(recipient OTP: delivery, verification, rate limits), `frontend` (drawer tab +
-public landing view + dashboard items + help), `audit_service` (new action
-codes), `discussion_threaded_communication` (owner of the Dashboard attention
-feed the creator's share notifications land in — §10.6), `docker_unified`
-(rate-limit zone). No change to `webdav_bridge`.
+**Scope (cross-repo):** **`share_service`** (new — owner of the record, the
+public door, and every share-specific decision), `ldap_manager` (recipient OTP:
+delivery, verification, rate limits), `frontend` (drawer tab + public landing
+view + dashboard items + help), `audit_service` (new action codes; **the
+authoritative record that a redemption was external**),
+`discussion_threaded_communication` (owner of the Dashboard attention feed the
+creator's share notifications land in — §10.6), `docker_unified` (new service +
+nginx routing + rate-limit zone). No change to `webdav_bridge`, and — the
+governing constraint of this design — **no change to `file_engine_core`**
+(§4).
 
 > Expanded from the original one-paragraph sketch (kept verbatim as §1). Every
 > decision is grounded in current code; what has been settled is collected in
@@ -98,13 +101,15 @@ ids, guessing codes, and probing the recipient list from many IPs (§8.4).
 
 | Topic | Decision |
 |---|---|
-| Where the record lives | **The core**, in a per-tenant `share_links` table. Not the bridge, not a stateless JWT — see §4. |
+| Where the record lives | **`share_service`** — a new feature service with its own per-tenant schema. **The core does not change at all**: no tables, no RPCs, no permission bit (§4, §13-R13). |
+| How a redemption reaches the bytes | **Delegated as the creator.** The service calls the core's existing `CheckPermission` / `StreamFileDownload` / `StreamFileUpload` with `AuthenticationContext{user: created_by}`. No synthetic principal exists anywhere (§4.1). |
+| Who knows it was external | **`audit_service`, authoritatively** — the core attributes the activity to the creator and cannot be asked otherwise, so the audit log is the sole custodian and `share_link_redeem` is fail-closed (§4.3, §12). |
 | Token shape | `{link_uid}.{secret}` — 128-bit uid + 256-bit CSPRNG secret, base64url. The DB stores **only** `sha256(secret)`; the plaintext is shown once at creation. |
-| Authority | The link carries the **creator's** authority, re-evaluated on **every** redemption, with their roles resolved **live from LDAP by the bridge** and admin roles stripped. Creator loses READ/WRITE → the link is dead (§6.3). |
-| Creation gate | New ACL bit **`SHARE_EXTERNAL = 0x4000`**, never granted by default — mirrors `CULL_VERSIONS`. Plus READ (download links) or WRITE (upload links) on the target. |
+| Authority | The link carries the **creator's** authority, re-evaluated on **every** redemption via `CheckPermission`, with their roles resolved **live from LDAP** and admin roles stripped. Creator loses READ/WRITE → the link is dead (§6.3). |
+| Creation gate | Membership of the **`share_external` LDAP group** (per-user, never granted by default) **and** `CheckPermission` for READ (download) or WRITE (upload) on the target. No new ACL bit — the core's permission model is untouched (§8.1, §13-R13). |
 | Use accounting | A **redemption session** consumes one use, not an HTTP request — so Range requests, resumes, and retries do not burn the budget (§6.4). |
 | Version served | A file download link is **pinned** to the version current at creation. `follow_latest` is an explicit opt-in (§6.2). |
-| Folder downloads | **In v1.** A folder link serves a **member snapshot** taken at creation, as a **store-only zip64** streamed by the bridge with a precomputed `Content-Length` (§6.5). Every member's authority is re-checked at redemption. |
+| Folder downloads | **In v1.** A folder link serves a **member snapshot** taken at creation, as a **store-only zip64** streamed by `share_service` with a precomputed `Content-Length` (§6.5). Every member's authority is re-checked at redemption. |
 | Passphrase | **None.** The OTP is the second factor; a passphrase would be a third secret to distribute for no additional property (§13-R1). |
 | Upload versioning | An upload link **never** creates a new version of an existing file. Name collisions get a de-duplicating suffix (§6.7). |
 | Upload ownership | Dropped files are **owned by the link creator**; the outside origin — including the verified sender address — is recorded in metadata and audit (§6.8). |
@@ -114,53 +119,125 @@ ids, guessing codes, and probing the recipient list from many IPs (§8.4).
 | Token in the URL | **Path form** — `/s/{uid}.{secret}`. The OTP is what makes a leaked URL inert, so the fragment form buys little and costs `curl`/QR (§13-R7). |
 | Creator notifications | **The Dashboard attention feed**, not email — share events join the existing "Needs your attention" list (§10.6, §13-R10). |
 | Failure disclosure | Unknown / expired / revoked / exhausted / unlisted-address / wrong-code all return the **same** generic response to the outside caller. The real reason goes to audit only (§8.5). |
-| Bridge routes | New `/v1/public/shares/*` prefix (unauthenticated, explicitly allowlisted) + owner-side `/v1/nodes/{uid}/shares` and `/v1/shares/*` (§7). |
+| Routes | Served by `share_service`, not the bridge: public `/share/v1/public/*` (unauthenticated) and owner-side `/share/v1/*` (bearer), both behind nginx on the tenant origin (§7). |
 | Frontend | A **Share** tab in `FileDetailsDrawer.vue`, plus a `requiresAuth: false` route `/s/:token` for the recipient (§10). |
 
 ---
 
-## 4. Why the core owns this (and not the bridge)
+## 4. Why this is a service, and why the core does not change
 
-The tempting design is the one already in the tree for SSO hand-off
-(`http_bridge/include/sso_handoff.h`): a stateless signed JWT, no storage, a
-replay guard for single use. That is right for hand-off and **wrong** here, for
-five reasons:
+**The core does not learn what a share link is.** No tables, no RPCs, no
+permission bit, no vocabulary. A new `share_service` owns the record and every
+share-specific decision, and reaches the core only through RPCs that already
+exist — `CheckPermission`, `StreamFileDownload`, `StreamFileUpload`,
+`SetMetadata` — exactly as `convert_search_ai`, `discussion`, `folder_actions`
+and `difference` already do (`CLAUDE.md`: feature services *"re-check every
+access as the end-user via the core's `CheckPermission`"*).
 
-1. **Read-by-default makes a synthetic principal catastrophic.**
-   `AclManager` ships with `default_read_ = true`
-   (`core/include/fileengine/acl_manager.h:277`): a principal with no matching
-   rule can read every resource whose parent chain is also readable. A
-   bridge-minted `AuthenticationContext{user: "share:abc"}` would therefore be a
-   *tenant-wide reader*, and the only thing keeping it scoped to one file would
-   be the bridge remembering to pass the right uid. Scope has to be enforced
-   where the resource is resolved — in the core, which is the sole ACL enforcer
-   by design (`CLAUDE.md`, trust model).
-2. **A use counter is durable, atomic state.** "5 downloads" across bridge
-   replicas is a single-statement `UPDATE ... WHERE uses_consumed < max_uses`
-   in Postgres (§5.3). A JWT cannot count, and the existing `ReplayGuard` is
-   explicitly per-process ("a multi-bridge deployment would back this with a
-   shared store").
-3. **Revocation must be instant.** Revoking a stateless token needs a denylist —
-   i.e. durable state anyway, but the worse half of it.
-4. **The authority re-check needs the ACL evaluator.** §6.3 requires
-   re-evaluating the *creator's* permission on the *current* resource at
-   redemption. Only the core can do that. The bridge's one contribution is the
-   creator's live LDAP role list (§6.3) — identity resolution, which is exactly
-   the job it does on every other request, and no part of the decision.
-5. **Audit and forensics need a queryable object.** "Which links can still reach
-   this file", "what did this departed user leave open", "who downloaded it and
-   from where" are table queries, not token introspection.
+### 4.1 The delegation model: the creator's identity, not a synthetic one
 
-The bridge stays what it is everywhere else: a protocol shim with no enforcement
-logic. It parses the URL, splits `{uid}.{secret}`, and hands both to the core.
+A redemption calls the core as **`created_by`** — a real principal, with real
+roles resolved live from LDAP, evaluated against real ACLs. There is no
+`share:abc` pseudo-user anywhere in the system.
+
+This matters more than it first appears. `AclManager` ships with
+`default_read_ = true` (`core/include/fileengine/acl_manager.h:277`): a principal
+with no matching rule reads everything whose parent chain is readable. A
+*synthetic* share principal would therefore have been a tenant-wide reader, kept
+scoped to one file only by whoever remembered to pass the right uid. Delegating
+the creator's own identity removes that failure mode at the root — the redemption
+can never exceed what the creator holds, because it *is* the creator, and §6.3's
+re-check is then an ordinary `CheckPermission` call rather than a special path.
+
+The property the feature is sold on — *delegation, not escalation* (§2) — is
+therefore preserved intact, and preserved by construction rather than by the core
+policing a credential type it would have had to learn.
+
+### 4.2 What moves out of the core, and where it lands
+
+| Concern | Owner | How |
+|---|---|---|
+| Link records, budgets, recipients, redemption ledger | `share_service` | its own per-tenant Postgres schema (§5) |
+| "May this user mint a link?" | `share_service` | LDAP group + `CheckPermission` (§6.1, §8.1) |
+| "Does the creator still have access?" | **the core**, asked by the service | `CheckPermission(created_by, uid, READ)` per redemption (§6.3) |
+| Bytes | **the core**, asked as the creator | `StreamFileDownload` / `StreamFileUpload` |
+| Recipient OTP | `ldap_manager` | existing 2FA seam (§6.9) |
+| *That a redemption was external* | `audit_service` | **the authoritative record** (§4.3) |
+
+The three things §4 previously argued only the core could do turn out not to need
+it: a durable atomic use counter is a Postgres statement in *any* service's
+schema (§5.3); instant revocation is a row update in the same place; and the
+forensic queries — "which links still reach this file", "what did this departed
+user leave open" — are table queries wherever the table lives. Only the ACL
+evaluation genuinely required the core, and that is available over an RPC built
+for precisely this.
+
+### 4.3 Auditability is preserved in full — it just lives in the event chain
+
+The delegation is **"an external party, authorized by a named system user"**, and
+that is exactly the shape the audit record already takes (§6.8): one event
+carrying `actor = "share:<link_uid>|<verified_email>"` — the door and the
+verified human who walked through it — with `created_by` in `detail`, the person
+accountable for opening it. Both identities, in one hash-chained record, on the
+same event stream that already holds the file's complete activity history. The
+reverse queries the roadmap asks for ("everything that touched this file",
+"every object a departed employee could still reach") are answered there, over
+share traffic and ordinary traffic alike.
+
+So nothing is lost from the audit trail. What changes is **which system you ask**.
+Because redemptions are delegated as the creator, the *core's* own events
+attribute the activity to the creator: querying the core directly for "who read
+this file" shows *Alice, 400 times*, and the core cannot be asked to say
+otherwise. The externality lives one layer up, in the security event chain, which
+is where a security team looks anyway and which is tamper-evident in a way core
+table queries are not.
+
+That is a sound arrangement. It carries three requirements, and none is optional
+— because the audit chain is now the *sole* custodian of the distinction, where a
+core-owned design would have kept a second copy inside the core:
+
+1. **`share_link_redeem` becomes fail-closed** (§12). Under a core-owned design a
+   lost audit event still left a `share_redemptions` row inside the core as a
+   second copy. Here there is no second copy anywhere the security model trusts:
+   an unrecorded redemption is external access that is **permanently
+   unattributable**. If the event cannot be written, the redemption does not
+   happen.
+2. **Every delegated core call carries a correlation id.** `AuditEntry` already
+   has a `request_id` field, plumbed all the way into the audit tables
+   (`core/src/audit_entry.cpp:104`, `database.cpp:138,2316`) and **populated by
+   nothing today**. The service stamps the `redemption_uid` there — on its own
+   event and, via `AuthenticationContext.claims` (`proto/fileservice.proto:76`),
+   on the delegated call — so the core's "Alice read X" and the service's
+   "bob@contractor.example redeemed link Y" join on one key. This fills an
+   existing unused column; it is not a core change.
+3. **Scope containment is now the service's job.** Previously the core would have
+   known a share credential was confined to one uid. Now the service holds the
+   creator's full authority and asks for a uid, so *a bug that asks for the wrong
+   uid is not contained by anything*. The service must resolve the target uid
+   **only** from the link record, never from caller input (§6.6), and that rule
+   carries a test of its own (§14).
+
+In short: the core stays clean, the delegation model is sound, and the full
+history of who touched a file — insider and outsider alike — remains answerable
+from the security event chain. The one thing to hold onto is that the chain is
+now the *only* place the distinction exists, which is what makes point 1
+non-negotiable: an event that fails to write is not a gap in a report, it is an
+external access that can never be attributed to anyone.
 
 ---
 
-## 5. Data model (core, per-tenant schema)
+## 5. Data model (`share_service`, per-tenant schema)
 
-Created alongside `files` / `versions` / `acls` in
-`Database::create_tenant_schema` (`core/src/database.cpp:2033`), with the same
-`CREATE TABLE IF NOT EXISTS` + idempotent-migration idiom used there.
+**In `share_service`'s own schema, not the core's.** Tenancy follows the pattern
+the other Python feature services already use — one schema per tenant, created on
+first use (`discussion`'s `connect_for_tenant(..., provision=True)` is the
+reference) — so a new tenant costs nothing and no core migration is ever
+involved. The DDL below is written in the same `CREATE TABLE IF NOT EXISTS` +
+additive-migration style the platform uses everywhere.
+
+Nothing here is reachable from the core, and nothing in the core references it.
+The only identifiers that cross the boundary are `resource_uid` / `member_uid`
+(core file UIDs, opaque here) and `created_by` (an LDAP username).
 
 ### 5.1 `share_links`
 
@@ -390,12 +467,14 @@ enforcement.
 
 ### 6.1 Creating a link
 
-`CreateShareLink` requires, on the target resource:
+`POST /share/v1/nodes/{uid}/links` requires:
 
-- `SHARE_EXTERNAL` (§8.1) **and**
-- `READ` for `kind = 0 | 2` (download), `WRITE` for `kind = 1` (upload), **and**
+- the caller is in the **`share_external` LDAP group** for this tenant (§8.1) —
+  a per-user gate the service reads from the caller's resolved roles, **and**
+- `CheckPermission(caller, resource_uid, READ)` for `kind = 0 | 2` (download) or
+  `WRITE` for `kind = 1` (upload) — asked of the core, as the caller, **and**
 - the target's type matches the kind — file for `0`, directory for `1` and `2`
-  (mismatch ⇒ `INVALID_ARGUMENT`), **and**
+  (mismatch ⇒ `400`), established from `Stat` as the caller, **and**
 - at least one recipient address, capped at `share.max_recipients` (§6.9), **and**
 - `expires_at` within the deployment's `share.max_ttl_days` cap (§9), **and**
 - for `kind = 2`: the snapshot walk succeeds within
@@ -432,8 +511,9 @@ Any failure ⇒ the link is dead. Consequences, all of them intended:
 - A departed employee's links die the moment their access does — this is what
   makes the roadmap's "lingering share links" query actionable rather than
   merely informative.
-- A link can never outrank its creator. That is what allows `SHARE_EXTERNAL` to
-  be an ordinary user permission instead of an admin-only one.
+- A link can never outrank its creator. That is what allows link creation to be
+  an ordinary user capability (the `share_external` group, §8.1) instead of an
+  admin-only one.
 
 #### Resolving the creator's roles when nobody is authenticated
 
@@ -464,24 +544,37 @@ JWT-borne claims, and a redemption carries no JWT.
 
 **Therefore, two rules.**
 
-1. **The bridge re-resolves the creator's roles live, at redemption.** It already
-   owns identity resolution, and `LDAPAuthenticator::getRolesByTenant(username)`
-   (`http_bridge/src/ldap_authenticator.cpp:587`) does exactly this for an
-   arbitrary username over the service bind — no credentials needed. The bridge
-   passes the result into `RedeemShareLink`, which forwards it as the
-   `request_roles` argument of the re-check. Roles are therefore **current, not
-   snapshotted**: removing a departed employee from the LDAP group kills their
-   links on the next redemption, with nothing stored anywhere to go stale. LDAP
-   being unreachable denies the redemption (fail-closed, consistent with every
-   other door).
-2. **Admin roles are stripped before the re-check** — `system_admin`,
-   `tenant_admin`, and the `administrators` alias that `addRolesAliased` maps to
-   it. The ACL bypass must never reach an unauthenticated route: a link minted by
-   an admin has to stand on ordinary ACL rules or not stand at all. An admin who
-   can reach a file *only* via the bypass therefore cannot mint a working link to
-   it — the safe failure, caught at creation by the pre-flight below.
+1. **`share_service` re-resolves the creator's roles live, at redemption**, over
+   its own LDAP service bind — the same lookup `ldap_manager` performs for an
+   arbitrary username, needing no credentials from the absent user. Those roles
+   go into the `AuthenticationContext.roles` of every delegated call, which is
+   the ordinary `request_roles` path the core's evaluator already unions
+   (`acl_manager.cpp:242`). Roles are therefore **current, not snapshotted**:
+   removing a departed employee from the LDAP group kills their links on the next
+   redemption, with nothing stored anywhere to go stale. LDAP being unreachable
+   denies the redemption (fail-closed, consistent with every other door).
 
-**Pre-flight at creation.** `CreateShareLink` runs the *exact* check a redemption
+   Note this is the *whole* mechanism — because the redemption runs as the
+   creator rather than as a synthetic principal, "give the core the creator's
+   real roles" is all that role resolution means here. There is no special
+   evaluation path for the core to implement, which is precisely why it needs no
+   change (§4.1).
+2. **Admin roles are stripped before the delegated call** — `system_admin`,
+   `tenant_admin`, and the `administrators` alias. The ACL bypass must never
+   reach an unauthenticated route: a link minted by an admin has to stand on
+   ordinary ACL rules or not stand at all. An admin who can reach a file *only*
+   via the bypass therefore cannot mint a working link to it — the safe failure,
+   caught at creation by the pre-flight below.
+
+   **This one is now load-bearing in a way it was not before.** Under a
+   core-owned design the core could have stripped admin roles itself as a second
+   line of defence. Here the core simply believes the `AuthenticationContext` it
+   is handed — that is its documented trust model — so **`share_service` is the
+   only thing standing between an admin's bypass and a public URL**. If it
+   forgets, the core will faithfully grant everything. That makes the stripping a
+   tested invariant of the service (§14), not an implementation detail.
+
+**Pre-flight at creation.** Link creation runs the *exact* check a redemption
 will run — creator, LDAP-resolved roles, no claims, no admin bypass — and refuses
 to mint a link that would be born dead, naming the reason. This turns every
 variant of the problem above (claim-only access, bypass-only access, an LDAP
@@ -494,8 +587,8 @@ Naively decrementing per HTTP request breaks on the first real browser: a Range
 request, a resumed download, or a retry after a dropped connection would each
 burn a use, and a 5-use link would be exhausted by one recipient.
 
-Instead, `RedeemShareLink` opens a **redemption session** (a `share_redemptions`
-row, TTL `share.session_ttl_seconds`, default 1 h) and *that* consumes the use. Every
+Instead, opening a session writes a **redemption session** row (`share_redemptions`,
+TTL `share.session_ttl_seconds`, default 1 h) and *that* consumes the use. Every
 byte transfer within the session — including `Range` continuations and retries —
 rides `redemption_uid` and consumes nothing further. `bytes_moved` accumulates
 on the row; `bytes_consumed` on the link is updated at session close.
@@ -595,7 +688,7 @@ Two consequences worth stating plainly rather than discovering in support:
 - **A member whose stored size no longer matches its bytes breaks the
   `Content-Length` contract.** The size is pinned at creation and the version is
   pinned with it, so this means the object was culled or corrupted mid-flight. On
-  a mismatch the bridge **aborts the connection** rather than padding or
+  a mismatch the service **aborts the connection** rather than padding or
   truncating: a short body under a declared length is a silently corrupt archive,
   and a broken transfer is the honest failure. Audited on the redemption row.
 
@@ -641,7 +734,7 @@ children.
   sender to inject a new version into an existing document's history — that is
   both a data-integrity problem and a plausible attack (poison the "latest" of a
   file someone else trusts).
-- **Budgets** are enforced twice: streaming in the bridge (fail fast, don't buffer
+- **Budgets** are enforced twice: streaming in the service (fail fast, don't buffer
   a 40 GB body) and authoritatively in the core — `max_file_bytes` per file,
   `max_bytes` remaining across the link, and **`max_files`** as the file count
   (§6.4; *not* `max_uses`, which counts sessions). The file slot is reserved
@@ -666,7 +759,7 @@ tables. The outside origin is recorded in full, in file metadata:
 |---|---|
 | `share.link_uid` | the link |
 | `share.redemption_uid` | the specific drop |
-| `share.source_addr` | client IP as forwarded by the bridge |
+| `share.source_addr` | client IP, resolved from the forwarded headers by the service |
 | `share.verified_email` | the recipient address that passed the OTP challenge (§6.9) — **verified**, not claimed |
 | `share.claimed_name` | free text the sender optionally typed; **untrusted**, and the UI must render it as such |
 
@@ -681,22 +774,39 @@ no orphan principal appears in the ACL tables — and this key is the only thing
 the file itself that says a stranger put it there. Three properties have to hold
 for it to function as an accounting record rather than a hint.
 
-**1. The `share.*` namespace is reserved and immutable.** `SetMetadata` today
-gates on `WRITE` and validates nothing about the key
-(`core/src/grpc_service.cpp:1119–1137`), so as specified above any user with
-WRITE on the dropped file could rewrite `share.verified_email` — or, worse in the
-other direction, **stamp it onto a file they uploaded themselves** and attribute
-their own document to an outside party. Erasure destroys evidence; forgery
-manufactures it, and forgery is the easier attack and the more damaging one.
+**1. The on-file copy is a convenience, and the audit log is the record.**
+`SetMetadata` gates on `WRITE` and validates nothing about the key
+(`core/src/grpc_service.cpp:1119–1137`), and **the core is not being changed to
+reserve the `share.*` namespace** (§13-R13). So these keys are, frankly,
+forgeable and erasable: any user with WRITE on the file can rewrite
+`share.verified_email` — or, in the more damaging direction, stamp it onto a file
+they uploaded themselves and attribute their own document to an outside party.
 
-So the core refuses `SetMetadata` / `DeleteMetadata` for any key matching
-`share.*` from every ordinary caller, returning `PERMISSION_DENIED` and emitting
-an audit event (`share_provenance_tamper`, category `permission`, fail-closed).
-The keys are writable **only** by the internal drop path that mints them. This
-holds for `system_admin` and `tenant_admin` too: a provenance field an
-administrator can edit is not evidence, and the correction path for a wrong
-record is the audit log, not mutation of the record. It is the same reasoning
-that makes the audit chain append-only.
+That is acceptable **only** because the metadata is not what anything trusts. The
+authoritative record of who dropped what is the `share_redemptions` row in
+`share_service` (with `result_uid` pointing at the file it created) and the
+hash-chained `share_link_redeem` event in `audit_service` — neither of which any
+file-level `WRITE` can touch. The metadata exists so the Origin block (point 3)
+can render without a second service call, and so an ordinary user browsing files
+sees where something came from.
+
+Two rules follow from that, and the UI must honour both:
+
+- **Never present the on-file value as verified.** The Origin block reads from
+  metadata for speed but labels it as descriptive, and the Share tab's ledger
+  (§10.2) — served from `share_service` — is what gets shown when someone asks
+  *"is that really who sent it?"*.
+- **Where they disagree, the ledger wins**, and the disagreement is itself worth
+  surfacing: metadata that no longer matches the redemption record means someone
+  edited it, which is exactly the signal a reserved namespace would have
+  prevented and now has to be detected instead. A periodic reconcile in
+  `share_service` (it already sweeps for retention, §5.5) can compare the two and
+  raise an attention item on drift.
+
+If the on-file record ever needs to be evidence rather than a hint, the change is
+small and self-contained — key validation in `SetMetadata` / `DeleteMetadata`,
+about fifteen lines — and can be made later without touching anything designed
+here. It is deliberately out of scope now because it is a core change (§4).
 
 **2. The provenance belongs to the version, not just the file.** Drops never
 version an existing file (§6.7), but nothing stops an *internal* user adding a
@@ -706,7 +816,8 @@ The keys are therefore written as **version metadata** on the dropped version
 (the core already carries per-version metadata — `GetVersionMetadata`,
 `proto/fileservice.proto:397`) *and* mirrored to file metadata for
 discoverability. Where they disagree, the version record governs, and the UI
-reads the version's.
+reads the version's. `share_service` writes both, as the creator, on the same
+delegated call path as the upload itself.
 
 **3. It has to be visible where the file is.** Today the drawer renders metadata
 as a flat, editable key/value table (`FileDetailsDrawer.vue:109`, with set and
@@ -753,7 +864,7 @@ unauthenticated internet caller the chooser of a destination address for
 tenant-branded mail: an open relay with the deployment's own sending reputation
 behind it. No rate limit makes that acceptable; the allowlist removes the
 capability entirely, because the destination set is closed at creation by an
-authenticated user with `SHARE_EXTERNAL`.
+authenticated user in the `share_external` group (§8.1).
 
 Two consequences, both intended:
 
@@ -816,7 +927,7 @@ secret + verification; http_bridge orchestrates."*
 |---|---|---|
 | Recipient allowlist, budgets, `verified_email` on the ledger | **core** | durable authorization state, per §4 |
 | Code generation, delivery, storage, single-use verify, send/attempt rate limits | **ldap_manager** | `TokenStore.issue_code` / `consume_code` (hashed, TTL, constant-time, single-use) and `rate_ok` — `tokens.py:106–137` |
-| Orchestration, recipient-token minting | **http_bridge** | the `require_internal` server-to-server pattern already used for `/internal/2fa/*` (`http_server.cpp:1710–1731`) |
+| Orchestration, recipient-token minting | **`share_service`** | the same `require_internal` server-to-server seam the bridge already uses for `/internal/2fa/*` — a second client of an established pattern, not a new one |
 
 **New endpoints on ldap_manager:** `POST /internal/share/email-challenge` and
 `POST /internal/share/email-verify`, guarded by the same shared internal secret.
@@ -827,11 +938,18 @@ govern whether an outside recipient can open a share link. New `kind` for the
 token store (`share_otp`), keyed by `link_uid|email`; new mail template
 `SHARE_OTP_EMAIL` in `templates.py`.
 
-**The core trusts the bridge's assertion** that an address was verified, exactly
-as it trusts `AuthenticationContext` everywhere else. The verification itself
-happens in `ldap_manager`; the bridge relays it; the core records it and enforces
-that the address is on the link's allowlist — so a bridge bug can misattribute a
-redemption but cannot admit an unlisted recipient.
+**`share_service` enforces the allowlist; `ldap_manager` proves the address.**
+The verification happens in `ldap_manager` (it owns the code and the mailbox);
+`share_service` relays the result and checks it against the link's recipient list
+before opening a session. The core is not in this loop at all — it never learns
+an email address was involved, and by the time it is asked for bytes the caller
+is simply the creator.
+
+That concentrates trust in `share_service`: nothing downstream will catch it if
+it opens a session for an address that was never verified. There is no second
+enforcement point to fall back on, which is the direct consequence of taking this
+out of the core (§4.3) and the reason the allowlist check is a tested invariant
+(§14) rather than an assertion in prose.
 
 #### Sending the link — the creator does it, not the system
 
@@ -867,7 +985,7 @@ config key, and no **Invited / Invite failed** rungs on the recipient roster
 - **SMTP misconfigured ⇒ every link is unusable**, and the current 2FA handler
   swallows send failures into `sent = False` (`routers/twofa.py:231`). The share
   variant must keep the *recipient's* response uniform while surfacing the
-  failure loudly — audit event, bridge log, and an **attention item for the link's
+  failure loudly — audit event, service log, and an **attention item for the link's
   creator** (§10.6). A silent mail failure here looks identical to a wrong
   address, which is the worst possible support experience. Note this is now the
   *only* mail path (§13-R9), so an SMTP outage takes the whole feature down
@@ -877,7 +995,7 @@ config key, and no **Invited / Invite failed** rungs on the recipient roster
 - **OTP brute force:** `consume_code` deliberately does *not* delete on a wrong
   code — its docstring puts rate-limiting on the caller. That counter must live
   in **`ldap_manager`'s Redis** (a `rate_ok` bucket keyed `share_otp:{link}:{email}`),
-  **not** in bridge process memory: the bridge is horizontally scaled, and a
+  **not** in `share_service` process memory: the service may be replicated, and a
   per-process counter would give an attacker one fresh allowance per replica —
   the same trap `ReplayGuard`'s own header calls out ("a multi-bridge deployment
   would back this with a shared store"). Five failures lock **that address out
@@ -889,41 +1007,53 @@ config key, and no **Invited / Invite failed** rungs on the recipient roster
 
 ---
 
-## 7. HTTP Bridge routes
+## 7. `share_service` routes
 
-Two clearly separated families. The split matters: the bridge's auth gate today
-is a prefix decision (`handleV1`, `src/http_server.cpp:301`) with individual
-unauthenticated paths allowlisted inline (`/v1/auth/token`,
-`/v1/auth/sso/redeem`, lines 334–357). Rather than scatter more exceptions
-through that block, **all** unauthenticated surface goes under one greppable
-prefix that nginx, CORS, and the rate limiter can target as a unit.
+All of it is served by `share_service` — the bridge is not involved and gains no
+routes. nginx puts the service on the tenant origin under `/share/`, alongside
+`/api/`, `/csai/`, `/diff/` and the rest, so the SPA reaches it same-origin and
+the public landing page is served from the same host as the bytes (§8.3).
 
-### 7.1 Owner-side (existing bearer auth, unchanged gate)
+Two clearly separated families, and the split is **structural here in a way it
+could not be in the bridge**. In the bridge, unauthenticated paths are exceptions
+allowlisted inline inside an otherwise-authenticated prefix (`handleV1`,
+`http_server.cpp:303`, with `/v1/auth/token` and `/v1/auth/sso/redeem` carved out
+at `:336`/`:351`) — one forgotten `else` away from exposing something. A
+standalone service can instead mount **two routers with different dependencies**:
+`/share/v1/*` requires a bearer token by construction, `/share/v1/public/*`
+refuses to read one at all. Nothing is allowlisted, so nothing can be
+accidentally added to the allowlist.
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/v1/nodes/{uid}/shares` | Create a link. Body: `kind`, **`recipients[]` (required, ≥1)**, `expires_at`\|`ttl`, `max_uses`, `max_uses_per_recipient?`, `max_bytes`, `max_file_bytes`, `max_files?` (upload — the file count, distinct from `max_uses`, §6.4), `follow_latest?`, `follow_folder?`, `include_subdirs?`, `landing_prefix?`, `ext_allowlist?`, `note?`. **201** returns the full URL once, plus `archive_bytes` / member count for `kind = 2` — the numbers §10.1 renders into the copyable summary the creator pastes into their own mail (§13-R9). No `send_invite`: v1 sends no invite. |
-| `GET` | `/v1/nodes/{uid}/shares` | Links on this node (requires `MANAGE_ACL` or being the creator). |
-| `GET` | `/v1/shares` | The caller's own links. `?all=true` (**`tenant_admin` only**) returns the tenant-wide set backing the admin console (§10.3), with `creator`, `recipient`, `subtree`, and `status` filters and `live=true` by default. |
-| `DELETE` | `/v1/shares/{link_uid}` | Revoke. Idempotent. |
-| `GET` | `/v1/shares/{link_uid}` | One link's **live status** (§10.2): computed state, budgets, and the result of the §6.1 pre-flight re-run — this is what surfaces "not working: you no longer have access". |
-| `GET` | `/v1/shares/{link_uid}/recipients` | The roster: per-address status ladder, invite/verify/download timestamps, uses consumed, failure counts. |
-| `POST` | `/v1/shares/{link_uid}/recipients` | Add an address to the allowlist after creation (creator only; optionally mails the invite). |
-| `DELETE` | `/v1/shares/{link_uid}/recipients/{email}` | Partial revoke — that address loses access, the link keeps working for the rest. |
-| `POST` | `/v1/shares/{link_uid}/recipients/{email}/resend` | Re-send the invite (or a fresh code), subject to the §9 send limits; returns the remaining wait when throttled. |
-| `GET` | `/v1/shares/{link_uid}/redemptions` | Usage ledger for one link (who, when, from where, how much; members served/omitted; `result_uid` for drops). |
+The public router also **never** falls back to session auth, so a logged-in
+browser hitting a public route is still session-less there and a redemption can
+never be misattributed to a passing authenticated user.
 
-### 7.2 Public (unauthenticated — new `/v1/public/` prefix)
+### 7.1 Owner-side (bearer auth — the SPA's own session)
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/v1/public/shares/{link_uid}` | **Peek.** Consumes nothing. Returns `kind`, display name, `expires_at`, `uses_remaining`, and either size + content-type (`kind = 0`) or member count + `archive_bytes` (`kind = 2`) or the remaining **file** and byte budget — `max_files - files_consumed` and `max_bytes - bytes_consumed` (`kind = 1`). |
-| `POST` | `/v1/public/shares/{link_uid}/identify` | `{email}` → mails a 6-digit code **iff** the address is on the link's allowlist. Uniform response either way (§6.9). Consumes nothing. |
-| `POST` | `/v1/public/shares/{link_uid}/verify` | `{email, code}` → the **recipient token** (TTL `share.recipient_ttl_seconds`). Consumes nothing; 5 failures per `(link, email)` per window lock that address out — a resend does **not** reset the count (§8.4). |
-| `POST` | `/v1/public/shares/{link_uid}/session` | Open a redemption session (**this is the use-consuming call**). Requires the recipient token. Returns `redemption_uid` + TTL, and writes `verified_email` onto the ledger row. |
-| `GET` | `/v1/public/shares/{link_uid}/content` | Stream the payload. `kind = 0`: the file, Range-capable, reusing the existing `streamFileDownload` path (`src/http_server.cpp:562`). `kind = 2`: the zip, `Content-Length: archive_bytes`, `Accept-Ranges: none`, assembled member-by-member (§7.3). Requires an open session. |
-| `POST` | `/v1/public/shares/{link_uid}/files` | Drop a file (raw body + `X-File-Name`, streamed through `StreamFileUpload`). Requires an open session. |
-| `GET` | `/v1/public/shares/{link_uid}/manifest` | `kind = 2`: the snapshot's member list (name, path, size). `kind = 1`: what *this session* dropped — never the folder's contents. |
+| `POST` | `/share/v1/nodes/{uid}/links` | Create a link. Body: `kind`, **`recipients[]` (required, ≥1)**, `expires_at`\|`ttl`, `max_uses`, `max_uses_per_recipient?`, `max_bytes`, `max_file_bytes`, `max_files?` (upload — the file count, distinct from `max_uses`, §6.4), `follow_latest?`, `follow_folder?`, `include_subdirs?`, `landing_prefix?`, `ext_allowlist?`, `note?`. **201** returns the full URL once, plus `archive_bytes` / member count for `kind = 2` — the numbers §10.1 renders into the copyable summary the creator pastes into their own mail (§13-R9). No `send_invite`: v1 sends no invite. |
+| `GET` | `/share/v1/nodes/{uid}/links` | Links on this node (requires `MANAGE_ACL` or being the creator). |
+| `GET` | `/share/v1/links` | The caller's own links. `?all=true` (**`tenant_admin` only**) returns the tenant-wide set backing the admin console (§10.3), with `creator`, `recipient`, `subtree`, and `status` filters and `live=true` by default. |
+| `DELETE` | `/share/v1/links/{link_uid}` | Revoke. Idempotent. |
+| `GET` | `/share/v1/links/{link_uid}` | One link's **live status** (§10.2): computed state, budgets, and the result of the §6.1 pre-flight re-run — this is what surfaces "not working: you no longer have access". |
+| `GET` | `/share/v1/links/{link_uid}/recipients` | The roster: per-address status ladder, invite/verify/download timestamps, uses consumed, failure counts. |
+| `POST` | `/share/v1/links/{link_uid}/recipients` | Add an address to the allowlist after creation (creator only; optionally mails the invite). |
+| `DELETE` | `/share/v1/links/{link_uid}/recipients/{email}` | Partial revoke — that address loses access, the link keeps working for the rest. |
+| `POST` | `/share/v1/links/{link_uid}/recipients/{email}/resend` | Re-send the invite (or a fresh code), subject to the §9 send limits; returns the remaining wait when throttled. |
+| `GET` | `/share/v1/links/{link_uid}/redemptions` | Usage ledger for one link (who, when, from where, how much; members served/omitted; `result_uid` for drops). |
+
+### 7.2 Public (unauthenticated — new `/share/v1/public/` prefix)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/share/v1/public/{link_uid}` | **Peek.** Consumes nothing. Returns `kind`, display name, `expires_at`, `uses_remaining`, and either size + content-type (`kind = 0`) or member count + `archive_bytes` (`kind = 2`) or the remaining **file** and byte budget — `max_files - files_consumed` and `max_bytes - bytes_consumed` (`kind = 1`). |
+| `POST` | `/share/v1/public/{link_uid}/identify` | `{email}` → mails a 6-digit code **iff** the address is on the link's allowlist. Uniform response either way (§6.9). Consumes nothing. |
+| `POST` | `/share/v1/public/{link_uid}/verify` | `{email, code}` → the **recipient token** (TTL `share.recipient_ttl_seconds`). Consumes nothing; 5 failures per `(link, email)` per window lock that address out — a resend does **not** reset the count (§8.4). |
+| `POST` | `/share/v1/public/{link_uid}/session` | Open a redemption session (**this is the use-consuming call**). Requires the recipient token. Returns `redemption_uid` + TTL, and writes `verified_email` onto the ledger row. |
+| `GET` | `/share/v1/public/{link_uid}/content` | Stream the payload. `kind = 0`: the file, Range-capable, reusing the existing `streamFileDownload` path (`src/http_server.cpp:562`). `kind = 2`: the zip, `Content-Length: archive_bytes`, `Accept-Ranges: none`, assembled member-by-member (§7.3). Requires an open session. |
+| `POST` | `/share/v1/public/{link_uid}/files` | Drop a file (raw body + `X-File-Name`, streamed through `StreamFileUpload`). Requires an open session. |
+| `GET` | `/share/v1/public/{link_uid}/manifest` | `kind = 2`: the snapshot's member list (name, path, size). `kind = 1`: what *this session* dropped — never the folder's contents. |
 
 The secret travels in the `X-Share-Secret` header (SPA) or `?k=` (direct-link
 fallback for `curl`/email clients). **R7 settles the URL form as the path**
@@ -942,67 +1072,125 @@ whole public family:
   `Cache-Control: no-store`, `X-Robots-Tag: noindex, nofollow`,
   `Content-Security-Policy: sandbox`. This is the anti-XSS boundary; §8.3 says
   why it is a handler-level concern and what has to be tested to keep it true.
-- **Logging:** the bridge logs `link_uid` and never the secret; the nginx
-  `access_log` for `location /api/v1/public/` must strip the query string
+- **Logging:** the service logs `link_uid` and never the secret; the nginx
+  `access_log` for `location /share/v1/public/` must strip the query string
   (`log_format` without `$query_string`) or the fallback `?k=` form defeats
   itself.
 
 ### 7.3 Where the zip is assembled
 
-**In the bridge, not the core.** The core stays a byte source: the bridge opens
-the session, reads the member list, and for each member issues
-`StreamFileDownload` carrying the *share credential* plus that `member_uid` —
-the core validates membership against `share_link_members` and runs the §6.5
-per-member re-check, so the bridge never decides who may read what. The bridge
-frames the stream into zip entries and streams them straight out; nothing is
-buffered to disk or to memory beyond one chunk, matching the
-`proxy_request_buffering off` / `proxy_buffering off` posture already set for
-`/api/` in `docker_unified/images/nginx/snippets/tenant.conf`.
+**In `share_service`.** The core stays a byte source and nothing more: the
+service opens the session, reads its own member list, and for each member issues
+`StreamFileDownload` **as the creator** (§4.1). It frames the resulting streams
+into zip entries and streams them straight out; nothing is buffered to disk or to
+memory beyond one chunk, and nginx needs the same `proxy_request_buffering off` /
+`proxy_buffering off` posture already set for `/api/` in
+`docker_unified/images/nginx/snippets/tenant.conf`.
 
-**The per-member re-check runs at session open, not mid-stream.** `RedeemShareLink`
-for `kind = 2` re-evaluates §6.3 across the whole snapshot, freezes the surviving
-member list onto the `share_redemptions` row, and returns its exact archive
-length — which is what `/content` then serves as `Content-Length`. Doing it any
-later means discovering an omitted member after the header is on the wire, and a
-zip whose declared length no longer matches its body is a corrupt download. The
-residual window (an ACL change between session open and stream end) is bounded
-by the transfer itself and is accepted; the link's *next* session sees the new
-state.
+**Membership is enforced here, and only here.** Under a core-owned design the
+core would have validated each `member_uid` against `share_link_members` — a
+second check behind the service's first. That check no longer exists: the core
+will stream any uid the creator may read. So the service must take member uids
+**exclusively from its own snapshot rows**, never from anything the caller
+supplied, and a `member_uid` that is not in this link's snapshot must be
+impossible to express rather than merely rejected. This is §4.3's containment
+point in its most concrete form, and it is why §14 tests it directly.
+
+**The per-member re-check runs at session open, not mid-stream.** Opening a
+`kind = 2` session re-evaluates §6.3 across the whole snapshot — one
+`CheckPermission` per member, as the creator — freezes the surviving member list
+onto the `share_redemptions` row, and computes the exact archive length that
+`/content` then serves as `Content-Length`. Doing it any later means discovering
+an omitted member after the header is on the wire, and a zip whose declared
+length no longer matches its body is a corrupt download. The residual window (an
+ACL change between session open and stream end) is bounded by the transfer itself
+and is accepted; the link's *next* session sees the new state.
+
+One operational note the core-owned design did not have: this is **N
+`CheckPermission` round-trips at session open**, where N is the member count
+(capped at `share.zip_max_members`, default 5000). They are independent and
+should be issued concurrently with a bounded pool; a 5000-member folder must not
+turn session-open into a minute of serial gRPC calls. Worth measuring in M1
+against the fixture tree.
 
 The zip writer itself is ~200 lines of local-header / central-directory framing
 — store-only removes the compressor entirely — with CRC-32 computed per member
 as its bytes pass through.
 
----
+### 7.4 Where the recipient token lives
 
-## 8. Security
+The recipient token (§6.9 step 3) is a 256-bit bearer credential, hashed at rest,
+bound to `(link_uid, email)`, TTL `share.recipient_ttl_seconds`. Earlier drafts
+said "hashed at rest" without ever saying **where**, which left the obvious
+implementation — a map in the process that minted it — available by default.
 
-### 8.1 The `SHARE_EXTERNAL` permission bit
+It goes in **`ldap_manager`'s Redis**, alongside the OTP state, as a
+`TokenStore`-issued value keyed `share_recipient:{link_uid}:{email}`. Two
+reasons:
 
-```c++
-enum class Permission {
-    SHARE_EXTERNAL = 0x4000, // Mint an outside share link to this resource —
-                             // redeemable without a session, by a recipient
-                             // verified only by a one-time code to an address
-                             // named at creation. Never granted by default: the
-                             // one permission that reaches outside the tenant's
-                             // identity boundary. Cf. CULL_VERSIONS.
-    CULL_VERSIONS  = 0x2000,
-    ...
-};
+1. **Process memory does not survive replication.** `share_service` is an
+   ordinary stateless service and will be run with more than one replica
+   eventually. A recipient who verifies against replica A and then opens a
+   session on replica B would be unknown there — and by §8.5 the failure is a
+   generic 404, so the symptom is *"the link works sometimes"*, which is close to
+   undiagnosable from either side. This is exactly the trap `ReplayGuard`'s own
+   header names ("a multi-bridge deployment would back this with a shared
+   store"), and it has now caught two designs in this document; the OTP attempt
+   counter (§6.9) is the other.
+2. **It is a verification artifact, not an authorization record.** The token says
+   "this address proved control recently" — the same kind of statement, with the
+   same lifecycle, as the code that produced it. `TokenStore` already provides
+   hashing, TTL, constant-time compare, and single-use semantics. The thing that
+   actually *grants* anything remains the `share_redemptions` row in
+   `share_service` (§5.3), which is where authorization state belongs.
+
+Client-side, the token lives in **`sessionStorage`, never `localStorage`** — the
+landing page is on the SPA's origin (§8.3), and a 24-hour bearer credential
+sitting in `localStorage` on a shared machine outlives the visit that earned it.
+
+### 8.1 The creation gate: an LDAP group, not a permission bit
+
+Minting a link is gated by **two independent checks**, both made by
+`share_service`, neither requiring a change to the core's permission model:
+
+```python
+# per-user: may this person share outside at all?
+if "share_external" not in ldap_roles(caller, tenant):      deny
+# per-resource: may they reach this thing, right now?
+if not core.CheckPermission(caller, resource_uid, READ):    deny   # WRITE for kind=1
 ```
 
-It must be added to `kAllPermissions` (`acl_manager.h:64`) or the `system_admin`
-bypass invariant `(kAllPermissions & required) == required` breaks for it.
-Downstream: the proto permission enum, the REST permission-name map, and
-`AclEditor.vue`'s checkbox list (labelled **"Create outside share links"**, with
-the same "this reaches outside" treatment `CULL_VERSIONS` gets).
+**Why a group rather than an ACL bit.** An earlier draft proposed
+`SHARE_EXTERNAL = 0x4000` in the core's `Permission` enum. That is a clean design
+in the abstract, but it puts a share concept in the core's vocabulary — including
+`kAllPermissions`, the proto enum, the REST name map, and `AclEditor.vue` — for a
+feature the core is otherwise entirely unaware of (§4). The group achieves the
+same *gating* outcome with no core surface at all, and it fits where role
+membership actually lives in this platform: LDAP `groupOfNames`, administered
+through `ldap_manager`, resolved per request — never the core's `user_roles`
+table, which is effectively always empty (§13-R5).
 
-Piggy-backing on `READ` was rejected: read-by-default means nearly every user
-holds `READ` nearly everywhere, so link creation would be effectively ungated.
-Piggy-backing on `MANAGE_ACL` was rejected as too coarse in the other direction —
-"can share a file with an outside client" and "can rewrite this folder's
-permissions" are not the same job.
+**What the two checks buy separately.** The group answers *"is this person
+trusted to send things outside the organization?"* — an HR-shaped question,
+answered once per person, administered where every other role already is. The
+`CheckPermission` call answers *"can they reach this file?"* — asked fresh, per
+resource, per creation. Neither alone is sufficient: read-by-default means nearly
+everyone holds `READ` nearly everywhere, so the resource check alone would leave
+creation effectively ungated; and the group alone would let a trusted sharer mint
+links to things they cannot open.
+
+**What is lost, honestly.** An ACL bit would have been *per-resource* —
+"Priya may share out of `/Projects/Acme` but not `/HR`". The group is
+per-user: someone in `share_external` may share anything they can read. For
+finer control the deployment splits the group by scope (`share_external_projects`)
+and the service maps group → permitted subtree prefix, which is a service-side
+policy table and still no core change. Not needed for v1, and worth stating so
+nobody assumes the granularity is there.
+
+The admin bypass needs no special handling at creation: `CheckPermission` will
+happily return true for an admin, and the **pre-flight** (§6.3) is what refuses
+to mint a link whose access exists only through the bypass — because the
+pre-flight runs the redemption's check, with admin roles already stripped.
 
 ### 8.2 Token strength & storage
 
@@ -1037,7 +1225,7 @@ are not optional:
 
 1. The headers are set **once**, in the public-prefix handler, before dispatch —
    never per route. A new public route inherits them or does not ship.
-2. A test asserts all three on every response from `/v1/public/shares/*`,
+2. A test asserts all three on every response from `/share/v1/public/*`,
    including error responses.
 
 A separate `dl.<base>` origin remains the structural answer if the deployment
@@ -1050,10 +1238,10 @@ already in the wild.
 | Vector | Control |
 |---|---|
 | Guessing secrets for a known `link_uid` | `failed_attempts` on the row; after 10 within the window, `locked_until = now() + 15 min`, and the link's creator is notified. Distributed guessing hits the same per-link counter, so IP rotation does not help. |
-| Enumerating `link_uid`s | 128-bit uid + a per-IP nginx `limit_req` zone on `location /api/v1/public/` + identical 404s (§8.5). |
-| Upload flood / storage exhaustion | Per-link file count (`max_files`), per-file bytes (`max_file_bytes`), total bytes (`max_bytes`), and session count (`max_uses`) — four independent bounds, since one sender's single session could otherwise deliver unlimited files (§6.4); per-IP request rate; the bridge's existing `max_body_bytes` (`src/http_server.cpp:294`) as the outer bound. |
+| Enumerating `link_uid`s | 128-bit uid + a per-IP nginx `limit_req` zone on `location /share/v1/public/` + identical 404s (§8.5). |
+| Upload flood / storage exhaustion | Per-link file count (`max_files`), per-file bytes (`max_file_bytes`), total bytes (`max_bytes`), and session count (`max_uses`) — four independent bounds, since one sender's single session could otherwise deliver unlimited files (§6.4); per-IP request rate; a service-level request-body cap (`share.max_body_bytes`) as the outer bound, since the bridge's `max_body_bytes` no longer sits in front of this traffic. |
 | Bandwidth drain on a download link | `max_uses` is the primary bound; sessions are also capped in count per link per hour. |
-| Zip amplification (a folder link as a bandwidth cannon) | `share.zip_max_bytes` / `share.zip_max_members` refused **at creation** (§6.1); `archive_bytes × max_uses` is the exact worst-case egress of a link and the UI shows it; concurrent zip streams capped per link and per bridge instance. |
+| Zip amplification (a folder link as a bandwidth cannon) | `share.zip_max_bytes` / `share.zip_max_members` refused **at creation** (§6.1); `archive_bytes × max_uses` is the exact worst-case egress of a link and the UI shows it; concurrent zip streams capped per link and per service instance. |
 | Zip-slip against the recipient | `archive_path` normalized and validated at creation (§5.2) — no `..`, no absolute paths, no leading separator. |
 | Replaying a session or recipient token | Both are random 256-bit values, hashed at rest, bound to `link_uid` (and the recipient token also to the verified address); neither survives its TTL. |
 | **Using the OTP endpoint as a mail relay** | Structurally impossible: the destination set is closed at creation (§6.9). There is no mode in which an outside caller chooses an address. |
@@ -1061,7 +1249,7 @@ already in the wild.
 | **OTP brute force** | 6 digits, **5 attempts per `(link, email)` per rolling window — not per challenge**, failures also feed the link's `failed_attempts`. `consume_code` does not delete on a wrong code, so the counter is an explicit `rate_ok` bucket in `ldap_manager`'s Redis — **shared across bridge replicas**, never per-process (§6.9). |
 | **Resetting the guess budget by requesting a new code** | The reason the bucket above is keyed per `(link, email)` and not per challenge. A per-challenge counter is defeated by the resend the recipient is explicitly offered (§6.9): burn 5 guesses, request a fresh code, get 5 more — 3 resends per 15 min turns a 10⁻⁶ guess into a steady 15 attempts per quarter-hour against a 6-digit space, indefinitely. Keying the attempt bucket to the address rather than the challenge closes it while leaving the resend freely available, since resending is what a stuck recipient legitimately needs and guessing is not. |
 | **Enumerating the recipient list** | `/identify` returns the identical response for listed and unlisted addresses (§6.9, §8.5). |
-| Confused deputy via MCP | The share RPCs are simply not exposed on the MCP door (§11). |
+| Confused deputy via MCP | Structural: the MCP door speaks to the core, and the core has no share operations to expose (§11). |
 
 #### Exceeding the attempt budget is a brute-force signal, not a user error
 
@@ -1164,7 +1352,11 @@ recipient list (§6.9).
 
 ---
 
-## 9. Configuration (core `core.conf` / env, bridge env)
+## 9. Configuration (`share_service` env)
+
+All of it belongs to `share_service` unless marked otherwise. **Nothing here goes
+in `core.conf`** — the core has no share configuration because it has no share
+feature (§4).
 
 > Note the two `share.*` namespaces: the **configuration** keys below, and the
 > per-file **metadata** keys in §6.8 (`share.link_uid`, `share.verified_email`,
@@ -1173,7 +1365,10 @@ recipient list (§6.9).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `share.enabled` | `false` | Deployment kill switch. Off ⇒ `CreateShareLink` refuses and the public prefix 404s wholesale. **Off by default** — an unauthenticated door is opt-in. |
+| `share.enabled` | `false` | Deployment kill switch. Off ⇒ creation refuses and the public prefix 404s wholesale. **Off by default** — an unauthenticated door is opt-in. Not deploying the service at all is the stronger form of the same switch, and is now available. |
+| `share.core_grpc` | `core:50051` | The core endpoint delegated calls go to. The service is a trusted gRPC caller like every other feature service, so this address must stay on the internal network (`CLAUDE.md`: gRPC must never be network-exposed). |
+| `share.ldap_group` | `share_external` | The group whose members may mint links (§8.1). |
+| `share.max_body_bytes` | `100 MiB` | Request-body cap on the public prefix. Replaces the bridge's `max_body_bytes`, which no longer sits in front of this traffic. |
 | `share.max_ttl_days` | `30` | Cap on `expires_at`; the UI cannot offer longer. |
 | `share.max_uses_cap` | `100` | Cap on `max_uses`; `0` (unlimited) is only accepted if this is `0`. |
 | `share.default_ttl_days` | `7` | Pre-filled in the UI. |
@@ -1199,7 +1394,7 @@ recipient list (§6.9).
 | `share.zip_deflate` | `false` | Compress instead of store — forfeits `Content-Length` and resume-free progress (§6.5). |
 | `share.zip_max_concurrent` | `4` | Simultaneous zip streams per bridge instance. |
 | `share.retention_days` | `365` | How long dead rows — including recipient addresses (PII, §5.4) — are kept for audit (§5.5). |
-| `SHARE_PUBLIC_BASE_URL` (bridge) | derived from `Host` | The origin URLs are built from at creation. Set explicitly to move share traffic to a separate download host later without invalidating links already sent (§8.3). |
+| `SHARE_PUBLIC_BASE_URL` | derived from `Host` | The origin URLs are built from at creation. Set explicitly to move share traffic to a separate download host later without invalidating links already sent (§8.3). |
 
 ---
 
@@ -1208,8 +1403,9 @@ recipient list (§6.9).
 ### 10.1 The drawer tab
 
 `FileDetailsDrawer.vue` gains **`Share`** in `visibleTabs` (`:245–253`), shown
-only when the user holds `SHARE_EXTERNAL` on the item and `share.enabled` is
-advertised by the bridge. A file gets the download-link form; a **folder gets
+only when the user is in the `share_external` group, holds READ/WRITE on the
+item, and `share.enabled` is
+advertised by `share_service`. A file gets the download-link form; a **folder gets
 both**, as a two-way choice at the top of the tab — *"Let someone download this
 folder"* vs *"Let someone send you files"* — since a folder can carry links of
 either kind at once. The tab is deliberately **separate from `Access`** — Access
@@ -1315,7 +1511,7 @@ nudge list.
 #### History
 
 Expanding a recipient (or the link's **History** view) shows the ledger from
-`GET /v1/shares/{link_uid}/redemptions` (§7.1), newest first: verified address,
+`GET /share/v1/links/{link_uid}/redemptions` (§7.1), newest first: verified address,
 timestamp, source IP, user agent, bytes moved, and — for a folder download — how
 many members were served and how many were omitted by the §6.5 per-member
 re-check. For an upload link each row links to the file the drop created
@@ -1344,7 +1540,7 @@ does (§12).
 A `tenant_admin` sees the Share tab's status model applied to the whole tenant at
 `/admin/shares` (`meta: { requiresAuth: true, requiresAdmin: true }`, alongside
 the existing admin routes in `src/router/index.ts:55–67`), backed by
-`GET /v1/shares?all=true` (§7.1).
+`GET /share/v1/links?all=true` (§7.1).
 
 **The question it answers** is not "list some rows" — it is *what is currently
 reachable from outside this tenant, by whom, and who opened that door*. So the
@@ -1575,7 +1771,7 @@ flat list:
   are not shown here; the Share tab is where history lives.
 
 Every row deep-links to the resource's Share tab. The panel is per-user and
-reuses `GET /v1/shares` (§7.1) — no new route — and reuses the status computation
+reuses `GET /share/v1/links` (§7.1) — no new route — and reuses the status computation
 from M5 rather than re-deriving it. `tenant_admin`'s tenant-wide view stays a
 separate surface (§10.3): this panel is *your* links, not the deployment's.
 
@@ -1590,14 +1786,21 @@ separate surface (§10.3): this panel is *your* links, not the deployment's.
   outside the tenant is exactly the action an agent should not be able to take
   from a prompt-injected document (the roadmap's own confused-deputy concern,
   §9.2). If it is ever wanted, it wants the interactive-consent path, not a tool
-  call.
+  call. This is now *structurally* true rather than a policy: the MCP server
+  talks to the core, and the core has no share operations to expose.
 - **CSAI / discussion / folder_actions** — no change. Outside drops arrive as
   ordinary `file.created` events and are indexed, converted, and processed
   normally.
-- **CLI** — `fileengine_cli share create|list|revoke` falls out of the new RPCs
-  for free; useful for scripted distribution. Note it can only *mint* links —
-  redemption needs the browser flow — so it is a provisioning tool, not a way to
-  fetch shared bytes. Low priority.
+- **`fileengine_cli`** — **no change, and no share subcommand.** The CLI is a
+  core gRPC client, and the core has no share RPCs; a `share create` there would
+  mean either a second client for `share_service`'s REST API or exactly the core
+  surface §4 removed. Scripted minting, if it is ever wanted, is an ordinary
+  authenticated `POST /share/v1/nodes/{uid}/links` — `curl` and a bearer token,
+  no new tool.
+- **`http_bridge`** — **no change.** An earlier draft put the public routes, the
+  zip writer, and the recipient-token minting here. All of it moved to
+  `share_service` (§7), and the bridge keeps its single unauthenticated-path
+  allowlist rather than growing a second family of exceptions.
 
 ---
 
@@ -1612,14 +1815,24 @@ New actions, added to `codes.py` and `audit_entry.h`'s string map in lockstep
 | `share_link_revoke` | `permission` | **yes** | Same reasoning. |
 | `share_link_recipient_add` | `permission` | **yes** | Extending the allowlist widens who can reach the resource — the same class of change as the grant itself. |
 | `share_link_recipient_remove` | `permission` | **yes** | The partial revoke (§10.2). |
-| `share_link_redeem` | `access` (download) / `mutate` (upload) | no | Follows the existing access/mutate policy. `actor = "share:<link_uid>\|<verified_email>"` — the same actor string §6.8 writes onto dropped files, so the door and the human are one identifier. |
+| `share_link_redeem` | `access` (download) / `mutate` (upload) | **yes — overriding the category default** | `actor = "share:<link_uid>\|<verified_email>"`, `created_by` in `detail` — the door, the verified human, and the person accountable, in one record (§4.3). **This is the only place in the platform where the fact of external access exists.** The category default would make it fail-open like any other access event; here a lost event is external access that can never be attributed, so the redemption must not proceed if it cannot be recorded. `is_fail_closed()` is per-category, so this is an explicit per-action override — call it out in the emitter, because it reads as an inconsistency to anyone who does not know why. |
 | `share_link_denied` | `access` | no | Outcome `denied`; `detail.reason` carries the real cause the caller never sees (§8.5). This is the event a rules-engine alert should watch — a burst of `denied` on one uid is a guessing attempt. |
 | `share_link_challenge_sent` | `auth` | **yes** | An OTP was mailed (§6.9). `is_fail_closed(Auth)` is already `true` — consistent with the platform rule that auth events block the operation if they cannot be recorded. `detail` carries the address; `outcome = error` when SMTP failed, which is the event support will look for. |
 | `share_link_challenge_verified` | `auth` | **yes** | The recipient proved control of the address. This is the event that makes a redemption attributable to a human. |
 | `share_link_challenge_failed` | `auth` | **yes** | Wrong code, burned challenge, or an unlisted address — `detail.reason` separates them, the recipient's response does not. |
-| `share_provenance_tamper` | `permission` | **yes** | An attempt to write or delete a reserved `share.*` metadata key through the ordinary metadata API (§6.8). Denied regardless of the caller's rights, including admins. Rare enough that any occurrence is worth looking at — it is either a client writing keys it should not know about, or someone trying to re-attribute a dropped file. `detail` carries the key, the attempted value, and the caller. |
+| `share_provenance_drift` | `permission` | no | Raised by `share_service`'s reconcile sweep when a dropped file's `share.*` metadata no longer matches the redemption ledger (§6.8) — i.e. someone edited it. The core does not reserve the namespace, so drift is **detected rather than prevented**; this event is the detection. `detail` carries the file uid, the ledger value, and the current metadata value. |
 | `share_link_locked` | `permission` | **yes** | **The security alert** (§8.4 rung 2): a publicly reachable link crossed the brute-force threshold and is locked. Distinct from `share_link_denied` because it is an adjudicated conclusion, not a data point — the rules engine should alert on *this* directly rather than inferring it from a burst. `detail` carries the contributing addresses, source IPs, and whether the failures were wrong secrets, wrong codes, or both. Fail-closed for the same reason as the grant events: a lockout the log did not record is a lockout nobody can investigate. |
 | `share_link_expired` | `admin` | **yes** | Emitted by the retention sweeper when a dead row is purged (§5.5). Fail-closed is not a concession to `is_fail_closed(Admin)` being `true` (`audit_entry.cpp:62`) — it is the right behaviour on its own: this event records the **destruction of audit evidence**, so if it cannot be written the purge must not happen. The sweeper skips the row and retries next pass; rows outliving `share.retention_days` during an audit outage is the harmless failure, and purging them unrecorded is not. |
+
+**Correlation with the core's own events.** Every delegated call carries the
+`redemption_uid` as `AuthenticationContext.claims["share.redemption_uid"]`
+(`proto/fileservice.proto:76`) and in `AuditEntry.request_id` — a field the
+envelope and the audit tables already have and nothing currently populates
+(`audit_entry.cpp:104`, `database.cpp:138,2316`). The core's event for the same
+operation therefore says *"Alice read X, request_id R"* while the service's says
+*"bob@contractor.example redeemed link Y as Alice, redemption R"*, and the two
+join on `R`. Without this the security log holds both halves of every external
+access and no way to connect them.
 
 `detail` carries `link_uid`, `resource_uid`, `created_by`, `verified_email`,
 budgets, and `bytes_moved`; `target_uid` / `target_type` are the shared resource, so the
@@ -1649,6 +1862,35 @@ collision is documented rather than silently renumbered.
 
 ### Resolved (2026-08-19)
 
+**R13 — Share links are a service; the core does not change.** *(Supersedes §4's
+original argument, which concluded the opposite.)* The record, the public door,
+and every share-specific decision live in a new **`share_service`**; the core
+gains no tables, no RPCs, and no permission bit. A redemption is **delegated as
+the creator** — a real principal with real LDAP roles and real ACLs, never a
+synthetic `share:*` user — so the core is asked only questions it already
+answers: `CheckPermission`, `Stat`, `StreamFileDownload`, `StreamFileUpload`,
+`SetMetadata`. Three sub-decisions were taken with it:
+
+- **Creation is gated by the `share_external` LDAP group plus a
+  `CheckPermission` on the resource** (§8.1), not by a new ACL bit. Per-user
+  rather than per-resource granularity is the accepted cost.
+- **The `share.*` file metadata stays as a convenience copy**, unprotected and
+  therefore not evidence; the redemption ledger and the audit chain are
+  authoritative, and drift between them is detected rather than prevented
+  (§6.8).
+- **`share_link_redeem` becomes fail-closed**, overriding its category default.
+  The security event chain is now the only place recording that an access was
+  external, so an unwritten event is an access nobody can ever attribute (§4.3).
+
+What this buys: the core stays the thing it is — the ACL enforcer, unaware of
+sharing — and the feature can ship, change, and be redeployed without touching
+C++ or the permission model. What it costs: **scope containment moves into the
+service.** The core would have known a share credential was confined to one uid;
+now the service holds the creator's whole authority and asks for a uid, so
+nothing behind it catches a bug that asks for the wrong one. That is why the
+"target uid comes only from the link record" rule (§4.3) and the admin-role
+stripping (§6.3) are tested invariants of M0 rather than remarks in prose.
+
 **R11 — The OTP gate is a brute-force surface, and says so.** The code is short
 (6 digits) and the door is a public URL, so the attempt budget is not a
 usability detail — it is the control standing between a leaked link and its
@@ -1669,8 +1911,8 @@ before the #". The decision rests on R4 having already demoted the token: a
 leaked URL is inert without a code mailed to an address fixed at creation, so
 the token is now the *weaker* of two factors and log hygiene is defence in
 depth rather than the control. The compensating measures in §7.2 stand — nginx
-must still strip the query string on the public location, and the bridge still
-logs `link_uid` and never the secret.
+must still strip the query string on the public location, and `share_service`
+still logs `link_uid` and never the secret.
 
 **R8 (was Q4) — A link is minted on one existing node; there is no file-picker.**
 The decision is about **UI complexity**, not about the record: v1 does not build
@@ -1754,9 +1996,10 @@ that gets written in the same email as the link. Removes
 core, and the `/unlock` route from the public surface.
 
 **R2 — Folder download: in v1.** Store-only zip64 over a creation-time member
-snapshot, assembled in the bridge, with the member set and exact archive length
+snapshot, assembled in `share_service` (**was** the bridge — moved by R13), with
+the member set and exact archive length
 frozen at session open (§6.5, §7.3). This is the largest single piece of new
-work in the proposal — it adds a zip writer to the bridge, a members table, a
+work in the proposal — it adds a zip writer, a members table, a
 per-member authority pass, and a genuine egress-amplification surface on an
 unauthenticated route (§8.4). Two sub-decisions were taken with it and are worth
 revisiting if the first real corpus argues otherwise:
@@ -1792,7 +2035,9 @@ worth stating as decisions in their own right:
   `require_internal` server-to-server seam the 2FA flow already established.
   Share links now depend on **Redis and SMTP** being healthy; both fail closed.
 
-**R5 — Creator role resolution at redemption: live from LDAP, via the bridge**
+**R5 — Creator role resolution at redemption: live from LDAP** *(via the bridge
+as originally decided; the resolver moved to `share_service` under R13, the
+mechanism is unchanged)*
 (§6.3, verified against the code). The earlier draft assumed the core could
 re-resolve the creator's roles from `user_roles` and proposed refusing links
 whose access came from a request-attached role. Both halves were wrong on the
@@ -1851,50 +2096,53 @@ inconsistencies rather than open questions, and all four are now fixed in place:
 
 ## 14. Implementation stages
 
-1. **M0 — Core: model & enforcement.** `SHARE_EXTERNAL` bit (+ `kAllPermissions`,
-   proto enum, REST name map); `share_links` / `share_link_members` /
-   `share_redemptions` in `create_tenant_schema`; `CreateShareLink` /
-   `ListShareLinks` / `RevokeShareLink` / `RedeemShareLink` /
-   `CloseShareSession` RPCs; the share-credential path on `StreamFileDownload` /
-   `StreamFileUpload`; the §6.3 re-check (taking the creator's roles as an RPC
-   argument, admin roles stripped core-side as a second line of defence);
-   the creation pre-flight; the recipient allowlist and its enforcement at
-   session open; **the reserved `share.*` metadata namespace on `SetMetadata` /
-   `DeleteMetadata`** and the drop path's version-metadata write (§6.8); audit
-   emission.
-   **Tests:** the authority re-check (creator loses READ mid-life), a link inside
-   a `DENY everyone + ALLOW role` gated section redeeming correctly with supplied
-   roles and failing without them, `system_admin`/`tenant_admin`/`administrators`
-   never granting anything on the share path, atomic use consumption under
-   concurrency **including the per-recipient cap** (concurrent sessions from one
-   recipient must not overrun `max_uses_per_recipient`, and a recipient refused
-   by their personal cap must not consume from the shared pool — §5.3),
-   `max_files` bounding drops independently of `max_uses` with a failed upload
-   releasing its slot (§6.4/§6.7), scope containment (a share credential cannot reach a sibling, a
-   parent, or an ACL), uniform failure, a session refusing to open for an address
-   not on the allowlist, and a wrong secret consuming an attempt but not a use.
-   Provenance (§6.8): a `share.*` key cannot be written, overwritten, or deleted
-   through `SetMetadata` / `DeleteMetadata` **by any caller including
-   `system_admin`** — tested in both directions, erasure *and* forgery onto a
-   file that was never dropped — and a version added to a dropped file afterwards
-   does not inherit the original sender's attribution.
-2. **M1 — Core: folder snapshots.** The creation-time walk and member capture,
-   `archive_bytes` computation, the per-member re-check at session open, the
-   frozen member list on the redemption row. Kept separate from M0 because it is
-   the one piece with real algorithmic content (§6.5, §7.3) and it should be
-   testable against a fixture tree before any bridge code exists. **Tests:**
-   snapshot excludes later additions; a member gaining DENY is omitted and
-   audited, not fatal; **archive-length arithmetic matches a real zip
+1. **M0 — `share_service`: skeleton, model & delegation.** A new Python/FastAPI
+   service on the folder_actions / difference pattern — health, readiness, the
+   verbatim `metrics.py`, per-tenant schema provisioning, audit publishing to the
+   Redis stream, bearer verification against the shared JWT secret. Then the
+   model: `share_links` / `share_link_members` / `share_redemptions` /
+   `share_link_recipients` (§5); link create / list / revoke; the **delegated
+   core client** (`CheckPermission`, `Stat`, `StreamFileDownload`,
+   `StreamFileUpload`, `SetMetadata` as `created_by`, §4.1); the `share_external`
+   group gate plus `CheckPermission` at creation (§8.1); the §6.3 re-check with
+   LDAP-resolved roles and **admin roles stripped**; the creation pre-flight; the
+   recipient allowlist enforced at session open; audit emission with
+   `request_id` correlation (§12).
+   **Tests:** the authority re-check (creator loses READ mid-life); a link inside
+   a `DENY everyone + ALLOW role` gated section redeeming correctly with resolved
+   roles and failing without them; **admin roles never reaching the delegated
+   call** — the invariant that now has no second line of defence behind it
+   (§6.3); **the target uid comes only from the link record** and no caller input
+   can redirect it (§4.3, the containment the core used to provide); atomic use
+   consumption under concurrency **including the per-recipient cap** (concurrent
+   sessions from one recipient must not overrun `max_uses_per_recipient`, and a
+   recipient refused by their personal cap must not consume from the shared pool
+   — §5.3); `max_files` bounding drops independently of `max_uses` with a failed
+   upload releasing its slot (§6.4/§6.7); uniform failure; a session refusing to
+   open for an address not on the allowlist; a wrong secret consuming an attempt
+   but not a use; and **`share_link_redeem` failing closed** — with the audit
+   sink unreachable, no bytes move (§4.3).
+   **Verify the core is untouched:** this milestone must land with an empty diff
+   against `file_engine_core`. That is the milestone's actual acceptance
+   criterion, and it is worth checking mechanically rather than by intention.
+2. **M1 — `share_service`: folder snapshots.** The creation-time walk and member
+   capture (as the creator), `archive_bytes` computation, the per-member re-check
+   at session open, the frozen member list on the redemption row. Kept separate
+   from M0 because it is the one piece with real algorithmic content (§6.5, §7.3)
+   and it should be testable against a fixture tree before any public surface
+   exists. **Tests:** snapshot excludes later additions; a member gaining DENY is
+   omitted and audited, not fatal; **archive-length arithmetic matches a real zip
    byte-for-byte** — the term that matters is the 24-byte zip64 data descriptor
    per entry (§6.5), so the test must extract with a real tool *and* compare the
    declared `Content-Length` to the produced byte count, including zip64 and
    empty directories; a member whose stored size no longer matches its bytes
    aborts the transfer rather than sending a short body; `archive_path` rejects
-   `..` and absolute forms.
-3. **M2 — Bridge: owner-side routes.** `/v1/nodes/{uid}/shares`,
-   `/v1/shares/*`; URL assembly from `SHARE_PUBLIC_BASE_URL`; audit passthrough.
-   No public surface yet — the model is exercisable end-to-end by an
-   authenticated caller before any public surface opens.
+   `..` and absolute forms. **Measure** the N-`CheckPermission` fan-out at
+   session open against a 5000-member fixture (§7.3).
+3. **M2 — `share_service`: owner-side routes.** `/share/v1/nodes/{uid}/links`,
+   `/share/v1/links/*`; URL assembly from `SHARE_PUBLIC_BASE_URL`; nginx `/share/`
+   routing in `docker_unified`. No public surface yet — the model is exercisable
+   end-to-end by an authenticated caller before any public door opens.
 4. **M3 — `ldap_manager`: recipient OTP.** `POST /internal/share/email-challenge`
    and `/internal/share/email-verify` behind `require_internal`; `share_otp` token
    kind keyed by `link_uid|email`; the `SHARE_OTP_EMAIL` template (**only** — no
@@ -1906,11 +2154,12 @@ inconsistencies rather than open questions, and all four are now fixed in place:
    send limits, a resend replacing the live code without restoring attempts,
    the two timing thresholds counting heavily while responding identically,
    and SMTP failure surfaced rather than swallowed.
-5. **M4 — Bridge: public routes + zip writer.** `/v1/public/shares/*` including
-   `identify` / `verify` and the recipient token, the allowlist check delegated
-   to the core, the uniform response for unlisted addresses, the per-challenge
-   attempt counter; the explicit unauthenticated prefix; the creator-role
-   resolution via `getRolesByTenant` on the redeem path (§6.3) with
+5. **M4 — `share_service`: public routes + zip writer.** `/share/v1/public/*`
+   including `identify` / `verify` and the recipient token (in **shared storage**,
+   never process memory — §7.4), the allowlist check, the uniform response for
+   unlisted addresses, the per-challenge
+   attempt counter; the separately-mounted public router (§7); the creator-role
+   resolution over the service's LDAP bind on the redeem path (§6.3) with
    LDAP-unreachable failing closed; the store-only zip64 framer; response-header
    hardening (with the §8.3 all-routes test); per-IP rate-limit zone; concurrency
    cap; log scrubbing. **This is the review gate** — it warrants its own
@@ -1932,7 +2181,7 @@ inconsistencies rather than open questions, and all four are now fixed in place:
 7. **M6 — Frontend: recipient side.** `/s/:token` landing, the email → code
    verification step, file download, folder download + manifest, drop flow.
 8. **M7 — Frontend + bridge: admin console.** `/admin/shares` (§10.3) over
-   `GET /v1/shares?all=true` with the creator / recipient / subtree / status
+   `GET /share/v1/links?all=true` with the creator / recipient / subtree / status
    filters, bulk **Revoke all by creator**, and the read-only ledger. Gated on
    `tenant_admin`; reuses the status computation written in M5 rather than
    re-deriving it.
@@ -1953,7 +2202,7 @@ inconsistencies rather than open questions, and all four are now fixed in place:
      `user_id == actor` trap); a *link dead* item survives the per-row READ
      re-check when the creator has lost access to the resource.
    - **M8c — Sharing panel.** `SharingInbox` beside `ReviewsInbox` over
-     `GET /v1/shares`, reusing M5's status computation.
+     `GET /share/v1/links`, reusing M5's status computation.
 10. **M9 — Ops & docs.** `audit_service` codes; **a rules-engine alert on
    `share_link_locked` directly** (the adjudicated brute-force signal, §8.4
    rung 2) plus the broader `share_link_denied` burst rule; retention sweeper;
@@ -1969,10 +2218,17 @@ inconsistencies rather than open questions, and all four are now fixed in place:
 M0–M4 are the security-bearing work; M5–M9 are surface. M2 is deliberately
 shippable on its own so the model can be exercised before a public door exists
 anywhere; M1 is separable so the zip arithmetic is proven against fixtures
-rather than debugged through an HTTP stream; M3 sits in a different repo and
-language, so it can run in parallel with M2 once the two `/internal/share/*`
-request shapes are agreed; and M8a sits in a *third* repo
-(`discussion_threaded_communication`) with no dependency on any of it.
+rather than debugged through an HTTP stream; M3 sits in a different repo, so it
+can run in parallel with M2 once the two `/internal/share/*` request shapes are
+agreed; and M8a sits in a *third* repo (`discussion_threaded_communication`)
+with no dependency on any of it.
+
+**`file_engine_core` is not on this list, and that is the point.** Every
+milestone above lands in `share_service`, `ldap_manager`, `frontend`,
+`discussion`, `audit_service` or `docker_unified`. If a milestone starts wanting
+a core change, that is the signal to re-open §4 deliberately rather than to make
+the change quietly — the whole architecture rests on the core staying unaware
+that share links exist (§13-R13).
 
 **Ops preconditions before M4 ships** — the unauthenticated door now depends on
 more than the core: **Redis** (OTP storage) and **SMTP** (delivery) must be
