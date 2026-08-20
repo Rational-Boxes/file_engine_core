@@ -869,7 +869,8 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
                                     const std::function<bool(const uint8_t*, size_t)>& raw_on_chunk,
                                     const std::string& user,
                                     const std::vector<std::string>& roles,
-                                    const std::string& tenant) {
+                                    const std::string& tenant,
+                                    const std::string& version_timestamp) {
     // Every emit path below goes through this, so the bound holds regardless of
     // how much plaintext a given source produces at once. Two sources produce a
     // lot: the cold path hands over the whole restored file, and decompression
@@ -900,7 +901,10 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
         return Result<void>::err("File does not exist");
     }
 
-    std::string current_version = file_info_result.value->version;
+    // An explicit version wins; empty means "whatever the file is at now".
+    std::string current_version = version_timestamp.empty()
+                                      ? file_info_result.value->version
+                                      : version_timestamp;
     if (current_version.empty()) {
         auto versions_result = list_versions(file_uid, user, roles, tenant);
         if (!versions_result.success || versions_result.value.empty()) {
@@ -929,7 +933,9 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
     // pieces rather than as one chunk, so a restored file large enough to exceed
     // a client's receive limit is still downloadable.
     if (!file_exists_locally) {
-        auto r = get(file_uid, user, roles, tenant);
+        auto r = version_timestamp.empty()
+                     ? get(file_uid, user, roles, tenant)
+                     : get_version(file_uid, current_version, user, roles, tenant);
         if (!r.success) return Result<void>::err(r.error);
         if (!r.value.empty()) on_chunk(r.value.data(), r.value.size());
         return Result<void>::ok();
