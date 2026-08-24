@@ -204,6 +204,34 @@ add_test(NAME transfer_tracker_tests COMMAND transfer_tracker_tests)
 # suite a developer can run anywhere.
 set_tests_properties(transfer_tracker_tests PROPERTIES LABELS "unit")
 
+# Drives a real multipart upload into a failure so the abort guard actually
+# runs. Needs an object store; skips cleanly without one. Labelled "integration"
+# so `ctest -L unit` stays infrastructure-free.
+add_executable(multipart_abort_integration multipart_abort_integration.cpp)
+target_link_libraries(multipart_abort_integration
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(multipart_abort_integration ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(multipart_abort_integration PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME multipart_abort_integration COMMAND multipart_abort_integration)
+set_tests_properties(multipart_abort_integration PROPERTIES LABELS "integration")
+
 add_executable(file_culler_tests file_culler_tests.cpp)
 target_link_libraries(file_culler_tests
     fileengine_core
