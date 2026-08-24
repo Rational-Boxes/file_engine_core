@@ -252,13 +252,37 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
     }
     const Aws::String upload_id = created.GetResult().GetUploadId();
 
+    // From here until the upload is COMMITTED, every exit must abort — otherwise
+    // the parts already uploaded stay in the bucket: billed, invisible to a
+    // normal listing, referenced by nothing, and indistinguishable from an
+    // upload still in flight.
+    //
+    // A scope guard rather than an abort call on each error path. Hand-placed
+    // aborts were already one short (the CompleteMultipartUpload failure
+    // returned without one, stranding a whole object's worth of parts at the
+    // point where the most data is at stake), and any early return or throw
+    // added later would have had the same problem. This way cleanup is the
+    // default and committing is the explicit act.
+    struct AbortGuard {
+        Aws::S3::S3Client* client;
+        Aws::String bucket, key, upload_id;
+        bool committed = false;
+        ~AbortGuard() {
+            if (committed || !client) return;
+            Aws::S3::Model::AbortMultipartUploadRequest req;
+            req.SetBucket(bucket);
+            req.SetKey(key);
+            req.SetUploadId(upload_id);
+            // Best-effort: we are already on a failure path and have nothing
+            // better to do if the abort itself fails. That residue is what the
+            // bucket's AbortIncompleteMultipartUpload lifecycle rule reaps —
+            // which is why that rule is not optional housekeeping.
+            client->AbortMultipartUpload(req);
+        }
+    } abort_guard{s3_client_.get(), Aws::String(bucket_), Aws::String(key), upload_id};
+
     std::ifstream in(local_path, std::ios::binary);
     if (!in.is_open()) {
-        Aws::S3::Model::AbortMultipartUploadRequest abort_req;
-        abort_req.SetBucket(Aws::String(bucket_));
-        abort_req.SetKey(Aws::String(key));
-        abort_req.SetUploadId(upload_id);
-        s3_client_->AbortMultipartUpload(abort_req);
         return Result<std::string>::err("Cannot open local file for multipart upload: " + local_path);
     }
 
@@ -299,11 +323,6 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
     }
 
     if (!ok) {
-        Aws::S3::Model::AbortMultipartUploadRequest abort_req;
-        abort_req.SetBucket(Aws::String(bucket_));
-        abort_req.SetKey(Aws::String(key));
-        abort_req.SetUploadId(upload_id);
-        s3_client_->AbortMultipartUpload(abort_req);
         return Result<std::string>::err("S3 multipart upload failed: " + err_msg);
     }
 
@@ -314,9 +333,15 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
     complete_req.SetMultipartUpload(completed);
     auto complete_res = s3_client_->CompleteMultipartUpload(complete_req);
     if (!complete_res.IsSuccess()) {
+        // Falls through to the guard, which aborts. This is the path that
+        // previously leaked, and the worst one to leak on: every part has
+        // uploaded by now, so it strands the whole object.
         return Result<std::string>::err("Failed to complete S3 multipart upload: " +
                                         complete_res.GetError().GetMessage());
     }
+
+    // Committed: the key is now visible and the parts belong to it.
+    abort_guard.committed = true;
     return Result<std::string>::ok(key);
 #else
     return Result<std::string>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");
