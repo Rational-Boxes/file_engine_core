@@ -15,6 +15,7 @@
 
 #include <mutex>
 #include "fileengine/s3_storage.h"
+#include "fileengine/transfer_tracker.h"
 #include "fileengine/server_logger.h"  // Explicitly include the core logger header
 #include <sstream>
 #include <curl/curl.h>
@@ -252,15 +253,79 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
     }
     const Aws::String upload_id = created.GetResult().GetUploadId();
 
+    // From here until the upload is COMMITTED, every exit must abort — otherwise
+    // the parts already uploaded stay in the bucket: billed, invisible to a
+    // normal listing, referenced by nothing, and indistinguishable from an
+    // upload still in flight.
+    //
+    // A scope guard rather than an abort call on each error path. Hand-placed
+    // aborts were already one short (the CompleteMultipartUpload failure
+    // returned without one, stranding a whole object's worth of parts at the
+    // point where the most data is at stake), and any early return or throw
+    // added later would have had the same problem. This way cleanup is the
+    // default and committing is the explicit act.
+    struct AbortGuard {
+        Aws::S3::S3Client* client;
+        Aws::String bucket, key, upload_id;
+        bool committed = false;
+        // Where it gave up, and how much crossed the wire first. Both are only
+        // meaningful on the failure path; on success the destructor returns
+        // early and the caller has already recorded the completion.
+        TransferTracker::Stage stage = TransferTracker::Stage::OpenFailed;
+        std::uint64_t bytes_sent = 0;
+        ~AbortGuard() {
+            if (committed || !client) return;
+            // A big transfer that did not arrive. Invisible everywhere else —
+            // no object, no reference, nothing in a normal bucket listing — so
+            // this counter is the only place it is ever seen.
+            TransferTracker::instance().record_aborted(stage, bytes_sent);
+
+            // The counters say a big upload failed; this says WHICH one, so a
+            // user reporting "my large file didn't upload" can be matched to an
+            // actual event rather than a rate on a graph. The key carries
+            // tenant, uid and version, which is everything needed to find it.
+            const char* where = (stage == TransferTracker::Stage::OpenFailed)     ? "open"
+                              : (stage == TransferTracker::Stage::PartFailed)     ? "transfer"
+                                                                                  : "commit";
+            SERVER_LOG_WARN("S3Storage::multipart",
+                            std::string("aborting multipart upload at ") + where +
+                            " — key=" + std::string(key.c_str()) +
+                            " bytes_transferred=" + std::to_string(bytes_sent) +
+                            " upload_id=" + std::string(upload_id.c_str()));
+
+            Aws::S3::Model::AbortMultipartUploadRequest req;
+            req.SetBucket(bucket);
+            req.SetKey(key);
+            req.SetUploadId(upload_id);
+            // Best-effort: we are already on a failure path and have nothing
+            // better to do if the abort itself fails. That residue is what the
+            // bucket's AbortIncompleteMultipartUpload lifecycle rule reaps —
+            // which is why that rule is not optional housekeeping, and why a
+            // rising abort_failed count is worth an alert of its own.
+            auto aborted = client->AbortMultipartUpload(req);
+            if (!aborted.IsSuccess()) {
+                TransferTracker::instance().record_abort_failed();
+                // Louder than the abort itself: this one leaves parts behind.
+                // They are billed, absent from a normal listing, and stay until
+                // the bucket's AbortIncompleteMultipartUpload rule reaps them —
+                // so the upload_id is the only handle anyone has on them.
+                SERVER_LOG_ERROR("S3Storage::multipart",
+                                 std::string("abort FAILED — parts are stranded until the "
+                                             "bucket lifecycle rule reaps them. key=") +
+                                 std::string(key.c_str()) +
+                                 " upload_id=" + std::string(upload_id.c_str()) +
+                                 " reason=" + aborted.GetError().GetMessage().c_str());
+            }
+        }
+    } abort_guard{s3_client_.get(), Aws::String(bucket_), Aws::String(key), upload_id};
+
     std::ifstream in(local_path, std::ios::binary);
     if (!in.is_open()) {
-        Aws::S3::Model::AbortMultipartUploadRequest abort_req;
-        abort_req.SetBucket(Aws::String(bucket_));
-        abort_req.SetKey(Aws::String(key));
-        abort_req.SetUploadId(upload_id);
-        s3_client_->AbortMultipartUpload(abort_req);
         return Result<std::string>::err("Cannot open local file for multipart upload: " + local_path);
     }
+
+    // The file opened, so any failure from here is a transfer failure.
+    abort_guard.stage = TransferTracker::Stage::PartFailed;
 
     Aws::S3::Model::CompletedMultipartUpload completed;
     std::vector<char> buf(static_cast<size_t>(PART_SIZE));
@@ -291,6 +356,7 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
             err_msg = part_res.GetError().GetMessage();
             break;
         }
+        abort_guard.bytes_sent += static_cast<std::uint64_t>(n);
         Aws::S3::Model::CompletedPart cp;
         cp.SetPartNumber(part_number);
         cp.SetETag(part_res.GetResult().GetETag());
@@ -299,13 +365,13 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
     }
 
     if (!ok) {
-        Aws::S3::Model::AbortMultipartUploadRequest abort_req;
-        abort_req.SetBucket(Aws::String(bucket_));
-        abort_req.SetKey(Aws::String(key));
-        abort_req.SetUploadId(upload_id);
-        s3_client_->AbortMultipartUpload(abort_req);
         return Result<std::string>::err("S3 multipart upload failed: " + err_msg);
     }
+
+    // Every part landed; only the commit remains. Distinguished because it is
+    // the cruellest failure — the whole transfer succeeded and still produced
+    // nothing — and because it points at the store rather than the link.
+    abort_guard.stage = TransferTracker::Stage::CompleteFailed;
 
     Aws::S3::Model::CompleteMultipartUploadRequest complete_req;
     complete_req.SetBucket(Aws::String(bucket_));
@@ -314,9 +380,16 @@ Result<std::string> S3Storage::store_file_from_path(const std::string& virtual_p
     complete_req.SetMultipartUpload(completed);
     auto complete_res = s3_client_->CompleteMultipartUpload(complete_req);
     if (!complete_res.IsSuccess()) {
+        // Falls through to the guard, which aborts. This is the path that
+        // previously leaked, and the worst one to leak on: every part has
+        // uploaded by now, so it strands the whole object.
         return Result<std::string>::err("Failed to complete S3 multipart upload: " +
                                         complete_res.GetError().GetMessage());
     }
+
+    // Committed: the key is now visible and the parts belong to it.
+    abort_guard.committed = true;
+    TransferTracker::instance().record_completed(abort_guard.bytes_sent);
     return Result<std::string>::ok(key);
 #else
     return Result<std::string>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");

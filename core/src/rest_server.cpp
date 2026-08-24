@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "fileengine/rest_server.h"
+#include "fileengine/transfer_tracker.h"
 #include "fileengine/cache_manager.h"
 #include "fileengine/file_culler.h"
 #include "fileengine/server_logger.h"
@@ -283,6 +284,55 @@ void RestServer::install_routes() {
             m.gauge("fileengine_threads_not_waiting",
                     "Threads not in interruptible sleep. An idle server should hold this near zero",
                     th.not_waiting());
+        }
+
+        // --- large object-store transfers --------------------------------
+        //
+        // Only multipart uploads reach these counters: small files take the
+        // single-PutObject path. So everything here is a BIG transfer, which is
+        // exactly the population worth watching — a failure costs the user a
+        // long wait and produces nothing they can see.
+        //
+        // A failed multipart is otherwise invisible. No object appears, nothing
+        // references it, the abandoned parts are absent from a normal listing,
+        // and the local copy survives so no data is lost. Without these the only
+        // symptom is a user saying a large file "didn't work".
+        {
+            const auto tx = TransferTracker::instance().stats();
+            m.counter("fileengine_multipart_completed_total",
+                      "Large (multipart) object-store uploads that committed",
+                      static_cast<double>(tx.completed));
+            m.counter("fileengine_multipart_completed_bytes_total",
+                      "Bytes committed by multipart uploads",
+                      static_cast<double>(tx.completed_bytes));
+
+            // Split by stage: where a big upload dies says what is wrong.
+            // open = local, part = the link, complete = the store itself.
+            m.family("fileengine_multipart_aborted_total",
+                     "Large uploads abandoned before commit, by the stage they reached",
+                     "counter");
+            m.emit("fileengine_multipart_aborted_total", "stage=\"open\"",
+                   static_cast<double>(tx.aborted_open));
+            m.emit("fileengine_multipart_aborted_total", "stage=\"part\"",
+                   static_cast<double>(tx.aborted_part));
+            m.emit("fileengine_multipart_aborted_total", "stage=\"complete\"",
+                   static_cast<double>(tx.aborted_complete));
+
+            // The frustration signal: bytes a user waited to send, discarded.
+            // Rate over time is the number to chart; a step change means large
+            // uploads have started failing for somebody.
+            m.counter("fileengine_multipart_aborted_bytes_total",
+                      "Bytes transferred by uploads that were then abandoned — work the "
+                      "user waited for and did not get",
+                      static_cast<double>(tx.aborted_bytes));
+
+            // Cleanup that failed, so parts are stranded in the bucket until the
+            // AbortIncompleteMultipartUpload lifecycle rule reaps them. Distinct
+            // from the failure itself: this one accumulates billable residue.
+            m.counter("fileengine_multipart_abort_failed_total",
+                      "Aborts that themselves failed, leaving parts to be garbage-collected "
+                      "by the bucket lifecycle rule",
+                      static_cast<double>(tx.abort_failed));
         }
 
         // --- in-flight RPCs ----------------------------------------------
