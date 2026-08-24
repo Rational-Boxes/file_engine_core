@@ -432,14 +432,36 @@ void test_group_permissions() {
     assert(result.success);
     std::cout << "  ✓ Granted READ permission to group\n";
     
-    // Test 2: GROUP ACLs apply to ALL users who don't have user-specific or role-specific ACLs.
-    // Note: the GROUP check does NOT match against the roles vector - it matches on
-    // PrincipalType::GROUP regardless of principal name. So any user without a USER or
-    // ROLE match will get GROUP permissions.
+    // Test 2: a GROUP rule grants NOBODY anything.
+    //
+    // This test used to assert the opposite — that a GROUP ACL applied to every
+    // user without a more specific rule — which made any stray GROUP row an
+    // accidental "everyone" grant. PrincipalType::GROUP is now a reserved slot
+    // that matches nobody: roles ARE the group mechanism (LDAP groups resolve to
+    // ROLE principals), and the enum value survives only for wire/DB numbering
+    // stability. Matching nobody means a stray row — a hand-written DB insert,
+    // an old record — grants no one rather than everyone.
     auto perm_result = acl_manager.get_effective_permissions(resource_uid, user, {});
     assert(perm_result.success);
-    assert((perm_result.value & static_cast<int>(Permission::READ)) == static_cast<int>(Permission::READ));
-    std::cout << "  ✓ User gets GROUP permission (applies to all users without user/role ACLs)\n";
+    assert((perm_result.value & static_cast<int>(Permission::READ)) != static_cast<int>(Permission::READ));
+    std::cout << "  ✓ GROUP rule grants nobody (reserved slot, fail-closed)\n";
+
+    // ...and naming the group in the caller's roles does not resurrect it. A
+    // GROUP rule is inert whatever the caller presents.
+    auto with_group_as_role = acl_manager.get_effective_permissions(resource_uid, user, {group});
+    assert(with_group_as_role.success);
+    assert((with_group_as_role.value & static_cast<int>(Permission::READ)) != static_cast<int>(Permission::READ));
+    std::cout << "  ✓ GROUP rule stays inert even when the name is presented as a role\n";
+
+    // The real mechanism, so the coverage this test was reaching for survives:
+    // grant to a ROLE and a caller holding that role gets it.
+    auto as_role = acl_manager.grant_permission(resource_uid, group, PrincipalType::ROLE,
+                                                static_cast<int>(Permission::READ));
+    assert(as_role.success);
+    auto role_perm = acl_manager.get_effective_permissions(resource_uid, user, {group});
+    assert(role_perm.success);
+    assert((role_perm.value & static_cast<int>(Permission::READ)) == static_cast<int>(Permission::READ));
+    std::cout << "  ✓ the same grant as a ROLE does apply to a holder of that role\n";
     
     std::cout << "Group-level permissions tests passed!\n\n";
 }
@@ -471,7 +493,8 @@ void test_permission_priority() {
     
     std::cout << "  ✓ Set up permissions at different levels\n";
 
-    // Test 2: Union model — USER, ROLE, and GROUP grants accumulate.
+    // Test 2: Union model — USER and ROLE grants accumulate. GROUP does not,
+    // because a GROUP rule matches nobody by design (see test_group_permissions).
     std::vector<std::string> roles = {role, group};
     auto perm_result = acl_manager.get_effective_permissions(resource_uid, user, roles);
     assert(perm_result.success);
@@ -480,8 +503,13 @@ void test_permission_priority() {
     std::cout << "  ✓ User has READ from user-level ACL\n";
 
     assert((perm_result.value & static_cast<int>(Permission::WRITE)) == static_cast<int>(Permission::WRITE));
-    assert((perm_result.value & static_cast<int>(Permission::EXECUTE)) == static_cast<int>(Permission::EXECUTE));
-    std::cout << "  ✓ Role and group permissions accumulate with user-level ACL (union)\n";
+    std::cout << "  ✓ Role permissions accumulate with user-level ACL (union)\n";
+
+    // The EXECUTE granted to the GROUP above must NOT appear, even though the
+    // group's name is in the caller's roles. This is the assertion that would
+    // have caught the accidental-everyone behaviour.
+    assert((perm_result.value & static_cast<int>(Permission::EXECUTE)) != static_cast<int>(Permission::EXECUTE));
+    std::cout << "  ✓ GROUP grant contributes nothing to the union\n";
 
     // Test 3: A different user (no USER ACL) with the role gets role permissions only
     auto other_perm = acl_manager.get_effective_permissions(resource_uid, "other_user", {role});

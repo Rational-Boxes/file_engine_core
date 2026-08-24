@@ -398,14 +398,28 @@ void test_acl_group_role_permissions() {
                                          static_cast<int>(Permission::EXECUTE));
     assert(result.success);
 
-    // Check that a user with the group in their roles has the group's EXECUTE permission
-    // In our implementation, groups are treated similarly to roles for permission calculation
-    std::vector<std::string> user_with_group = {group}; // User belongs to the group
+    // A GROUP rule grants NOBODY anything — not even a caller presenting the
+    // group's name among their roles. This test previously asserted the reverse,
+    // on the assumption that "groups are treated similarly to roles". They are
+    // not: PrincipalType::GROUP is a reserved slot kept for wire/DB numbering
+    // stability, and roles ARE the group mechanism (LDAP groups resolve to ROLE
+    // principals). It matches nobody so that a stray GROUP row grants no one
+    // rather than everyone.
+    std::vector<std::string> user_with_group = {group};
     perm_result = acl_manager.get_effective_permissions(resource_uid, "test-group-user", user_with_group);
     assert(perm_result.success);
-    // User in the group should have EXECUTE from the group ACL
+    assert((perm_result.value & static_cast<int>(Permission::EXECUTE)) != static_cast<int>(Permission::EXECUTE));
+    std::cout << "  GROUP rule grants nobody, even a caller holding that name: OK\n";
+
+    // Granting the same thing through the mechanism that IS live keeps the
+    // behaviour this test was reaching for under coverage.
+    result = acl_manager.grant_permission(resource_uid, group, PrincipalType::ROLE,
+                                          static_cast<int>(Permission::EXECUTE));
+    assert(result.success);
+    perm_result = acl_manager.get_effective_permissions(resource_uid, "test-group-user", user_with_group);
+    assert(perm_result.success);
     assert((perm_result.value & static_cast<int>(Permission::EXECUTE)) == static_cast<int>(Permission::EXECUTE));
-    std::cout << "  User in group has EXECUTE permission: OK\n";
+    std::cout << "  same grant as a ROLE does apply to a holder of that role: OK\n";
     
     // Test 8: Check permission with role taking precedence over group
     std::vector<std::string> roles_with_higher_priority = {role, "another-role"};
