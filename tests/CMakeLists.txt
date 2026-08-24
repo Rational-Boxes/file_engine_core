@@ -192,6 +192,18 @@ target_include_directories(test_deleted_reachability PRIVATE
 # File culler data-loss regression (mock IStorage/IObjectStore; no live DB).
 # Proves culling fails closed: a local payload is never deleted unless the
 # object store confirms a durable copy.
+# Header-only tracker: no core link needed, just threads. Keeping it standalone
+# means the counters stay testable without dragging in gRPC and libpq.
+add_executable(transfer_tracker_tests transfer_tracker_tests.cpp)
+target_link_libraries(transfer_tracker_tests Threads::Threads)
+target_include_directories(transfer_tracker_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+)
+add_test(NAME transfer_tracker_tests COMMAND transfer_tracker_tests)
+# Pure counters, no database, no object store, no network — it belongs in the
+# suite a developer can run anywhere.
+set_tests_properties(transfer_tracker_tests PROPERTIES LABELS "unit")
+
 add_executable(file_culler_tests file_culler_tests.cpp)
 target_link_libraries(file_culler_tests
     fileengine_core
