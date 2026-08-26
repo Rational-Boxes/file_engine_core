@@ -356,7 +356,45 @@ from a subsystem that has no `seq`. Time is the only axis the sources share, so
 time is what the interleave runs on, and `recorded_until` is the watermark that
 makes it decidable.
 
-Two consequences worth being explicit about:
+#### 4.3.4 What the ordering guarantee actually is
+
+The operational rule is simple: **drain the table to current, then process the
+queue event.** Never the reverse, and never partially.
+
+What that buys is worth stating exactly, because the chain will contain
+arrangements that look like anomalies to anyone expecting more:
+
+- **The chain is ordered by *recording* time, not by *happening* time.** Entries
+  are appended in the order the sink committed them.
+- **Core records are exactly ordered among themselves** — strictly monotonic
+  `ts` under the chain lock (§5.3.3), with no slack at all.
+- **Cross-source ordering is accurate to within the queue latency.** A subsystem
+  event is delivered some milliseconds after it occurred; a core record
+  committing inside that window is drained first and therefore recorded first,
+  even though the subsystem event happened marginally earlier.
+
+That residual slack is accepted deliberately. Removing it would mean holding
+every subsystem event in a buffer longer than the worst-case queue latency before
+recording it — paying a delay on everything to correct an ordering nobody can
+act on.
+
+**Causal order survives regardless**, which is the property that actually
+matters. If event B depends on event A — an access permitted by a grant, a
+deletion following a permission change — then B could only occur after A was
+*visible*, which is strictly later than A being recorded. Causally related events
+are therefore separated by far more than the latency window, and the chain orders
+them correctly. What may be transposed is only genuinely concurrent activity,
+where no security conclusion turns on which came first.
+
+**Consequence for the entry format:** each audit entry should carry both the time
+it was *recorded* into the chain and the `occurred_at` reported by its source.
+The chain is ordered by the former; the latter can legitimately run slightly
+backwards between adjacent entries from different sources. Recording both makes
+that visible and explicable, rather than looking like clock corruption to a later
+reader — or worse, prompting someone to "fix" it by reordering a tamper-evident
+structure.
+
+Two further consequences worth being explicit about:
 
 - **What this does and does not give.** Every subsystem event is correctly
   ordered *relative to core records*. Ordering **between** two different
@@ -702,5 +740,16 @@ twice.
     the scheduled poll, the audit log contains the core record **ahead of** the
     subsystem event. Verified by inspecting the resulting chain order, not just
     the timestamps.
+11. **The table is drained fully before a queue event is recorded (§4.3.4).**
+    With a backlog of N pending core records and a subsystem event arriving, the
+    chain contains all N ahead of that event — not a partial drain, and not the
+    event first.
+12. **Causal order is preserved end to end.** A grant, then an access permitted
+    by that grant, appear in the chain in that order even when they originate
+    from different sources — the property the §4.3.4 slack is argued not to
+    disturb, so it is tested rather than assumed.
+13. **Both timestamps are recorded** on every entry, and `occurred_at` running
+    marginally backwards between adjacent entries from different sources is
+    accepted by the chain verifier rather than flagged as corruption.
 8. A load check confirming the synchronous write is not on a hot path — a
    content read/write benchmark is unchanged, because neither is in scope (§4.1).
