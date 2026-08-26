@@ -1,45 +1,78 @@
-6.1# Proposal: `metadata.changed` events + fixing versioned metadata
+# Proposal: bring metadata up to the platform's versioning architecture
 
-**Status:** Draft — §6 decisions recorded 2026-08-26; §6.5 follow-ons open
+**Status:** Decided 2026-08-26 — all decisions recorded; ready for implementation planning
 **Branch:** `design/metadata-change-events` (file_engine_core)
-**Author:** finding surfaced 2026-08-26 while specifying the CMIS adapter (`cmis/SPECIFICATION.md`)
-**Scope (cross-repo):** `file_engine_core` (publisher + metadata layer), `convert_search_ai` (contract doc + consumer), `folder_actions` (consumer), `cmis` (consumer, planned)
+**Author:** gap surfaced 2026-08-26 while specifying the CMIS adapter (`cmis/SPECIFICATION.md`)
+**Scope (cross-repo):** `file_engine_core` (metadata layer + publisher), `convert_search_ai` (contract doc + consumer), `folder_actions` (consumer), `cmis` (consumer, planned)
 
-> This is a design proposal, not an implementation. Two defects are documented
-> below; both were found by reading the code, and each is reproducible from the
-> line references given. **§6** carries the decisions taken on 2026-08-26 —
-> including a versioning model (§6.1/§6.2) more expressive than any of the three
-> options originally offered — and §6.5 collects the follow-on details those
-> decisions imply but do not settle.
+> **The metadata model was never brought up to the architecture the rest of the
+> platform is built on.** FileEngine is pervasively versioned, immutable,
+> soft-deleting, attributed, and observable through an event stream. Metadata —
+> a first-class part of every object — is none of those things. It is a mutable,
+> unattributed, silently-overwritten key/value side-table whose versioning was
+> stubbed out and left with a comment saying so.
+>
+> This is a foundational oversight rather than a collection of bugs: the
+> individual faults in §2 are not independent, they are what a subsystem looks
+> like when it has not been held to the standard applied everywhere else. This
+> plan closes that gap and brings metadata to parity.
+>
+> **Read §4.7 before sizing this.** Bringing a storage model to parity is
+> substantially more than a patch, and §4.7 gives the real surface area. It also
+> carries the reason to do it **now**: no deployment makes significant use of
+> metadata yet, so this is a drop-and-replace with no migration — and it stops
+> being one as soon as the CMIS shape catalog and csai's metadata indexing start
+> putting data there that users care about.
 
 ---
 
 ## 1. Summary
 
-Two independent defects in the metadata layer, found together:
+FileEngine's architecture is stated plainly across the codebase and its docs:
+content is **pervasively versioned**, versions are **immutable**, deletion is
+**soft and reversible**, revisions are **attributed**, destruction happens **only
+through explicit permissioned culling**, and every mutation is **observable** on
+`fileengine:events` so downstream services can stay consistent.
 
-**A — Metadata mutations emit no event.** `FileSystem::set_metadata` and
-`delete_metadata` publish nothing at all — not even `file.updated`. Every
-metadata change is invisible to `fileengine:events`, and therefore to every
-consumer on the platform.
+Metadata meets none of them.
 
-**B — Versioned metadata always misses.** The four unversioned metadata
-functions hard-code the sentinel string `"current"` as the version, while the two
-`*_for_version` variants pass the caller's real timestamp through. The versioned
-readers therefore query a `(uid, version_timestamp, key)` tuple that **nothing
-ever writes**, and always return "not found".
+| Architectural standard | Content | Metadata (today) |
+|---|---|---|
+| Versioned | version series per file | **No** — versioning stubbed behind a `"current"` sentinel |
+| Immutable | versions never rewritten | **No** — `set_metadata` overwrites in place |
+| Soft-deleting | `RemoveFile` + `UndeleteFile` | **No** — `delete_metadata` destroys the row |
+| Attributed | versions carry `revised_by` | **No** — no actor is recorded at all |
+| Destruction only by culling | `PurgeOldVersions` + `CULL_VERSIONS` | **No** — any caller with WRITE destroys history |
+| Observable | events on every mutation | **No** — metadata writes emit nothing |
 
-Defect A is already acknowledged at the publisher level —
-`convert_search_ai/design_documents/EVENT_CONTRACT.md` §6 lists `metadata.changed`
-under *"Not yet in the publisher (tracked in the core plan)"*. What is new is
-(i) that it now has **three** blocked consumers rather than one, (ii) that the
-consumer side was never built either (§3.2), and (iii) defect B, which appears
-to be undocumented anywhere.
+These are not six separate bugs to trade off against each other. They are one
+omission with six faces: **metadata was built as a mutable key/value side-table
+and never revisited when the platform committed to a versioned, immutable,
+event-sourced model.** The evidence that this was an unfinished intention rather
+than a decision is in the source itself — four functions carry the sentinel
+`version_timestamp = "current"` with the comment *"Would use actual current
+version in practice"* (§2.1).
 
-### 1.1 Governing principle — destruction is culling, and nothing else
+The cost is not theoretical. Three services are blocked on the missing events
+(§2.6), two advertised RPCs return "not found" for every possible input (§2.2),
+and the platform's own destruction guarantee — that committed data goes away only
+through culling — is silently false for metadata.
 
-The design in §6 rests on a rule that holds for the **core system as a whole**,
-not just for metadata:
+**This plan brings metadata to parity**, on the same terms the rest of the core
+already uses: its own version series, an append-only immutable log, tombstones
+instead of deletes, attribution on every change, culling as the sole destructive
+operation, and an event for every mutation.
+
+One piece was already known: `convert_search_ai/design_documents/EVENT_CONTRACT.md`
+§6 lists `metadata.changed` under *"Not yet in the publisher (tracked in the core
+plan)"*. What that entry frames as a missing feature is better understood as one
+visible symptom of the gap described here.
+
+### 1.1 The standard being restored — destruction is culling, and nothing else
+
+Of the six parity gaps above, one is worth stating as an explicit rule, because
+it is a **system-wide guarantee that metadata currently breaks silently** (§2.3)
+and because the §6 design is built to restore it:
 
 > **Culling is the only permissible destructive operation.** Old payload versions
 > are lost when history is culled; pre-cut metadata history is lost in exactly
@@ -55,7 +88,7 @@ history is already accepting that old file content is gone; this makes the
 metadata that accompanied it go with it, on the same terms — rather than leaving
 orphaned metadata history describing payloads that no longer exist.
 
-Two things follow, and both are load-bearing rather than stylistic:
+Three things follow, and all are load-bearing rather than stylistic:
 
 - Any implementation that removes a metadata row outside a cull — a `DELETE` for
   `delete_metadata`, a "tidy-up" sweep, a retention default — **breaks the rule**
@@ -63,65 +96,22 @@ Two things follow, and both are load-bearing rather than stylistic:
 - Because the rule is system-wide, the permission is the existing
   `CULL_VERSIONS` rather than a new one, and its documented meaning widens from
   "purge old content versions" to "cull history" (§6.5.3).
+- Restoring the rule is not optional polish. A guarantee that holds for content
+  and quietly fails for metadata is worse than one that was never claimed, since
+  every layer above — bridges, adapters, audit — is written assuming it holds.
 
 ---
 
-## 2. Defect A — no metadata event
+## 2. Evidence — where metadata departs from the architecture
 
-### 2.1 Evidence
+Every claim below is reproducible from the referenced source. Taken together they
+describe one subsystem that was never held to the platform's standard, not six
+unrelated faults.
 
-`core/src/filesystem.cpp`, `FileSystem::set_metadata` in full:
+### 2.1 Versioning was stubbed, not decided
 
-```cpp
-auto context = get_tenant_context(tenant);
-if (!context || !context->db) { /* err */ }
-auto perm_result = validate_user_permissions(file_uid, user, roles,
-                                             static_cast<int>(Permission::WRITE), tenant);
-if (!perm_result.success || !perm_result.value) { /* err */ }
-std::string version_timestamp = "current"; // Would use actual current version in practice
-auto db_result = context->db->set_metadata(file_uid, version_timestamp, key, value, tenant);
-return db_result;                          // <-- no emit_fs_event()
-```
-
-Compare the established pattern elsewhere in the same file — `put`,
-`restore_to_version` and the rest all end with:
-
-```cpp
-emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
-```
-
-`delete_metadata` has the same omission.
-
-### 2.2 Current event vocabulary
-
-`core/include/fileengine/event.h`, `enum class FileEventType`:
-
-`DirCreated`, `DirDeleted`, `FileCreated`, `FileUpdated`, `FileMoved`,
-`FileRenamed`, `FileDeleted`, `FileRestored`, `AclChanged`, `RoleAssigned`,
-`RoleMemberRemoved`, `RoleDeleted`.
-
-There is no metadata member. The contract doc's §3 table has no `metadata.*` row.
-
-### 2.3 Why it matters — three blocked consumers
-
-| Consumer | What it cannot do today |
-|---|---|
-| **convert_search_ai** | Synchronise the search index against metadata changes. Compounded by §3.2 — csai does not index the metadata bag at all |
-| **cmis** (planned) | Emit a CMIS `updated` change-log event for a property-only edit. CMIS clients (CmisSync) sync primarily off `getContentChanges`; without this, property edits **never reach the desktop** until the client's ~6-hourly full crawl |
-| **folder_actions** | Trigger any rule on a metadata change. Every one of its plug-in actions is driven off `fileengine:events` |
-
-A single missing event blocks three services. That is the argument for fixing it
-in the publisher rather than working around it in each consumer — a CMIS-side
-workaround (poll metadata during crawl) would paper over a platform gap in one
-adapter and leave the other two unserved.
-
----
-
-## 3. Defect B — versioned metadata is a stub
-
-### 3.1 Evidence
-
-In `core/src/filesystem.cpp`:
+In `core/src/filesystem.cpp`, four functions hard-code a sentinel where the
+version should be, each carrying the same comment:
 
 | Function | Version argument passed to the DB layer |
 |---|---|
@@ -132,35 +122,110 @@ In `core/src/filesystem.cpp`:
 | `get_metadata_for_version` | **the caller's `version_timestamp`** |
 | `get_all_metadata_for_version` | **the caller's `version_timestamp`** |
 
-All four unversioned functions carry the same comment: `// Would use actual
-current version in practice`.
+```cpp
+std::string version_timestamp = "current"; // Would use actual current version in practice
+```
+
+That comment is the clearest statement of the problem this document exists to
+solve. Versioned metadata was *intended*; the schema carries a version column for
+it; the proto exposes RPCs for it. The wiring was never finished, and the
+placeholder became the permanent behaviour.
+
+### 2.2 The versioned RPCs always miss
 
 The writers are internally consistent — everything lands under the sentinel — so
-the *unversioned* API works correctly. But nothing ever writes a row under a real
-version timestamp, so:
+the *unversioned* API works. But nothing ever writes a row under a real version
+timestamp, while the two `*_for_version` readers query exactly that. Therefore:
 
-- `GetMetadataForVersion` and `GetAllMetadataForVersion` **always** return
-  "Metadata key not found", for every input.
-- Metadata does not participate in versioning: restoring an old version does not
-  restore the metadata that was current when that version was written.
+- `GetMetadataForVersion` and `GetAllMetadataForVersion` return
+  **"Metadata key not found" for every possible input**.
+- Metadata does not participate in versioning at all: restoring an old content
+  version does not restore the metadata that accompanied it.
 
-Both RPCs are advertised in `proto/fileservice.proto` and are reachable from every
-SDK and bridge. They are a stub that fails silently rather than a documented
-limitation.
+Both RPCs are advertised in `proto/fileservice.proto` and reachable from every SDK
+and bridge. The failure is indistinguishable from "this file has no metadata",
+which is why it survived undetected.
 
-### 3.2 The consumer-side half
+### 2.3 Writes are destructive and in place
 
-Independently: **convert_search_ai has never indexed the metadata bag.** Its only
-`metadata` references are SSRF guards and the `xeokit3d` plugin reading IFC
-attributes out of model files. It indexes content only.
+`set_metadata` overwrites the row; `delete_metadata` removes it. Neither leaves a
+trace. This is the sharpest departure: the platform's guarantee is that committed
+data is destroyed only by explicit, permissioned culling (§1.1), and for metadata
+that guarantee is simply false — **any caller with `WRITE` silently destroys
+history**, with no `CULL_VERSIONS` and no audit.
 
-So shipping `metadata.changed` alone would not make metadata searchable — csai
-needs a metadata-indexing path before it has anything to synchronise. Both halves
-are needed; the event is the prerequisite, not the whole fix.
+### 2.4 Changes are unattributed
+
+`Database::set_metadata(file_uid, version_timestamp, key, value, tenant)` takes no
+actor. The caller's identity is used for the permission check and then discarded.
+
+Content revisions record `revised_by`, directory entries carry `created_by` and
+`modified_by`, and every event carries `actor` — but who changed a metadata value,
+and when, is not recorded anywhere in the system.
+
+### 2.5 Mutations emit nothing
+
+`FileSystem::set_metadata` ends at `return db_result;`. Compare `put`,
+`restore_to_version` and every other mutation in the same file, which end with:
+
+```cpp
+emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+```
+
+`delete_metadata` has the same omission, and the vocabulary has no metadata
+member to emit even if they did — `core/include/fileengine/event.h` defines
+`DirCreated`, `DirDeleted`, `FileCreated`, `FileUpdated`, `FileMoved`,
+`FileRenamed`, `FileDeleted`, `FileRestored`, `AclChanged`, `RoleAssigned`,
+`RoleMemberRemoved`, `RoleDeleted`. The contract doc's §3 table has no
+`metadata.*` row.
+
+### 2.6 Consequence — three services blocked
+
+| Consumer | What it cannot do today |
+|---|---|
+| **convert_search_ai** | Synchronise the search index against metadata changes. Compounded by §3 — csai does not index the metadata bag at all |
+| **cmis** (planned) | Emit a CMIS `updated` change-log event for a property-only edit. CMIS clients (CmisSync) sync primarily off `getContentChanges`; without this, property edits **never reach the desktop** until the client's ~6-hourly full crawl |
+| **folder_actions** | Trigger any rule on a metadata change. Every one of its plug-in actions is driven off `fileengine:events` |
+
+One absent event blocks three services — the argument for closing this in the
+core rather than working around it per consumer. A CMIS-side workaround (poll
+metadata during crawl) would hide a platform gap inside one adapter and leave the
+other two unserved.
 
 ---
 
-## 4. Proposal
+## 3. The consumer side was never built either
+
+**convert_search_ai has never indexed the metadata bag.** Its only `metadata`
+references are SSRF guards and the `xeokit3d` plugin reading IFC attributes out of
+model files. It indexes content only.
+
+This matters for sequencing: shipping `metadata.changed` alone does not make
+metadata searchable, because there is no index for it to synchronise. The event is
+the prerequisite, not the whole fix, and the csai-side work is tracked separately
+(§5).
+
+It also reinforces the framing. Metadata was not merely under-implemented in the
+core — no consumer ever treated it as first-class either, because the core gave
+them no way to.
+
+---
+
+## 4. Proposal — parity, not patches
+
+Each element below closes one of the §1 parity gaps. They are presented
+separately for review, but they are a single change: fixing the event without the
+storage model leaves metadata mutable and unattributed, and fixing the storage
+model without the event leaves three services blind to it.
+
+| §1 gap | Closed by |
+|---|---|
+| Not versioned | §4.5 — its own timestamped series (§6.1) |
+| Not immutable | §4.5 — append-only log; writes append rather than overwrite |
+| No soft delete | §6.5.3 — `delete_metadata` becomes a tombstone append |
+| Unattributed | §4.5 — every log entry carries its actor |
+| Destroyable outside culling | §1.1 / §6.5.3 — culling becomes the only destructive path |
+| Unobservable | §4.1–§4.4 — `metadata.changed` and the contract update |
 
 ### 4.1 Add the event type
 
@@ -170,7 +235,7 @@ are needed; the event is the prerequisite, not the whole fix.
 enum class FileEventType {
     …
     AclChanged,
-    MetadataChanged,    // a metadata key was set or deleted on file_uid
+    MetadataChanged,    // metadata keys were set and/or deleted on file_uid
     RoleAssigned,
     …
 };
@@ -178,6 +243,12 @@ enum class FileEventType {
 
 Contract string `metadata.changed`, matching the name already reserved in
 EVENT_CONTRACT.md §6. Update `to_string()` in `core/src/event.cpp`.
+
+Inserting mid-enum is safe here: the enumerator's numeric value is not
+serialized or persisted anywhere — the wire contract is the string form via
+`to_string()`, and a search finds no numeric use of `FileEventType`. Grouping it
+next to `AclChanged` therefore costs nothing, and the check is recorded so an
+implementer does not have to repeat it.
 
 ### 4.2 Carry the changed key
 
@@ -204,19 +275,35 @@ fills exactly one entry, so consumers see one shape either way.
 
 ### 4.3 Emit at the write sites
 
-Two lines, following the existing pattern:
+`FileSystem` already uses **one helper per event family** — `emit_fs_event` for
+lifecycle, `emit_acl_event` for grant/revoke (carrying `principal` +
+`permissions`), `emit_role_event` for membership. Metadata follows that
+precedent with a sibling rather than an overload:
 
 ```cpp
-// FileSystem::set_metadata, after a successful db_result
-emit_fs_event(tenant, FileEventType::MetadataChanged, file_uid, user, key, /*deleted=*/false);
-
-// FileSystem::delete_metadata, after a successful db_result
-emit_fs_event(tenant, FileEventType::MetadataChanged, file_uid, user, key, /*deleted=*/true);
+// core/include/fileengine/filesystem.h, beside emit_acl_event / emit_role_event
+// One event per write — batch or single — naming what changed.
+void emit_metadata_event(const std::string& tenant, const std::string& uid,
+                         const std::vector<std::string>& keys_set,
+                         const std::vector<std::string>& keys_deleted,
+                         const std::string& user) noexcept;
 ```
 
-`emit_fs_event` needs an overload carrying the key. Emission stays fail-open and
-async on the existing bounded outbox (EVENT_CONTRACT.md §6.4) — a metadata write
-must never block or roll back on a broker outage.
+Called once per committed write, after the log append succeeds. Emission stays
+`noexcept`, fail-open and async on the existing bounded outbox
+(EVENT_CONTRACT.md §6.4) — a metadata write must never block or roll back on a
+broker outage.
+
+> **§6.4 costs nothing.** `emit_fs_event` already enriches the envelope with
+> `is_rendition`, "detected when the parent is a file" (`filesystem.h:285`). The
+> metadata helper reuses that same enrichment, so flagging rendition metadata
+> events needs no new detection logic — only that the helper not skip it.
+
+**This is not a two-line change.** An earlier draft of this section described it
+as one, which was true when the proposal was only "add a missing emit". It no
+longer is: §6.1 replaces the metadata storage model underneath these call sites,
+so `set_metadata` and `delete_metadata` are rewritten rather than appended to.
+See §4.7 for the actual surface area.
 
 ### 4.4 Update the shared contract
 
@@ -229,7 +316,7 @@ of truth and must be updated in the same change:
 - §6 — remove `metadata.changed` from the "not yet in the publisher" list.
 - `schema` stays at `1`: these are additive fields (§8).
 
-### 4.5 Fix versioned metadata (defect B)
+### 4.5 Version, immutability and attribution (§2.1–§2.4)
 
 Per §6.1/§6.2: give metadata **its own timestamped version series**, independent
 of the content series, stored as an **append-only change log** and reconstructed
@@ -239,7 +326,12 @@ bag is the latest entry per key, and history begins at the current base state.
 
 In every case the `*_for_version` RPCs must stop silently returning "not found":
 they either return real values under the semantics fixed in §6.5.1, or an
-explicit error. Silence is the defect being removed.
+explicit error. Silent wrong answers are what §2.2 is about, and replacing them
+with honest ones is part of the parity being restored.
+
+Immutability and attribution come with the log rather than as separate work: an
+append-only structure cannot overwrite, and every entry carries the actor the
+old schema discarded (§2.4).
 
 ### 4.6 Batch write API
 
@@ -247,11 +339,81 @@ Per §6.3, a batch `SetMetadata` is in scope: multi-key, one transaction, one
 metadata version, one event. It is what makes the event's key list meaningful,
 and it makes CMIS `updateProperties` atomic.
 
+### 4.7 Shape and size of the change
+
+Bringing a subsystem to architectural parity is not a patch, and the work should
+not be sized as one. The gap in §1 was open for the life of the metadata layer,
+so closing it means **replacing the metadata storage model** — not adding an emit
+and correcting a sentinel. Anyone estimating from §4.1–§4.3 alone would
+underestimate it substantially, so the surface area is stated explicitly.
+
+| Area | Change |
+|---|---|
+| Schema | New append-only `metadata_log(uid, seq, ts, actor, key, op, value)` + index `(uid, key, seq DESC)`; the old flat table becomes the `t0` base state |
+| `FileSystem` | `set_metadata`, `delete_metadata`, `get_metadata`, `get_all_metadata`, `get_metadata_for_version`, `get_all_metadata_for_version` all rewritten against the log |
+| New reads | `ListMetadataVersions`, `GetAllMetadataAt`, window flags on the `*_for_version` responses |
+| New writes | Batch `SetMetadata` (§4.6) |
+| Culling | `PurgeOldVersions` extended to collapse the metadata log at the oldest retained version's timestamp (§6.5.3) |
+| Events | `MetadataChanged` type, plural payload fields, `emit_metadata_event` |
+| Proto | New RPCs + messages, redefined `*_for_version` semantics, documented in comments |
+| Cross-repo | `EVENT_CONTRACT.md` (§4.4); csai and folder_actions become able to consume |
+| Migration | **None** — see below |
+
+Only the last two rows are new *services* work; the rest is core.
+
+#### No migration, and why that makes now the moment
+
+**No deployment makes significant use of metadata, and losing the existing rows
+on a schema change affects nothing.** That collapses the hardest part of this
+work before it starts:
+
+- The old `metadata` table is **dropped and replaced**, not migrated. No
+  backfill, no rewriting sentinel rows into base entries, no dual-write, no
+  cutover, no soak.
+- Earlier drafts of this section proposed a four-step rollout — event first, log
+  alongside, cut reads over, then new surface. That sequence existed to manage
+  *migration* risk against live data. With no data worth preserving, the risk it
+  hedged does not exist, and the steps are not worth their complexity.
+- What remains is one coherent change. Any further splitting should be for
+  **reviewability** — smaller PRs — not for risk management, and the pieces can
+  land in any order that keeps the build green.
+
+The one thing that does **not** become negotiable is the **API contract**. The
+data may vanish; the endpoints may not. `GetMetadata` / `GetAllMetadata` /
+`SetMetadata` / `DeleteMetadata` are wired into the REST bridge and the web UI's
+Metadata tab (`FileDetailsDrawer.vue`), so they must keep working against an
+empty store rather than start erroring. That is the whole of the compatibility
+burden.
+
+> **This is the cheap moment, and it will not last.** The reason this change is
+> nearly free today is precisely that nothing depends on metadata yet. That
+> stops being true shortly: the CMIS adapter's shape catalog puts business
+> properties on documents and renders them inline in every listing entry, and
+> csai's metadata indexing (§3) makes them searchable. Both are specified and
+> both are coming. Doing this **after** they land turns a drop-and-replace into a
+> genuine migration of data users care about, under exactly the parity guarantees
+> §1 says are missing. The gap has been open for the life of the subsystem;
+> closing it while it is still cheap is the argument for doing it now rather than
+> minimally.
+
+The same reasoning applies beyond metadata. **The platform as a whole is still
+dev/alpha** — no production data, no external compatibility obligations, and
+every bridge and service still under active construction. That is the window in
+which an architectural deficiency costs a schema change instead of a migration,
+a coordinated release and a back-compatibility shim.
+
+Metadata's gap was found by accident, while specifying an unrelated adapter. That
+it survived this long undetected is itself a signal: the standards in §1 are
+stated in the architecture but not systematically checked against each subsystem.
+Auditing the others against the same six properties — versioned, immutable,
+soft-deleting, attributed, culling-only, observable — is work worth doing while it
+is still this cheap, and is tracked outside this proposal.
+
 ---
 
 ## 5. Non-goals
 
-- Building csai's metadata indexing (§3.2). That is csai-side work this proposal
+- Building csai's metadata indexing (§3). That is csai-side work this proposal
   unblocks, not part of it.
 - The CMIS adapter's own change log — it consumes this event; it does not
   motivate changing its shape beyond §4.2.
@@ -335,11 +497,16 @@ metadata_log (uid, seq, ts, actor, key, op, value)
 snapshot rows alongside the deltas — nothing that duplicates or denormalizes what
 the log already holds, and therefore nothing that can drift from it.
 
-The concern this has to answer is read cost: `GetAllMetadata` on the live bag is
-by far the hottest metadata read — every CMIS `getObject`, every listing entry
-carrying properties, every web-UI Metadata tab — and naive replay would make the
-hot path pay for the cold path. It does not need a second table, because
-"latest entry per key" is an indexed lookup, not a replay:
+The concern this has to answer is read cost. `GetAllMetadata` on the live bag
+becomes by far the hottest metadata read once the consumers now being specified
+arrive — every CMIS `getObject`, every listing entry carrying properties, csai
+indexing — and naive replay would make that hot path pay for the cold path. The
+load is prospective rather than current (§4.7: metadata is barely used today),
+but designing for it costs nothing here, and retrofitting it later would cost the
+migration this plan is timed to avoid.
+
+It does not need a second table, because "latest entry per key" is an indexed
+lookup, not a replay:
 
 ```sql
 -- current bag; index on (uid, key, seq DESC) makes this one seek per key
@@ -465,14 +632,23 @@ exactly at any instant at or after `T_cut`; the individual changes below it are
 is the trade being bought, and it should be documented in the proto rather than
 discovered by a caller.
 
-##### Migration
+##### Schema change, not migration
 
-Clean, and it needs no special mechanism: the existing `"current"`-sentinel rows
-**are** an initial base state at `t0`. Migration writes them as `op = 'base'`
-entries stamped `t0` with an empty log above — structurally identical to the
-result of a cull, so the same code path produces and reads it. Unversioned
-behaviour is unchanged from the first deploy, and history simply begins at the
-migration.
+There is nothing to migrate: no deployment makes significant use of metadata, so
+the existing rows are not worth carrying across (§4.7). The old `metadata` table
+is dropped and `metadata_log` created in its place; every object simply starts
+with an empty log.
+
+Had the rows needed preserving, the mechanism was available and cheap — the
+`"current"`-sentinel rows are structurally an initial base state, so writing them
+as `op = 'base'` entries at `t0` would have produced exactly what a cull produces,
+readable by the same code path. It is recorded here because it is the fallback if
+some deployment turns out to hold metadata worth keeping, but it is **not** part
+of the plan.
+
+What must survive is the **API contract**, not the data: the unversioned reads and
+writes keep working unchanged against an empty store, because the REST bridge and
+the web UI's Metadata tab call them.
 
 #### API surface
 
@@ -647,9 +823,12 @@ exists, the metadata sequence is guaranteed reconstructable.
      and the single-key variant scopes both flags to its own key.
 8. A regression test asserting (7), because the current behaviour is
    indistinguishable from "this file has no metadata".
-9. The unversioned API is unchanged in behaviour across the migration:
-   `GetAllMetadata` returns the same bag before and after, with the former
-   sentinel rows now the `t0` base state.
+9. The unversioned API is **contract-compatible across the schema change**:
+   `GetMetadata`, `GetAllMetadata`, `SetMetadata` and `DeleteMetadata` behave
+   correctly against an empty store — an absent key reads as absent, not as an
+   error — and a set-then-get round-trip works on a freshly replaced schema. The
+   *data* is expected not to survive (§4.7); the *endpoints* must, since the REST
+   bridge and the web UI's Metadata tab depend on them.
 10. **Reconstruction is exact:** for a file with a long metadata history,
     `GetAllMetadataAt(uid, T)` equals the bag that `GetAllMetadata` returned at
     time `T`, for arbitrary `T`.
