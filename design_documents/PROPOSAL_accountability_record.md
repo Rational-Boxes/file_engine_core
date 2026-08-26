@@ -63,10 +63,11 @@ Content is the reference implementation and holds on every axis. Everything
 attached *to* content — the authorization and identity layer — does not.
 
 > **Where the matrix is heading.** The metadata row is closed by
-> `PROPOSAL_metadata_change_events.md`; the ACL and role rows are closed by the
-> §7.2 decision, on the same append-only pattern. Tenants remain open — see §7.3,
-> where tenant deletion is both the most destructive operation in the system and
-> the one whose record cannot live in the tenant's own schema.
+> `PROPOSAL_metadata_change_events.md`; the ACL and role rows by the §7.2
+> decision, on the same append-only pattern. The tenant row is closed differently
+> (§7.3): a tenant's history is tenant data and is destroyed with it, so the row
+> stays ✗ **by design** — what changes is that the *act* of creating or destroying
+> a tenant becomes recorded, globally and permanently, which today it is not.
 
 ### 2.1 Destructive operations outside culling
 
@@ -87,6 +88,9 @@ Each of these is reachable by an ordinary permissioned caller, not by
 `CULL_VERSIONS`. Tenant deletion is the most severe: a single `DROP SCHEMA
 CASCADE` destroys every file, version, ACL, role and metadata row for a tenant,
 and emits **no event at all** — there is no tenant event type in the vocabulary.
+That the destruction is intended (§7.3) does not make its silence acceptable:
+the platform currently cannot say that a tenant ever existed, let alone who
+removed it.
 
 ### 2.2 What the sweep implies
 
@@ -442,8 +446,10 @@ Two properties fall out of per-tenant chains that a global chain could not offer
 - **A tenant's history can be verified and exported on its own**, without access
   to any other tenant's records — which a single interleaved chain would make
   impossible, since verification would require the entire chain.
-- **A tenant's history can be removed with the tenant**, cleanly. That is what
-  makes §7.3's export-before-`DROP SCHEMA` approach tractable.
+- **A tenant's history can be removed with the tenant**, cleanly — which is
+  exactly what §7.3 decides should happen. A global chain would have made tenant
+  deletion either impossible to honour or destructive to every other tenant's
+  verifiability.
 
 The shared queue's usual hazard — head-of-line blocking, one tenant's burst
 delaying another — is also defused by the pull design: the queue is a hint
@@ -670,12 +676,42 @@ twice.
    never-culled, guaranteed record of the *act* and its actor. Authorization
    changes are the canonical security event and stay in both, deliberately.
    Content and metadata writes remain out, as before.
-3. **Tenant deletion.** `DROP SCHEMA CASCADE` destroys the tenant's
-   `accountability_record` along with everything else — the one operation whose
-   record cannot live in the tenant schema. Options: a global (non-tenant) table
-   for `identity`-category records, or requiring export before tenant deletion.
-   **Recommend a global table for tenant lifecycle**, which also fixes the
-   missing tenant event noted in §2.1.
+3. **Tenant deletion.** **Decided: the history is tenant-scoped data and is
+   destroyed with the tenant.** `DROP SCHEMA CASCADE` takes the tenant's
+   accountability records along with its files, versions, ACLs, roles and
+   metadata. No mandatory export, no retention of tenant contents past the
+   tenant.
+
+   One thing cannot live there, for a mechanical reason: **the record of the
+   deletion itself**. A record inside the schema being dropped deletes itself, so
+   the act needs a home outside the tenant. That is not an exception to the rule
+   — the *tenant's* history is tenant data, but *"this tenant existed and was
+   destroyed, by whom, when"* is platform-level accountability about an operator
+   action, not content belonging to the tenant.
+
+   So a small **global** table carries tenant lifecycle only — create and delete,
+   with actor, source and timestamp. Nothing about the tenant's contents. This
+   also closes the gap §2.1 identified independently: tenant deletion is
+   currently the most destructive operation in the system and emits **no event at
+   all**, because no tenant event type exists.
+
+   **The tension this resolves, deliberately.** If deleting a tenant erased every
+   trace of it, tenant deletion would become the cleanest way to destroy
+   evidence: whoever can delete a tenant could erase the entire record of what
+   happened inside it, including the record of their own actions. Splitting it as
+   above defuses that — the contents are genuinely gone, but the fact that they
+   existed and who removed them is permanent and lives where the deleter cannot
+   reach.
+
+   That split is also the shape data-protection regimes ask for: erase the
+   subject's data, retain the record that erasure occurred.
+
+   **Consequence for `audit_service`.** Its own store is separate, so the rule
+   has to reach it: on seeing a tenant-deletion record it stops polling that
+   tenant, drops its `recorded_until` cursor, and purges its retained records for
+   that tenant — keeping only the lifecycle entry. The global record is what makes
+   this drivable; without it the service would poll a vanished schema forever and
+   silently retain history the platform believes it destroyed.
 4. **Does the bridge-supplied identity need strengthening?** The core trusts
    `AuthenticationContext` entirely, so `actor` is only as good as the bridge that
    set it. That is the existing trust model and this proposal does not change it —
@@ -789,5 +825,15 @@ twice.
 13. **Both timestamps are recorded** on every entry, and `occurred_at` running
     marginally backwards between adjacent entries from different sources is
     accepted by the chain verifier rather than flagged as corruption.
+14. **Tenant destruction is total but not silent (§7.3).** After deleting a
+    tenant:
+    - Its accountability records are gone with its schema, and every other
+      tenant's chain still verifies end to end.
+    - A **global** record names the deletion, its actor and its time, and
+      survives.
+    - `audit_service` stops polling the tenant, drops its cursor, and purges its
+      retained records for it — keeping the lifecycle entry.
+    - Creating a tenant with the same name afterwards starts a fresh chain and
+      does not resurrect or splice onto the old one.
 8. A load check confirming the synchronous write is not on a hot path — a
    content read/write benchmark is unchanged, because neither is in scope (§4.1).
