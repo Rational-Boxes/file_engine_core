@@ -148,7 +148,7 @@ transaction as the operation it describes**.
 
 ```sql
 CREATE TABLE accountability_record (
-    seq          BIGSERIAL PRIMARY KEY,      -- total order within the tenant
+    seq          BIGINT PRIMARY KEY,         -- gap-free, commit-ordered; assigned under the chain lock (§5.3.2) — NOT a BIGSERIAL
     ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
     actor        VARCHAR(255) NOT NULL,      -- never empty; "system" is explicit, not a default
     actor_roles  TEXT[],                     -- roles as presented at the time
@@ -229,9 +229,11 @@ operation ──┬─▶ commit (state + accountability_record, one transaction
             └─▶ Redis XADD (optional)                  ← latency hint only
 ```
 
-Each consumer keeps a per-tenant cursor over `seq`. Because `seq` is a monotonic
-`BIGSERIAL` assigned in the committing transaction, a cursor cannot skip a record
-and cannot see one that was rolled back.
+Each consumer keeps a per-tenant cursor over `seq`. Because `seq` is assigned
+under the chain lock (§5.3.2) rather than by a sequence generator, it is
+**gap-free and commit-ordered**: a cursor cannot skip a record, cannot observe
+one that was rolled back, and cannot be overtaken by a lower-numbered record
+committing later.
 
 What this buys, beyond the guarantee itself:
 
@@ -247,10 +249,22 @@ What this buys, beyond the guarantee itself:
 - **Backlog is visible and bounded by disk**, not by an outbox capacity that
   drops oldest under pressure.
 
-The queue is kept as a **latency hint**, not a delivery mechanism: the rules
-engine wants to react to a suspicious authorization change sooner than a poll
-interval, so a best-effort `XADD` still fires. If it is lost, the poll picks the
-record up regardless. Nothing is *only* on the queue.
+The queue is kept as a **trigger and a freshness assertion**, never a data
+source. A best-effort `XADD` still fires, carrying the committed `seq` and
+nothing the consumer acts on directly. On receipt the consumer does not process
+the payload — it **reads the table immediately**, out of schedule.
+
+That gives three things at once:
+
+- **Latency.** The rules engine reacts to a suspicious authorization change
+  without waiting out a poll interval.
+- **No dependence.** A lost hint costs latency only; the scheduled poll collects
+  the record regardless. Nothing is *only* on the queue.
+- **A freshness check.** The hint asserts *"at least `seq` N exists"*. If the
+  table read does not show N, the consumer is reading stale or lagging state —
+  a replica behind the primary, say — and must retry rather than advance its
+  cursor. Without the assertion that condition is invisible: the read simply
+  looks like "no new records".
 
 This is the same correction the metadata proposal makes one level down: *the
 durable log is not the queue.* A stream that is trimmed, sampled or fail-open is
@@ -269,6 +283,72 @@ alongside the monitoring listener — returning records in `seq` order with a
 `has_more` flag. The consumer advances its cursor only after its own durable
 write, which makes redelivery-on-crash at-least-once; `(tenant, seq)` is the
 idempotency key, and `audit_service` already de-duplicates on a comparable key.
+
+#### 4.3.2 What the consumer verifies on every read
+
+Whether triggered by the schedule or by a queue hint, the consumer performs the
+same check — the hint only changes *when*, never *what*. On each batch, in `seq`
+order:
+
+| Check | Break means |
+|---|---|
+| `seq` is contiguous from the cursor | A record is missing. Under §5.3.2 gaps cannot occur naturally, so this is an integrity alarm, not a retry |
+| `prev_hash[n] == hash[n-1]` | The chain is broken or forked — tampering, or a write that bypassed the chain lock |
+| `hash[n]` recomputes from the row | The row was altered after commit |
+| The hint's asserted `seq` is present | Stale or lagging read (§4.3); retry, do **not** advance the cursor |
+
+The first three are **security events in their own right** and must be raised as
+such — not logged and stepped over. A consumer that skips a gap to keep draining
+converts an integrity failure into silent data loss, which is the failure this
+whole proposal exists to prevent. The correct behaviour is to stop advancing that
+tenant's cursor, alarm, and require operator acknowledgement.
+
+This is also why the chain is verified **on the consumer side** and not only at
+rest in the core: it checks the record *and* its delivery in one operation, so a
+transport that reorders, duplicates or drops is caught by the same mechanism that
+catches a tampered row.
+
+#### 4.3.3 Precedence — the database is the first authority
+
+The rule generalises past core events: **on any incoming queue event, from any
+subsystem, the core table is consulted and drained before that event is
+recorded.**
+
+```
+queue event (csai / share / discussion / bridge / …)
+        │
+        ├─▶ 1. consult the core accountability table
+        ├─▶ 2. drain and append every pending authoritative record, in seq order
+        └─▶ 3. only then append the incoming subsystem event
+```
+
+The reason is the audit log's own chain. `audit_service` maintains a
+tamper-evident hash chain across *all* sources, and a chain records the order in
+which it was written. Appending a subsystem event while authoritative core
+records that happened **earlier** are still unread would place them out of
+temporal order permanently — the chain cannot be re-sorted after the fact without
+rewriting it, which is precisely what a tamper-evident structure exists to
+prevent.
+
+So the core's gap-free, commit-ordered `seq` (§5.3.2) becomes the **anchor** the
+rest of the platform is sequenced against. Other subsystems have no equivalent
+guarantee; interleaving them against a source that does is what keeps the
+combined log meaningful.
+
+Two consequences worth being explicit about:
+
+- **What this does and does not give.** Every subsystem event is correctly
+  ordered *relative to core records*. Ordering **between** two different
+  non-core subsystems still rests on their timestamps, and so remains subject to
+  clock skew. This proposal anchors the chain; it does not claim a perfect global
+  total order across services, and the audit log should not be read as offering
+  one.
+- **Behaviour when the core is unreachable.** Recording a subsystem event without
+  first draining would break the ordering guarantee, so the security sink must
+  **not** proceed — consistent with the platform's existing posture, where auth
+  events already fail closed if the audit path is unavailable. This does create a
+  dependency chain (subsystem → audit → core) whose failure behaviour should be
+  reviewed deliberately rather than inherited: see §7.8.
 
 Consequence worth noting: polling is per tenant, so a deployment with many
 tenants makes many small queries per interval. A cheap `max(seq)` probe per
@@ -306,20 +386,72 @@ permissioned operation that records its own execution, and should require export
 before deletion. **Not proposed here** — the right default at alpha is that it
 never deletes.
 
-### 5.3 Tamper evidence
+### 5.3 The chain — tamper evidence *and* ordering
 
-`prev_hash` / `hash` give a per-tenant hash chain: `hash = H(prev_hash ‖
-canonical(row))`. This makes local tampering detectable without depending on
-`audit_service` being reachable, mirroring the chain it already maintains.
+`prev_hash` / `hash` give a per-tenant hash chain:
+`hash = H(prev_hash ‖ canonical(row))`. It makes tampering locally detectable
+without depending on `audit_service` being reachable, mirroring the chain that
+service already maintains.
 
-The cost is a serialization point: each append must read the previous row's hash
-inside the transaction, so accountability writes serialize per tenant. Acceptable
-for rare operations, with one caveat — bulk authorization changes (setting a
-tenant's initial ACLs, say) should be written as **one record describing the
-batch**, not N chained rows, both for contention and because they are one logical
-act.
+But a chain is inherently **order-dependent**, and that turns out to solve a
+second problem rather than merely coexisting with it.
 
-Optional for v1 if the chain is judged premature (see §7).
+#### 5.3.1 The hazard a naive sequence has
+
+An earlier draft of §4 gave `seq` as `BIGSERIAL`. That is wrong for a chained,
+cursor-read table, in two compounding ways:
+
+- **Values are assigned at INSERT and become visible at COMMIT.** Two concurrent
+  writers can take 9 and 10, and 10 can commit first. A reader polling
+  `seq > cursor` sees 10, advances to 10, and **record 9 is never read** — lost
+  permanently, silently, and precisely for the record type that must not be lost.
+- **Rolled-back transactions burn values.** Gaps are therefore *normal*, so a
+  consumer cannot treat a missing number as an anomaly — which makes gap
+  detection useless exactly where it is most wanted.
+
+Chaining on top of that is worse: two transactions both read the same chain head
+and both write `prev_hash = H8`, forking the chain.
+
+#### 5.3.2 The chain *is* the sequence
+
+Derive both from one locked head row per tenant:
+
+```sql
+CREATE TABLE accountability_chain_head (
+    tenant     VARCHAR(255) PRIMARY KEY,
+    last_seq   BIGINT NOT NULL DEFAULT 0,
+    last_hash  BYTEA
+);
+```
+
+Each accountability write, inside the operation's transaction:
+
+1. `SELECT ... FOR UPDATE` the tenant's head row — serializing appends per tenant.
+2. `seq = last_seq + 1`; `hash = H(last_hash ‖ canonical(row))`.
+3. Insert the record; update the head.
+4. The lock releases at commit.
+
+This aligns three orderings that were previously independent: **assignment order
+== commit order == chain order.** The consequences are what make the design work:
+
+- **No gaps, ever.** A rolled-back transaction releases the lock without
+  advancing `last_seq`, so numbers are never burned. A gap is therefore an
+  unambiguous integrity alarm rather than routine noise.
+- **No out-of-order visibility.** A record with a lower `seq` cannot commit after
+  a higher one, so a cursor reader can advance safely with no snapshot watermark,
+  no lag heuristic, and no risk of skipping.
+- **The chain verifies the transport.** A consumer checking contiguity and
+  linkage is checking delivery integrity at the same time.
+
+The cost is real and should be stated: accountability writes **serialize per
+tenant**. That is affordable only because §4.1 keeps the scope to rare
+operations — it would be unacceptable on a content path. One caveat follows from
+it: bulk authorization changes (setting a tenant's initial ACLs, say) must be
+written as **one record describing the batch**, not N chained rows — for
+contention, and because they are one logical act.
+
+Given that the chain now carries the ordering guarantee and not merely tamper
+evidence, treating it as optional (§7.1) is much weaker than it first appeared.
 
 ---
 
@@ -338,11 +470,15 @@ Optional for v1 if the chain is judged premature (see §7).
 
 ## 7. Open decisions
 
-1. **Hash chain in v1?** It is cheap at these volumes and removes a dependency on
-   `audit_service` for tamper evidence. The counter-argument is that Postgres
-   integrity plus the downstream chain may be enough at alpha. Recommend
-   **including it** — retrofitting a chain over existing rows means either a
-   rebuild or a gap.
+1. ~~**Hash chain in v1?**~~ **Effectively settled by §5.3.2.** It was posed as an
+   optional tamper-evidence feature, but the chain's locked head row is also what
+   makes `seq` gap-free and commit-ordered — without it a cursor reader can
+   permanently skip a record that commits late. The chain is load-bearing for
+   *delivery correctness*, not only for tamper evidence, so it ships. The genuine
+   remaining question is narrower: whether the head row is locked with
+   `SELECT ... FOR UPDATE` or a Postgres advisory lock, which is an
+   implementation choice about lock granularity and deadlock behaviour under
+   concurrent tenant activity.
 2. **Should the authorization layer also become append-only?** §2 shows ACLs and
    roles are current-state tables with in-place destruction. Recording the change
    (this proposal) and versioning the state (like metadata) are different fixes.
@@ -372,6 +508,22 @@ Optional for v1 if the chain is judged premature (see §7).
    this table's scope, §4.1). So the WAL is not removed, only relieved of the
    accountability categories. Confirm that is the intended split rather than a
    staging post toward pulling everything.
+8. **The dependency chain §4.3.3 creates.** Making the core the ordering
+   authority means the security sink cannot record a subsystem event while the
+   core is unreachable, and several subsystems already fail closed when the audit
+   path is unavailable. Chained together that is
+   *core down → audit blocked → subsystems blocked*, turning a core outage into a
+   platform-wide write freeze.
+
+   That may be the correct posture for a system whose selling point is a
+   defensible record — but it should be **chosen**, not inherited by composition.
+   The alternatives worth weighing: let the sink buffer subsystem events
+   unrecorded and replay them once the core returns (preserves availability,
+   defers ordering); or record them into a quarantine region of the log that is
+   explicitly marked as unordered and reconciled later (preserves availability
+   and honesty, at the cost of a two-tier log). Recommend deciding this
+   explicitly before implementation, since it determines the platform's
+   behaviour during exactly the incidents the audit log exists to explain.
 
 ---
 
@@ -396,7 +548,23 @@ Optional for v1 if the chain is judged premature (see §7).
 6. **Queryable:** "every authorization change affecting principal P" and
    "everything actor A did between T1 and T2" are answerable from the core alone,
    with no `audit_service` and no Redis.
-7. If the chain ships (§7.1): modifying or deleting a row is detectable by
-   verifying the chain.
+7. **Chain and ordering hold under concurrency.** With N writers issuing
+   accountability operations against one tenant simultaneously:
+   - `seq` is contiguous with no gaps and no duplicates.
+   - Commit order matches `seq` order — no record with a lower `seq` becomes
+     visible after a higher one.
+   - The chain links cleanly end to end, with no fork.
+   - A cursor reader polling throughout observes every record exactly once.
+8. **Integrity breaks are raised, not absorbed.** Modifying a row, deleting one,
+   or inserting one out of band is detected on the next consumer read; the
+   consumer stops advancing that tenant's cursor and alarms rather than skipping
+   ahead.
+9. **A queue hint naming a `seq` the read cannot see** causes a retry, not a
+   cursor advance.
+10. **Precedence holds (§4.3.3).** Given a core accountability record committed
+    at T1 and a subsystem queue event arriving at T2 > T1 but delivered before
+    the scheduled poll, the audit log contains the core record **ahead of** the
+    subsystem event. Verified by inspecting the resulting chain order, not just
+    the timestamps.
 8. A load check confirming the synchronous write is not on a hot path — a
    content read/write benchmark is unchanged, because neither is in scope (§4.1).
