@@ -130,6 +130,14 @@ The core is not naive here, and the proposal should not pretend otherwise.
 
 Nothing below is a criticism of that design. The gap is narrower and structural.
 
+> **One thing does need changing, though, and it is not a gap but a leak.**
+> `emit_mutate_audit` and `emit_access_audit` resolve the target's display name
+> and store it in `AuditEntry::target_name` (`grpc_service.cpp:127`, `:189`).
+> Filenames are party data, so the audit log accumulates content-derived data in
+> a structure designed never to release it — see §5.4.7, which sets the rule that
+> the chain captures identifiers and structure but never payload, and shows how
+> to keep the logs readable without storing the name.
+
 ### 3.2 Why it cannot *guarantee* a record
 
 | # | Gap | Evidence |
@@ -167,10 +175,10 @@ CREATE TABLE accountability_record (
     source_addr  VARCHAR(64),                -- client IP forwarded by the bridge
     category     VARCHAR(32) NOT NULL,       -- authorization | destruction | identity
     action       VARCHAR(64) NOT NULL,       -- acl.grant | acl.revoke | role.assign | cull.versions | tenant.delete | …
-    target_uid   VARCHAR(64),                -- resource, where one applies
+    target_uid   VARCHAR(64),                -- resource, where one applies. The uid ONLY — names are resolved at read time (§5.4.7), never stored
     target_type  VARCHAR(32),
     principal    VARCHAR(255),               -- for authorization changes: whose access changed
-    detail       JSONB NOT NULL DEFAULT '{}',-- permission mask, effect, keep_count, cut timestamp, …
+    detail       JSONB NOT NULL DEFAULT '{}',-- SCHEMA-CONSTRAINED per action (§5.4.7): permission mask, effect, keep_count, cut timestamp. Never content, filenames or metadata values
     prev_hash    BYTEA,                      -- §5.3
     hash         BYTEA
 );
@@ -926,27 +934,65 @@ doing it — the same shape as a drain that exits 0 and appears to have shut dow
 cleanly. Each service should expose the timestamp of its last successful sweep,
 and a stale value should alarm. An unmonitored backstop is not a backstop.
 
-#### 5.4.7 Erasing personal data from the record itself
+#### 5.4.7 The chain must never capture content in the first place
 
-This proposal creates a conflict it must also resolve. The accountability record
-is deliberately **immutable, hash-chained and never culled** — and it contains
-personal data: `actor`, `actor_roles`, `source_addr` (a client IP), and free-text
-`detail`. The retained skeletal record after a file erasure carries the same, plus
-possibly the filename (§5.4.1).
+The accountability record is deliberately **immutable, hash-chained and never
+culled**. Anything it captures is therefore something the platform has committed
+to keeping — which makes *what goes into it* a compliance decision, not a
+convenience one.
 
-So a right-to-erasure request aimed at a *person* rather than a *file* lands on
-exactly the structure designed to be unerasable.
+**The governing rule: the chain records identifiers and structure, never
+payload.** It is a history trace of what was done, and it must be constructed so
+that data subject to a removal obligation cannot enter it. Prevention, not
+remediation: the cleanest way to survive an erasure request is to have nothing to
+erase.
 
-Audit records commonly have a retention justification — a legal obligation to
-keep them, or the establishment and defence of legal claims — and that may well
-cover this log. But **"the chain makes it technically impossible" is not a
-justification**, it is the failure mode the user's point identifies. The system
-must be *able* to redact; whether it should in a given case is a separate
+| Never captured | Necessarily captured |
+|---|---|
+| File content, or anything extracted from it | `target_uid` — an opaque identifier |
+| **Filenames** | `actor`, `actor_roles`, `source_addr` |
+| Metadata **values** | `principal` whose access changed |
+| Checkin comments, discussion text, any free-text user input | action, outcome, timestamps |
+| Anything the platform stores on a customer's behalf | permission masks, keep-counts, cut timestamps |
+
+**This is already violated.** `emit_mutate_audit` and `emit_access_audit` resolve
+the target's name and store it in `AuditEntry::target_name`
+(`grpc_service.cpp:127`, `:189`). Filenames are party data — §5.4.1 flags
+`Acme_Corp_Contract_J_Smith.pdf` as needing redaction on erasure — so the audit
+log currently accumulates exactly the class of data this rule excludes, in the
+one structure designed never to release it.
+
+**Store references, resolve for display.** The fix keeps audit logs readable
+without capturing anything: store the `uid`, and let a viewer join to the current
+name at read time. Before erasure the log reads exactly as it does today; after
+erasure the join finds nothing and the log automatically stops disclosing the
+name. Compliance becomes a property of the architecture rather than an operation
+someone must remember to run.
+
+**Make `detail` structurally incapable of holding content.** A free-form JSONB
+blob is where content leaks in — one well-meaning `detail["new_value"] = value`
+and the log is holding metadata payload forever. `detail` should be a
+**schema-constrained, per-action structure** with enumerated fields, not an open
+map: `acl.grant → {principal, mask, effect}`, `cull → {keep_count, cut_ts}`. If
+there is no field to put content in, content cannot arrive by accident.
+
+##### The residue — identity, and why redaction is still needed
+
+The rule above removes content from the problem entirely. What it cannot remove
+is the record's *purpose*: `actor`, `source_addr` and `principal` are personal
+data, and an accountability log that omitted them would record nothing worth
+recording.
+
+That residue is far more defensible than content would be — audit records
+commonly carry a retention justification, whether a legal obligation to keep them
+or the establishment and defence of legal claims — and it is the category
+regulators most readily accept retaining. But **"the chain makes it technically
+impossible" is not a justification**, it is the failure mode. The system must be
+*able* to redact an identity; whether it should in a given case is a separate
 question with a separate answer.
 
-**Design for redaction without breaking the chain.** A naive redaction destroys
-verifiability: change the payload and its hash no longer recomputes, so the chain
-fails from that point on. The fix is to make redaction a first-class operation:
+So redaction remains, now as a rarely-exercised capability for identity rather
+than the primary defence for content:
 
 - Each row's stored `hash` is retained as the chain link, **and the link is what
   the next row chains from** — so replacing a payload never breaks continuity.
@@ -1266,6 +1312,13 @@ tenant-scoped record would destroy itself.
     - **Field erasure is scoped:** erasing one property's history leaves the
       file's content and its other properties intact, and still reaches csai's
       index.
+    - **The chain holds no content (§5.4.7):** after erasing a file, a full scan
+      of the accountability records and the audit chain yields no filename, no
+      metadata value and no extract — only uids, identities, actions and
+      timestamps. Asserted by scanning the chain for the erased file's known
+      name and property values and finding neither.
+    - **`detail` cannot carry content:** an attempt to record an unenumerated
+      field for an action is rejected by the schema rather than stored.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
