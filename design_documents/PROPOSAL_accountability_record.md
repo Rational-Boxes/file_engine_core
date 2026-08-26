@@ -664,8 +664,9 @@ file while leaving the search index intact does not meet any purge obligation
 worth signing.
 
 Erasure is therefore a **platform-wide operation, not a core-local one**. The
-core owns the authoritative act and the record; each service must expose an
-erasure endpoint and honour it for a given uid or tenant.
+core owns the authoritative act and the record; each service must honour an
+erasure for a given uid or tenant, driven by the event and pull mechanism in
+§5.4.5.
 
 #### 5.4.3 Attestation — you must be able to prove it happened
 
@@ -683,7 +684,8 @@ fire-and-forget propagation is insufficient. Erasure is a tracked job:
 
 A service that is unreachable delays completion; it must never be skipped, and an
 erasure stuck incomplete is an operational alarm, because it represents an unmet
-contractual obligation rather than a transient error.
+contractual obligation rather than a transient error. §5.4.5 covers how the ask
+reaches each service and how a service that missed it converges.
 
 #### 5.4.4 Storage reality, and where it stops
 
@@ -712,7 +714,69 @@ rewrite, and the reason per-file keys are worth considering as follow-on work.
 **v1 should implement direct deletion and state the backup limitation plainly**
 rather than implying a completeness it does not have.
 
-#### 5.4.5 Tenant-scale erasure
+#### 5.4.5 The erasure event, and how services honour it
+
+Services need to be *told*, and the natural mechanism is the one they already
+consume. Two new types join the vocabulary:
+
+| Event | Meaning to a consumer |
+|---|---|
+| `file.erased` | Destroy everything you derived from this uid, permanently, then acknowledge |
+| `tenant.erased` | The same for every uid in the tenant, plus your tenant-scoped state |
+
+**These must be distinct from `file.deleted`.** A consumer treats `file.deleted`
+as a *soft* delete — recoverable, since `UndeleteFile` exists — so csai may
+reasonably keep an index entry marked deleted rather than destroying the vectors.
+Reusing that type for erasure would leave the extracted text and embeddings
+exactly where they were, which is the failure §5.4.2 exists to prevent. The
+semantics are different, so the type must be too.
+
+**The event triggers; it does not guarantee.** `fileengine:events` is fail-open,
+trimmed and drop-oldest by design (EVENT_CONTRACT.md §6.4) — appropriate for a
+notification, unacceptable for a contractual obligation. A dropped erasure event
+would leave a service holding data the platform has certified destroyed, and
+would do so silently.
+
+So erasure uses the same push/pull split as §4.3, which by now is the platform's
+consistent answer to this shape of problem:
+
+- **Push** — the event, for latency. A service purges within milliseconds.
+- **Pull** — each service periodically asks the core for **erasures it has not
+  acknowledged**, and works through them. This is the guarantee path, and it is
+  what §5.4.3's attestation counts.
+- **Acknowledge** — completion is reported back, closing the loop.
+
+A service that missed the event, was down, or is newly reconnected converges via
+the pull. The reconcile-sweep obligation in EVENT_CONTRACT.md §7 already
+establishes this pattern for consumers; erasure makes it mandatory rather than
+advisory.
+
+**The late-write race.** An erasure can arrive while a service is mid-flight on
+the same uid — a conversion running, an embedding being written. Purging and then
+letting the in-flight job complete puts the derived data straight back, after the
+erasure was recorded complete. This is how purges silently fail, so honouring an
+erasure has two parts:
+
+1. Destroy what exists.
+2. **Record a local tombstone for the uid and refuse to write derived data for it
+   thereafter.** Cancelling in-flight work is best-effort; refusing the write is
+   what actually closes the race.
+
+**Cross-repo work.** `EVENT_CONTRACT.md` §3 gains both event types with their
+consumer obligations spelled out — that consumers must *destroy* rather than mark
+deleted, must acknowledge, and must tombstone. That doc is the contract every
+consumer is written against, so an erasure semantics that lives only here will
+not be implemented uniformly.
+
+> **Restore resurrects derivatives.** Restoring a service from a backup taken
+> before an erasure reinstates the derived data the erasure destroyed, with no
+> event to re-trigger the purge. The unacknowledged-erasure pull is the natural
+> remedy — a restored service re-acknowledges from scratch — but it only works if
+> the core retains erasure records long enough to outlive any restorable backup.
+> That retention window is a deployment decision worth stating alongside the
+> backup limitation in §5.4.4.
+
+#### 5.4.6 Tenant-scale erasure
 
 The same operation at tenant scope is what makes §7.3's decision genuinely
 executable: `DROP SCHEMA CASCADE` destroys the core's copy, but a tenant erasure
@@ -982,6 +1046,14 @@ tenant-scoped record would destroy itself.
     - The erasure is marked **complete only after every participating service
       acknowledges**; with one service unreachable it stays visibly incomplete
       rather than reporting success.
+    - A service that **never receives the event** — stopped for the whole test —
+      still purges after restart, via the unacknowledged-erasure pull (§5.4.5),
+      proving the event is not the guarantee path.
+    - **`file.erased` is not treated as `file.deleted`:** csai destroys the
+      vectors rather than marking the entry deleted.
+    - **Late-write race:** an erasure issued while a conversion is in flight
+      leaves no derived data behind once that job finishes — the local tombstone
+      refuses the write.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
