@@ -62,6 +62,12 @@ applicable.
 Content is the reference implementation and holds on every axis. Everything
 attached *to* content — the authorization and identity layer — does not.
 
+> **Where the matrix is heading.** The metadata row is closed by
+> `PROPOSAL_metadata_change_events.md`; the ACL and role rows are closed by the
+> §7.2 decision, on the same append-only pattern. Tenants remain open — see §7.3,
+> where tenant deletion is both the most destructive operation in the system and
+> the one whose record cannot live in the tenant's own schema.
+
 ### 2.1 Destructive operations outside culling
 
 The §1.1 guarantee in the metadata proposal — committed data goes away only
@@ -179,10 +185,12 @@ versioned home of its own**:
 | Tenant create / delete | listings, stats | no accountability content |
 | Hard deletes, if any are ever added | | |
 
-**The organising rule: if a subsystem holds its own attributed, immutable
-history, it does not also belong here.** That is why the metadata proposal and
-this one are complementary rather than overlapping — they answer different
-questions:
+**The organising rule: an operation belongs here if it is security-relevant and
+needs a guaranteed, chained, never-culled record — not merely because it lacks a
+history elsewhere.** Content and metadata writes are excluded because their
+versioned stores answer the question asked of them; authorization changes are
+included even though §7.2 gives them their own append-only history, because they
+are the canonical security event and the two records serve different purposes:
 
 - *State reconstruction* — "what was the value at time T" — belongs to the
   versioned store (content versions, the metadata log).
@@ -190,8 +198,9 @@ questions:
   here.
 
 A versioned store cannot answer the second (it records values, not the act of
-changing them, and it disappears when the row is destroyed). An accountability
-log cannot answer the first without becoming the store. Both are needed.
+changing them, and it is culled with the resource it describes). An
+accountability log cannot answer the first without becoming the store. Both are
+needed, and for authorization changes both are kept.
 
 ### 4.2 Guarantees
 
@@ -480,11 +489,65 @@ evidence, treating it as optional (§7.1) is much weaker than it first appeared.
    `SELECT ... FOR UPDATE` or a Postgres advisory lock, which is an
    implementation choice about lock granularity and deadlock behaviour under
    concurrent tenant activity.
-2. **Should the authorization layer also become append-only?** §2 shows ACLs and
-   roles are current-state tables with in-place destruction. Recording the change
-   (this proposal) and versioning the state (like metadata) are different fixes.
-   Recording is the higher value per unit of work and should come first, but the
-   question deserves its own answer.
+2. **Should the authorization layer also become append-only?**
+   **Decided: yes.** ACLs and role memberships become append-only on the same
+   pattern as metadata, closing the remaining ✗ column in §2's matrix.
+
+   That makes it a **platform pattern rather than three separate fixes** — the
+   metadata proposal's design transfers directly: an append-only log keyed by the
+   subsystem's natural identity, current state as the latest entry per key,
+   revocation as a tombstone rather than a row removal, an actor on every entry,
+   and destruction only through culling.
+
+   | | Log key | Value | Ops |
+   |---|---|---|---|
+   | Metadata | `key` | value | set / delete |
+   | ACLs | `(resource_uid, principal, principal_type, effect)` | permission bitmask | grant / revoke |
+   | Role membership | `(user_name, role_name)` | — | assign / remove |
+
+   Each entry records the **resulting** bitmask for its tuple rather than a
+   delta, so reconstruction is a lookup rather than a fold; a revoke to zero
+   writes a tombstone. ACL history culls with the resource it is attached to, at
+   the same cut as that resource's version history — the same derivation the
+   metadata log uses. Role history has no payload to mirror and should simply not
+   be culled: role changes are rare, the volume is negligible, and it is precisely
+   the data an accountability question needs.
+
+   **Two things to weigh before implementing, neither of which changes the
+   decision:**
+
+   *The ACL read is genuinely hot, unlike metadata.* `validate_user_permissions`
+   has 33 call sites and runs on essentially every operation, and evaluation
+   walks ancestor containers (`acl_manager.cpp:230`) — so a permission check is
+   already multi-row and recursive. Turning current-state reads into
+   latest-entry-per-key scans multiplies that by ancestors × entries × a log
+   seek each. The metadata pattern's `DISTINCT ON` with an index on
+   `(resource_uid, principal, principal_type, effect, seq DESC)` should hold up,
+   since resources carry few ACL entries, and the feature services already cache
+   permission decisions behind a TTL. But this **must be benchmarked before it
+   ships**, and it should not be assumed to transfer for free from metadata,
+   where the equivalent read is cold by comparison.
+
+   *Core role membership is nearly empty.* `user_roles` is effectively unused on
+   this platform — roles are request-borne from LDAP groups, so the core table
+   rarely holds anything. Making it append-only is therefore correct but
+   low-value on its own: **the role changes that actually matter happen in LDAP**,
+   via `ldap_manager`. Real coverage for role accountability comes from
+   `ldap_manager` writing accountability records for group membership changes, not
+   from versioning a core table nobody populates. Worth confirming that is
+   understood, since the core-side work alone would give a misleading sense of
+   coverage.
+
+   **Interaction with §4.1's scope rule.** That rule says a subsystem holding its
+   own attributed, immutable history does not also belong in
+   `accountability_record` — which, read literally, would now exclude ACL and role
+   changes. It should not, and the rule needs sharpening: the discriminator is
+   **security relevance and guarantee, not merely the existence of a history.**
+   The ACL log reconstructs *state* ("what could this principal do at time T") and
+   is culled with its resource; the accountability record is the chained,
+   never-culled, guaranteed record of the *act* and its actor. Authorization
+   changes are the canonical security event and stay in both, deliberately.
+   Content and metadata writes remain out, as before.
 3. **Tenant deletion.** `DROP SCHEMA CASCADE` destroys the tenant's
    `accountability_record` along with everything else — the one operation whose
    record cannot live in the tenant schema. Options: a global (non-tenant) table
