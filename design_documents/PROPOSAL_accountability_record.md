@@ -72,7 +72,8 @@ attached *to* content — the authorization and identity layer — does not.
 ### 2.1 Destructive operations outside culling
 
 The §1.1 guarantee in the metadata proposal — committed data goes away only
-through explicit, permissioned culling — is currently false in five places:
+through explicit, permissioned destruction (culling, and now erasure, §5.4) — is
+currently false in five places:
 
 | Site | Operation | Destroys |
 |---|---|---|
@@ -481,10 +482,16 @@ So the table survives `PurgeOldVersions`, and records it: a cull writes a
 cut timestamp. Growth is acceptable because §4.1's scope is rare operations, not
 traffic.
 
-If retention over this table is ever needed, it must itself be an explicitly
-permissioned operation that records its own execution, and should require export
-before deletion. **Not proposed here** — the right default at alpha is that it
-never deletes.
+**Erasure is the deliberate exception, and only at the right scope.** A *file*
+erasure (§5.4) destroys the content but keeps the accountability trail — the
+record of the erasure is the point of it. A *tenant* erasure destroys the tenant's
+records with everything else (§7.3), leaving only the global lifecycle entry.
+So the rule is: the record outlives every destruction of the thing it describes,
+except the destruction of the tenant that owns it.
+
+If retention over this table is ever needed beyond that, it must itself be an
+explicitly permissioned operation that records its own execution. **Not proposed
+here** — the right default at alpha is that it never deletes.
 
 ### 5.3 The chain — tamper evidence *and* ordering
 
@@ -593,15 +600,146 @@ twice.
 
 ---
 
+### 5.4 True delete (erasure) — the second destructive operation
+
+Contracts and data-protection policy require the ability to **completely purge an
+external party's data**: a business engagement ends, and the agreement obliges
+technical destruction, not archival. Culling cannot serve this — it compacts
+*history* while preserving current state, which is the opposite of what a purge
+obligation asks for.
+
+So the platform needs a second destructive operation, with a different shape:
+
+| | Cull (`PurgeOldVersions`) | **Erasure ("true delete")** |
+|---|---|---|
+| Destroys | old versions and pre-cut history | **all content, every version, everywhere** |
+| Preserves | current state | **the record that the file existed** |
+| Driven by | storage/retention housekeeping | contractual or legal obligation |
+| Permission | `CULL_VERSIONS` | a distinct, stronger grant (below) |
+
+> **Amendment required.** `PROPOSAL_metadata_change_events.md` §1.1 states that
+> *culling is the only permissible destructive operation*. That must become
+> **culling and erasure are the only two**, with erasure defined here. The rule's
+> intent is unchanged — destruction happens only through named, permissioned,
+> recorded operations — but it is no longer a single one. The metadata proposal
+> is on a separate branch; this amendment should land when the two merge.
+
+#### 5.4.1 What erasure destroys, and what survives
+
+The principle mirrors §7.3's tenant split one level down: **the payload is
+destroyed; the fact is retained.**
+
+Destroyed: every version's content bytes, in local storage, in the object store,
+and in cache. Metadata values, which routinely carry party data. And critically,
+**everything derived from the content** — see §5.4.2.
+
+Retained: a skeletal existence record — uid, parent, creation and erasure
+timestamps, the erasing actor — plus the accountability record of the erasure
+itself. Enough to answer *"a file existed here and was erased, by whom, when"*
+without retaining anything of what it contained.
+
+**Open question the obligation itself raises:** does the *filename* survive?
+`Acme_Corp_Contract_J_Smith.pdf` is itself external-party data, and a contract
+requiring complete purge may not tolerate it. Recommend the name is redacted by
+default and retention of it made an explicit option, since the safe default for
+an erasure feature is to erase.
+
+#### 5.4.2 Derived data is the hard part
+
+An erasure that clears only core storage is a **false guarantee**, because the
+content exists in derived form across the platform:
+
+| Holder | What it retains of the content |
+|---|---|
+| **csai** | extracted text, chunk contents, vector embeddings, search index entries |
+| **Renditions / markup** | rendered page images, thumbnails, previews — hidden children under the file uid |
+| **convert / ONLYOFFICE output** | converted document copies |
+| **difference_service** | comparison manifests |
+| **discussion** | comment text quoting document content |
+| **Backups / replicas** | everything, at rest — §5.4.4 |
+
+Extracted text and embeddings are the sharpest of these: an embedding is a lossy
+but real derivative, and a full-text index holds the words verbatim. Erasing the
+file while leaving the search index intact does not meet any purge obligation
+worth signing.
+
+Erasure is therefore a **platform-wide operation, not a core-local one**. The
+core owns the authoritative act and the record; each service must expose an
+erasure endpoint and honour it for a given uid or tenant.
+
+#### 5.4.3 Attestation — you must be able to prove it happened
+
+The contractual value of erasure is the ability to **demonstrate compliance**, so
+fire-and-forget propagation is insufficient. Erasure is a tracked job:
+
+1. The core destroys its own content and records the erasure as *initiated*.
+2. Each participating service is asked to erase and **acknowledges** completion
+   for that uid/tenant.
+3. The erasure is recorded *complete* only when every participant has
+   acknowledged; partial completion stays visibly incomplete rather than
+   silently passing.
+4. The completion record — participants, timestamps, outcome — is what an
+   auditor is shown.
+
+A service that is unreachable delays completion; it must never be skipped, and an
+erasure stuck incomplete is an operational alarm, because it represents an unmet
+contractual obligation rather than a transient error.
+
+#### 5.4.4 Storage reality, and where it stops
+
+Two findings from the code, one of which contradicts the documentation:
+
+- **Object-store deletion is available.** `S3Storage::delete_file` exists.
+  `CLAUDE.md` states *"S3 objects are immutable by design — deletion is not
+  supported in the object store"*, which is either stale or describes a policy
+  stance rather than a capability. Worth correcting either way, because an
+  erasure feature cannot be designed against a constraint that is not real — nor
+  shipped against one that is.
+- **Encryption is deployment-wide, not per-file.** `Storage` takes a
+  `bool encrypt_data` flag; the key is not per object. So **crypto-shredding —
+  destroying a per-file key to render its ciphertext unrecoverable — is not
+  available today**, although the primitives support it (`EncryptStream` already
+  takes a key per stream).
+
+That second point matters because of what deletion cannot reach: **backups,
+snapshots and replicas.** Deleting live objects does not erase a file from last
+night's dump or a replicated bucket, and backup retention is exactly what a purge
+obligation collides with. The honest options are a re-erasure list applied after
+any restore, backup retention short enough to satisfy the contract, or
+crypto-shredding — which is the only one that erases from media you cannot
+rewrite, and the reason per-file keys are worth considering as follow-on work.
+
+**v1 should implement direct deletion and state the backup limitation plainly**
+rather than implying a completeness it does not have.
+
+#### 5.4.5 Tenant-scale erasure
+
+The same operation at tenant scope is what makes §7.3's decision genuinely
+executable: `DROP SCHEMA CASCADE` destroys the core's copy, but a tenant erasure
+must also propagate to every service holding derived data for that tenant, under
+the same attestation (§5.4.3), leaving only the global lifecycle record.
+
+Tenant erasure is the platform's most destructive operation and should require a
+distinct grant — not `CULL_VERSIONS`, which exists for routine housekeeping and
+would be far too widely held. Recommend a separate `ERASE` permission, restricted
+to administrators, and recorded in the **global** table (§7.3), since a
+tenant-scoped record would destroy itself.
+
+---
+
 ## 6. Non-goals
 
 - Replacing `audit_service` or its cross-service chain (§4.3).
 - Recording reads. Volume makes it a different problem, already answered by the
   sampled access audit.
 - Fixing §2.1's destructive operations. This proposal makes them *recorded*; it
-  does not make them *non-destructive*. Whether ACL revoke and role removal
-  should also become append-only with tombstones — as metadata is becoming — is a
-  real question and a separate one (§7).
+  does not make them *non-destructive*. §7.2 decides that ACLs and roles do
+  become append-only, but that is its own piece of work.
+- **Implementing erasure.** §5.4 defines what true delete must mean and what it
+  must reach, because it changes the destruction rule this proposal depends on.
+  Building it — the core operation, the per-service erasure endpoints, the
+  attestation job — is a separate effort, and the cross-service half is larger
+  than the core half.
 - Retention/export tooling over the table (§5.2).
 
 ---
@@ -712,6 +850,13 @@ twice.
    that tenant — keeping only the lifecycle entry. The global record is what makes
    this drivable; without it the service would poll a vanished schema forever and
    silently retain history the platform believes it destroyed.
+
+   **`audit_service` is one participant among several.** Tenant destruction must
+   be genuinely complete to satisfy the contractual purpose (§5.4), which means
+   propagating to every service holding derived data for that tenant — csai's
+   index and embeddings above all — under the attestation in §5.4.3. A
+   `DROP SCHEMA CASCADE` alone destroys the core's copy and leaves the tenant's
+   documents legible in the search index.
 4. **Does the bridge-supplied identity need strengthening?** The core trusts
    `AuthenticationContext` entirely, so `actor` is only as good as the bridge that
    set it. That is the existing trust model and this proposal does not change it —
@@ -825,7 +970,19 @@ twice.
 13. **Both timestamps are recorded** on every entry, and `occurred_at` running
     marginally backwards between adjacent entries from different sources is
     accepted by the chain verifier rather than flagged as corruption.
-14. **Tenant destruction is total but not silent (§7.3).** After deleting a
+14. **Erasure destroys payload and derived data, not the fact (§5.4).** After
+    erasing a file:
+    - No version's content is retrievable from local storage, the object store,
+      or cache.
+    - **csai returns no extracted text, no chunk content and no embedding** for
+      it, and its renditions, previews and conversions are gone — the check that
+      distinguishes a real purge from a core-local one.
+    - A skeletal record remains showing that a file existed and was erased, with
+      actor and time, and the accountability record of the erasure survives.
+    - The erasure is marked **complete only after every participating service
+      acknowledges**; with one service unreachable it stays visibly incomplete
+      rather than reporting success.
+15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
       tenant's chain still verifies end to end.
