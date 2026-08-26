@@ -640,8 +640,8 @@ The principle mirrors §7.3's tenant split one level down: **the payload is
 destroyed; the fact is retained.**
 
 Destroyed: every version's content bytes, in local storage, in the object store,
-and in cache. Metadata values, which routinely carry party data. And critically,
-**everything derived from the content** — see §5.4.2.
+and in cache. **The entire value history of the file's metadata** (below). And
+critically, **everything derived from the content** — see §5.4.2.
 
 Retained: a skeletal existence record — uid, parent, creation and erasure
 timestamps, the erasing actor — plus the accountability record of the erasure
@@ -654,6 +654,61 @@ requiring complete purge may not tolerate it. Recommend the name is redacted by
 default and retention of it made an explicit option, since the safe default for
 an erasure feature is to erase.
 
+##### Metadata history, not just current metadata
+
+Metadata values routinely carry personal data — a party name in a custom
+property, a reference number, a free-text note. Erasing the *current* value is
+not enough: under `PROPOSAL_metadata_change_events.md` metadata becomes an
+**append-only log**, so every superseded value remains readable in history, and a
+purge that clears only the live value leaves the PII intact one query away.
+
+So erasure destroys the **value history**, across every entry in the log and any
+base state left by an earlier cull. What remains is a **metadata trace**: the
+entries keep their `seq`, `ts`, `actor`, `key` and operation, with values
+replaced by redaction tombstones.
+
+That preserves exactly the right thing. The metadata proposal's temporal queries
+still work *structurally* — `ListMetadataVersions` still returns the sequence, and
+`GetAllMetadataAt` still reports which keys were set at an instant — so the record
+of *activity* survives while the data does not. One can still establish that a
+field was set four times, last by a named actor on a given date, and then
+deleted, with no way to recover what it ever said.
+
+Note this is the same immutable-structure conflict as §5.4.7: an append-only log
+must support value redaction, or erasure and the log's own guarantees are
+irreconcilable. The metadata log has no hash chain, so redaction there is simpler
+than in the accountability record — but it must be designed in, not bolted on.
+
+**Key names are the metadata equivalent of the filename question above.** A key
+like `patient_name` or `claimant_ssn` reveals by existing. Keys are usually
+schema-shaped and safe to retain as the trace — and retaining them is what makes
+the trace useful — but the same default should apply where they are not:
+redactable, with retention the explicit choice.
+
+##### Granularity — erasing a field without erasing the file
+
+The obligation does not always target a whole document. A perfectly legitimate
+file may carry one property containing a person's data, and the lawful response is
+to remove that property's history while leaving the document intact.
+
+Erasure therefore needs two scopes:
+
+| Operation | Destroys |
+|---|---|
+| **File erasure** | content, all versions, the whole metadata value history, all derived data |
+| **Field erasure** | one metadata key's value history for one file; content and other fields untouched |
+
+Both record accountability, both propagate to services holding derived copies
+(§5.4.5) — a field-level erasure still has to reach csai, whose index will hold
+the property value once shape-catalog properties become searchable — and both are
+covered by the reconciliation sweep (§5.4.6).
+
+> **Cross-document amendment.** `PROPOSAL_metadata_change_events.md` must gain
+> value redaction as an operation on the log, alongside the cull it already
+> defines. Its §1.1 amendment (culling *and erasure*) already anticipates a second
+> destructive operation; this specifies what erasure means for that subsystem —
+> values destroyed, trace retained, structure intact.
+
 #### 5.4.2 Derived data is the hard part
 
 An erasure that clears only core storage is a **false guarantee**, because the
@@ -661,7 +716,8 @@ content exists in derived form across the platform:
 
 | Holder | What it retains of the content |
 |---|---|
-| **csai** | extracted text, chunk contents, vector embeddings, search index entries |
+| **csai** | extracted text, chunk contents, vector embeddings, search index entries — **and metadata property values**, once shape-catalog properties become searchable |
+| **cmis adapter** | its own property store keyed `(tenant, uid, version)`; checkin comments are free text and can carry party data |
 | **Renditions / markup** | rendered page images, thumbnails, previews — hidden children under the file uid |
 | **convert / ONLYOFFICE output** | converted document copies |
 | **difference_service** | comparison manifests |
@@ -1202,6 +1258,14 @@ tenant-scoped record would destroy itself.
       from an accountability row leaves the chain verifying end to end, reports
       that row as redacted rather than corrupt, and writes its own accountability
       record.
+    - **Metadata history is purged, not just current values (§5.4.1):** after
+      erasing a file whose property was set, changed and deleted over time, no
+      query — including `GetAllMetadataAt` at any instant and
+      `ListMetadataVersions` — returns any of those values, while the trace
+      (`seq`, `ts`, `actor`, `key`, operation) remains.
+    - **Field erasure is scoped:** erasing one property's history leaves the
+      file's content and its other properties intact, and still reaches csai's
+      index.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
