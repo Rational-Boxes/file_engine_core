@@ -602,11 +602,21 @@ twice.
 
 ### 5.4 True delete (erasure) — the second destructive operation
 
-Contracts and data-protection policy require the ability to **completely purge an
-external party's data**: a business engagement ends, and the agreement obliges
-technical destruction, not archival. Culling cannot serve this — it compacts
-*history* while preserving current state, which is the opposite of what a purge
-obligation asks for.
+**This is a compliance capability, not a convenience.** EU data-protection law
+grants a right to erasure, and a system that *cannot technically remove a
+specific piece of data* cannot satisfy it — the inability is itself the
+violation, independent of whether anyone ever asks. Contracts add their own
+purge obligations on top, but the legal floor is what makes erasure
+non-optional: a document platform without it is unshippable into the EU
+regardless of what its customers ask for.
+
+Culling cannot serve this. It compacts *history* while preserving current
+state — the opposite of what an erasure obligation asks for.
+
+> This document describes the engineering shape that makes the obligation
+> satisfiable. Whether a given deployment complies is a legal determination
+> involving retention justifications and exemptions, not an engineering one, and
+> nothing here should be read as making that determination.
 
 So the platform needs a second destructive operation, with a different shape:
 
@@ -704,15 +714,34 @@ Two findings from the code, one of which contradicts the documentation:
   takes a key per stream).
 
 That second point matters because of what deletion cannot reach: **backups,
-snapshots and replicas.** Deleting live objects does not erase a file from last
-night's dump or a replicated bucket, and backup retention is exactly what a purge
-obligation collides with. The honest options are a re-erasure list applied after
-any restore, backup retention short enough to satisfy the contract, or
-crypto-shredding — which is the only one that erases from media you cannot
-rewrite, and the reason per-file keys are worth considering as follow-on work.
+snapshots, replicas, and any storage configured to be immutable.**
 
-**v1 should implement direct deletion and state the backup limitation plainly**
-rather than implying a completeness it does not have.
+Two cases, with genuinely different answers:
+
+**Backups and snapshots — solvable, and already solved here.** Deleting live
+objects does not erase a file from last night's dump. The generally accepted
+regulatory position is that backups need not be rewritten on demand, provided the
+data is put beyond use and **cannot return to production** — which is exactly what
+§5.4.6's full-from-zero reconciliation sweep provides: restore, then re-purge
+before the data becomes usable. That is not a limitation to disclose apologetically;
+it is the recognised mitigation, and the design already implements it.
+
+**Immutable media — not solvable by deletion, at all.** Object-lock or
+compliance-mode buckets, WORM archives and write-once tape cannot be rewritten
+until their retention expires, by design. No delete call helps. The only
+mechanism that erases from media you cannot rewrite is **crypto-shredding**:
+encrypt each file under its own key and destroy the key, leaving ciphertext that
+is not data about anyone.
+
+That elevates per-file keys from a nice-to-have to **the prerequisite for
+compliance-grade erasure on immutable storage**. The primitives already exist —
+`EncryptStream` takes a key per stream — but the storage layer wires in a
+deployment-wide `bool encrypt_data` instead, so the capability is absent today.
+
+**Recommendation:** v1 implements direct deletion, which covers live storage and,
+with the sweep, backups. **Deployments on immutable or WORM storage must not be
+told erasure works for them until per-file keys land** — that is a false
+compliance claim, and the worst possible thing to be wrong about here.
 
 #### 5.4.5 The erasure event, and how services honour it
 
@@ -841,7 +870,48 @@ doing it — the same shape as a drain that exits 0 and appears to have shut dow
 cleanly. Each service should expose the timestamp of its last successful sweep,
 and a stale value should alarm. An unmonitored backstop is not a backstop.
 
-#### 5.4.7 Tenant-scale erasure
+#### 5.4.7 Erasing personal data from the record itself
+
+This proposal creates a conflict it must also resolve. The accountability record
+is deliberately **immutable, hash-chained and never culled** — and it contains
+personal data: `actor`, `actor_roles`, `source_addr` (a client IP), and free-text
+`detail`. The retained skeletal record after a file erasure carries the same, plus
+possibly the filename (§5.4.1).
+
+So a right-to-erasure request aimed at a *person* rather than a *file* lands on
+exactly the structure designed to be unerasable.
+
+Audit records commonly have a retention justification — a legal obligation to
+keep them, or the establishment and defence of legal claims — and that may well
+cover this log. But **"the chain makes it technically impossible" is not a
+justification**, it is the failure mode the user's point identifies. The system
+must be *able* to redact; whether it should in a given case is a separate
+question with a separate answer.
+
+**Design for redaction without breaking the chain.** A naive redaction destroys
+verifiability: change the payload and its hash no longer recomputes, so the chain
+fails from that point on. The fix is to make redaction a first-class operation:
+
+- Each row's stored `hash` is retained as the chain link, **and the link is what
+  the next row chains from** — so replacing a payload never breaks continuity.
+- The payload is overwritten with a redaction tombstone naming what was removed
+  and under what authority.
+- Verification then reports the row as *redacted*: the chain is intact and the
+  row's own content is no longer verifiable — which is the honest and correct
+  result, not a failure.
+- The redaction is itself an accountability record, so removing evidence is
+  recorded evidence.
+
+The alternative — pseudonymising actors up front, storing an opaque subject id
+resolvable through a separate mapping that can be destroyed — is cleaner
+cryptographically but degrades every routine audit query into a join, and moves
+the erasure problem into the mapping rather than removing it.
+
+**Recommend building redaction-tolerant chaining from the start.** Retrofitting
+it means either rebuilding every chain or accepting a permanent break, and the
+choice determines whether the log can ever satisfy an erasure request at all.
+
+#### 5.4.8 Tenant-scale erasure
 
 The same operation at tenant scope is what makes §7.3's decision genuinely
 executable: `DROP SCHEMA CASCADE` destroys the core's copy, but a tenant erasure
@@ -866,9 +936,12 @@ tenant-scoped record would destroy itself.
   become append-only, but that is its own piece of work.
 - **Implementing erasure.** §5.4 defines what true delete must mean and what it
   must reach, because it changes the destruction rule this proposal depends on.
-  Building it — the core operation, the per-service erasure endpoints, the
+  Building it — the core operation, the per-service purge and sweep, the
   attestation job — is a separate effort, and the cross-service half is larger
-  than the core half.
+  than the core half. Given §5.4's regulatory framing it is also the highest
+  priority of the work this document implies: the accountability record improves
+  a guarantee the platform already partly makes, whereas erasure supplies a
+  capability it currently lacks entirely.
 - Retention/export tooling over the table (§5.2).
 
 ---
@@ -1125,6 +1198,10 @@ tenant-scoped record would destroy itself.
       case without any instruction being redelivered.
     - **The sweep is observable:** each service reports its last successful sweep
       time, and a stopped sweep alarms rather than appearing healthy.
+    - **Redaction preserves the chain (§5.4.7):** redacting a personal identifier
+      from an accountability row leaves the chain verifying end to end, reports
+      that row as redacted rather than corrupt, and writes its own accountability
+      record.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
