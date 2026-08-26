@@ -345,10 +345,11 @@ Two consequences worth being explicit about:
   one.
 - **Behaviour when the core is unreachable.** Recording a subsystem event without
   first draining would break the ordering guarantee, so the security sink must
-  **not** proceed — consistent with the platform's existing posture, where auth
-  events already fail closed if the audit path is unavailable. This does create a
-  dependency chain (subsystem → audit → core) whose failure behaviour should be
-  reviewed deliberately rather than inherited: see §7.8.
+  **not** proceed. This costs nothing in practice: a core outage already stops
+  the platform — feature services fail closed without the core, and the bridges
+  have nothing to serve — so there is no work being lost that the sink would
+  otherwise have recorded. **A core outage is intended to take the system down**
+  (§7.8), which makes blocking here consistent rather than costly.
 
 Consequence worth noting: polling is per tenant, so a deployment with many
 tenants makes many small queries per interval. A cheap `max(seq)` probe per
@@ -508,22 +509,38 @@ evidence, treating it as optional (§7.1) is much weaker than it first appeared.
    this table's scope, §4.1). So the WAL is not removed, only relieved of the
    accountability categories. Confirm that is the intended split rather than a
    staging post toward pulling everything.
-8. **The dependency chain §4.3.3 creates.** Making the core the ordering
-   authority means the security sink cannot record a subsystem event while the
-   core is unreachable, and several subsystems already fail closed when the audit
-   path is unavailable. Chained together that is
-   *core down → audit blocked → subsystems blocked*, turning a core outage into a
-   platform-wide write freeze.
+8. ~~**The dependency chain §4.3.3 creates.**~~ **Decided: a core outage should
+   take the platform down.** Every service depends on the core; there is no
+   useful work to preserve while it is unavailable.
 
-   That may be the correct posture for a system whose selling point is a
-   defensible record — but it should be **chosen**, not inherited by composition.
-   The alternatives worth weighing: let the sink buffer subsystem events
-   unrecorded and replay them once the core returns (preserves availability,
-   defers ordering); or record them into a quarantine region of the log that is
-   explicitly marked as unordered and reconciled later (preserves availability
-   and honesty, at the cost of a two-tier log). Recommend deciding this
-   explicitly before implementation, since it determines the platform's
-   behaviour during exactly the incidents the audit log exists to explain.
+   The concern as originally written here overstated the cost. It described the
+   precedence rule as *turning* a core outage into a platform-wide write freeze —
+   but the platform is already frozen in that situation, by design and
+   independently of anything proposed here. Feature services fail closed on an
+   unreachable core (csai's permission cache is explicitly fail-closed; the same
+   posture holds across the feature services), the bridges are pass-throughs with
+   nothing to serve, and no service can authorize a write without the core. The
+   audit dependency **aligns with an existing failure mode rather than adding
+   one**, so the alternatives previously sketched — buffer-and-replay, or a
+   quarantine region of the log — would buy availability that does not exist and
+   pay for it in ordering guarantees that do.
+
+   Three corollaries worth acting on, since this makes the posture explicit
+   rather than emergent:
+
+   - **Core availability *is* platform availability.** It is therefore the single
+     highest-leverage place to invest in resilience — which is what
+     `REPLICATION_FAILOVER.md` and the connection-router failover work already
+     address. Nothing else needs its own survive-the-core story.
+   - **Fail fast and legibly.** Dependent services should surface "core
+     unavailable" directly rather than degrading into scattered timeouts, and
+     their `/readyz` should reflect core reachability so load balancers drain
+     them instead of serving confusing partial failures.
+   - **Do not build cleverness against it.** A service that tried to keep
+     accepting work during a core outage would be manufacturing exactly the
+     unordered, unverifiable records §4.3.3 exists to prevent. This should be
+     stated in the architecture notes so the temptation is closed off rather than
+     re-litigated per service.
 
 ---
 
