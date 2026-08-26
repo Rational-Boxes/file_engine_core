@@ -155,7 +155,7 @@ transaction as the operation it describes**.
 ```sql
 CREATE TABLE accountability_record (
     seq          BIGINT PRIMARY KEY,         -- gap-free, commit-ordered; assigned under the chain lock (§5.3.2) — NOT a BIGSERIAL
-    ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ts           TIMESTAMPTZ NOT NULL,       -- microsecond; clock_timestamp() under the chain lock, strictly monotonic per tenant (§5.3.3). NOT now()
     actor        VARCHAR(255) NOT NULL,      -- never empty; "system" is explicit, not a default
     actor_roles  TEXT[],                     -- roles as presented at the time
     source_iface VARCHAR(32),                -- grpc | rest | webdav | cmis | …
@@ -238,11 +238,14 @@ operation ──┬─▶ commit (state + accountability_record, one transaction
             └─▶ Redis XADD (optional)                  ← latency hint only
 ```
 
-Each consumer keeps a per-tenant cursor over `seq`. Because `seq` is assigned
-under the chain lock (§5.3.2) rather than by a sequence generator, it is
-**gap-free and commit-ordered**: a cursor cannot skip a record, cannot observe
-one that was rolled back, and cannot be overtaken by a lower-numbered record
-committing later.
+Each consumer keeps a per-tenant **`recorded_until` timestamp** — the `ts` of the
+last record it appended to the audit chain — and fetches everything
+**newer than** it. Because `ts` is assigned under the chain lock and forced
+strictly monotonic per tenant (§5.3.3), a `ts > recorded_until` fetch is exact:
+it cannot skip a record, return one twice, observe one that was rolled back, or
+be overtaken by an earlier-stamped record committing later. `seq` travels with
+each record so the consumer can verify contiguity and chain linkage (§4.3.2),
+but the cursor itself is the timestamp.
 
 What this buys, beyond the guarantee itself:
 
@@ -287,9 +290,9 @@ core's own access control, and make any future schema change a cross-repo
 release.
 
 Instead the core exposes a pull endpoint — `ListAccountabilityRecords(tenant,
-after_seq, limit)` over the existing gRPC surface, or an `/internal` REST route
-alongside the monitoring listener — returning records in `seq` order with a
-`has_more` flag. The consumer advances its cursor only after its own durable
+newer_than_ts, limit)` over the existing gRPC surface, or an `/internal` REST
+route alongside the monitoring listener — returning records in `ts` order (which
+is also `seq` order) with a `has_more` flag. The consumer advances its cursor only after its own durable
 write, which makes redelivery-on-crash at-least-once; `(tenant, seq)` is the
 idempotency key, and `audit_service` already de-duplicates on a comparable key.
 
@@ -301,7 +304,8 @@ order:
 
 | Check | Break means |
 |---|---|
-| `seq` is contiguous from the cursor | A record is missing. Under §5.3.2 gaps cannot occur naturally, so this is an integrity alarm, not a retry |
+| `seq` is contiguous from the last seen | A record is missing. Under §5.3.2 gaps cannot occur naturally, so this is an integrity alarm, not a retry |
+| `ts` is strictly increasing across the batch | The monotonic guard (§5.3.3) failed, or rows were reordered in transit — the cursor's exactness no longer holds |
 | `prev_hash[n] == hash[n-1]` | The chain is broken or forked — tampering, or a write that bypassed the chain lock |
 | `hash[n]` recomputes from the row | The row was altered after commit |
 | The hint's asserted `seq` is present | Stale or lagging read (§4.3); retry, do **not** advance the cursor |
@@ -339,10 +343,18 @@ temporal order permanently — the chain cannot be re-sorted after the fact with
 rewriting it, which is precisely what a tamper-evident structure exists to
 prevent.
 
-So the core's gap-free, commit-ordered `seq` (§5.3.2) becomes the **anchor** the
-rest of the platform is sequenced against. Other subsystems have no equivalent
-guarantee; interleaving them against a source that does is what keeps the
-combined log meaningful.
+So the core becomes the **anchor** the rest of the platform is sequenced against.
+Other subsystems have no equivalent guarantee; interleaving them against a source
+that does is what keeps the combined log meaningful.
+
+This is also why the consumer's cursor is a **timestamp** rather than a sequence
+number (§4.3.1). The precedence question is *"are there core records older than
+this incoming subsystem event?"* — a comparison against the event's own time. A
+`seq` cursor answers "have I read everything the core has written", which is a
+weaker and differently-shaped question: it cannot be compared against an event
+from a subsystem that has no `seq`. Time is the only axis the sources share, so
+time is what the interleave runs on, and `recorded_until` is the watermark that
+makes it decidable.
 
 Two consequences worth being explicit about:
 
@@ -430,6 +442,7 @@ Derive both from one locked head row per tenant:
 CREATE TABLE accountability_chain_head (
     tenant     VARCHAR(255) PRIMARY KEY,
     last_seq   BIGINT NOT NULL DEFAULT 0,
+    last_ts    TIMESTAMPTZ,
     last_hash  BYTEA
 );
 ```
@@ -437,7 +450,8 @@ CREATE TABLE accountability_chain_head (
 Each accountability write, inside the operation's transaction:
 
 1. `SELECT ... FOR UPDATE` the tenant's head row — serializing appends per tenant.
-2. `seq = last_seq + 1`; `hash = H(last_hash ‖ canonical(row))`.
+2. `seq = last_seq + 1`; `ts = monotonic clock` (§5.3.3);
+   `hash = H(last_hash ‖ canonical(row))`.
 3. Insert the record; update the head.
 4. The lock releases at commit.
 
@@ -462,6 +476,42 @@ contention, and because they are one logical act.
 
 Given that the chain now carries the ordering guarantee and not merely tamper
 evidence, treating it as optional (§7.1) is much weaker than it first appeared.
+
+#### 5.3.3 The timestamp — high resolution, and strictly monotonic
+
+Every record carries a high-resolution timestamp, and **the same lock that orders
+the chain also orders the clock**. Three details make it correct rather than
+approximately correct:
+
+- **Use `clock_timestamp()`, not `now()`.** `now()` / `CURRENT_TIMESTAMP` /
+  `transaction_timestamp()` all return *transaction start* time, so every record
+  written in one transaction would share a timestamp taken before the lock was
+  even acquired — reintroducing exactly the ordering ambiguity §5.3.2 removes.
+  `clock_timestamp()` reads the wall clock at the moment of the call, which,
+  taken inside the lock, falls in lock order.
+- **Resolution is native.** PostgreSQL `timestamptz` stores microseconds, so no
+  special type is needed; microsecond granularity is what "high resolution" means
+  here, and it is fine enough that distinct records under a serializing lock do
+  not realistically collide.
+- **Enforce strict monotonicity anyway.** A clock can step backwards — NTP
+  correction, VM migration, a leap-second smear — and a non-monotonic timestamp
+  silently breaks any newer-than cursor. The head row therefore carries
+  `last_ts`, and the append takes
+  `ts = max(clock_timestamp(), last_ts + 1µs)`. Cheap, and it removes a whole
+  class of problem: within a tenant, `ts` is **strictly increasing**, no
+  duplicates, never backwards, regardless of what the system clock does.
+
+Strict monotonicity is what makes the consumer's cursor exact. Because no two
+records in a tenant share a `ts`, a `ts > recorded_until` fetch needs no
+composite key and no tiebreak, and can neither skip a record nor return one
+twice.
+
+`seq` and `ts` therefore have distinct, non-overlapping jobs, and both are kept:
+
+| | Job |
+|---|---|
+| `seq` | Chain linkage and **gap detection** — contiguity is what proves nothing was removed |
+| `ts` | The **consumer cursor**, and the axis on which core records interleave with other subsystems' events (§4.3.3) |
 
 ---
 
@@ -618,7 +668,7 @@ evidence, treating it as optional (§7.1) is much weaker than it first appeared.
 4. **Not bypassable by queue state:** with Redis unreachable for the whole test,
    every operation in (1) still produces a row and still succeeds. Further:
    - **Pull delivers what push could not** — `audit_service` receives every
-     record with Redis down throughout, polling by cursor from `after_seq`.
+     record with Redis down throughout, polling `ts > recorded_until`.
    - **Replay** — a consumer restarted with a reset cursor reproduces the full
      core history in `seq` order.
    - **Node loss** — records committed before a hard kill of the core process are
@@ -631,10 +681,16 @@ evidence, treating it as optional (§7.1) is much weaker than it first appeared.
 7. **Chain and ordering hold under concurrency.** With N writers issuing
    accountability operations against one tenant simultaneously:
    - `seq` is contiguous with no gaps and no duplicates.
-   - Commit order matches `seq` order — no record with a lower `seq` becomes
+   - `ts` is **strictly increasing** with no duplicates, and matches `seq` order.
+   - Commit order matches both — no record with a lower `seq`/`ts` becomes
      visible after a higher one.
    - The chain links cleanly end to end, with no fork.
-   - A cursor reader polling throughout observes every record exactly once.
+   - A consumer polling `ts > recorded_until` throughout observes every record
+     exactly once.
+   - **Clock hostility:** with the system clock stepped backwards mid-run, `ts`
+     still increases strictly and no record is skipped or duplicated — proving
+     the monotonic guard (§5.3.3), not merely the absence of NTP events during
+     the test.
 8. **Integrity breaks are raised, not absorbed.** Modifying a row, deleting one,
    or inserting one out of band is detected on the next consumer read; the
    consumer stops advancing that tenant's cursor and alarms rather than skipping
