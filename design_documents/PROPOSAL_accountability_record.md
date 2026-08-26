@@ -770,13 +770,78 @@ not be implemented uniformly.
 
 > **Restore resurrects derivatives.** Restoring a service from a backup taken
 > before an erasure reinstates the derived data the erasure destroyed, with no
-> event to re-trigger the purge. The unacknowledged-erasure pull is the natural
-> remedy — a restored service re-acknowledges from scratch — but it only works if
-> the core retains erasure records long enough to outlive any restorable backup.
-> That retention window is a deployment decision worth stating alongside the
-> backup limitation in §5.4.4.
+> event to re-trigger the purge. This is resolved by the reconciliation sweep
+> (§5.4.6) rather than by the pull: because erasure records are never culled and
+> the history is small, a restored service re-reads it **from zero** and re-purges
+> what it should not hold — no retention window to get wrong, and no dependence on
+> any instruction being redelivered.
 
-#### 5.4.6 Tenant-scale erasure
+#### 5.4.6 Reconciliation sweeps — the backstop
+
+The pull in §5.4.5 answers *"did I process every erasure instruction?"*. A
+reconciliation sweep answers a different and stronger question: *"does the
+derived data I hold correspond to content that still exists?"* — and it is the
+only mechanism that does not depend on the erasure instruction reaching the
+service at all.
+
+That difference matters, because the ack-pull cannot catch:
+
+| Failure | Why the pull misses it |
+|---|---|
+| A purge that was acknowledged but silently failed — a partial delete, a swallowed exception | The instruction *was* processed; the ack is a lie |
+| Derived data restored from a backup predating the erasure (§5.4.5) | The service already acked; nothing re-issues the instruction |
+| Orphans — derived data for a uid the service was never told about | There is no erasure record to pull |
+| A tombstone lost with the service's own state | Same |
+
+So erasure needs both, and they are complementary rather than redundant:
+**instruction-driven purge for promptness, state-driven reconciliation for
+eventual correctness.**
+
+**Sweep against the accountability table, not against current state.** The
+erasure history in that table is the guaranteed artefact — committed with the
+operation, gap-free and commit-ordered (§5.3.2), never culled (§5.2). Everything
+else a sweep could consult is weaker: the queue can drop, and a state query can
+mislead.
+
+That last point is worth being explicit about, because it is the intuitive design
+and it is wrong. Erasure retains a skeletal existence record (§5.4.1), so an
+erased uid still *exists* as an entity — a sweep asking "does this uid exist?"
+gets `true` and keeps the derived data, silently defeating the purge. Sweeping
+the erasure history sidesteps that entirely: it asks what was erased rather than
+what exists, and gets an authoritative answer.
+
+**This makes the sweep cheap, which is what makes it viable.** Sweeping a corpus
+is O(documents) — a million-document tenant means a million checks, so it gets
+run rarely, incrementally, or not at all. Sweeping the erasure history is
+**O(erasures)**, and erasures are rare by nature: a handful per tenant per year,
+not per day. The entire erasure history for a tenant is small enough to re-read
+**from zero**, regularly, without incremental bookkeeping.
+
+Practically, a service reads the tenant's erasure records — from its watermark
+for routine passes, from zero for a periodic full pass — intersects the uids with
+what it holds, and purges the overlap. It reuses the same pull endpoint and
+cursor mechanism as §4.3.1; there is no new query surface.
+
+The full-from-zero pass is what makes the backup-restore case (§5.4.5) resolve
+cleanly: a service restored from an old snapshot re-reads the whole erasure
+history and re-purges everything it should not have, with no dependence on
+retention windows or on any instruction being redelivered.
+
+**What this sweep does not cover.** It reconciles against *erasures*, so derived
+data for a uid that was never erased — an orphan from a bug, or an indexing race
+— is outside its scope. That is the forward direction of the existing obligation
+in EVENT_CONTRACT.md §7, which requires consumers to reconcile against FileEngine
+for content that exists and should be indexed. The two directions together are
+what make the derived corpus correct; erasure adds the second, and neither
+subsumes the other.
+
+**The sweep must itself be observable.** A reconciliation that silently stops
+running produces exactly the failure it exists to prevent, and looks healthy while
+doing it — the same shape as a drain that exits 0 and appears to have shut down
+cleanly. Each service should expose the timestamp of its last successful sweep,
+and a stale value should alarm. An unmonitored backstop is not a backstop.
+
+#### 5.4.7 Tenant-scale erasure
 
 The same operation at tenant scope is what makes §7.3's decision genuinely
 executable: `DROP SCHEMA CASCADE` destroys the core's copy, but a tenant erasure
@@ -1054,6 +1119,12 @@ tenant-scoped record would destroy itself.
     - **Late-write race:** an erasure issued while a conversion is in flight
       leaves no derived data behind once that job finishes — the local tombstone
       refuses the write.
+    - **Reconciliation catches what the instruction path cannot (§5.4.6):** a
+      service whose purge silently half-failed, and one restored from a backup
+      predating the erasure, both converge to purged after a sweep — the restored
+      case without any instruction being redelivered.
+    - **The sweep is observable:** each service reports its last successful sweep
+      time, and a stopped sweep alarms rather than appearing healthy.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
