@@ -410,11 +410,45 @@ Two further consequences worth being explicit about:
   otherwise have recorded. **A core outage is intended to take the system down**
   (§7.8), which makes blocking here consistent rather than costly.
 
-Consequence worth noting: polling is per tenant, so a deployment with many
-tenants makes many small queries per interval. A cheap `max(seq)` probe per
-tenant, or a single global "tenants with new records" query, keeps that from
-scaling badly. Not a v1 concern at alpha, but it should not be designed out of
-reach.
+#### 4.3.5 Tenancy — independent histories over one transport
+
+**Each tenant has an independent history.** The chain, the `seq`, the `ts`
+monotonicity, the `recorded_until` cursor and the drain-before-process rule are
+all *per tenant*. There is no global chain and no cross-tenant ordering
+guarantee, because there is no question that needs one: tenants are isolated
+by design, down to separate PostgreSQL schemas.
+
+The queue is shared, and that is a **transport decision, not a coupling**. Items
+are ownership-tagged — `AuditEntry` already carries `scope = Tenant` and the
+tenant id — and demultiplexed by the sink into per-tenant processing. One queue
+is chosen for performance and simplicity; it does not merge the histories any
+more than a shared network link does.
+
+This resolves the precedence rule (§4.3.3) to something much cheaper than it
+first sounds: an arriving event for tenant X requires draining **tenant X's**
+table, not everyone's. A busy tenant never gates a quiet one, and the sink's work
+per event is bounded by that tenant's backlog alone.
+
+It also means per-tenant polling is the **correct shape rather than an
+inefficiency to engineer around**. An earlier draft treated "many small queries
+per interval" as a scaling problem needing a global probe; it is simply what
+independent histories look like. Should the query count ever matter at scale, the
+fix is a cheap "tenants with records newer than their cursor" probe to skip idle
+tenants — an optimisation of *when* to poll, never a merging of the histories
+themselves.
+
+Two properties fall out of per-tenant chains that a global chain could not offer:
+
+- **A tenant's history can be verified and exported on its own**, without access
+  to any other tenant's records — which a single interleaved chain would make
+  impossible, since verification would require the entire chain.
+- **A tenant's history can be removed with the tenant**, cleanly. That is what
+  makes §7.3's export-before-`DROP SCHEMA` approach tractable.
+
+The shared queue's usual hazard — head-of-line blocking, one tenant's burst
+delaying another — is also defused by the pull design: the queue is a hint
+(§4.3), so a delayed or dropped item costs latency only, and the scheduled poll
+collects the records regardless.
 
 ---
 
@@ -743,7 +777,11 @@ twice.
 11. **The table is drained fully before a queue event is recorded (§4.3.4).**
     With a backlog of N pending core records and a subsystem event arriving, the
     chain contains all N ahead of that event — not a partial drain, and not the
-    event first.
+    event first. Scoped per tenant (§4.3.5):
+    - A backlog in tenant A does not delay recording for tenant B.
+    - An event for tenant X drains only X's table.
+    - Tenant A's chain verifies end to end with tenant B's records absent
+      entirely — the property a single interleaved chain could not provide.
 12. **Causal order is preserved end to end.** A grant, then an access permitted
     by that grant, appear in the chain in that order even when they originate
     from different sources — the property the §4.3.4 slack is argued not to
