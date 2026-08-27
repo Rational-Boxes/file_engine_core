@@ -110,8 +110,31 @@ demonstrates one.
 
 **Stored hashed, never plaintext.** The map holds
 `HMAC-SHA256(secret, pepper)`, following the pattern `ldap_manager` already uses
-for user service credentials, with constant-time comparison. A read of the core's
-config or database yields no usable token.
+for user service credentials, with constant-time comparison. The row is readable,
+but the secret is not in it — a database dump yields no usable token.
+
+#### Why a fast MAC is enough, and the condition it depends on
+
+Password hashing normally demands a deliberately slow KDF (bcrypt, argon2)
+because human-chosen passwords have little entropy and a fast hash can be
+brute-forced. That reasoning does not apply here, and `ldap_manager` already
+states why:
+
+> *"The server pepper defends a bare DB read; a fast MAC is sufficient for a
+> full-entropy secret."* — `service_cred.py`
+
+The secret half is **256 bits of machine-generated randomness** (§3.3). There is
+no dictionary to run and no candidate space to search, so slowing the hash buys
+nothing. The pepper defends the narrower case of an attacker who has the dump
+*and* candidate secrets to verify — belt-and-braces at this entropy, and the
+reason it must live outside the database (§3.5).
+
+> **The guardrail this rests on: service tokens are always *generated*, never
+> chosen.** The moment any path lets an operator type a memorable token, the
+> entropy assumption fails and HMAC stops being sufficient — quietly, with no
+> visible change, because the stored value looks identical. If hand-chosen tokens
+> are ever wanted, the storage must move to a slow KDF at the same time. Better
+> to keep generation the only path.
 
 #### Lookup direction
 
@@ -758,6 +781,10 @@ every subsequent step measurable.
     - The CLI **refuses to run against a world-readable secret file**, and the
       packaging installs it non-world-readable.
 11. Comparison is constant-time, and the core stores no plaintext secret.
+    Guardrail (§3.3): **no code path accepts an operator-supplied service
+    token** — issuing one always generates 256 bits, so the entropy assumption
+    that makes a fast MAC sufficient cannot be weakened by a convenience feature
+    added later.
 12. **The map resolves the source correctly:** each service's token yields that
     service's name and no other, and a token whose secret half is altered by one
     character resolves to nothing rather than to a neighbouring entry.
