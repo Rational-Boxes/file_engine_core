@@ -1120,10 +1120,15 @@ How well it currently holds depends entirely on how the platform is deployed:
 | Bare metal / systemd (the `.deb`, `.rpm`, `PKGBUILD` and Ansible paths) | Defaulted to **`0.0.0.0`** in both `config_loader.h` and the shipped `core.conf`, with `InsecureServerCredentials()` | **Was a host-firewall dependency; now fixed** — see below |
 
 As found, the invariant was enforced by **deployment topology, not by the
-application**: adequate in containers, fragile everywhere else. It was the same
-shape as the known monitoring-listener exposure, where the REST monitor defaults
-to `0.0.0.0:8081` and is left to per-deployment verification — that one remains
-outstanding and is out of scope here.
+application**: adequate in containers, fragile everywhere else.
+
+> The monitoring listener was checked expecting the same problem, and does not
+> have it. `http_metrics_addr` has defaulted to `127.0.0.1` since the L2 security
+> review, `core.conf` does not set it, no compose file publishes `8081`, and the
+> Ansible role leaves the default. `CLAUDE.md` claimed it defaulted to `0.0.0.0`
+> and was "a known exposure to verify per deployment" — stale, and misleading in
+> the dangerous direction, since it invited someone to widen a correct bind to
+> match the documentation. Corrected on `security/grpc-loopback-default`.
 
 **Done — the default is now loopback.** Implemented on
 `security/grpc-loopback-default` (core) and `security/grpc-explicit-bind`
