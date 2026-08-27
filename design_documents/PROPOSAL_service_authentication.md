@@ -412,7 +412,80 @@ looser "code for destructive operations, config for the rest" in §8.4.
 
 ---
 
-## 7. Rollout
+## 6.5 The end user's IP — already built, one door short
+
+Recording the *external* client's address, rather than the internal peer, is the
+natural companion to `source_iface`. Together the three fields answer the whole
+question:
+
+| Field | Answers | State |
+|---|---|---|
+| `actor` | **who** | works |
+| `source_iface` | **through which door** | exists but hardcoded `"grpc"` (§2) |
+| `source_addr` | **from where** | **works** — see below |
+
+**This is already implemented.** `AuthenticationContext.source_addr` (proto field
+5) is documented as *"client IP forwarded by the bridge (audit)"*, and it flows
+end to end: the caller sets it, the core lifts it into `t_audit_source_`, and the
+audit entry carries it.
+
+The doors populate it from a **trusted-proxy-aware** resolver rather than the raw
+peer, which is the part that makes it trustworthy:
+
+| Door | Populates `source_addr` |
+|---|---|
+| `http_bridge` | ✅ `http_server.cpp:568`, from `clientIp(req)` |
+| `webdav_bridge` | ✅ `webdav_server.cpp:230`, `:368`, via `resolveRequestIp(request, trusted_proxies)` |
+| `mcp`, `csai`, `discussion`, `share`, `folder_actions` | ✅ via the Python SDK's `source_addr` parameter |
+| **`bcf_services`** | ❌ **the gap** |
+
+`bcf_services` is a genuine external door (BCF-API, OAuth/Bearer) and **has** the
+client address to hand — `auth.py:167` and `app.py:83` both read
+`request.client.host` — but never forwards it, and sets no `X-Forwarded-For` on
+its upstream calls either. So for BCF traffic the audit trail records an internal
+address, or nothing.
+
+That is the whole of the work: **fix one service, not build a mechanism.**
+
+### 6.5.1 Chained doors lose it silently
+
+The `bcf_services` case generalises. Whenever one service fronts another, the end
+user's address survives only if it is deliberately propagated — either in
+`source_addr` when calling the core directly, or as `X-Forwarded-For` when
+calling through a bridge that resolves it. A hop that forgets does not error; it
+simply substitutes its own container address, and the audit trail quietly becomes
+less true.
+
+Worth a note in `EVENT_CONTRACT.md` or the bridge developer docs, since it is the
+kind of thing each new door has to be told once.
+
+### 6.5.2 Empty is correct, and must stay correct
+
+`source_addr` is **optional and legitimately empty**. Plenty of core traffic
+originates from event-driven internal work — `folder_actions` reacting to a
+`file.created`, csai indexing, `difference` generating a comparison — where there
+is no external user and no address to record. Empty means "not user-initiated",
+which is itself information.
+
+So it must never be validated as required, and an empty value must not be treated
+as a defect to be "fixed" by substituting the peer address. Doing so would
+manufacture a plausible-looking external origin for work no external user asked
+for — worse than the blank it replaced.
+
+### 6.5.3 Why it stays in the message, not a metadata header
+
+The service token goes in call metadata (§3.1); `source_addr` stays in
+`AuthenticationContext`. That is a principled split rather than an
+inconsistency:
+
+- The **token** describes the *connection* — which service is speaking, stable
+  across every call it makes.
+- **`source_addr`** describes *this request's end user*, exactly like `user`,
+  `roles` and `tenant`, and belongs with them.
+
+Splitting one request's identity across two transports invites the state where a
+call carries a user but not their origin, or vice versa. And it already works
+where it is — moving it would be churn against a live audit path for no gain.
 
 This touches every caller, so sequencing matters more than usual.
 
@@ -500,3 +573,8 @@ every subsequent step measurable.
 12. **The map resolves the source correctly:** each service's token yields that
     service's name and no other, and a token whose secret half is altered by one
     character resolves to nothing rather than to a neighbouring entry.
+13. **End-user origin survives every external door (§6.5).** A request through
+    `bcf_services` records the caller's real address, not an internal one — the
+    one door currently missing it. And an event-driven internal call records an
+    **empty** `source_addr` rather than a substituted peer address, so
+    "not user-initiated" stays distinguishable from "user at 10.0.0.4".
