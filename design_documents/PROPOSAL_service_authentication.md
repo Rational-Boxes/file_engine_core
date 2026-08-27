@@ -121,15 +121,47 @@ worth making deliberately:
 | | Mechanism | Assessment |
 |---|---|---|
 | **Scan** | Compare the presented secret's hash against every entry | Simple, and trivial at ~13 services. But it is O(N) per RPC on the hot path, and every miss costs a full sweep |
-| **Prefixed token** (recommended) | Token is `<service_id>.<secret>`; look up by `service_id`, then verify the secret half | O(1), and mirrors the platform's existing `fesk_`/`fesks_` shape where a public key id accompanies a secret |
+| **Prefixed token** ✅ **chosen** | Token carries the `service_id`; look up by it, then verify the secret half | O(1), and mirrors the platform's existing `fesk_`/`fesks_` shape where a public key id accompanies a secret |
 
-The prefixed form is recommended: constant-time lookup, no per-call sweep, and it
-matches a credential shape already in use in-house. The trade is that a stolen
-token reveals which service it belongs to — which is not secret information, and
-is knowable from the traffic anyway.
+**Decided: the prefixed form.** Constant-time lookup, no per-call sweep on the
+hot path, and it matches a credential shape already in use in-house. The trade is
+that a stolen token reveals which service it belongs to — not secret information,
+and knowable from the traffic anyway.
 
-Either way the **verification** of the secret half stays constant-time; only the
-lookup is indexed.
+#### Token format
+
+```
+fesvc_<service_id>.<secret>
+└──┬─┘ └────┬────┘ └──┬──┘
+   │        │         └─ 256 bits, URL-safe base64
+   │        └─ indexes the map: http_bridge, cmis, audit_service, …
+   └─ scannable prefix
+```
+
+Three details, each with a reason:
+
+- **`fesvc_` prefix.** Not decoration — the platform already uses distinctive
+  prefixes (`fesk_`, `fesks_`) specifically *"so leaked-credential scanners can
+  flag exposure"*. A token pasted into a ticket, committed to a repository or
+  echoed into a log becomes greppable by gitleaks and equivalents. This one marks
+  an internal **svc** credential, distinct from the user-facing ones.
+- **`.` as the separator, not `_`.** Service ids already contain underscores —
+  `http_bridge`, `webdav_bridge`, `folder_actions` — so an underscore separator
+  is ambiguous to parse. Dots do not appear in service ids, so splitting on the
+  first `.` after the prefix is unambiguous.
+- **256-bit secret half**, URL-safe base64, matching `token_urlsafe(32)` as
+  already used for the user service credentials.
+
+Verification: strip the prefix, split on the first `.`, index the map by
+`service_id`, then **constant-time compare** the HMAC of the secret half. Only
+the lookup is indexed; the comparison never short-circuits.
+
+> **Do not let an unknown service id fail faster than a bad secret.** If a
+> nonexistent id returns immediately while a real one runs a full comparison, the
+> timing difference enumerates valid service names. Perform a dummy comparison on
+> the miss path so both cost the same. The value of that enumeration is admittedly
+> low — service names are guessable — but the mitigation is a few lines, and
+> "cheap enough to just do" is the right threshold for this kind of leak.
 
 ### 3.4 Rotation must overlap
 
@@ -606,6 +638,13 @@ every subsequent step measurable.
 12. **The map resolves the source correctly:** each service's token yields that
     service's name and no other, and a token whose secret half is altered by one
     character resolves to nothing rather than to a neighbouring entry.
+    Format-specific (§3.3):
+    - A token for a service id containing an underscore (`http_bridge`) parses
+      correctly — the separator is the first `.`, not the first `_`.
+    - A malformed token (no prefix, no separator, empty secret half) is rejected
+      rather than parsed into a partial match.
+    - An **unknown service id costs the same time as a valid id with a wrong
+      secret**, so timing does not enumerate service names.
 13. **End-user origin survives every external door (§6.5).** A request through
     `bcf_services` records the caller's real address, not an internal one — the
     one door currently missing it. And an event-driven internal call records an
