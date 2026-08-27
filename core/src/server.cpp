@@ -19,6 +19,7 @@
 #include <thread>
 #include "fileengine/rpc_interceptor.h"
 #include "fileengine/service_auth_interceptor.h"
+#include "fileengine/bootstrap_listener.h"
 #include <signal.h>
 #include <csignal>
 #include <cstdlib>
@@ -358,6 +359,41 @@ int main(int argc, char** argv) {
         std::make_unique<fileengine::ServiceAuthInterceptorFactory>(
             database.get(), service_auth));
     builder.experimental().SetInterceptorCreators(std::move(interceptors));
+
+    // One-shot enrolment (PROPOSAL_service_authentication.md §3.6).
+    //
+    // Started ONLY when bootstrap is incomplete, so on an established system the
+    // socket is never created and the surface is absent rather than merely
+    // closed. The completion marker is deliberately separate from "are there
+    // rows in the map" — conditioning on emptiness would reopen the path for
+    // anyone who can delete rows, turning a one-shot into a permanent back door.
+    std::unique_ptr<fileengine::BootstrapListener> bootstrap;
+    {
+        auto complete = database->service_bootstrap_complete();
+        if (!complete.success) {
+            // Fail closed. If we cannot tell whether bootstrap has been used,
+            // do NOT open the socket: guessing the other way opens an
+            // unauthenticated credential-minting path on a database hiccup.
+            fileengine::ServerLogger::getInstance().security(
+                "Bootstrap", "Could not determine bootstrap state; the enrolment socket "
+                             "will NOT be opened: " + complete.error);
+        } else if (!complete.value) {
+            fileengine::BootstrapConfig bootstrap_config;
+            bootstrap_config.socket_path    = config.bootstrap_socket_path;
+            bootstrap_config.pepper         = config.service_token_pepper;
+            bootstrap_config.pepper_version = config.service_token_pepper_version;
+            if (!bootstrap_config.pepper.empty()) {
+                bootstrap = std::make_unique<fileengine::BootstrapListener>(
+                    database.get(), bootstrap_config);
+                bootstrap->start();
+            } else {
+                fileengine::ServerLogger::getInstance().security(
+                    "Bootstrap", "Bootstrap is incomplete but no pepper is configured, so "
+                                 "no credential could be hashed — the enrolment socket is "
+                                 "not opened. Set FILEENGINE_SERVICE_TOKEN_PEPPER.");
+            }
+        }
+    }
 
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
     if (!server) {

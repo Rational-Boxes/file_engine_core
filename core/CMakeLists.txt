@@ -171,6 +171,7 @@ add_library(fileengine_core SHARED
     src/accountability.cpp     # Guaranteed accountability record: canonical form + chain
     src/service_credential.cpp # Per-service gRPC credentials + capability definitions
     src/service_auth_interceptor.cpp # Authenticate the caller; gate the method
+    src/bootstrap_listener.cpp # One-shot credential enrolment over a Unix socket
     src/audit_entry.cpp        # Audit record model + envelope JSON (§4)
     src/audit_sink_factory.cpp # Builds the durable audit sink (or a null sink)
 )

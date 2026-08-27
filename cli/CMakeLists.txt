@@ -29,6 +29,7 @@ set(PROTO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/../core/generated)
 # Add the CLI executable
 add_executable(fileengine_cli
         src/fileengine_cli.cpp
+    src/service_admin.cpp
 )
 
 # Include directories
@@ -76,7 +77,8 @@ install(TARGETS fileengine_cli
 option(BUILD_STATIC_CLI "Also build a statically-linked fileengine_cli_static" OFF)
 
 if(BUILD_STATIC_CLI)
-    add_executable(fileengine_cli_static src/fileengine_cli.cpp)
+    add_executable(fileengine_cli_static src/fileengine_cli.cpp
+    src/service_admin.cpp)
 
     target_include_directories(fileengine_cli_static PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/../core/include

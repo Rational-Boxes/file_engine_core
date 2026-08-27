@@ -409,6 +409,8 @@ Config ConfigLoader::load_from_env() {
     if (!env_value.empty()) config.service_token_pepper_version = std::stoi(env_value);
     env_value = get_env_var("FILEENGINE_SERVICE_MAP_CACHE_TTL", "");
     if (!env_value.empty()) config.service_map_cache_ttl_seconds = std::stoi(env_value);
+    env_value = get_env_var("FILEENGINE_BOOTSTRAP_SOCKET", "");
+    if (!env_value.empty()) config.bootstrap_socket_path = env_value;
 
     env_value = get_env_var("FILEENGINE_LOG_TO_FILE", "");
     if (!env_value.empty()) config.log_to_file = (env_value == "true");

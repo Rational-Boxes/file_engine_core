@@ -71,6 +71,10 @@ struct Config {
     // service or finishing a rotation takes effect without a core restart; a
     // long cache would hand that back.
     int service_map_cache_ttl_seconds = 30;
+    // Where the one-shot enrolment socket is created, and only while bootstrap
+    // is incomplete. In containers this must be a volume shared with whatever
+    // runs the enrolment, or the init has no way to reach it.
+    std::string bootstrap_socket_path = "/run/fileengine/bootstrap.sock";
 
     // Server configuration
     //
