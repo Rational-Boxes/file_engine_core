@@ -1117,24 +1117,37 @@ How well it currently holds depends entirely on how the platform is deployed:
 | Deployment | Enforcement | Assessment |
 |---|---|---|
 | `docker_unified` | The `core` service publishes **no ports**; peers reach it as `FILEENGINE_GRPC_HOST: core` over the compose network | **Holds.** Verified — there is no `50051:` host publish anywhere in the stack |
-| Bare metal / systemd (the `.deb`, `.rpm`, `PKGBUILD` and Ansible paths) | `server_address` defaults to **`0.0.0.0`** (`config_loader.h:54`) with `InsecureServerCredentials()` | **Depends on a host firewall.** The process itself listens on every interface |
+| Bare metal / systemd (the `.deb`, `.rpm`, `PKGBUILD` and Ansible paths) | Defaulted to **`0.0.0.0`** in both `config_loader.h` and the shipped `core.conf`, with `InsecureServerCredentials()` | **Was a host-firewall dependency; now fixed** — see below |
 
-So the invariant is enforced by **deployment topology, not by the application**.
-That is adequate in containers and fragile everywhere else — the same shape as
-the known monitoring-listener exposure, where the core's REST monitor defaults to
-`0.0.0.0:8081` and is left to be verified per deployment.
+As found, the invariant was enforced by **deployment topology, not by the
+application**: adequate in containers, fragile everywhere else. It was the same
+shape as the known monitoring-listener exposure, where the REST monitor defaults
+to `0.0.0.0:8081` and is left to per-deployment verification — that one remains
+outstanding and is out of scope here.
 
-Two changes make the safe case the default rather than the careful one:
+**Done — the default is now loopback.** Implemented on
+`security/grpc-loopback-default` (core) and `security/grpc-explicit-bind`
+(`docker_unified`):
 
-- **Default `server_address` to `127.0.0.1`**, requiring an explicit opt-in to
-  bind wider. Containers set `0.0.0.0` deliberately — they must, to be reachable
-  across the compose network, and there the network provides the isolation — while
-  a bare-metal install stops listening to the world by accident. This inverts the
-  failure mode: today, forgetting the firewall exposes the system; afterwards,
-  forgetting the config merely breaks connectivity, which is discovered
-  immediately.
-- **Firewall the port explicitly in the Ansible deploy**, rather than relying on
-  whatever the host happens to have.
+- `server_address` defaults to `127.0.0.1`, requiring explicit opt-in to bind
+  wider. This inverts the failure mode: previously, forgetting the firewall
+  exposed the port silently; now, forgetting to widen the bind breaks
+  connectivity immediately and visibly.
+- **`core.conf` had to change too**, and this was the part that mattered. It
+  shipped `FILEENGINE_GRPC_HOST=0.0.0.0` and is what the packaged systemd path
+  installs to `/etc/fileengine/core.conf` — so changing the code default alone
+  would have left the bare-metal deployment, the one actually at risk,
+  completely unaffected.
+- The compose stack sets `FILEENGINE_GRPC_HOST: "0.0.0.0"` explicitly on the
+  `core` service, where the network supplies the isolation instead. Verified
+  across all three compose files: the base declares no `ports` for core, the test
+  overlay adds none, and the external-data overlay overrides only `depends_on`.
+- The Ansible `fileengine_core` role **already** set `0.0.0.0` explicitly, so
+  that path needed no change and is unaffected.
+
+Still worth doing: **firewall the port explicitly in the Ansible deploy**, rather
+than relying on whatever the host happens to have. The loopback default makes
+that belt-and-braces rather than load-bearing.
 
 > **Worth considering, not required: mTLS on gRPC.** The channel currently uses
 > `InsecureServerCredentials()`, so "the caller is a trusted bridge" is a claim
