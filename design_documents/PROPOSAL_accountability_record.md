@@ -1,7 +1,7 @@
 # Proposal: a guaranteed accountability record in the core
 
 **Status:** Draft / research — for review
-**Branch:** `design/accountability-record` (file_engine_core)
+**Branch:** `feat/accountability-record` (file_engine_core)
 **Author:** follows the subsystem parity sweep prompted by `PROPOSAL_metadata_change_events.md` (2026-08-26)
 **Scope:** `file_engine_core` (schema + service layer); `audit_service` (consumer, unchanged contract)
 
@@ -41,6 +41,24 @@ never culled — and **delivered by pull rather than push**: `audit_service` rea
 forward from a cursor over the table instead of depending on a queue (§4.3). The
 table is a transactional outbox, so no broker outage, outbox overflow or lost
 node can lose a record, and a consumer can replay core history from zero.
+
+### The document has a second half
+
+§5.4 addresses a capability the platform lacks entirely: **true delete**. EU
+data-protection law grants a right to erasure, and a system that cannot
+technically remove a specific piece of data cannot satisfy it — the inability is
+itself the violation. Contracts add their own purge obligations on top.
+
+That belongs here rather than in a separate document because it **changes the
+rule this proposal depends on.** §1.1 states that culling is the only permissible
+destructive operation; erasure makes it two, and the accountability record is
+what makes the second one defensible — an irreversible, legally-motivated
+destruction that leaves no attributable trace would be worse than not offering it.
+
+The two halves also size differently. The accountability record improves a
+guarantee the platform already partly makes; erasure supplies one it does not
+have at all, and its cross-service half (§5.4.2) is larger than its core half.
+**If only one is built, build erasure.**
 
 ---
 
@@ -195,8 +213,17 @@ versioned home of its own**:
 | ACL grant / revoke | content writes | the version series already records who and when |
 | Role create / delete / assign / remove | metadata writes | the metadata log will (its own proposal) |
 | Version culls, metadata culls | reads | volume; the audit sink samples these by design |
-| Tenant create / delete | listings, stats | no accountability content |
-| Hard deletes, if any are ever added | | |
+| **Erasures** — file, field and tenant (§5.4) | listings, stats | no accountability content |
+| Tenant create / delete | | |
+| **Service-credential lifecycle** — issue, rotate, prune, revoke, pepper rotation, capability grant/revoke | | |
+
+The last row comes from `PROPOSAL_service_authentication.md` §3.6, which makes
+each of those a record written in the same transaction as the change. They fit
+this scope rule exactly: security-relevant, needing a guaranteed record, with no
+versioned home of their own. Two constraints ride with them — the record must
+never contain the credential itself (§5.4.7's payload rule applies with unusual
+force there), and it names the **operator**, not the `cli` identity that carried
+the call.
 
 **The organising rule: an operation belongs here if it is security-relevant and
 needs a guaranteed, chained, never-culled record — not merely because it lacks a
@@ -1500,7 +1527,7 @@ that belt-and-braces rather than load-bearing.
       name and property values and finding neither.
     - **`detail` cannot carry content:** an attempt to record an unenumerated
       field for an action is rejected by the schema rather than stored.
-16. **Erasure is gated (§5.4.9).**
+15. **Erasure is gated (§5.4.9).**
     - A `system_admin` can erase — the superuser holds every permission.
     - A **`tenant_admin` cannot**, until `ERASE` is explicitly granted; the same
       holds for `CULL_VERSIONS`, closing the gap between the proto's
@@ -1513,7 +1540,7 @@ that belt-and-braces rather than load-bearing.
       host publish in the container stack, and a bare-metal install binds
       loopback unless explicitly configured otherwise. Checked as a deployment
       test, since this is the invariant every permission decision rests on.
-15. **Tenant destruction is total but not silent (§7.3).** After deleting a
+16. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
       tenant's chain still verifies end to end.
@@ -1523,5 +1550,5 @@ that belt-and-braces rather than load-bearing.
       retained records for it — keeping the lifecycle entry.
     - Creating a tenant with the same name afterwards starts a fresh chain and
       does not resurrect or splice onto the old one.
-8. A load check confirming the synchronous write is not on a hot path — a
+17. A load check confirming the synchronous write is not on a hot path — a
    content read/write benchmark is unchanged, because neither is in scope (§4.1).
