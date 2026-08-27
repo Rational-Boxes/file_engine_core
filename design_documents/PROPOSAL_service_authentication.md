@@ -416,6 +416,51 @@ accountability record for issuing a credential names an administrator. Attributi
 every administrative action to `cli` would make the record technically complete
 and practically useless.
 
+#### Every credential change is a recorded event
+
+Credential lifecycle is exactly the class of act
+`PROPOSAL_accountability_record.md` exists to capture — it changes who can speak
+to the core at all — so each operation writes an accountability record in the
+**same transaction** as the map change (§4.2 there). If the record cannot be
+written, the credential change does not happen.
+
+| Event | Category | Written when |
+|---|---|---|
+| `service_token.issued` | `identity` | a service identity gains its first credential |
+| `service_token.rotated` | `identity` | a second secret is added alongside the current one |
+| `service_token.pruned` | `identity` | the superseded secret is removed after rollout |
+| `service_token.revoked` | `identity` | a credential is invalidated |
+| `pepper.rotation_started` / `…_completed` | `identity` | the map-wide re-key begins / finishes |
+| `service_capability.narrowed` | `authorization` | configuration subtracts a capability (§6.4) |
+
+`identity` rather than `authorization` for the token events: what a service *may
+do* lives in code and does not change here (§6.4). What changes is what it can
+*prove it is*.
+
+**Record the decision, not the mechanics.** Pepper rotation migrates rows
+opportunistically as services authenticate (§3.5), and emitting an event per
+row would produce one record per service per rotation — noise that buries the two
+records anyone actually wants. Start and completion are the administrative acts;
+the migration in between is bookkeeping.
+
+> **The record must never contain the credential.** Not the secret, not its hash,
+> not the pepper. This follows the rule in `PROPOSAL_accountability_record.md`
+> §5.4.7 — the chain carries identifiers and structure, never payload — and the
+> failure here would be the sharpest possible version of it: a tamper-evident,
+> never-culled, permanently-retained log containing every service secret ever
+> issued. Record the `service_id`, the action, the operator and the pepper
+> version. Nothing else is needed to answer "who granted what, when".
+
+One useful property falls out of the core writing these rather than the CLI:
+**revoking a service's credential is recorded independently of that service.**
+Cutting off `audit_service` itself still produces a durable record, because the
+core writes it transactionally and the consumer pulls later (§4.3 there) — the
+act does not depend on the party being cut off remaining functional.
+
+**Cross-document addition.** `PROPOSAL_accountability_record.md` §4.1's scope
+table should gain these events. They fit its stated rule cleanly — security
+relevant, needing a guaranteed record, with no versioned home of their own.
+
 #### Bootstrapping the first credential
 
 The map starts empty, and the CLI needs a credential to talk to the core — so the
@@ -933,7 +978,14 @@ every subsequent step measurable.
 15. **The CLI is the only supported management path (§3.6).**
     - `issue` prints the secret **once** and never again; `list` never prints one.
     - Every management command writes an accountability record naming the
-      **invoking operator**, not `cli`.
+      **invoking operator**, not `cli`, in the same transaction — a failed record
+      write means the credential change does not happen.
+    - **No record contains a secret, hash or pepper**, asserted by scanning the
+      accountability table for the issued token after a full issue → rotate →
+      prune → revoke cycle and finding nothing.
+    - Pepper rotation emits **exactly two** records (start, completion) however
+      many services migrate in between.
+    - Revoking `audit_service`'s own credential still produces a durable record.
     - `--json` output and exit codes make the full issue → rotate → prune cycle
       scriptable without parsing human text.
     - `pepper status` reports rows per pepper version, so "is the rotation
