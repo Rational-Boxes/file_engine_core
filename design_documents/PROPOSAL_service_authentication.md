@@ -326,22 +326,15 @@ neither requires a core restart, which matters because a core restart is a
 platform outage (`PROPOSAL_accountability_record.md` §7.8). **A credential
 lifecycle that costs an outage is one that gets skipped.**
 
-#### Capabilities stay in code — the reviewed and the operational differ
+#### The row carries the capabilities too
 
-§6.4 keeps capability grouping and per-service assignment in code, and moving the
-secret map into the database does not change that. The split is deliberate:
+A service's granted capabilities live in the same row as its secret. Only the
+capability **definitions** — which RPCs make up `destroy`, `acl`, `read` — stay
+compiled, because those describe the API rather than a deployment (§6.4).
 
-- **What a service may do** is a security decision that should require a code
-  change and a review. Putting it in a table makes it one `UPDATE` away from a
-  bridge holding `destroy` under deployment pressure.
-- **Which secret a service holds** is an operational fact that changes on a
-  rotation schedule and must not require a release.
-
-One friction to acknowledge: a genuinely new *kind* of service then needs a core
-release for its capability set. That is the intended cost — a new door is exactly
-what should be reviewed — but capabilities should key on the service **class**
-rather than a deployment instance, so adding a replica or renaming an environment
-needs no code change.
+So a service row is `service_id`, hashed secret, pepper version, granted
+capabilities. **Adding a service is one insert**, and it takes effect on every
+node within the cache TTL with no release and no restart.
 
 #### Not the CLI's own token
 
@@ -384,15 +377,19 @@ fileengine_cli service-token rotate   <service_id>     # issue alongside the old
 fileengine_cli service-token prune    <service_id>     # drop the superseded entry post-rollout
 fileengine_cli service-token revoke   <service_id>
 fileengine_cli service-token list                      # ids, created, last-used, pepper version
-fileengine_cli service capabilities   <service_id>     # effective set — read-only (§6.4)
+fileengine_cli service add            <service_id> --capabilities read,write
+fileengine_cli service capabilities   <service_id>     # show the granted set
+fileengine_cli service grant          <service_id> <capability>
+fileengine_cli service revoke-cap     <service_id> <capability>
 fileengine_cli pepper rotate                           # begin; both accepted
 fileengine_cli pepper status                           # rows per pepper version — when is it safe to retire
 ```
 
 `list` never prints a secret; `issue` and `rotate` print it exactly once, since
-there is nothing to recover it from afterwards. `service capabilities` is
-read-only by construction — assignments live in code (§6.4), so a command to
-change them would imply an authority the design deliberately withholds.
+there is nothing to recover it from afterwards. `grant` validates the capability
+against the compiled definitions, so a typo is rejected rather than stored as a
+capability nothing will ever match — and granting a **high-risk** capability
+requires the explicit confirmation described in §6.4.
 
 `pepper status` deserves its place: §3.5's online pepper rotation completes when
 no rows remain on the old version, and that is a question an operator must be
@@ -441,7 +438,8 @@ written, the credential change does not happen.
 | `service_token.revoked` | `identity` | a credential is invalidated |
 | `pepper.rotation_started` / `…_completed` | `identity` | the map-wide re-key begins / finishes |
 | `service_capability.narrowed` | `authorization` | configuration subtracts a capability (§6.4) |
-| `service_capability.changed` | `authorization` | a service's **effective** set differs from the last recorded one, detected at startup — this is what catches deploy-time changes |
+| `service_capability.granted` / `.revoked` | `authorization` | a capability is added to or removed from a service (§6.4) |
+| `service_capability.changed` | `authorization` | a startup diff finds a set the log cannot account for — **an out-of-band table edit**, not a routine change |
 
 `identity` rather than `authorization` for the token events: what a service *may
 do* lives in code and does not change here (§6.4). What changes is what it can
@@ -462,35 +460,36 @@ the migration in between is bookkeeping.
 > version. Nothing else is needed to answer "who granted what, when".
 
 **Record the capability set with every credential event.** Each record carries
-the service's **effective** capabilities at that moment — post config-narrowing
-(§6.4), not the compiled set — so the log answers not just *"`cmis` got a
-credential on the 14th"* but *"…and that credential could do these nine things"*.
+the service's granted capabilities at that moment, so the log answers not just
+*"`cmis` got a credential on the 14th"* but *"…and that credential could do these
+nine things"*.
 
-The reason this matters more than it first appears: **capabilities are the one
-part of the authorization picture that does not live in the database.** ACLs,
-roles and the token map are all queryable historically. Capability assignments
-are compiled into the binary (§6.4), so without recording them the audit trail
-has a permanent blind spot exactly where the coarse authorization axis sits —
-reconstructing what a service could do last March would mean finding the commit
-that was deployed and reading it.
+With assignments in the database (§6.4) this is partly redundant with the grant
+records themselves — but only partly, and cheaply: it means a single credential
+record is self-contained, and reconstructing a service's authority at a past
+instant does not require replaying every grant and revoke that preceded it.
 
-##### That alone is not sufficient — capabilities change on deploy, not on issue
+##### The startup diff is now tamper detection, not change detection
 
-Recording only at credential events snapshots the set at arbitrary moments and
-misses the moments that matter. If a release grants `cmis` a new capability and
-no credential operation happens for six months, nothing records the change, and
-the log confidently shows a stale set the whole time — worse than showing none.
+An earlier draft justified a startup diff on the grounds that capabilities were
+compiled, so a release could change them with nothing recording it. **With
+assignments in the database (§6.4) that argument is void** — every grant and
+revoke is a CLI operation recorded at the moment it happens, so there is no
+unrecorded change path to catch.
 
-So the core also records **on change, at startup**: it compares each service's
-effective set against the last recorded one and writes a
-`service_capability.changed` record only where they differ.
+The diff is still worth keeping, for a different and better reason. On startup
+the core compares each service's stored capability set against the last one the
+accountability log recorded, and writes `service_capability.changed` only where
+they differ. Since every legitimate change already produced a record, **a
+difference the log cannot account for means the table was edited outside the
+CLI.** That is precisely what §3.6 declares unsupported, and it should be visible
+rather than assumed away.
 
-- **Only on difference**, so ordinary restarts — which are frequent, and are a
-  platform outage besides — do not fill the log with identical snapshots.
-- It catches the *actual* change moment, which is the deploy.
-- It also catches an unintended widening: a capability appearing that nobody
-  meant to grant shows up as a record at the release that introduced it, rather
-  than being discovered later by reading code.
+- **Only on difference**, so ordinary restarts do not fill the log with identical
+  snapshots.
+- A record with no matching grant is an **integrity signal**, not routine
+  bookkeeping — the same shape as the chain-break alarms in
+  `PROPOSAL_accountability_record.md` §4.3.2.
 
 Capabilities are structure, not payload, so recording them is consistent with
 §5.4.7's rule.
@@ -779,17 +778,75 @@ Of every caller on the platform, the AI door is the one whose behaviour is least
 predictable from its code. It is the strongest case for enforcing intent rather
 than trusting it.
 
-### 6.4 Config may narrow, never widen
+### 6.4 Definitions in code, assignments in the database
 
-The **grouping** of RPCs into capabilities is a property of the API and belongs
-in code. The **assignment** of capabilities to services is more tempting to put
-in config — but a config-granted capability is one deployment-pressure change
-away from a bridge holding `destroy`.
+Two different things were conflated in an earlier draft of this section, which
+put both in code:
 
-So: assignments live in code, and configuration may only **subtract**. An
-operator can tighten a service below its compiled set for a hardened deployment;
-nobody can widen one without a code change and a review. This supersedes the
-looser "code for destructive operations, config for the rest" in §8.4.
+| | Where | Why |
+|---|---|---|
+| Capability **definitions** — which RPCs constitute `destroy`, `acl`, `read` | **Code** | A property of the API itself. Expressing it in data would mean inventing a config language for something that changes only when the API does |
+| Capability **assignments** — which services hold which capabilities | **Database**, alongside the secret | An operational fact about a deployment, not a property of the API |
+
+**So adding a service is a row.** Insert `service_id`, its hashed secret and its
+granted capabilities via the CLI (§3.6); it works immediately, on every node,
+within the cache TTL.
+
+#### Zero-downtime onboarding is the feature, not a side effect
+
+No build, no release, no restart — which matters disproportionately here, because
+a core restart is a platform outage (`PROPOSAL_accountability_record.md` §7.8).
+Compiled assignments would mean **taking the whole platform down to add a
+microservice**, and a process that expensive does not get followed carefully; it
+gets worked around, usually by granting the new service an existing service's
+credential and moving on. The friction would actively produce the outcome the
+capability system exists to prevent.
+
+Deploying a new door becomes: issue its credential, grant its capabilities, start
+it. Every step online, every step recorded, no window in which the platform is
+unavailable. That is worth having on its own terms — it makes the platform
+extensible without a maintenance window — and it is only possible because the
+registry is data rather than a compiled table.
+
+#### Correcting the earlier argument
+
+The previous draft argued assignments must be compiled so that widening requires
+"a code change and a review", on the grounds that a data-driven grant is one
+pressured change away from a bridge holding `destroy`.
+
+That reasoning does not survive contact with the rest of this design. Under
+§3.6, a grant made through the CLI is **recorded as an accountability event
+naming the operator**, in the same transaction, permanently. A code change is
+reviewed at pull-request time and then deployed by someone, somewhere, with no
+comparable record of the act. **An audit record with your name on it is a
+stronger deterrent than a diff in a rushed review** — and it is certainly better
+evidence afterwards.
+
+The control was never really "it's in code". It is "the change is deliberate,
+attributed and visible", and the database path delivers that better.
+
+#### Preserving the actual intent
+
+What the earlier rule was protecting — that nobody casually hands a bridge
+`destroy` — is kept by making dangerous grants *deliberate* rather than
+*impossible*:
+
+- **High-risk capabilities are flagged** (`destroy`, `accountability`) and cannot
+  be granted in the same operation that issues a credential. Onboarding a service
+  and arming it are separate acts.
+- Granting one requires an explicit confirmation flag, and writes its own
+  accountability record distinct from the ordinary assignment event.
+- The startup diff (§3.6) changes role usefully: with assignments in data, a
+  `service_capability.changed` record that no CLI operation accounts for is
+  **evidence of an out-of-band database edit** — it becomes tamper detection
+  rather than deploy-change detection.
+
+#### What remains compiled
+
+Definitions, and one guardrail worth keeping: **the set of capabilities a service
+*may ever* hold is not itself data.** `cli` is the only identity permitted the
+full set (§6.1), and that stays in code — otherwise the reserved-identity rule is
+one `UPDATE` from being untrue.
 
 ---
 
@@ -939,9 +996,12 @@ every subsequent step measurable.
 3. **One token per service, or per instance?** Per-instance narrows revocation
    blast radius and identifies *which* replica acted, at the cost of managing
    many more secrets. Recommend per-service until there is an operational reason.
-4. ~~**Should the allowlist live in config or in code?**~~ **Answered in §6.4:**
-   capability *grouping* and service *assignments* both live in code, and config
-   may only subtract. Widening requires a code change and a review.
+4. ~~**Should the allowlist live in config or in code?**~~ **Answered in §6.4,
+   then revised:** capability *definitions* stay compiled, because they describe
+   the API; *assignments* live in the database beside the secret, so onboarding a
+   service needs no release and no core restart. The safety the original answer
+   was reaching for comes from the grant being deliberate, attributed and
+   recorded — not from being compiled.
 5. **Rate limiting / lockout on repeated bad tokens?** Cheap to add at the
    interceptor and a useful signal, but on a private network it may be noise.
 
@@ -971,9 +1031,15 @@ every subsequent step measurable.
 8. **Every RPC is classified.** A test enumerates the service descriptor and
    fails if any method belongs to no capability — so a newly added RPC cannot
    reach production unclassified, and is denied to everyone until it is.
-9. **Config cannot widen.** A configuration attempting to grant a service a
-   capability outside its compiled set is rejected at startup rather than
-   honoured (§6.4).
+9. **Onboarding is zero-downtime (§6.4).** A new service is added, granted
+   capabilities and serving traffic **without restarting the core** — verified
+   against a running instance, with an unrelated request in flight throughout.
+   Additionally:
+   - A grant naming a capability that does not exist is **rejected**, not stored.
+   - Granting a **high-risk** capability (`destroy`, `accountability`) requires
+     explicit confirmation and cannot ride along with credential issue.
+   - `cli` remains the only identity able to hold the full set, and that cannot
+     be conferred on another service by any database change.
 10. **No blanket grant is representable**, with `cli` the sole reserved
     exception. No `*` form exists for any other identity, and:
     - An **unclassified RPC is refused to every identity including `cli`** —
@@ -1032,10 +1098,10 @@ every subsequent step measurable.
     - Every credential record carries the service's **effective capability set**
       at that moment, so the log shows what the credential could do without
       consulting the deployed binary.
-    - **Deploy-time capability changes are caught:** a release that widens a
-      service's set produces a `service_capability.changed` record at first
-      startup, and a restart with **no** change produces none — so the log is not
-      filled with identical snapshots by ordinary restarts.
+    - **Out-of-band edits are caught:** a capability added by direct `UPDATE`
+      produces a `service_capability.changed` record at next startup that no
+      grant accounts for, while a restart after a normal CLI grant produces none
+      — the diff signals tampering rather than routine change.
     - `--json` output and exit codes make the full issue → rotate → prune cycle
       scriptable without parsing human text.
     - `pepper status` reports rows per pepper version, so "is the rotation
