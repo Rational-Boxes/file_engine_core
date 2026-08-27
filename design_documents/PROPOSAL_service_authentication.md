@@ -10,8 +10,9 @@
 > platform can record *who* did something but not *through which door*.
 >
 > This proposes a per-service bearer secret carried in gRPC call metadata,
-> validated centrally, resolved to a service identity, and recorded. It is a
-> significant internal refactor: it touches every caller and every deployment.
+> validated centrally, resolved to a service identity, recorded, and used to gate
+> which operations that service may perform at all. It is a significant internal
+> refactor: it touches every caller and every deployment.
 
 ---
 
@@ -62,13 +63,18 @@ thing already implied by the fact that it reached the core.
 
 ### 3.1 Transport — call metadata, not the message
 
-The secret rides in gRPC **call metadata** (`authorization: Bearer <secret>`, or
-a dedicated `x-fe-service-token`), never in a protobuf field.
+The secret rides in gRPC **call metadata**, in a dedicated
+**`x-fe-service-token`** header — never in a protobuf field.
 
 Reasons: it is a transport concern rather than a request concern; it can be
 enforced in one place; and adding it to `AuthenticationContext` would put a
 credential inside a message that is already logged and passed around, which is
 how secrets end up in logs.
+
+A distinct header rather than `authorization: Bearer` because the bridges already
+handle end-user bearer tokens, and two different credentials under one header
+name is how the wrong one ends up validated — or logged by a redaction rule
+written for the other.
 
 ### 3.2 Enforcement — one interceptor, not 41 handlers
 
@@ -94,14 +100,21 @@ identical, and benefits 2 and 3 above evaporate. So the core holds a
 **source-to-secret map**, and the secret a caller presents is what identifies it:
 
 ```
-http_bridge    → <secret>
-webdav_bridge  → <secret>
-cmis           → <secret>
-csai           → <secret>
-mcp            → <secret>
-audit_service  → <secret>
+service_id      hash                  pepper_version   capabilities
+──────────────────────────────────────────────────────────────────────
+http_bridge     HMAC(secret, pepper)   2               read write delete restore acl roles admin
+webdav_bridge   HMAC(secret, pepper)   2               read write delete restore
+cmis            HMAC(secret, pepper)   2               read write delete restore acl
+csai            HMAC(secret, pepper)   1               read write
+audit_service   HMAC(secret, pepper)   2               accountability
+cli:alice       HMAC(secret, pepper)   2               (all — reserved, §6.1)
 …
 ```
+
+One row per identity, carrying everything the core needs to answer *"who is this
+and what may they do"*: the hash (§3.3), the pepper version that hash was
+computed under (§3.5), and the granted capability set (§6.4). Illustrative
+capability sets only — the real ones are derived per service in §6.2.
 
 Authentication and attribution are then the same operation: a valid secret both
 proves the caller is legitimate and names it. There is no separate "who are you?"
@@ -336,19 +349,17 @@ So a service row is `service_id`, hashed secret, pepper version, granted
 capabilities. **Adding a service is one insert**, and it takes effect on every
 node within the cache TTL with no release and no restart.
 
-#### Not the CLI's own token
+#### The database holds hashes; the plaintext lives with each holder
 
-The `cli` secret comes from the secrets store like every other (§6.1), but is
-*delivered* differently: injected as `FILEENGINE_CLI_TOKEN` for automated use,
-and materialised as a `0640` root-owned file for interactive use, because the CLI
-is the one credential consumer with no supervisor to inject for it. Encrypting
-that file separately would need a key the operator must supply to decrypt their
-own credential — recursion with no gain.
+The map is the core's copy — hashes only. Each *holder* keeps its own plaintext:
+a service in its environment, an administrator in a `0600` file under their own
+home directory (§6.1). Nothing in the database can be used to authenticate as
+anyone.
 
-The asymmetry is deliberate: the core runs unattended and validates many
-identities, so its map lives in the database; the CLI holds one secret and is
-often driven by a human, so it gets filesystem permissions and a tool that
-refuses to run when they are wrong.
+The asymmetry is deliberate. The core runs unattended and validates many
+identities, so its side lives in the database and needs no secret in it. A
+credential holder has exactly one secret and must present it, so it lives where
+that holder can read it and nobody else can.
 
 ---
 
@@ -502,13 +513,14 @@ rather than assumed away.
   `PROPOSAL_accountability_record.md` §4.3.2.
 
 Capabilities are structure, not payload, so recording them is consistent with
-§5.4.7's rule.
+that same rule in `PROPOSAL_accountability_record.md` §5.4.7.
 
 One useful property falls out of the core writing these rather than the CLI:
 **revoking a service's credential is recorded independently of that service.**
 Cutting off `audit_service` itself still produces a durable record, because the
-core writes it transactionally and the consumer pulls later (§4.3 there) — the
-act does not depend on the party being cut off remaining functional.
+core writes it transactionally and the consumer pulls later
+(`PROPOSAL_accountability_record.md` §4.3) — the act does not depend on the party
+being cut off remaining functional.
 
 **Cross-document addition.** `PROPOSAL_accountability_record.md` §4.1's scope
 table should gain these events. They fit its stated rule cleanly — security
@@ -754,7 +766,7 @@ for attribution. The honest sequencing is in §7.
 | Setting | Where | Meaning |
 |---|---|---|
 | `FILEENGINE_SERVICE_TOKEN` | each calling service | the `fesvc_…` secret it presents (§3.3) |
-| `FILEENGINE_CLI_TOKEN` | CLI, automated use | the `cli` secret when a supervisor injects it; takes precedence over the file (§6.1) |
+| `FILEENGINE_CLI_TOKEN` | CLI, automated use | a `cli:*` secret when a supervisor injects it; takes precedence over the file (§6.1) |
 | `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | **the one secret** — HMAC pepper for the stored hashes. Injected, never in the database (§3.5) |
 | `FILEENGINE_SERVICE_AUTH_REQUIRED` | core | default **`true`** |
 | `FILEENGINE_SERVICE_MAP_CACHE_TTL` | core | how long the map is cached between reads (§3.5); short, so an update takes effect without a restart |
@@ -1307,30 +1319,42 @@ where it is — moving it would be churn against a live audit path for no gain.
 
 This touches every caller, so sequencing matters more than usual.
 
-1. **Core accepts and records, does not require.** Add the interceptor with
+1. **Schema and enrolment.** Add the service-map table, the bootstrap socket
+   (§3.6) and the CLI's management commands. Nothing authenticates yet; this is
+   the machinery that lets credentials exist.
+2. **Core accepts and records, does not require.** Add the interceptor with
    `FILEENGINE_SERVICE_AUTH_REQUIRED=false`, resolve identities when present, and
    populate `source_iface`. Nothing breaks; attribution starts working
    immediately for services that have been updated.
-2. **Roll the callers.** Each service, the CLI, and the SDK examples gain a
-   token. Progress is directly observable — audit records still saying `"grpc"`
-   are callers not yet migrated, which makes the migration self-tracking.
-3. **Flip to required.** Once no unattributed calls remain, default it on.
-4. **Add the allowlist** (§6), starting with the destructive operations, since
-   those carry the most value and the least legitimate cross-service traffic.
-5. **Later, if the port must ever leave a private network: mTLS**, which replaces
-   the token rather than supplementing it.
+3. **Roll the callers.** Each service and the CLI gains a token, issued through
+   the CLI and delivered by the deployment (§3.6). Progress is directly
+   observable — audit records still saying `"grpc"` are callers not yet migrated,
+   which makes the migration self-tracking.
+4. **Flip to required.** Once no unattributed calls remain, default it on.
+5. **Add capability gating** (§6), starting with the destructive capabilities,
+   since those carry the most value and the least legitimate cross-service
+   traffic. Derive each service's set by the measure-don't-guess method in §6.2.
+6. **Later, if the port must ever leave a private network: mTLS**, which replaces
+   the token rather than supplementing it (§4).
 
-Step 1 is worth having even alone: it closes the `source_iface` gap and makes
+Step 2 is worth having even alone: it closes the `source_iface` gap and makes
 every subsequent step measurable.
+
+Note the ordering constraint that falls out of §3.6: **services cannot start
+before their credentials exist**, so from step 3 onward the deployment gains a
+`service-auth-init` stage between core-healthy and service-start. That is a
+change to the compose graph and the Ansible play order, not just to the services
+themselves.
 
 ---
 
 ## 8. Open decisions
 
-1. **`authorization: Bearer` or a custom header?** Reusing `authorization` is
-   conventional and interceptor-friendly, but risks confusion with the end-user
-   bearer tokens the bridges already handle. A distinct `x-fe-service-token`
-   makes it unambiguous in logs and code. Recommend the distinct header.
+1. ~~**`authorization: Bearer` or a custom header?**~~ **Settled in §3.1:**
+   `x-fe-service-token`. The bridges already carry end-user bearer tokens under
+   `authorization`, and two different credentials sharing a header name is how
+   the wrong one gets validated, or logged by a redaction rule written for the
+   other.
 2. **Does the SDK path get tokens?** `python_interface` and `javascript_interface`
    speak gRPC directly and are documented as safe only server-side. Issuing them
    tokens legitimises a path that is already the weakest link; refusing to
@@ -1426,7 +1450,7 @@ every subsequent step measurable.
       rather than parsed into a partial match.
     - An **unknown service id costs the same time as a valid id with a wrong
       secret**, so timing does not enumerate service names.
-14. **The map at rest is unusable alone (§3.5).** A database dump yields no
+13. **The map at rest is unusable alone (§3.5).** A database dump yields no
     usable token, because the pepper is not in the database.
     - **Adding a service takes effect without a core restart** — a transactional
       update, visible within the cache TTL. This is the property that keeps
@@ -1442,7 +1466,7 @@ every subsequent step measurable.
     - **Pepper rotation is online:** with both peppers configured, rows migrate
       to the new one as services authenticate, no token is re-issued, and the
       old pepper is retired only once a query shows no rows remain on it.
-15. **The CLI is the only supported management path (§3.6).**
+14. **The CLI is the only supported management path (§3.6).**
     - `issue` prints the secret **once** and never again; `list` never prints one.
     - Every management command writes an accountability record naming the
       **invoking operator**, not `cli`, in the same transaction — a failed record
@@ -1482,7 +1506,7 @@ every subsequent step measurable.
       complete, and is removed immediately on successful enrolment.
     - The enrolment writes an accountability record, so the first credential's
       creation is as attributable as every later one.
-16. **Disaster recovery is exercised, not assumed (§3.6).**
+15. **Disaster recovery is exercised, not assumed (§3.6).**
     - Restoring **the database alone** onto a fresh host is demonstrated to be
       unusable — the point being that this is discovered in a drill rather than
       in an incident.
@@ -1495,12 +1519,12 @@ every subsequent step measurable.
       showing a recovery occurred.
     - There is **no file-based map path** to configure, so no way to change
       service credentials without an accountability record (§3.5).
-13. **End-user origin survives every external door (§6.5).** A request through
+16. **End-user origin survives every external door (§6.5).** A request through
     `bcf_services` records the caller's real address, not an internal one — the
     one door currently missing it. And an event-driven internal call records an
     **empty** `source_addr` rather than a substituted peer address, so
     "not user-initiated" stays distinguishable from "user at 10.0.0.4".
-14. **Derived writes do not inherit the originator's address (§6.5.2).** After a
+17. **Derived writes do not inherit the originator's address (§6.5.2).** After a
     user uploads a file and csai writes its rendition, exactly **one** record
     carries the user's address — the upload. The rendition record shows the user
     as `actor`, `csai` as `source_iface`, and an empty `source_addr`.
