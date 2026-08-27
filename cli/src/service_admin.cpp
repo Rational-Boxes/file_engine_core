@@ -152,11 +152,6 @@ void print_secret_once(const std::string& token) {
               << "Beware `set -x` and CI jobs that archive stdout — that is the realistic leak.\n";
 }
 
-// ── The CLI's own credential (§6.1) ─────────────────────────────────────────
-
-namespace {
-
-
 int service_token_command(int argc, char** argv) {
     const std::string sub = arg_at(argc, argv, 1);
     ServiceAdminContext ctx;
