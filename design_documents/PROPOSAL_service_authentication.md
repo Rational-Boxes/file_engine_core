@@ -541,8 +541,9 @@ credential between the install step and the configure step.
 
 Five constraints make the window narrow rather than nominal. All are required:
 
-1. **Loopback only** — the same constraint as every `cli:*` identity (§6.1),
-   enforced on the peer address, not the bind.
+1. **Reachable only over a Unix domain socket**, gated by filesystem permissions
+   and a verified peer uid — see below. Not merely loopback, since loopback is
+   not a privilege.
 2. **Only when the service map is empty** — not "no `cli` identity", but zero
    rows of any kind.
 3. **Only this one operation.** Not a mode in which unauthenticated calls are
@@ -557,23 +558,53 @@ Five constraints make the window narrow rather than nominal. All are required:
    credential event (§3.6), so the first credential's creation is as accountable
    as every later one.
 
-##### The residual risk, stated plainly
+##### Enrolment happens over a Unix domain socket, not TCP
 
-Between schema creation and the deployment's enrol call, **any local process can
-claim the first `cli:*` credential** — which carries the full capability set.
-The window is short, loopback-bound, and occurs on a host mid-provisioning, so in
-the normal case there are no untrusted local users present to exploit it. That
-is a reasonable trade for removing secret distribution, but it is a real
-difference from the alternative: with an out-of-band secret in a `0640` file, an
-unprivileged local user could never enrol; here, briefly, they can.
+Constraint 1 above says loopback, but loopback is not a privilege — *any* local
+process can connect to it. Left there, the window between schema creation and the
+deployment's enrol call is one in which an unprivileged local user could claim
+the first `cli:*` credential and its full capability set. Short and
+mid-provisioning, but real: with an out-of-band secret in a `0640` file they
+never could.
 
-**The refinement that closes it** is the Unix domain socket already raised in
-§6.1: accept the enrolment only over `/run/fileengine/bootstrap.sock`, mode
-`0600` and root-owned. Filesystem permissions then decide who may enrol, which
-restores the property the out-of-band secret provided — without any secret to
-distribute. It is the same mechanism, moved from "a file you must read" to "a
-socket you must be permitted to open", and it is worth doing if the platform ever
-runs on a host with untrusted local users.
+So the enrolment is served on a **Unix domain socket instead**, and the operating
+system decides who may reach it:
+
+```
+/run/fileengine/bootstrap.sock     0600, owned by the core's service user
+```
+
+- **Only that user and root can connect.** Filesystem permissions restore
+  exactly the property the out-of-band secret provided, with no secret to
+  distribute — the mechanism moves from *"a file you must read"* to *"a socket
+  you must be permitted to open"*.
+- **Verify the peer with `SO_PEERCRED`**, do not rely on the mode alone. The
+  kernel reports the connecting process's uid/gid, so the core can *check* the
+  caller is root or the service user rather than inferring it from permissions
+  that a misconfiguration could widen. This is unforgeable in a way no
+  credential is.
+- **The socket only exists while it is needed.** It is created at startup only
+  when bootstrap is incomplete, and removed on successful enrolment. On an
+  established system it is never created at all, so the surface is absent rather
+  than merely closed.
+- **Enrolment is not offered on TCP.** This replaces the loopback-TCP enrolment
+  rather than supplementing it — one path, for the same reason §3.5 keeps one
+  store: an alternative route is the one that gets attacked and the one that
+  rots.
+
+Day-to-day `cli:*` traffic still uses loopback TCP with a credential (§6.1). The
+socket is enrolment-only, because that is the one operation with no credential to
+present — everywhere else the token is doing the work and a second transport
+would earn nothing.
+
+> **Container note.** `service-auth-init` (below) needs the socket, so
+> `/run/fileengine` must be a shared volume between the core and the init
+> container — or the init must `docker exec` into the core. The shared volume is
+> cleaner and keeps the init a normal service in the compose graph.
+
+Two portability caveats, neither blocking on this platform: socket permissions
+are enforced on `connect()` on Linux (historically not on all BSDs), and
+`SO_PEERCRED` is Linux-specific — `LOCAL_PEERCRED` is the equivalent elsewhere.
 
 ##### Deployment drives the CLI to issue the real credentials
 
@@ -1039,18 +1070,18 @@ the transport constraint holds independently of who knows the secret. The one
 identity whose compromise would matter most is the one whose credential matters
 least on its own.
 
-> **Stronger variant worth considering: a Unix domain socket.** gRPC supports
-> `unix:` addresses, and a UDS restricted to the `fileengine` user or group makes
-> `cli` access local-only *by construction* and adds OS-level identity —
-> filesystem permissions decide who may connect at all, before any token is
-> examined. It removes the loopback check rather than implementing it, and cannot
-> be widened by a misconfigured bind.
+> **A Unix domain socket is already used for one thing.** §3.6 serves the
+> bootstrap enrolment over `/run/fileengine/bootstrap.sock` precisely because
+> that operation has no credential to present, so the OS has to decide who may
+> perform it.
 >
-> Note it collapses both constraints above into one mechanism: the socket's
-> permissions exclude off-host callers *and* unprivileged local ones, using the
-> same filesystem permissions that would otherwise be protecting the secret file.
-> The token becomes belt-and-braces rather than load-bearing. The cost is a second
-> listener and a small amount of packaging work.
+> Extending it to *all* `cli:*` traffic is a plausible next step and is **not
+> proposed here.** It would make CLI access local-only by construction rather
+> than by a peer-address check, and add a verified OS identity alongside the
+> token. But day-to-day CLI calls already carry a credential that names the
+> administrator (§6.1), so the socket would be belt-and-braces there, whereas for
+> enrolment it is the whole mechanism. Worth revisiting if the loopback check
+> ever proves awkward to get right; not worth a second listener on its own.
 
 ### 6.2 Deriving the assignments — measure, do not guess
 
@@ -1442,7 +1473,13 @@ every subsequent step measurable.
     - **Deleting every row in the service map does not reopen it**, since
       completion is marked independently of the map's contents. This is the
       property that separates a bootstrap step from a back door.
-    - **A non-loopback caller is refused** even while the path is open.
+    - **Enrolment is unreachable over TCP entirely** — attempting it on
+      `:50051`, loopback included, is refused; it exists only on the socket.
+    - **An unprivileged local user cannot enrol**, even while the path is open
+      and even with the socket path known: `connect()` is denied by mode, and a
+      caller that somehow reaches it is rejected on `SO_PEERCRED` uid.
+    - The socket is **absent entirely** on a core whose bootstrap is already
+      complete, and is removed immediately on successful enrolment.
     - The enrolment writes an accountability record, so the first credential's
       creation is as attributable as every later one.
 16. **Disaster recovery is exercised, not assumed (§3.6).**
