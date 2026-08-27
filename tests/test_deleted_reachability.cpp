@@ -132,18 +132,20 @@ public:
     Result<std::vector<std::string>> get_infrequently_accessed_files(int = 30, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
     Result<int64_t> get_storage_usage(const std::string& = "") override { return Result<int64_t>::ok(0); }
     Result<int64_t> get_storage_capacity(const std::string& = "") override { return Result<int64_t>::ok(0); }
-    Result<void> create_tenant_schema(const std::string&) override { return Result<void>::ok(); }
+    Result<void> create_tenant_schema(const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<bool> tenant_schema_exists(const std::string&) override { return Result<bool>::ok(true); }
-    Result<void> cleanup_tenant_data(const std::string&) override { return Result<void>::ok(); }
+    Result<void> cleanup_tenant_data(const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<std::vector<std::string>> list_tenants() override { return Result<std::vector<std::string>>::ok({}); }
-    Result<void> add_acl(const std::string& r, const std::string& p, int t, int perm, const std::string& = "", const std::string& = "", int eff = 0) override { AclEntry e; e.resource_uid = r; e.principal = p; e.type = t; e.permissions = perm; e.effect = eff; acls_[r].push_back(e); return Result<void>::ok(); }
-    Result<void> remove_acl(const std::string&, const std::string&, int, int, const std::string& = "", const std::string& = "", int = 0) override { return Result<void>::ok(); }
+    Result<void> add_acl(const std::string& r, const std::string& p, int t, int perm, const std::string&, const AccountabilityContext&, int eff = 0) override { AclEntry e; e.resource_uid = r; e.principal = p; e.type = t; e.permissions = perm; e.effect = eff; acls_[r].push_back(e); return Result<void>::ok(); }
+    Result<void> remove_acl(const std::string&, const std::string&, int, int, const std::string&, const AccountabilityContext&, int = 0) override { return Result<void>::ok(); }
     Result<std::vector<AclEntry>> get_user_acls(const std::string& r, const std::string& p, int t, const std::string& = "") override { std::vector<AclEntry> out; auto it = acls_.find(r); if (it != acls_.end()) for (auto& e : it->second) if (e.principal == p && e.type == t) out.push_back(e); return Result<std::vector<AclEntry>>::ok(out); }
     Result<std::vector<std::string>> list_claims(const std::string&, int, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
-    Result<void> create_role(const std::string&, const std::string& = "") override { return Result<void>::ok(); }
-    Result<void> delete_role(const std::string&, const std::string& = "") override { return Result<void>::ok(); }
-    Result<void> assign_user_to_role(const std::string&, const std::string&, const std::string& = "") override { return Result<void>::ok(); }
-    Result<void> remove_user_from_role(const std::string&, const std::string&, const std::string& = "") override { return Result<void>::ok(); }
+    Result<void> create_role(const std::string&, const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
+    Result<void> delete_role(const std::string&, const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
+    Result<void> assign_user_to_role(const std::string&, const std::string&,
+                                     const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
+    Result<void> remove_user_from_role(const std::string&, const std::string&,
+                                       const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<std::vector<std::string>> get_users_for_role(const std::string&, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
     Result<std::vector<std::string>> get_all_roles(const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
 };

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "types.h"
+#include "accountability.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -107,9 +108,21 @@ public:
     virtual Result<int64_t> get_storage_capacity(const std::string& tenant = "") = 0;
 
     // Tenant management operations
-    virtual Result<void> create_tenant_schema(const std::string& tenant) = 0;
+    // `ctx` attributes the tenant's creation in the GLOBAL accountability record
+    // (§7.3). Only a schema that did not already exist writes one — this is
+    // called lazily on nearly every tenant context lookup, so recording
+    // unconditionally would fill the global chain with duplicate "created"
+    // rows for tenants that have existed for months.
+    virtual Result<void> create_tenant_schema(const std::string& tenant,
+                                              const AccountabilityContext& ctx) = 0;
     virtual Result<bool> tenant_schema_exists(const std::string& tenant) = 0;
-    virtual Result<void> cleanup_tenant_data(const std::string& tenant) = 0;
+    // DROP SCHEMA CASCADE — the platform's most destructive operation. The
+    // tenant's own accountability history goes with it, by design (§7.3): a
+    // tenant's history is tenant data. The record that the deletion HAPPENED is
+    // written to the global table first, in the same transaction, because a
+    // record inside the schema being dropped would delete itself.
+    virtual Result<void> cleanup_tenant_data(const std::string& tenant,
+                                             const AccountabilityContext& ctx) = 0;
     virtual Result<std::vector<std::string>> list_tenants() = 0;
 
     // ACL operations
@@ -146,14 +159,24 @@ public:
                                                        const std::vector<AclGrant>& acl_grants,
                                                        const std::string& tenant = "") = 0;
 
-    // performed_by records who triggered the change in granted_by and the
-    // acl_audit table. effect (default 0 = ALLOW) selects which logical row
-    // for the (resource, principal, type) tuple is updated — ALLOW and DENY
-    // are stored separately so they can coexist for the same principal.
+    // `ctx` names who is making the change and from where. It replaces the old
+    // free-standing performed_by: ctx.actor lands in granted_by and the
+    // acl_audit table exactly as before, AND drives the accountability record
+    // written in the same transaction as the ACL change. ctx.actor must not be
+    // empty — an unattributed authorization change is refused rather than
+    // recorded as anonymous (§5.1).
+    //
+    // ctx.mode selects whether this write is its own accountability event. See
+    // AccountabilityMode: every deliberate grant/revoke uses Record; only
+    // creation-time default and inherited ACLs use PartOfCreation.
+    //
+    // effect (default 0 = ALLOW) selects which logical row for the
+    // (resource, principal, type) tuple is updated — ALLOW and DENY are stored
+    // separately so they can coexist for the same principal.
     virtual Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                                  int type, int permissions,
-                                 const std::string& tenant = "",
-                                 const std::string& performed_by = "",
+                                 const std::string& tenant,
+                                 const AccountabilityContext& ctx,
                                  int effect = 0) = 0;
     // Clear the bits in `permissions` from the matching ACL row. If the
     // resulting permission bitmask is zero the row is deleted. Pass -1 (all
@@ -161,8 +184,8 @@ public:
     // (default 0 = ALLOW) selects which logical row to revoke from.
     virtual Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                                     int type, int permissions,
-                                    const std::string& tenant = "",
-                                    const std::string& performed_by = "",
+                                    const std::string& tenant,
+                                    const AccountabilityContext& ctx,
                                     int effect = 0) = 0;
     virtual Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                                  const std::string& tenant = "") = 0;
@@ -177,18 +200,66 @@ public:
                                                          int limit,
                                                          const std::string& tenant = "") = 0;
 
-    // Role management operations
-    virtual Result<void> create_role(const std::string& role, const std::string& tenant = "") = 0;
-    virtual Result<void> delete_role(const std::string& role, const std::string& tenant = "") = 0;
+    // Role management operations. Each takes the acting identity for the same
+    // reason the ACL calls do: the accountability record is written in the
+    // operation's own transaction, so the layer that owns the transaction has
+    // to know who is acting. Note the coverage limit worth being honest about
+    // (§7.2): core `user_roles` is nearly always empty on this platform because
+    // roles are request-borne from LDAP groups, so these records cover local
+    // role management only — real role accountability comes from ldap_manager
+    // recording group-membership changes.
+    virtual Result<void> create_role(const std::string& role, const std::string& tenant,
+                                     const AccountabilityContext& ctx) = 0;
+    virtual Result<void> delete_role(const std::string& role, const std::string& tenant,
+                                     const AccountabilityContext& ctx) = 0;
     virtual Result<void> assign_user_to_role(const std::string& user, const std::string& role,
-                                             const std::string& tenant = "") = 0;
+                                             const std::string& tenant,
+                                             const AccountabilityContext& ctx) = 0;
     virtual Result<void> remove_user_from_role(const std::string& user, const std::string& role,
-                                               const std::string& tenant = "") = 0;
+                                               const std::string& tenant,
+                                               const AccountabilityContext& ctx) = 0;
     virtual Result<std::vector<std::string>> get_roles_for_user(const std::string& user,
                                                                 const std::string& tenant = "") = 0;
     virtual Result<std::vector<std::string>> get_users_for_role(const std::string& role,
                                                                 const std::string& tenant = "") = 0;
     virtual Result<std::vector<std::string>> get_all_roles(const std::string& tenant = "") = 0;
+
+    // Cull a file's old versions and record the cull, in ONE transaction.
+    //
+    // Batched deliberately: this is one logical act, and §5.3.2 requires bulk
+    // changes to be a single chained record rather than N — both because the
+    // chain serializes per tenant and because "the cull removed 40 versions" is
+    // the true statement, not forty separate destructions.
+    //
+    // `cut_version_timestamp` is the oldest version RETAINED, so the record
+    // states where the history was cut without listing what was destroyed.
+    // Non-pure so ACL/RBAC mocks need no change.
+    virtual Result<int> purge_versions(const std::string& /*file_uid*/,
+                                       const std::vector<std::string>& /*version_timestamps*/,
+                                       const std::string& /*cut_version_timestamp*/,
+                                       int /*keep_count*/,
+                                       const std::string& /*tenant*/,
+                                       const AccountabilityContext& /*ctx*/) {
+        return Result<int>::err("version culling is not available from this database implementation");
+    }
+
+    // ── The accountability pull surface (§4.3) ──────────────────────────────
+    // Read forward by cursor. `newer_than_micros` is the consumer's
+    // `recorded_until` watermark in epoch microseconds; because ts is assigned
+    // under the chain lock and forced strictly monotonic per tenant (§5.3.3),
+    // a strictly-greater-than fetch is exact — it cannot skip a record, return
+    // one twice, observe one that was rolled back, or be overtaken by an
+    // earlier-stamped record committing later.
+    //
+    // Pass kGlobalChainKey as `tenant` to read the global tenant-lifecycle
+    // chain. Non-pure so the ACL/RBAC mocks need no change; the concrete
+    // Database is the only implementation that can honour it.
+    virtual Result<std::vector<StoredAccountabilityRecord>> list_accountability_records(
+            const std::string& /*tenant*/, std::int64_t /*newer_than_micros*/,
+            int /*limit*/, bool& /*has_more*/) {
+        return Result<std::vector<StoredAccountabilityRecord>>::err(
+            "accountability records are not available from this database implementation");
+    }
 };
 
 } // namespace fileengine

@@ -28,6 +28,16 @@
 #include "fileengine/types.h"
 #include "fileengine/IDatabase.h"
 
+// A stand-in acting identity for the mock-backed suites. The real path refuses
+// an operation whose actor is empty (PROPOSAL_accountability_record.md §5.1), so
+// tests have to name one even though the mocks record nothing.
+static const fileengine::AccountabilityContext kTestCtx = [] {
+    fileengine::AccountabilityContext c;
+    c.actor = "test";
+    c.source_iface = "test";
+    return c;
+}();
+
 using namespace fileengine;
 
 // =============================================================================
@@ -87,7 +97,10 @@ public:
         // Mock simulates atomicity by sequencing add_acl calls; tests that
         // care about transactional semantics should run against real Postgres.
         for (const auto& g : grants) {
-            add_acl(uid, g.principal, g.type, g.permissions, tenant, g.performed_by, g.effect);
+            AccountabilityContext gctx;
+            gctx.actor = g.performed_by.empty() ? std::string("system") : g.performed_by;
+            gctx.mode  = AccountabilityMode::PartOfCreation;
+            add_acl(uid, g.principal, g.type, g.permissions, tenant, gctx, g.effect);
         }
         last_atomic_create_grants_ = grants;
         ++atomic_create_count_;
@@ -132,9 +145,9 @@ public:
     Result<std::vector<std::string>> get_infrequently_accessed_files(int, const std::string&) override { return Result<std::vector<std::string>>::ok({}); }
     Result<int64_t> get_storage_usage(const std::string&) override { return Result<int64_t>::ok(0); }
     Result<int64_t> get_storage_capacity(const std::string&) override { return Result<int64_t>::ok(0); }
-    Result<void> create_tenant_schema(const std::string&) override { return Result<void>::ok(); }
+    Result<void> create_tenant_schema(const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<bool> tenant_schema_exists(const std::string&) override { return Result<bool>::ok(true); }
-    Result<void> cleanup_tenant_data(const std::string&) override { return Result<void>::ok(); }
+    Result<void> cleanup_tenant_data(const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<std::vector<std::string>> list_tenants() override { return Result<std::vector<std::string>>::ok({}); }
 
     // =========================================================================
@@ -143,9 +156,10 @@ public:
 
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
-                         const std::string& tenant = "",
-                         const std::string& performed_by = "",
+                         const std::string& tenant,
+                         const AccountabilityContext& ctx,
                          int effect = 0) override {
+        const std::string& performed_by = ctx.actor;
         std::string key = tenant + "::" + resource_uid;
         auto& resource_acls = acls_[key];
         // Upsert by (principal, type, effect). ALLOW and DENY coexist as
@@ -175,9 +189,10 @@ public:
 
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
-                            const std::string& tenant = "",
-                            const std::string& performed_by = "",
+                            const std::string& tenant,
+                            const AccountabilityContext& ctx,
                             int effect = 0) override {
+        const std::string& performed_by = ctx.actor;
         std::string key = tenant + "::" + resource_uid;
         auto& resource_acls = acls_[key];
         int permissions_after = 0;
@@ -257,12 +272,12 @@ public:
 
     // Role management - tenant-aware in-memory persistence (matches the real
     // Database now that Phase 4 wires the tables up).
-    Result<void> create_role(const std::string& role, const std::string& tenant) override {
+    Result<void> create_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         if (role.empty()) return Result<void>::err("Role name cannot be empty");
         roles_[tenant].insert(role);
         return Result<void>::ok();
     }
-    Result<void> delete_role(const std::string& role, const std::string& tenant) override {
+    Result<void> delete_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         if (role.empty()) return Result<void>::err("Role name cannot be empty");
         roles_[tenant].erase(role);
         auto& ur = user_roles_[tenant];
@@ -271,12 +286,14 @@ public:
         }
         return Result<void>::ok();
     }
-    Result<void> assign_user_to_role(const std::string& user, const std::string& role, const std::string& tenant) override {
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant, const AccountabilityContext&) override {
         if (user.empty() || role.empty()) return Result<void>::err("User and role names cannot be empty");
         user_roles_[tenant].insert({user, role});
         return Result<void>::ok();
     }
-    Result<void> remove_user_from_role(const std::string& user, const std::string& role, const std::string& tenant) override {
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant, const AccountabilityContext&) override {
         if (user.empty() || role.empty()) return Result<void>::err("User and role names cannot be empty");
         auto& ur = user_roles_[tenant];
         for (auto it = ur.begin(); it != ur.end(); ) {
@@ -397,7 +414,7 @@ void test_priority_user_only() {
     AclManager acl(db);
     std::string res = "res-001";
 
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -410,7 +427,7 @@ void test_priority_role_only() {
     AclManager acl(db);
     std::string res = "res-002";
 
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // User with matching role gets role permissions
     auto result = acl.get_effective_permissions(res, "bob", {"editor"});
@@ -433,7 +450,7 @@ void test_priority_group_only() {
 
     // Roles ARE the group mechanism (LDAP groups resolve to role names), so a
     // "group" grant is a ROLE grant applied to users who hold that role.
-    acl.grant_permission(res, "developers", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "developers", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "charlie", {"developers"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -449,7 +466,7 @@ void test_priority_other_only() {
     AclManager acl(db);
     std::string res = "res-004";
 
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ, "", kTestCtx);
 
     // OTHER applies when no user, role, or group matched
     auto result = acl.get_effective_permissions(res, "anyone", {});
@@ -463,8 +480,8 @@ void test_priority_user_role_union() {
     AclManager acl(db);
     std::string res = "res-005";
 
-    acl.grant_permission(res, "admin", PrincipalType::ROLE, PERM_ALL);
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "admin", PrincipalType::ROLE, PERM_ALL, "", kTestCtx);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     // Union model: alice's USER grant of READ adds to admin's ROLE grant of ALL.
     auto result = acl.get_effective_permissions(res, "alice", {"admin"});
@@ -480,8 +497,8 @@ void test_priority_user_group_union() {
     std::string res = "res-006";
 
     // "group" grant == ROLE grant; alice holds the devs role.
-    acl.grant_permission(res, "devs", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE);
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "devs", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE, "", kTestCtx);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "alice", {"devs"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -495,8 +512,8 @@ void test_priority_user_other_union() {
     AclManager acl(db);
     std::string res = "res-007";
 
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ | PERM_WRITE);
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ | PERM_WRITE, "", kTestCtx);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -510,8 +527,8 @@ void test_priority_role_group_union() {
     std::string res = "res-008";
 
     // Two group/role grants union for a user who holds both roles.
-    acl.grant_permission(res, "devs", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE);
-    acl.grant_permission(res, "viewer", PrincipalType::ROLE, PERM_READ);
+    acl.grant_permission(res, "devs", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE, "", kTestCtx);
+    acl.grant_permission(res, "viewer", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "bob", {"viewer", "devs"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -525,8 +542,8 @@ void test_priority_role_other_union() {
     AclManager acl(db);
     std::string res = "res-009";
 
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ | PERM_WRITE);
-    acl.grant_permission(res, "viewer", PrincipalType::ROLE, PERM_READ);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ | PERM_WRITE, "", kTestCtx);
+    acl.grant_permission(res, "viewer", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "bob", {"viewer"});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -539,8 +556,8 @@ void test_priority_group_and_other_both_apply() {
     AclManager acl(db);
     std::string res = "res-010";
 
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_WRITE);
-    acl.grant_permission(res, "team", PrincipalType::GROUP, PERM_READ);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_WRITE, "", kTestCtx);
+    acl.grant_permission(res, "team", PrincipalType::GROUP, PERM_READ, "", kTestCtx);
 
     // Union model: GROUP and OTHER grants accumulate.
     auto result = acl.get_effective_permissions(res, "charlie", {});
@@ -558,7 +575,7 @@ void test_rbac_single_role() {
     AclManager acl(db);
     std::string res = "res-rbac-001";
 
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     auto result = acl.check_permission(res, "user1", {"editor"}, PERM_READ);
     TEST_ASSERT(result.success && result.value, "editor should have READ");
@@ -576,8 +593,8 @@ void test_rbac_multiple_roles_cumulative() {
     std::string res = "res-rbac-002";
 
     // Two separate role grants
-    acl.grant_permission(res, "reader", PrincipalType::ROLE, PERM_READ);
-    acl.grant_permission(res, "writer", PrincipalType::ROLE, PERM_WRITE);
+    acl.grant_permission(res, "reader", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
+    acl.grant_permission(res, "writer", PrincipalType::ROLE, PERM_WRITE, "", kTestCtx);
 
     // User with both roles should have cumulative permissions
     auto result = acl.get_effective_permissions(res, "user1", {"reader", "writer"});
@@ -593,9 +610,9 @@ void test_rbac_role_hierarchy_users_contributors_admins() {
     std::string res = "res-rbac-003";
 
     // Typical role hierarchy
-    acl.grant_permission(res, "users", PrincipalType::ROLE, PERM_READ);
-    acl.grant_permission(res, "contributors", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
-    acl.grant_permission(res, "administrators", PrincipalType::ROLE, PERM_ALL);
+    acl.grant_permission(res, "users", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
+    acl.grant_permission(res, "contributors", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
+    acl.grant_permission(res, "administrators", PrincipalType::ROLE, PERM_ALL, "", kTestCtx);
 
     // Regular user: READ only
     auto result = acl.get_effective_permissions(res, "viewer", {"users"});
@@ -627,7 +644,7 @@ void test_rbac_unmatched_role() {
     AclManager acl(db);
     std::string res = "res-rbac-004";
 
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // User has a role not defined on this resource. The editor role's WRITE
     // must not apply; only the read-by-default baseline READ remains.
@@ -642,7 +659,7 @@ void test_rbac_empty_roles_vector() {
     AclManager acl(db);
     std::string res = "res-rbac-005";
 
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "user1", {});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -655,15 +672,15 @@ void test_role_manager_crud_round_trip() {
     RoleManager rm(db);
 
     // create -> get_all_roles
-    TEST_ASSERT(rm.create_role("admin").success, "create_role(admin) should succeed");
-    TEST_ASSERT(rm.create_role("viewer").success, "create_role(viewer) should succeed");
+    TEST_ASSERT(rm.create_role("admin", "", kTestCtx).success, "create_role(admin) should succeed");
+    TEST_ASSERT(rm.create_role("viewer", "", kTestCtx).success, "create_role(viewer) should succeed");
     auto all = rm.get_all_roles();
     TEST_ASSERT(all.success && all.value.size() == 2, "get_all_roles should return 2 roles");
 
     // assign -> get_roles_for_user / get_users_for_role
-    TEST_ASSERT(rm.assign_user_to_role("alice", "admin").success, "assign should succeed");
-    TEST_ASSERT(rm.assign_user_to_role("alice", "viewer").success, "assign viewer should succeed");
-    TEST_ASSERT(rm.assign_user_to_role("bob", "viewer").success, "assign bob/viewer should succeed");
+    TEST_ASSERT(rm.assign_user_to_role("alice", "admin", "", kTestCtx).success, "assign should succeed");
+    TEST_ASSERT(rm.assign_user_to_role("alice", "viewer", "", kTestCtx).success, "assign viewer should succeed");
+    TEST_ASSERT(rm.assign_user_to_role("bob", "viewer", "", kTestCtx).success, "assign bob/viewer should succeed");
 
     auto alice_roles = rm.get_roles_for_user("alice");
     TEST_ASSERT(alice_roles.success && alice_roles.value.size() == 2, "alice should have 2 roles");
@@ -672,13 +689,13 @@ void test_role_manager_crud_round_trip() {
     TEST_ASSERT(viewer_users.success && viewer_users.value.size() == 2, "viewer should have 2 users");
 
     // remove single assignment
-    TEST_ASSERT(rm.remove_user_from_role("alice", "viewer").success, "remove should succeed");
+    TEST_ASSERT(rm.remove_user_from_role("alice", "viewer", "", kTestCtx).success, "remove should succeed");
     alice_roles = rm.get_roles_for_user("alice");
     TEST_ASSERT(alice_roles.value.size() == 1 && alice_roles.value[0] == "admin",
                 "alice should now only have admin");
 
     // delete_role cascades to user_roles
-    TEST_ASSERT(rm.delete_role("viewer").success, "delete_role should succeed");
+    TEST_ASSERT(rm.delete_role("viewer", "", kTestCtx).success, "delete_role should succeed");
     auto bob_roles = rm.get_roles_for_user("bob");
     TEST_ASSERT(bob_roles.success && bob_roles.value.empty(),
                 "deleting a role should clear its assignments");
@@ -691,11 +708,11 @@ void test_db_roles_union_with_request_roles_in_check_permission() {
     std::string res = "shared-resource";
 
     // Resource is readable by anyone in the "editor" role.
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // alice is assigned the editor role server-side, NOT passed in the request.
-    rm.create_role("editor");
-    rm.assign_user_to_role("alice", "editor");
+    rm.create_role("editor", "", kTestCtx);
+    rm.assign_user_to_role("alice", "editor", "", kTestCtx);
 
     // Request roles are empty, but DB-stored role should be picked up.
     auto perms = acl.get_effective_permissions(res, "alice", {});
@@ -710,8 +727,8 @@ void test_rbac_same_user_different_roles_different_resources() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
 
-    acl.grant_permission("project-a", "developer", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
-    acl.grant_permission("project-b", "viewer", PrincipalType::ROLE, PERM_READ);
+    acl.grant_permission("project-a", "developer", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
+    acl.grant_permission("project-b", "viewer", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
 
     // alice is developer on project-a and viewer on project-b
     auto result_a = acl.get_effective_permissions("project-a", "alice", {"developer", "viewer"});
@@ -737,7 +754,7 @@ void test_claims_grant_matches_on_claim() {
 
     // Grant READ|WRITE to anyone whose claims contain department=engineering.
     acl.grant_permission(res, "department=engineering", PrincipalType::CLAIM,
-                         PERM_READ | PERM_WRITE);
+                         PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // A requester presenting the matching claim is granted.
     std::map<std::string, std::string> eng = {{"department", "engineering"}};
@@ -765,8 +782,8 @@ void test_claims_effective_permissions_union_with_roles() {
     // DELETE via claim, WRITE via role: effective set is the union. (DELETE is
     // used as the claim's observable bit because READ is granted to everyone by
     // the read-by-default baseline and so cannot witness the claim's effect.)
-    acl.grant_permission(res, "clearance=secret", PrincipalType::CLAIM, PERM_DELETE);
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_WRITE);
+    acl.grant_permission(res, "clearance=secret", PrincipalType::CLAIM, PERM_DELETE, "", kTestCtx);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_WRITE, "", kTestCtx);
 
     std::map<std::string, std::string> secret = {{"clearance", "secret"}};
     auto eff = acl.get_effective_permissions(res, "dave", {"editor"}, "", secret);
@@ -786,9 +803,9 @@ void test_claims_deny_overrides_allow() {
     std::string res = "res-claims-003";
 
     // ALLOW READ to everyone, but DENY READ to a quarantined claim.
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ, "", kTestCtx);
     acl.grant_permission(res, "status=quarantined", PrincipalType::CLAIM, PERM_READ,
-                         "", "", AclEffect::DENY);
+                         "", kTestCtx, AclEffect::DENY);
 
     std::map<std::string, std::string> bad = {{"status", "quarantined"}};
     auto r1 = acl.check_permission(res, "eve", {}, PERM_READ, "", bad);
@@ -806,7 +823,7 @@ void test_claims_malformed_principal_never_matches() {
 
     // A CLAIM principal with no '=' is malformed and must never match. WRITE is
     // probed because READ is granted to everyone by the read-by-default baseline.
-    acl.grant_permission(res, "no-equals-sign", PrincipalType::CLAIM, PERM_WRITE);
+    acl.grant_permission(res, "no-equals-sign", PrincipalType::CLAIM, PERM_WRITE, "", kTestCtx);
     std::map<std::string, std::string> any = {{"no-equals-sign", "x"}};
     auto r = acl.check_permission(res, "grace", {}, PERM_WRITE, "", any);
     TEST_ASSERT(r.success && !r.value, "malformed claim rule never matches");
@@ -839,7 +856,7 @@ void test_all_individual_permissions() {
 
     for (const auto& p : perms) {
         std::string res = std::string("res-perm-") + p.name;
-        acl.grant_permission(res, "user", PrincipalType::USER, p.perm);
+        acl.grant_permission(res, "user", PrincipalType::USER, p.perm, "", kTestCtx);
 
         auto result = acl.check_permission(res, "user", {}, p.perm);
         TEST_ASSERT(result.success && result.value,
@@ -865,7 +882,7 @@ void test_permission_bitmask_combination() {
     std::string res = "res-bitmask-001";
 
     // Grant READ|WRITE|DELETE as a single bitmask
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE | PERM_DELETE, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "user", {"editor"});
     TEST_ASSERT(has_perm(result.value, PERM_READ), "should have READ");
@@ -882,11 +899,11 @@ void test_version_specific_permissions_via_roles() {
 
     // Version-viewer role: can view and retrieve but not restore
     int version_view = PERM_VIEW_VERSIONS | PERM_RETRIEVE_BACK_VERSION;
-    acl.grant_permission(res, "version_viewer", PrincipalType::ROLE, version_view);
+    acl.grant_permission(res, "version_viewer", PrincipalType::ROLE, version_view, "", kTestCtx);
 
     // Version-admin role: can also restore
     int version_admin = version_view | PERM_RESTORE_TO_VERSION;
-    acl.grant_permission(res, "version_admin", PrincipalType::ROLE, version_admin);
+    acl.grant_permission(res, "version_admin", PrincipalType::ROLE, version_admin, "", kTestCtx);
 
     // Viewer can view but not restore
     auto result = acl.get_effective_permissions(res, "user1", {"version_viewer"});
@@ -907,11 +924,11 @@ void test_deleted_file_permissions_via_roles() {
     std::string res = "res-deleted-perms";
 
     // Auditor: can list deleted items but not undelete
-    acl.grant_permission(res, "auditor", PrincipalType::ROLE, PERM_READ | PERM_LIST_DELETED);
+    acl.grant_permission(res, "auditor", PrincipalType::ROLE, PERM_READ | PERM_LIST_DELETED, "", kTestCtx);
 
     // Recovery-admin: can list deleted and undelete
     acl.grant_permission(res, "recovery_admin", PrincipalType::ROLE,
-                         PERM_READ | PERM_LIST_DELETED | PERM_UNDELETE);
+                         PERM_READ | PERM_LIST_DELETED | PERM_UNDELETE, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "user1", {"auditor"});
     TEST_ASSERT(has_perm(result.value, PERM_LIST_DELETED), "auditor should list deleted");
@@ -931,7 +948,7 @@ void test_check_permission_requires_all_bits() {
     AclManager acl(db);
     std::string res = "res-check-001";
 
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     // Check for READ alone: should pass
     auto result = acl.check_permission(res, "alice", {}, PERM_READ);
@@ -947,7 +964,7 @@ void test_check_permission_with_superset() {
     AclManager acl(db);
     std::string res = "res-check-002";
 
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE | PERM_DELETE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE | PERM_DELETE, "", kTestCtx);
 
     // Check for subset of granted permissions
     auto result = acl.check_permission(res, "alice", {}, PERM_READ);
@@ -973,8 +990,8 @@ void test_grant_accumulates_per_principal_effect() {
     // bits into the existing row, so callers can grant bits incrementally
     // without overwriting earlier grants. The DB enforces this with
     //   ON CONFLICT DO UPDATE SET permissions = acls.permissions | $4
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "", kTestCtx);
 
     auto acls = acl.get_acls_for_resource(res);
     TEST_ASSERT(acls.success, "get_acls should succeed");
@@ -991,12 +1008,12 @@ void test_revoke_clears_only_requested_bits() {
     std::string res = "res-revoke-001";
 
     // Grant WRITE|DELETE in a single call (matches how the DB merges on conflict).
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE | PERM_DELETE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE | PERM_DELETE, "", kTestCtx);
 
     // Revoke only the WRITE bit — DELETE must remain. (Non-baseline bits are
     // used so the revoke is observable; revoking an ALLOW READ would be masked
     // by the read-by-default baseline.)
-    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_WRITE);
+    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "", kTestCtx);
 
     auto result = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(result.success, "get_effective_permissions should succeed");
@@ -1009,10 +1026,10 @@ void test_revoke_all_bits_deletes_row() {
     AclManager acl(db);
     std::string res = "res-revoke-001b";
 
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // Pass -1 (all bits) to fully revoke the principal's row.
-    acl.revoke_permission(res, "alice", PrincipalType::USER, -1);
+    acl.revoke_permission(res, "alice", PrincipalType::USER, -1, "", kTestCtx);
 
     auto acls = acl.get_acls_for_resource(res);
     TEST_ASSERT(acls.success, "get_acls_for_resource should succeed");
@@ -1024,11 +1041,11 @@ void test_revoke_only_affects_matching_type() {
     AclManager acl(db);
     std::string res = "res-revoke-002";
 
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
-    acl.grant_permission(res, "alice", PrincipalType::ROLE, PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
+    acl.grant_permission(res, "alice", PrincipalType::ROLE, PERM_WRITE, "", kTestCtx);
 
     // Revoke USER type only
-    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     // ROLE entry should remain
     auto acls = acl.get_acls_for_resource(res);
@@ -1042,7 +1059,7 @@ void test_revoke_nonexistent_permission() {
     std::string res = "res-revoke-003";
 
     // Revoking when nothing was granted should succeed (no-op)
-    auto result = acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    auto result = acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
     TEST_ASSERT(result.success, "revoking nonexistent permission should succeed");
 }
 
@@ -1058,9 +1075,9 @@ void test_inherit_acls_copies_inheritable_rules_only() {
 
     // Two rules marked inheritable, one not.
     const int inherit = PERM_ACL_INHERIT;
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE | inherit);
-    acl.grant_permission(parent, "editor", PrincipalType::ROLE, PERM_READ | inherit);
-    acl.grant_permission(parent, "other", PrincipalType::OTHER, PERM_READ); // no inherit bit
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE | inherit, "", kTestCtx);
+    acl.grant_permission(parent, "editor", PrincipalType::ROLE, PERM_READ | inherit, "", kTestCtx);
+    acl.grant_permission(parent, "other", PrincipalType::OTHER, PERM_READ, "", kTestCtx); // no inherit bit
 
     auto result = acl.inherit_acls(parent, child);
     TEST_ASSERT(result.success, "inherit_acls should succeed");
@@ -1083,8 +1100,8 @@ void test_inherit_acls_skips_non_inheritable_rules() {
     std::string child = "dir-non-inherit-child";
 
     // None of the parent rules carry ACL_INHERIT.
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ);
-    acl.grant_permission(parent, "bob", PrincipalType::USER, PERM_WRITE);
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
+    acl.grant_permission(parent, "bob", PrincipalType::USER, PERM_WRITE, "", kTestCtx);
 
     auto result = acl.inherit_acls(parent, child);
     TEST_ASSERT(result.success, "inherit_acls should succeed even with nothing to copy");
@@ -1100,11 +1117,11 @@ void test_inherit_acls_is_one_time_copy() {
     std::string parent = "dir-parent-2";
     std::string child = "dir-child-2";
 
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_ACL_INHERIT);
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_READ | PERM_ACL_INHERIT, "", kTestCtx);
     acl.inherit_acls(parent, child);
 
     // Add more permissions to parent AFTER inheritance.
-    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_WRITE | PERM_ACL_INHERIT);
+    acl.grant_permission(parent, "alice", PrincipalType::USER, PERM_WRITE | PERM_ACL_INHERIT, "", kTestCtx);
 
     // Child should NOT get the new permission.
     auto child_perms = acl.get_effective_permissions(child, "alice", {});
@@ -1215,7 +1232,7 @@ void test_manage_acl_required_separately_from_write() {
     std::string res = "managed-resource";
 
     // bob has WRITE but no MANAGE_ACL.
-    acl.grant_permission(res, "bob", PrincipalType::USER, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "bob", PrincipalType::USER, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // check_permission(MANAGE_ACL) should return false even though bob has WRITE.
     auto can_manage = acl.check_permission(res, "bob", {}, PERM_MANAGE_ACL);
@@ -1254,8 +1271,8 @@ void test_system_admin_role_bypasses_acls() {
     // roles are unioned via resolve_effective_roles).
     acl.is_system_admin("bob", {kSystemAdminRole}); // no-op, just consistency
     RoleManager rm(db);
-    rm.create_role(kSystemAdminRole);
-    rm.assign_user_to_role("bob", kSystemAdminRole);
+    rm.create_role(kSystemAdminRole, "", kTestCtx);
+    rm.assign_user_to_role("bob", kSystemAdminRole, "", kTestCtx);
     auto via_db = acl.check_permission(res, "bob", {}, PERM_WRITE);
     TEST_ASSERT(via_db.success && via_db.value,
                 "system_admin role via DB-stored assignment should also bypass");
@@ -1266,11 +1283,18 @@ void test_audit_log_records_actor_for_grant_and_revoke() {
     AclManager acl(db);
     std::string res = "audited-resource";
 
-    // Direct AclManager API: actor is the trailing performed_by argument.
+    // Direct AclManager API: the actor now travels in the AccountabilityContext,
+    // which is also what the DB layer records.
+    auto ctx_for = [](const char* actor) {
+        AccountabilityContext c;
+        c.actor = actor;
+        c.source_iface = "test";
+        return c;
+    };
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"admin");
+                         /*tenant=*/"", ctx_for("admin"));
     acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"auditor");
+                         /*tenant=*/"", ctx_for("auditor"));
 
     const auto& log = db->audit_log();
     TEST_ASSERT(log.size() == 2, "audit log should have one row per grant + one per revoke");
@@ -1310,9 +1334,9 @@ void test_deny_rule_subtracts_from_allow() {
 
     // alice has READ|WRITE via ALLOW, but a DENY removes WRITE.
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::ALLOW);
+                         /*tenant=*/"", kTestCtx, AclEffect::ALLOW);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto perms = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(perms.success, "get_effective_permissions should succeed");
@@ -1328,9 +1352,9 @@ void test_deny_role_grant_for_specific_user() {
     std::string res = "shared-doc";
 
     // "everyone in role editor" gets READ|WRITE — alice is the exception.
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     // bob (an editor) gets full role permissions.
     auto bob = acl.get_effective_permissions(res, "bob", {"editor"});
@@ -1354,7 +1378,7 @@ void test_deny_on_bit_never_granted_is_noop() {
     // DENY READ on a resource where alice has no explicit ALLOW. The DENY
     // clears the read-by-default baseline (deny always wins), leaving zero.
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto perms = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(perms.success && perms.value == 0,
@@ -1367,9 +1391,9 @@ void test_deny_and_allow_coexist_as_separate_rows() {
     std::string res = "two-row-resource";
 
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::ALLOW);
+                         /*tenant=*/"", kTestCtx, AclEffect::ALLOW);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto acls = acl.get_acls_for_resource(res);
     TEST_ASSERT(acls.success && acls.value.size() == 2,
@@ -1388,13 +1412,13 @@ void test_deny_revoke_targets_the_deny_row() {
     std::string res = "revoke-target-test";
 
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::ALLOW);
+                         /*tenant=*/"", kTestCtx, AclEffect::ALLOW);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     // Revoking from the DENY row removes the block — alice gets WRITE back.
     acl.revoke_permission(res, "alice", PrincipalType::USER, -1,
-                          /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                          /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto perms = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(has_perm(perms.value, PERM_READ), "READ remains from allow");
@@ -1447,7 +1471,7 @@ void test_cache_coalesces_repeat_reads_within_scope() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "cached-resource";
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     db->reset_get_acls_call_count();
     {
@@ -1465,7 +1489,7 @@ void test_cache_disabled_outside_scope() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "uncached-resource";
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     db->reset_get_acls_call_count();
     acl.check_permission(res, "alice", {}, PERM_READ);
@@ -1478,7 +1502,7 @@ void test_cache_invalidated_on_grant_within_scope() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "mutated-resource";
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     db->reset_get_acls_call_count();
     {
@@ -1486,7 +1510,7 @@ void test_cache_invalidated_on_grant_within_scope() {
         acl.check_permission(res, "alice", {}, PERM_READ); // DB read 1, cached
         // A mid-scope grant invalidates the cached entry so a subsequent
         // check sees the new permission.
-        acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
+        acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE, "", kTestCtx);
         auto perms = acl.get_effective_permissions(res, "alice", {});
         TEST_ASSERT(has_perm(perms.value, PERM_WRITE),
                     "post-grant check should see WRITE, not the stale cached value");
@@ -1499,7 +1523,7 @@ void test_nested_cache_scopes_share_outer_cache() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "nested-scope-resource";
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     db->reset_get_acls_call_count();
     {
@@ -1542,7 +1566,7 @@ void test_grpc_bitmask_regression_octal_vs_hex() {
     // Grant exactly READ|WRITE (NOT DELETE/LIST_DELETED) so the octal-collision
     // checks below are meaningful — the creator's default ACL now includes DELETE
     // and LIST_DELETED (full owner control), which would mask this regression.
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // Correct enum constants: creator can READ and WRITE their own resource.
     auto correct_read  = acl.check_permission(res, "alice", {}, static_cast<int>(Permission::READ));
@@ -1573,10 +1597,10 @@ void test_tenant_acls_are_isolated() {
     std::string res = "shared-resource-uid";
 
     // Grant READ on tenant-a
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "tenant-a");
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "tenant-a", kTestCtx);
 
     // Grant WRITE on tenant-b
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "tenant-b");
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "tenant-b", kTestCtx);
 
     // Check tenant-a: should have READ only
     auto perms_a = acl.get_effective_permissions(res, "alice", {}, "tenant-a");
@@ -1598,8 +1622,8 @@ void test_tenant_role_isolation() {
     AclManager acl(db);
     std::string res = "multi-tenant-res";
 
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "org-1");
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ, "org-2");
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "org-1", kTestCtx);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ, "org-2", kTestCtx);
 
     auto perms_1 = acl.get_effective_permissions(res, "user1", {"editor"}, "org-1");
     TEST_ASSERT(has_perm(perms_1.value, PERM_WRITE), "editor in org-1 should have WRITE");
@@ -1615,11 +1639,11 @@ void test_tenant_revoke_isolation() {
 
     // Use WRITE (a non-baseline bit) so the revoke is observable; revoking an
     // ALLOW READ would be masked by the read-by-default baseline.
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "t1");
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "t2");
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "t1", kTestCtx);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "t2", kTestCtx);
 
     // Revoke on t1 should not affect t2
-    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "t1");
+    acl.revoke_permission(res, "alice", PrincipalType::USER, PERM_WRITE, "t1", kTestCtx);
 
     auto perms_t1 = acl.get_effective_permissions(res, "alice", {}, "t1");
     TEST_ASSERT(!has_perm(perms_t1.value, PERM_WRITE), "alice should NOT have WRITE on t1 after revoke");
@@ -1654,8 +1678,8 @@ void test_different_resources_independent_acls() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
 
-    acl.grant_permission("resource-a", "alice", PrincipalType::USER, PERM_READ);
-    acl.grant_permission("resource-b", "alice", PrincipalType::USER, PERM_WRITE);
+    acl.grant_permission("resource-a", "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
+    acl.grant_permission("resource-b", "alice", PrincipalType::USER, PERM_WRITE, "", kTestCtx);
 
     auto perms_a = acl.get_effective_permissions("resource-a", "alice", {});
     TEST_ASSERT(has_perm(perms_a.value, PERM_READ), "alice should have READ on resource-a");
@@ -1674,8 +1698,8 @@ void test_different_users_same_resource() {
     AclManager acl(db);
     std::string res = "shared-resource";
 
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE);
-    acl.grant_permission(res, "bob", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ | PERM_WRITE, "", kTestCtx);
+    acl.grant_permission(res, "bob", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     auto alice_perms = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(has_perm(alice_perms.value, PERM_WRITE), "alice should have WRITE");
@@ -1691,8 +1715,8 @@ void test_multiple_group_acls_cumulative() {
 
     // Multiple group/role ACLs accumulate for a user who holds those roles
     // (roles are the group mechanism).
-    acl.grant_permission(res, "group-a", PrincipalType::ROLE, PERM_READ);
-    acl.grant_permission(res, "group-b", PrincipalType::ROLE, PERM_WRITE);
+    acl.grant_permission(res, "group-a", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
+    acl.grant_permission(res, "group-b", PrincipalType::ROLE, PERM_WRITE, "", kTestCtx);
 
     auto perms = acl.get_effective_permissions(res, "user1", {"group-a", "group-b"});
     TEST_ASSERT(has_perm(perms.value, PERM_READ), "should have READ from group-a role");
@@ -1704,8 +1728,8 @@ void test_multiple_other_acls_cumulative() {
     AclManager acl(db);
     std::string res = "res-multi-other";
 
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ);
-    acl.grant_permission(res, "everyone", PrincipalType::OTHER, PERM_EXECUTE);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ, "", kTestCtx);
+    acl.grant_permission(res, "everyone", PrincipalType::OTHER, PERM_EXECUTE, "", kTestCtx);
 
     auto perms = acl.get_effective_permissions(res, "anyone", {});
     TEST_ASSERT(has_perm(perms.value, PERM_READ), "should have READ from other");
@@ -1717,14 +1741,14 @@ void test_grant_zero_permissions() {
     AclManager acl(db);
     std::string res = "res-zero-perms";
 
-    auto result = acl.grant_permission(res, "alice", PrincipalType::USER, 0);
+    auto result = acl.grant_permission(res, "alice", PrincipalType::USER, 0, "", kTestCtx);
     TEST_ASSERT(result.success, "granting zero permissions should succeed");
 
     // A zero-bits USER grant contributes nothing under the union model — it
     // does NOT suppress role grants. Today there's no deny semantic, so the
     // only way to revoke is to remove the role assignment or call
     // revoke_permission(). See plan §6.1 for future deny rules.
-    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "editor", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     auto perms = acl.get_effective_permissions(res, "alice", {"editor"});
     TEST_ASSERT(has_perm(perms.value, PERM_READ), "zero-perm user ACL does not suppress role READ");
@@ -1739,22 +1763,22 @@ void test_role_manager_empty_validation() {
     auto db = std::make_shared<MockDatabase>();
     RoleManager rm(db);
 
-    auto result = rm.create_role("");
+    auto result = rm.create_role("", "", kTestCtx);
     TEST_ASSERT(!result.success, "creating role with empty name should fail");
 
-    result = rm.delete_role("");
+    result = rm.delete_role("", "", kTestCtx);
     TEST_ASSERT(!result.success, "deleting role with empty name should fail");
 
-    result = rm.assign_user_to_role("", "admin");
+    result = rm.assign_user_to_role("", "admin", "", kTestCtx);
     TEST_ASSERT(!result.success, "assigning empty user should fail");
 
-    result = rm.assign_user_to_role("alice", "");
+    result = rm.assign_user_to_role("alice", "", "", kTestCtx);
     TEST_ASSERT(!result.success, "assigning empty role should fail");
 
-    result = rm.remove_user_from_role("", "admin");
+    result = rm.remove_user_from_role("", "admin", "", kTestCtx);
     TEST_ASSERT(!result.success, "removing empty user should fail");
 
-    result = rm.remove_user_from_role("alice", "");
+    result = rm.remove_user_from_role("alice", "", "", kTestCtx);
     TEST_ASSERT(!result.success, "removing empty role should fail");
 }
 
@@ -1762,10 +1786,10 @@ void test_role_manager_valid_operations_persist() {
     auto db = std::make_shared<MockDatabase>();
     RoleManager rm(db);
 
-    auto result = rm.create_role("admin");
+    auto result = rm.create_role("admin", "", kTestCtx);
     TEST_ASSERT(result.success, "create_role should succeed");
 
-    result = rm.assign_user_to_role("alice", "admin");
+    result = rm.assign_user_to_role("alice", "admin", "", kTestCtx);
     TEST_ASSERT(result.success, "assign_user_to_role should succeed");
 
     // Phase 4: assignments persist.
@@ -1777,12 +1801,12 @@ void test_role_manager_valid_operations_persist() {
     TEST_ASSERT(users.success && users.value.size() == 1 && users.value[0] == "alice",
                 "get_users_for_role should return [alice]");
 
-    result = rm.remove_user_from_role("alice", "admin");
+    result = rm.remove_user_from_role("alice", "admin", "", kTestCtx);
     TEST_ASSERT(result.success, "remove_user_from_role should succeed");
     roles = rm.get_roles_for_user("alice");
     TEST_ASSERT(roles.success && roles.value.empty(), "alice should have no roles after removal");
 
-    result = rm.delete_role("admin");
+    result = rm.delete_role("admin", "", kTestCtx);
     TEST_ASSERT(result.success, "delete_role should succeed");
     auto all = rm.get_all_roles();
     TEST_ASSERT(all.success && all.value.empty(), "no roles should remain after delete");
@@ -1805,10 +1829,10 @@ void test_scenario_file_sharing_workflow() {
     acl.apply_default_acls(readme, "owner");
 
     // Grant team role READ|WRITE on project dir
-    acl.grant_permission(project_dir, "team-member", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(project_dir, "team-member", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
 
     // Grant external reviewer READ only
-    acl.grant_permission(readme, "reviewer", PrincipalType::ROLE, PERM_READ);
+    acl.grant_permission(readme, "reviewer", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
 
     // Owner has full access (READ|WRITE|EXECUTE from defaults)
     auto owner_perms = acl.get_effective_permissions(project_dir, "owner", {"team-member"});
@@ -1840,11 +1864,11 @@ void test_scenario_multi_role_user() {
     std::string res = "sensitive-doc";
 
     // Finance team can READ
-    acl.grant_permission(res, "finance", PrincipalType::ROLE, PERM_READ);
+    acl.grant_permission(res, "finance", PrincipalType::ROLE, PERM_READ, "", kTestCtx);
     // Managers can WRITE
-    acl.grant_permission(res, "manager", PrincipalType::ROLE, PERM_WRITE);
+    acl.grant_permission(res, "manager", PrincipalType::ROLE, PERM_WRITE, "", kTestCtx);
     // Auditors can see deleted and versions
-    acl.grant_permission(res, "auditor", PrincipalType::ROLE, PERM_LIST_DELETED | PERM_VIEW_VERSIONS);
+    acl.grant_permission(res, "auditor", PrincipalType::ROLE, PERM_LIST_DELETED | PERM_VIEW_VERSIONS, "", kTestCtx);
 
     // User with all three roles gets cumulative permissions
     auto perms = acl.get_effective_permissions(res, "finance_manager_auditor",
@@ -1862,12 +1886,12 @@ void test_scenario_role_grants_accumulate_with_user() {
     std::string res = "restricted-resource";
 
     // Admin role has full permissions
-    acl.grant_permission(res, "admin", PrincipalType::ROLE, PERM_ALL);
+    acl.grant_permission(res, "admin", PrincipalType::ROLE, PERM_ALL, "", kTestCtx);
 
     // Adding a USER grant cannot subtract — union model.
     // The only way to restrict alice's effective permissions is to remove her
     // admin role assignment (or, in the future, use deny rules; see plan §6.1).
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     auto perms = acl.get_effective_permissions(res, "alice", {"admin"});
     TEST_ASSERT(has_perm(perms.value, PERM_READ), "alice should have READ");
@@ -1880,8 +1904,8 @@ void test_scenario_access_after_role_removal() {
     AclManager acl(db);
     std::string res = "project-resource";
 
-    acl.grant_permission(res, "developer", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
-    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ);
+    acl.grant_permission(res, "developer", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
+    acl.grant_permission(res, "other", PrincipalType::OTHER, PERM_READ, "", kTestCtx);
 
     // User with developer role can read+write
     auto perms = acl.get_effective_permissions(res, "bob", {"developer"});
@@ -1906,7 +1930,7 @@ void test_everyone_deny_blocks_read() {
     // DENY READ to everyone (OTHER) hides the resource entirely, overriding the
     // read-by-default baseline.
     acl.grant_permission(res, kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions(res, "anyone", {});
     TEST_ASSERT(!has_perm(eff.value, PERM_READ), "everyone DENY clears baseline READ");
@@ -1923,9 +1947,9 @@ void test_user_allow_beats_everyone_deny() {
     // Home-folder pattern: deny everyone, but the owner keeps access. The user
     // tier resolves before the everyone tier, so alice's ALLOW wins over the
     // everyone DENY — while a non-owner still falls through to that DENY.
-    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ);
+    acl.grant_permission(res, "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
     acl.grant_permission(res, kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions(res, "alice", {});
     TEST_ASSERT(has_perm(eff.value, PERM_READ), "user ALLOW beats everyone DENY (home folder)");
@@ -1942,9 +1966,9 @@ void test_role_allow_beats_everyone_deny() {
     // Role-gated section: deny everyone read, allow the role read+write. A member
     // resolves at the role/claim tier (before the everyone DENY); a non-member
     // falls through to the everyone DENY.
-    acl.grant_permission(res, "engineering", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "engineering", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
     acl.grant_permission(res, kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto member = acl.get_effective_permissions(res, "alice", {"engineering"});
     TEST_ASSERT(has_perm(member.value, PERM_READ) && has_perm(member.value, PERM_WRITE),
@@ -1959,9 +1983,9 @@ void test_deny_wins_within_a_tier() {
     std::string res = "doc-mixed";
 
     // Same tier (role): a DENY beats an ALLOW for the same bit.
-    acl.grant_permission(res, "r-allow", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "r-allow", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
     acl.grant_permission(res, "r-deny", PrincipalType::ROLE, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions(res, "u", {"r-allow", "r-deny"});
     TEST_ASSERT(has_perm(eff.value, PERM_READ), "role READ allowed");
@@ -1975,17 +1999,17 @@ void test_user_tier_beats_role_tier() {
     // User tier resolves before the role tier: a user DENY beats a role ALLOW,
     // and a user ALLOW beats a role DENY, for the same bit.
     std::string res = "doc-tiers";
-    acl.grant_permission(res, "team", PrincipalType::ROLE, PERM_READ | PERM_WRITE);
+    acl.grant_permission(res, "team", PrincipalType::ROLE, PERM_READ | PERM_WRITE, "", kTestCtx);
     acl.grant_permission(res, "alice", PrincipalType::USER, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
     auto eff = acl.get_effective_permissions(res, "alice", {"team"});
     TEST_ASSERT(has_perm(eff.value, PERM_READ), "role READ applies (user tier silent on read)");
     TEST_ASSERT(!has_perm(eff.value, PERM_WRITE), "user DENY beats role ALLOW (write)");
 
     std::string res2 = "doc-tiers2";
     acl.grant_permission(res2, "team", PrincipalType::ROLE, PERM_WRITE,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
-    acl.grant_permission(res2, "alice", PrincipalType::USER, PERM_WRITE);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
+    acl.grant_permission(res2, "alice", PrincipalType::USER, PERM_WRITE, "", kTestCtx);
     auto eff2 = acl.get_effective_permissions(res2, "alice", {"team"});
     TEST_ASSERT(has_perm(eff2.value, PERM_WRITE), "user ALLOW beats role DENY (write)");
 }
@@ -2022,7 +2046,7 @@ void test_parent_deny_blocks_child_subtree() {
     // DENY READ to everyone on the FOLDER. The file itself has no ACL (baseline
     // readable), but it must become unreachable because its parent is hidden.
     acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     // Effective permissions reflect traversal: an unreadable parent collapses
     // the child's effective set to none.
@@ -2047,7 +2071,7 @@ void test_effective_permissions_reflect_readable_parent() {
     // Parent readable (by default), child grants alice WRITE. Effective perms
     // for alice include both baseline READ and the granted WRITE — traversal
     // does not strip perms when the path is reachable.
-    acl.grant_permission("file", "alice", PrincipalType::USER, PERM_WRITE);
+    acl.grant_permission("file", "alice", PrincipalType::USER, PERM_WRITE, "", kTestCtx);
 
     auto eff = acl.get_effective_permissions("file", "alice", {});
     TEST_ASSERT(has_perm(eff.value, PERM_READ), "reachable child keeps baseline READ");
@@ -2064,7 +2088,7 @@ void test_effective_permissions_reflect_system_admin() {
     // perms to zero. A system_admin bypasses ACLs entirely, so its effective
     // set is every permission regardless of ACLs or traversal.
     acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto eff = acl.get_effective_permissions("file", "root", {kSystemAdminRole});
     TEST_ASSERT(eff.success, "effective lookup succeeds for admin");
@@ -2087,7 +2111,7 @@ void test_parent_deny_blocks_grandchild() {
 
     // DENY READ to everyone at the TOP level blocks the whole subtree.
     acl.grant_permission("top", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto leaf = acl.check_permission("leaf", "nobody", {}, PERM_READ);
     TEST_ASSERT(leaf.success && !leaf.value, "ancestor DENY several levels up blocks the grandchild");
@@ -2103,8 +2127,8 @@ void test_child_allow_cannot_override_ancestor_deny() {
     // Path semantics: alice still cannot reach the file through a folder she
     // cannot read.
     acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
-    acl.grant_permission("file", "alice", PrincipalType::USER, PERM_READ);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
+    acl.grant_permission("file", "alice", PrincipalType::USER, PERM_READ, "", kTestCtx);
 
     auto check = acl.check_permission("file", "alice", {}, PERM_READ);
     TEST_ASSERT(check.success && !check.value,
@@ -2118,7 +2142,7 @@ void test_system_admin_bypasses_parent_deny() {
     db->set_file("file", "folder");
 
     acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     // system_admin bypasses ACLs entirely, including path traversal.
     auto check = acl.check_permission("file", "root", {kSystemAdminRole}, PERM_READ);
@@ -2150,7 +2174,7 @@ void test_cull_versions_not_implied_by_write() {
 
     // A user with broad write-ish access still cannot cull versions.
     acl.grant_permission(res, "editor", PrincipalType::USER,
-                         PERM_READ | PERM_WRITE | PERM_DELETE);
+                         PERM_READ | PERM_WRITE | PERM_DELETE, "", kTestCtx);
 
     auto check = acl.check_permission(res, "editor", {}, PERM_CULL_VERSIONS);
     TEST_ASSERT(check.success && !check.value,
@@ -2162,7 +2186,7 @@ void test_cull_versions_requires_explicit_grant() {
     AclManager acl(db);
     std::string res = "doc-cullable";
 
-    acl.grant_permission(res, "archivist", PrincipalType::USER, PERM_CULL_VERSIONS);
+    acl.grant_permission(res, "archivist", PrincipalType::USER, PERM_CULL_VERSIONS, "", kTestCtx);
 
     auto check = acl.check_permission(res, "archivist", {}, PERM_CULL_VERSIONS);
     TEST_ASSERT(check.success && check.value,
@@ -2192,9 +2216,9 @@ void test_cull_versions_blocked_by_everyone_deny_and_traversal() {
 
     // archivist holds CULL_VERSIONS on the file, but the parent folder is hidden
     // from everyone — path traversal still blocks the destroy-data op.
-    acl.grant_permission("file", "archivist", PrincipalType::USER, PERM_CULL_VERSIONS);
+    acl.grant_permission("file", "archivist", PrincipalType::USER, PERM_CULL_VERSIONS, "", kTestCtx);
     acl.grant_permission("folder", kEveryonePrincipal, PrincipalType::OTHER, PERM_READ,
-                         /*tenant=*/"", /*performed_by=*/"", AclEffect::DENY);
+                         /*tenant=*/"", kTestCtx, AclEffect::DENY);
 
     auto check = acl.check_permission("file", "archivist", {}, PERM_CULL_VERSIONS);
     TEST_ASSERT(check.success && !check.value,

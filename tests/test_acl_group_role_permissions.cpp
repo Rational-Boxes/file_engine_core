@@ -24,6 +24,16 @@
 #include "fileengine/types.h"
 #include "fileengine/IDatabase.h"
 
+// A stand-in acting identity for the mock-backed suites. The real path refuses
+// an operation whose actor is empty (PROPOSAL_accountability_record.md §5.1), so
+// tests have to name one even though the mocks record nothing.
+static const fileengine::AccountabilityContext kTestCtx = [] {
+    fileengine::AccountabilityContext c;
+    c.actor = "test";
+    c.source_iface = "test";
+    return c;
+}();
+
 using namespace fileengine;
 
 // Mock database implementation for testing
@@ -174,13 +184,13 @@ public:
     }
     
     // Tenant management operations
-    Result<void> create_tenant_schema(const std::string& tenant) override {
+    Result<void> create_tenant_schema(const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     Result<bool> tenant_schema_exists(const std::string& tenant) override {
         return Result<bool>::ok(true);
     }
-    Result<void> cleanup_tenant_data(const std::string& tenant) override {
+    Result<void> cleanup_tenant_data(const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     Result<std::vector<std::string>> list_tenants() override {
@@ -190,8 +200,8 @@ public:
     // ACL operations - these are the important ones for our test
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
-                         const std::string& tenant = "",
-                         const std::string& /*performed_by*/ = "",
+                         const std::string& tenant,
+                         const AccountabilityContext& /*ctx*/,
                          int /*effect*/ = 0) override {
         AclEntry entry;
         entry.resource_uid = resource_uid;
@@ -206,8 +216,8 @@ public:
     
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
-                            const std::string& tenant = "",
-                            const std::string& /*performed_by*/ = "",
+                            const std::string& tenant,
+                            const AccountabilityContext& /*ctx*/,
                             int /*effect*/ = 0) override {
         auto& resource_acls = acls_[resource_uid];
         for (auto& entry : resource_acls) {
@@ -275,21 +285,21 @@ public:
     }
 
     // Role management operations
-    Result<void> create_role(const std::string& role, const std::string& tenant = "") override {
+    Result<void> create_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
-    Result<void> delete_role(const std::string& role, const std::string& tenant = "") override {
+    Result<void> delete_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
-    Result<void> assign_user_to_role(const std::string& user, const std::string& role, 
-                                     const std::string& tenant = "") override {
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
-    Result<void> remove_user_from_role(const std::string& user, const std::string& role, 
-                                       const std::string& tenant = "") override {
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
@@ -332,19 +342,19 @@ void test_acl_group_role_permissions() {
     // Test 1: Grant READ permission to a user
     std::cout << "Test 1: Granting READ permission to user...\n";
     auto result = acl_manager.grant_permission(resource_uid, user, PrincipalType::USER, 
-                                              static_cast<int>(Permission::READ));
+                                              static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     
     // Test 2: Grant WRITE permission to a group
     std::cout << "Test 2: Granting WRITE permission to group...\n";
     result = acl_manager.grant_permission(resource_uid, group, PrincipalType::GROUP, 
-                                         static_cast<int>(Permission::WRITE));
+                                         static_cast<int>(Permission::WRITE), "", kTestCtx);
     assert(result.success);
     
     // Test 3: Grant DELETE permission to a role
     std::cout << "Test 3: Granting DELETE permission to role...\n";
     result = acl_manager.grant_permission(resource_uid, role, PrincipalType::ROLE, 
-                                         static_cast<int>(Permission::DELETE));
+                                         static_cast<int>(Permission::DELETE), "", kTestCtx);
     assert(result.success);
     
     // Test 4: Check permissions for user
@@ -395,7 +405,7 @@ void test_acl_group_role_permissions() {
 
     // Grant EXECUTE permission to the group
     result = acl_manager.grant_permission(resource_uid, group, PrincipalType::GROUP,
-                                         static_cast<int>(Permission::EXECUTE));
+                                         static_cast<int>(Permission::EXECUTE), "", kTestCtx);
     assert(result.success);
 
     // A GROUP rule grants NOBODY anything — not even a caller presenting the
@@ -414,7 +424,7 @@ void test_acl_group_role_permissions() {
     // Granting the same thing through the mechanism that IS live keeps the
     // behaviour this test was reaching for under coverage.
     result = acl_manager.grant_permission(resource_uid, group, PrincipalType::ROLE,
-                                          static_cast<int>(Permission::EXECUTE));
+                                          static_cast<int>(Permission::EXECUTE), "", kTestCtx);
     assert(result.success);
     perm_result = acl_manager.get_effective_permissions(resource_uid, "test-group-user", user_with_group);
     assert(perm_result.success);
@@ -432,7 +442,7 @@ void test_acl_group_role_permissions() {
     // Test 9: Revoke permission
     std::cout << "Test 9: Revoking permission...\n";
     result = acl_manager.revoke_permission(resource_uid, user, PrincipalType::USER, 
-                                          static_cast<int>(Permission::READ));
+                                          static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     
     // User should no longer have READ permission

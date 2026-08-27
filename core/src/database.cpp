@@ -26,6 +26,7 @@
 #include <memory>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 
 namespace fileengine {
@@ -130,6 +131,12 @@ Result<void> Database::create_schema() {
             actor        VARCHAR(255) NOT NULL,
             actor_roles  TEXT,
             target_uid   VARCHAR(64),
+            -- Retained as a nullable column so existing chains still verify
+            -- (it is part of the hash's canonical row form), but it is never
+            -- populated any more: filenames are party data and this log is
+            -- immutable, so a name stored here is one the platform cannot
+            -- remove on request. Emitters send the uid; viewers resolve the
+            -- current name at read time (§5.4.7).
             target_name  VARCHAR(1024),
             target_type  SMALLINT,
             detail       JSONB,
@@ -137,15 +144,82 @@ Result<void> Database::create_schema() {
             source_addr  VARCHAR(64),
             request_id   VARCHAR(64),
             tenant       VARCHAR(255),
+            -- Two times, deliberately (PROPOSAL_accountability_record.md §4.3.4).
+            -- `ts` is when the event OCCURRED, as reported by its source. This
+            -- column is when it was RECORDED into the chain. The chain is
+            -- ordered by the latter, and the former can legitimately run
+            -- slightly backwards between adjacent entries from different
+            -- sources, because cross-source ordering is only accurate to within
+            -- the queue latency. Recording both makes that visible and
+            -- explicable instead of looking like clock corruption to a later
+            -- reader — or worse, prompting someone to "fix" it by reordering a
+            -- tamper-evident structure. Not part of the hash: it describes
+            -- delivery, not the event.
+            recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
             prev_hash    BYTEA,
             row_hash     BYTEA,
             PRIMARY KEY (seq, ts),
             UNIQUE (event_id, ts)
         ) PARTITION BY RANGE (ts);
 
+        ALTER TABLE audit_log_global
+            ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
         CREATE INDEX IF NOT EXISTS idx_audit_global_actor  ON audit_log_global(actor, ts);
         CREATE INDEX IF NOT EXISTS idx_audit_global_action ON audit_log_global(category, action, ts);
         CREATE INDEX IF NOT EXISTS idx_audit_global_tenant ON audit_log_global(tenant, ts);
+
+        -- Global accountability record (PROPOSAL_accountability_record.md §7.3).
+        -- A tenant's history is tenant data and is destroyed with the tenant —
+        -- DROP SCHEMA CASCADE takes its accountability_record along with
+        -- everything else. One thing cannot live there, for a mechanical
+        -- reason: the record of the deletion itself would delete itself. So
+        -- tenant lifecycle (create + delete) is recorded HERE, outside every
+        -- tenant schema, where whoever deletes a tenant cannot reach it.
+        --
+        -- Without this, deleting a tenant is the cleanest way to destroy
+        -- evidence: it would erase the entire record of what happened inside,
+        -- including the deleter's own actions. It also closes the §2.1 finding
+        -- that tenant deletion — the most destructive operation in the system —
+        -- currently emits no event at all.
+        --
+        -- Contents are deliberately limited to the fact of the lifecycle event.
+        -- Nothing about what the tenant held ever appears here.
+        CREATE TABLE IF NOT EXISTS accountability_record_global (
+            seq          BIGINT       PRIMARY KEY,
+            ts           TIMESTAMPTZ  NOT NULL,
+            actor        VARCHAR(255) NOT NULL,
+            actor_roles  TEXT[],
+            source_iface VARCHAR(32),
+            source_addr  VARCHAR(64),
+            category     VARCHAR(32)  NOT NULL,
+            action       VARCHAR(64)  NOT NULL,
+            target_uid   VARCHAR(64),
+            target_type  VARCHAR(32),
+            principal    VARCHAR(255),
+            tenant       VARCHAR(255),
+            detail       JSONB        NOT NULL DEFAULT '{}'::jsonb,
+            prev_hash    BYTEA,
+            hash         BYTEA        NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_accountability_global_ts     ON accountability_record_global(ts);
+        CREATE INDEX IF NOT EXISTS idx_accountability_global_actor  ON accountability_record_global(actor, ts);
+        CREATE INDEX IF NOT EXISTS idx_accountability_global_tenant ON accountability_record_global(tenant, ts);
+
+        -- The global chain's head. Same table shape as the per-tenant one so the
+        -- append path is literally the same code with a different schema; the
+        -- single row is keyed by the reserved '*global*' name, which no real
+        -- tenant can take (validate_schema_name strips '*').
+        CREATE TABLE IF NOT EXISTS accountability_chain_head_global (
+            tenant     VARCHAR(255) PRIMARY KEY,
+            last_seq   BIGINT NOT NULL DEFAULT 0,
+            last_ts    TIMESTAMPTZ,
+            last_hash  BYTEA
+        );
+
+        INSERT INTO accountability_chain_head_global (tenant) VALUES ('*global*')
+        ON CONFLICT (tenant) DO NOTHING;
     )SQL";
 
     // Execute global schema SQL statements
@@ -2033,7 +2107,464 @@ Result<int64_t> Database::get_storage_capacity(const std::string& tenant) {
     return Result<int64_t>::ok(1024LL * 1024 * 1024 * 1024); // 1 TB
 }
 
-Result<void> Database::create_tenant_schema(const std::string& tenant) {
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The guaranteed accountability record (PROPOSAL_accountability_record.md)
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// EXTRACT(EPOCH FROM ts) returns double precision on PostgreSQL below 14, and a
+// microsecond of a 2020s epoch is right at the edge of what a double represents
+// exactly — so the obvious expression can silently round the very field the
+// consumer's cursor and the chain hash both depend on. Splitting whole seconds
+// (always exact) from the sub-second field keeps it exact on every version.
+constexpr const char* kEpochMicrosExpr =
+    "(EXTRACT(EPOCH FROM date_trunc('second', last_ts))::bigint * 1000000 "
+    " + (EXTRACT(MICROSECONDS FROM last_ts)::bigint % 1000000))";
+
+// Round-trip the timestamp as TEXT rather than as a float for the same reason.
+constexpr const char* kIsoTextExpr =
+    "to_char(last_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')";
+
+// A Postgres text[] literal. Roles go in as a real array rather than a joined
+// string so "which records name role X" is an index-able question instead of a
+// pattern match over a CSV.
+std::string text_array_literal(const std::vector<std::string>& values) {
+    std::string out = "{";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) out += ",";
+        out += "\"";
+        for (char c : values[i]) {
+            if (c == '"' || c == '\\') out += '\\';
+            out += c;
+        }
+        out += "\"";
+    }
+    out += "}";
+    return out;
+}
+
+}  // namespace
+
+// Append one accountability record INSIDE the caller's open transaction.
+//
+// This is the whole guarantee: the record and the operation commit together or
+// not at all (§4.2). Every caller must treat a failure here as fatal to the
+// operation — roll back and fail — because the alternative is a committed
+// authorization change or destruction with nothing anywhere recording it, which
+// is the exact failure this table exists to prevent.
+//
+// The single locked head row aligns three orderings that were otherwise
+// independent: assignment order == commit order == chain order (§5.3.2). That
+// is what lets a consumer read forward by cursor with no snapshot watermark, no
+// lag heuristic, and no risk of skipping a record that commits late — and what
+// makes a gap in `seq` an unambiguous integrity alarm rather than routine noise.
+Result<Database::AccountabilityCommit> Database::append_accountability(
+        PGconn* conn, const std::string& tenant, const AccountabilityRecord& rec) {
+    auto fail = [&tenant](const std::string& msg) {
+        // Reaching here means an operation is about to be rolled back because
+        // its record could not be written. That is the fail-closed guarantee
+        // doing its job — and the single most important thing an operator can
+        // know, because the alternative design would have let the operation
+        // through unrecorded and said nothing at all.
+        SERVER_LOG_SECURITY("Accountability",
+                            "Accountability write FAILED for tenant '" + tenant +
+                            "' — the operation will be refused: " + msg);
+        return Result<AccountabilityCommit>::err("accountability: " + msg);
+    };
+
+    auto validated = validate_record(rec);
+    if (!validated.success) {
+        // A record the code could not honestly write — no actor, an action out
+        // of scope, a detail field no schema enumerates. Every one of those is a
+        // programming error on a security path, and the operation is about to be
+        // refused because of it, so it goes on the unsuppressable channel rather
+        // than being returned as a bare string nobody reads.
+        SERVER_LOG_SECURITY("Accountability",
+                            "Refusing to write an invalid accountability record for tenant '" +
+                            tenant + "' (action=" + rec.action + "): " + validated.error);
+        return fail(validated.error);
+    }
+
+    const bool is_global = (tenant == kGlobalChainKey);
+    if (is_global && rec.global_tenant.empty()) {
+        return fail("a global record must name the tenant it is about");
+    }
+    // Same statements either way; only the table names differ. The global chain
+    // lives outside every tenant schema precisely so a tenant deletion cannot
+    // reach it (§7.3).
+    const std::string schema       = is_global ? std::string() : get_schema_prefix(tenant);
+    const std::string head_table   = is_global ? std::string("accountability_chain_head_global")
+                                               : "\"" + schema + "\".accountability_chain_head";
+    const std::string record_table = is_global ? std::string("accountability_record_global")
+                                               : "\"" + schema + "\".accountability_record";
+    const std::string chain_key    = is_global ? std::string(kGlobalChainKey)
+                                               : (tenant.empty() ? std::string("default") : tenant);
+
+    // Bootstrap. Normally a no-op — create_tenant_schema seeds the row — but a
+    // tenant provisioned before this table existed would otherwise fail its
+    // first authorization change, which is exactly the moment the guarantee is
+    // supposed to start holding.
+    {
+        const std::string sql = "INSERT INTO " + head_table + " (tenant) VALUES ($1) "
+                                "ON CONFLICT (tenant) DO NOTHING;";
+        const char* params[1] = { chain_key.c_str() };
+        PGresult* res = PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(conn);
+        PQclear(res);
+        if (!ok) return fail("could not ensure chain head: " + err);
+    }
+
+    // Claim this record's position, under the head row's lock, in one statement.
+    // UPDATE ... RETURNING holds that lock until commit — that is what serializes
+    // appends per tenant, and what makes a rolled-back transaction release the
+    // lock WITHOUT advancing last_seq (so numbers are never burned and gaps
+    // cannot occur naturally).
+    //
+    // clock_timestamp(), NOT now(): now() / CURRENT_TIMESTAMP /
+    // transaction_timestamp() all return TRANSACTION START time, so records
+    // written in one transaction would share a timestamp taken before the lock
+    // was even acquired — reintroducing the ordering ambiguity the lock exists
+    // to remove. clock_timestamp() reads the wall clock inside the lock, so it
+    // falls in lock order.
+    //
+    // GREATEST(..., last_ts + 1µs) forces STRICT monotonicity. A clock can step
+    // backwards — NTP correction, VM migration, a leap-second smear — and a
+    // non-monotonic ts silently breaks any newer-than cursor. With the guard, ts
+    // within a tenant is strictly increasing whatever the system clock does,
+    // which is what makes `ts > recorded_until` exact: no two records share a
+    // ts, so the cursor needs no composite key and no tiebreak, and can neither
+    // skip a record nor return one twice.
+    std::int64_t seq = 0;
+    std::int64_t ts_micros = 0;
+    std::string  ts_text;
+    std::vector<std::uint8_t> prev_hash;
+    {
+        const std::string sql =
+            "UPDATE " + head_table + " SET "
+            "  last_seq = last_seq + 1, "
+            "  last_ts  = GREATEST(clock_timestamp(), last_ts + interval '1 microsecond') "
+            "WHERE tenant = $1 "
+            "RETURNING last_seq, " + kEpochMicrosExpr + ", " + kIsoTextExpr + ", last_hash;";
+        const char* params[1] = { chain_key.c_str() };
+        PGresult* res = PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+            const std::string err = PQerrorMessage(conn);
+            PQclear(res);
+            return fail("could not claim chain position: " + err);
+        }
+        seq       = std::strtoll(PQgetvalue(res, 0, 0), nullptr, 10);
+        ts_micros = std::strtoll(PQgetvalue(res, 0, 1), nullptr, 10);
+        ts_text   = PQgetvalue(res, 0, 2);
+        if (!PQgetisnull(res, 0, 3)) prev_hash = parse_bytea_hex(PQgetvalue(res, 0, 3));
+        PQclear(res);
+    }
+
+    const std::string canonical = canonical_record(seq, ts_micros, rec);
+    const std::vector<std::uint8_t> hash = chain_hash(prev_hash, canonical);
+    if (hash.empty()) return fail("chain hash could not be computed");
+
+    const std::string seq_param       = std::to_string(seq);
+    const std::string ts_param        = ts_text + "+00";   // text, not a float — see kIsoTextExpr
+    const std::string roles_param     = text_array_literal(rec.ctx.actor_roles);
+    const std::string category_param  = to_string(rec.category);
+    const std::string detail_param    = rec.detail.canonical_json();
+    const std::string prev_hash_param = bytea_hex(prev_hash);
+    const std::string hash_param      = bytea_hex(hash);
+
+    {
+        std::string sql =
+            "INSERT INTO " + record_table + " ("
+            "  seq, ts, actor, actor_roles, source_iface, source_addr, category, action,"
+            "  target_uid, target_type, principal, detail, prev_hash, hash"
+            + std::string(is_global ? ", tenant" : "") + ") VALUES ("
+            "  $1::bigint, $2::timestamptz, $3, NULLIF($4, '{}')::text[],"
+            "  NULLIF($5, ''), NULLIF($6, ''), $7, $8,"
+            "  NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), $12::jsonb,"
+            "  NULLIF($13, '\\x')::bytea, $14::bytea"
+            + std::string(is_global ? ", $15" : "") + ");";
+        std::vector<const char*> params = {
+            seq_param.c_str(), ts_param.c_str(), rec.ctx.actor.c_str(), roles_param.c_str(),
+            rec.ctx.source_iface.c_str(), rec.ctx.source_addr.c_str(), category_param.c_str(),
+            rec.action.c_str(), rec.target_uid.c_str(), rec.target_type.c_str(),
+            rec.principal.c_str(), detail_param.c_str(), prev_hash_param.c_str(),
+            hash_param.c_str()
+        };
+        if (is_global) params.push_back(rec.global_tenant.c_str());
+        PGresult* res = PQexecParams(conn, sql.c_str(), static_cast<int>(params.size()),
+                                     nullptr, params.data(), nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(conn);
+        PQclear(res);
+        if (!ok) return fail("could not write record: " + err);
+    }
+
+    {
+        const std::string sql = "UPDATE " + head_table + " SET last_hash = $2::bytea WHERE tenant = $1;";
+        const char* params[2] = { chain_key.c_str(), hash_param.c_str() };
+        PGresult* res = PQexecParams(conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(conn);
+        PQclear(res);
+        if (!ok) return fail("could not advance chain head: " + err);
+    }
+
+    AccountabilityCommit commit;
+    commit.seq = seq;
+    commit.ts_micros = ts_micros;
+    return Result<AccountabilityCommit>::ok(commit);
+}
+
+void Database::fire_accountability_hint(const std::string& tenant, std::int64_t seq) noexcept {
+    if (seq <= 0 || !accountability_hint_) return;
+    try {
+        accountability_hint_(tenant, seq);
+    } catch (...) {
+        // Deliberately swallowed. The record is already committed; the hint only
+        // shortens the consumer's latency, so a failure here must never surface
+        // as a failed operation.
+    }
+}
+
+// Cull a file's old versions and record the cull, in one transaction (§5.2).
+//
+// The accountability record is NOT culled with the content. Culling erases
+// history by design — that is the bargain — and a record that vanished with it
+// would erase the evidence *of* the cull. So the table survives PurgeOldVersions
+// and records it: actor, target, keep-count, and the resulting cut.
+Result<int> Database::purge_versions(const std::string& file_uid,
+                                     const std::vector<std::string>& version_timestamps,
+                                     const std::string& cut_version_timestamp,
+                                     int keep_count,
+                                     const std::string& tenant,
+                                     const AccountabilityContext& ctx) {
+    if (!ctx.valid()) {
+        return Result<int>::err("Refusing version cull with no actor");
+    }
+    if (version_timestamps.empty()) {
+        return Result<int>::ok(0);   // nothing destroyed, so nothing to record
+    }
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<int>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN purge_versions transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<int>::err(msg);
+    };
+
+    // One statement for the whole batch: = ANY($2::text[]) rather than a loop,
+    // so the deletion is as atomic as the record that describes it.
+    const std::string list_literal = text_array_literal(version_timestamps);
+    const std::string sql =
+        "DELETE FROM " + schema + ".versions "
+        "WHERE file_uid = $1 AND version_timestamp = ANY($2::text[]);";
+    const char* params[2] = { file_uid.c_str(), list_literal.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to purge versions: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        return rollback_and_fail(error);
+    }
+    const int removed = std::atoi(PQcmdTuples(res));
+    PQclear(res);
+
+    std::int64_t hint_seq = 0;
+    {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Destruction;
+        rec.action      = accountability_action::kCullVersions;
+        rec.target_uid  = file_uid;
+        rec.target_type = "file";
+        rec.detail.set("keep_count", keep_count);
+        rec.detail.set("versions_removed", removed);
+        rec.detail.set("cut_ts", cut_version_timestamp);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Version cull refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT purge_versions: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+    return Result<int>::ok(removed);
+}
+
+// The pull surface (§4.3.1). Reads forward from the consumer's watermark in ts
+// order — which, under the chain lock, is also seq order.
+//
+// Deliberately reads the PRIMARY, not a replica: the consumer treats a gap or a
+// missing hinted seq as an integrity alarm rather than a retry (§4.3.2), so
+// serving it lagging replica state would manufacture security alarms out of
+// ordinary replication delay.
+Result<std::vector<StoredAccountabilityRecord>> Database::list_accountability_records(
+        const std::string& tenant, std::int64_t newer_than_micros, int limit, bool& has_more) {
+    has_more = false;
+    if (limit <= 0) limit = 500;
+    if (limit > 5000) limit = 5000;
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<StoredAccountabilityRecord>>::err(
+            "Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    const bool is_global = (tenant == kGlobalChainKey);
+    const std::string record_table = is_global
+        ? std::string("accountability_record_global")
+        : "\"" + get_schema_prefix(tenant) + "\".accountability_record";
+
+    // Fetch one more than asked so has_more is a fact, not an estimate.
+    const std::string micros_expr =
+        "(EXTRACT(EPOCH FROM date_trunc('second', ts))::bigint * 1000000 "
+        " + (EXTRACT(MICROSECONDS FROM ts)::bigint % 1000000))";
+    const std::string sql =
+        "SELECT seq, " + micros_expr + ", "
+        "       to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), "
+        "       actor, COALESCE(array_to_string(actor_roles, ','), ''), "
+        "       COALESCE(source_iface, ''), COALESCE(source_addr, ''), "
+        "       category, action, COALESCE(target_uid, ''), COALESCE(target_type, ''), "
+        "       COALESCE(principal, ''), detail::text, prev_hash, hash"
+        + std::string(is_global ? ", COALESCE(tenant, '')" : "") +
+        "  FROM " + record_table +
+        " WHERE " + micros_expr + " > $1::bigint"
+        " ORDER BY seq ASC LIMIT $2::int;";
+
+    const std::string cursor_param = std::to_string(newer_than_micros);
+    const std::string limit_param  = std::to_string(limit + 1);
+    const char* params[2] = { cursor_param.c_str(), limit_param.c_str() };
+
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<StoredAccountabilityRecord>>::err(
+            "Failed to read accountability records: " + err);
+    }
+
+    int rows = PQntuples(res);
+    if (rows > limit) {
+        has_more = true;
+        rows = limit;
+    }
+
+    std::vector<StoredAccountabilityRecord> out;
+    out.reserve(rows);
+    for (int i = 0; i < rows; ++i) {
+        StoredAccountabilityRecord r;
+        r.seq       = std::strtoll(PQgetvalue(res, i, 0), nullptr, 10);
+        r.ts_micros = std::strtoll(PQgetvalue(res, i, 1), nullptr, 10);
+        r.ts_iso    = PQgetvalue(res, i, 2);
+        r.record.ctx.actor        = PQgetvalue(res, i, 3);
+        const std::string roles_csv = PQgetvalue(res, i, 4);
+        if (!roles_csv.empty()) {
+            size_t start = 0;
+            while (start <= roles_csv.size()) {
+                size_t comma = roles_csv.find(',', start);
+                if (comma == std::string::npos) {
+                    r.record.ctx.actor_roles.push_back(roles_csv.substr(start));
+                    break;
+                }
+                r.record.ctx.actor_roles.push_back(roles_csv.substr(start, comma - start));
+                start = comma + 1;
+            }
+        }
+        r.record.ctx.source_iface = PQgetvalue(res, i, 5);
+        r.record.ctx.source_addr  = PQgetvalue(res, i, 6);
+        const std::string category = PQgetvalue(res, i, 7);
+        r.record.category = (category == "identity")    ? AccountabilityCategory::Identity
+                          : (category == "destruction") ? AccountabilityCategory::Destruction
+                          : (category == "lifecycle")   ? AccountabilityCategory::Lifecycle
+                                                        : AccountabilityCategory::Authorization;
+        r.record.action      = PQgetvalue(res, i, 8);
+        r.record.target_uid  = PQgetvalue(res, i, 9);
+        r.record.target_type = PQgetvalue(res, i, 10);
+        r.record.principal   = PQgetvalue(res, i, 11);
+        // Re-canonicalize: Postgres normalizes JSONB into its own key order and
+        // spacing, so handing back its text form would give the consumer bytes
+        // that cannot reproduce the stored hash.
+        auto detail = detail_from_json(PQgetisnull(res, i, 12) ? "" : PQgetvalue(res, i, 12));
+        if (!detail.success) {
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<std::vector<StoredAccountabilityRecord>>::err(
+                "Accountability record seq " + std::to_string(r.seq) + ": " + detail.error);
+        }
+        r.record.detail = detail.value;
+        if (!PQgetisnull(res, i, 13)) r.prev_hash = parse_bytea_hex(PQgetvalue(res, i, 13));
+        r.hash = parse_bytea_hex(PQgetvalue(res, i, 14));
+        if (is_global) r.record.global_tenant = PQgetvalue(res, i, 15);
+        out.push_back(std::move(r));
+    }
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<StoredAccountabilityRecord>>::ok(out);
+}
+
+// The seq a freshness hint asserts. Without it a consumer cannot tell "no new
+// records" apart from "I am reading state that has not caught up" — and the
+// second silently looks exactly like the first (§4.3).
+Result<std::int64_t> Database::accountability_head_seq(const std::string& tenant) {
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::int64_t>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    const bool is_global = (tenant == kGlobalChainKey);
+    const std::string head_table = is_global
+        ? std::string("accountability_chain_head_global")
+        : "\"" + get_schema_prefix(tenant) + "\".accountability_chain_head";
+    const std::string chain_key = is_global ? std::string(kGlobalChainKey)
+                                            : (tenant.empty() ? std::string("default") : tenant);
+
+    const std::string sql = "SELECT last_seq FROM " + head_table + " WHERE tenant = $1;";
+    const char* params[1] = { chain_key.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::int64_t>::err("Failed to read accountability head: " + err);
+    }
+    std::int64_t seq = (PQntuples(res) == 1) ? std::strtoll(PQgetvalue(res, 0, 0), nullptr, 10) : 0;
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::int64_t>::ok(seq);
+}
+
+Result<void> Database::create_tenant_schema(const std::string& tenant,
+                                           const AccountabilityContext& ctx) {
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection for tenant schema creation");
@@ -2330,12 +2861,20 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         "    actor        VARCHAR(255) NOT NULL,"
         "    actor_roles  TEXT,"
         "    target_uid   VARCHAR(64),"
+        // Never populated any more — see the audit_log_global comment
+        // in create_schema and §5.4.7. Kept nullable so existing rows
+        // and the hash chain's canonical form are unaffected.
         "    target_name  VARCHAR(1024),"
         "    target_type  SMALLINT,"
         "    detail       JSONB,"
         "    source_iface VARCHAR(16),"
         "    source_addr  VARCHAR(64),"
         "    request_id   VARCHAR(64),"
+        // `ts` is when the event OCCURRED; recorded_at is when it was appended
+        // to the chain. The chain is ordered by the latter; the former can run
+        // slightly backwards between adjacent entries from different sources
+        // (§4.3.4). Not part of the hash — it describes delivery, not the event.
+        "    recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),"
         "    prev_hash    BYTEA,"
         "    row_hash     BYTEA,"
         "    PRIMARY KEY (seq, ts),"
@@ -2354,6 +2893,14 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
     // parent are themselves partitioned and propagate to every child partition.
     // Names are suffixed with the schema per the repo convention (index names
     // are unique per-schema). Index creation is non-critical.
+    // Backfill migration for tenants created before recorded_at existed. On a
+    // partitioned parent this propagates to every child partition.
+    std::string migrate_audit_recorded_at =
+        "ALTER TABLE \"" + escaped_schema + "\".audit_log "
+        "ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ NOT NULL DEFAULT now();";
+    res = PQexec(pg_conn, migrate_audit_recorded_at.c_str());
+    PQclear(res);  // column may already exist; status is irrelevant
+
     std::string create_idx_audit_actor =
         "CREATE INDEX IF NOT EXISTS idx_audit_actor_" + escaped_schema +
         " ON \"" + escaped_schema + "\".audit_log(actor, ts);";
@@ -2371,6 +2918,105 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         " ON \"" + escaped_schema + "\".audit_log(category, action, ts);";
     res = PQexec(pg_conn, create_idx_audit_action.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+
+    // ── The guaranteed accountability record (PROPOSAL_accountability_record.md)
+    // Append-only, written in the SAME TRANSACTION as the operation it
+    // describes, never culled, and not disableable by configuration. It exists
+    // because the audit path above cannot *guarantee* a record: it is
+    // best-effort for mutations, silently absent when unconfigured,
+    // non-transactional and node-local (§3.2). This table closes all four.
+    //
+    // Deliberately NOT partitioned and NOT range-keyed on ts like audit_log:
+    // retention here is "never delete" (§5.2), so there is nothing for a
+    // partition boundary to do, and the consumer reads it as a cursor-ordered
+    // outbox rather than a time window.
+    //
+    // seq is a plain BIGINT, NOT a BIGSERIAL. That is the load-bearing choice
+    // (§5.3.1): sequence values are assigned at INSERT and become visible at
+    // COMMIT, so two concurrent writers can take 9 and 10 and 10 can commit
+    // first — a cursor reader would advance past 9 and lose it permanently, for
+    // exactly the record type that must never be lost. Rolled-back transactions
+    // also burn values, making gaps routine and gap detection useless. Instead
+    // seq is assigned under the chain-head lock (see accountability_chain_head),
+    // which aligns assignment order, commit order and chain order.
+    std::string create_accountability_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".accountability_record ("
+        "    seq          BIGINT       PRIMARY KEY,"      // gap-free, commit-ordered
+        "    ts           TIMESTAMPTZ  NOT NULL,"          // clock_timestamp() under the lock, strictly monotonic
+        "    actor        VARCHAR(255) NOT NULL,"          // never empty; 'system' is explicit
+        "    actor_roles  TEXT[],"                         // roles as presented at the time
+        "    source_iface VARCHAR(32),"
+        "    source_addr  VARCHAR(64),"
+        "    category     VARCHAR(32)  NOT NULL,"          // authorization|identity|destruction|lifecycle
+        "    action       VARCHAR(64)  NOT NULL,"
+        "    target_uid   VARCHAR(64),"                    // the uid ONLY — names resolve at read time (§5.4.7)
+        "    target_type  VARCHAR(32),"
+        "    principal    VARCHAR(255),"                   // whose access changed
+        "    detail       JSONB        NOT NULL DEFAULT '{}'::jsonb,"  // schema-constrained per action
+        "    prev_hash    BYTEA,"
+        "    hash         BYTEA        NOT NULL"
+        ");";
+    res = PQexec(pg_conn, create_accountability_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant accountability_record table: " + error);
+    }
+    PQclear(res);
+
+    // The chain head is both the tamper-evidence link AND the sequencer (§5.3.2).
+    // Every append locks this one row, so assignment order == commit order ==
+    // chain order: no gaps (a rollback releases the lock without advancing
+    // last_seq), no out-of-order visibility, and a consumer that checks
+    // contiguity is checking delivery integrity at the same time. The cost is
+    // that accountability writes serialize per tenant — affordable only because
+    // the scope is rare operations (§4.1), never a content path.
+    std::string create_accountability_head =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".accountability_chain_head ("
+        "    tenant     VARCHAR(255) PRIMARY KEY,"
+        "    last_seq   BIGINT NOT NULL DEFAULT 0,"
+        "    last_ts    TIMESTAMPTZ,"
+        "    last_hash  BYTEA"
+        ");";
+    res = PQexec(pg_conn, create_accountability_head.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant accountability_chain_head table: " + error);
+    }
+    PQclear(res);
+
+    // Seed the head row here so the write path's bootstrap is normally a no-op.
+    // ON CONFLICT DO NOTHING because tenant provisioning is not serialized —
+    // idempotent DDL is not the same thing as concurrency-safe DDL, and two
+    // simultaneous provisioning calls must both succeed.
+    std::string seed_accountability_head =
+        "INSERT INTO \"" + escaped_schema + "\".accountability_chain_head (tenant) "
+        "VALUES (" + escape_string(tenant.empty() ? "default" : tenant, pg_conn) + ") "
+        "ON CONFLICT (tenant) DO NOTHING;";
+    res = PQexec(pg_conn, seed_accountability_head.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+    else { PQclear(res); }
+
+    // §4.2 guarantee 5: the accountability question must be answerable from the
+    // core alone, with no audit_service and no Redis. (ts) is the consumer
+    // cursor; the other two answer "everything actor A did between T1 and T2"
+    // and "every change affecting this resource".
+    for (const auto& idx : std::vector<std::string>{
+             "CREATE INDEX IF NOT EXISTS idx_accountability_ts_" + escaped_schema +
+                 " ON \"" + escaped_schema + "\".accountability_record(ts);",
+             "CREATE INDEX IF NOT EXISTS idx_accountability_actor_" + escaped_schema +
+                 " ON \"" + escaped_schema + "\".accountability_record(actor, ts);",
+             "CREATE INDEX IF NOT EXISTS idx_accountability_target_" + escaped_schema +
+                 " ON \"" + escaped_schema + "\".accountability_record(target_uid, ts);",
+             "CREATE INDEX IF NOT EXISTS idx_accountability_principal_" + escaped_schema +
+                 " ON \"" + escaped_schema + "\".accountability_record(principal, ts);"}) {
+        res = PQexec(pg_conn, idx.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); }
+        else { PQclear(res); }
+    }
 
     std::string create_roles_table =
         "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".roles ("
@@ -2472,24 +3118,92 @@ Result<void> Database::create_tenant_schema(const std::string& tenant) {
         // create_tenant_schema before the public.tenants registration ran.
     }
 
-    // Register the tenant in the global tenants table for multi-tenant sync
+    // Register the tenant in the global tenants table, and — if this call is
+    // what actually created it — record the fact globally (§7.3).
+    //
+    // The registry INSERT is the arbiter of "was this tenant new?", not a
+    // separate existence check: this function is called lazily on nearly every
+    // tenant context lookup and is not serialized between callers, so an
+    // exists-then-create pair would let two simultaneous provisioning calls
+    // both conclude "new" and write two creation records. ON CONFLICT DO
+    // NOTHING RETURNING answers it atomically — exactly one caller gets a row.
     std::string tenant_id_to_register = tenant.empty() ? "default" : tenant;
-    std::string register_tenant_sql = "INSERT INTO tenants (tenant_id, schema_name, created_at, updated_at) "
-        "VALUES (" + escape_string(tenant_id_to_register, pg_conn) + ", " +
-        escape_string(escaped_schema, pg_conn) + ", CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
-        "ON CONFLICT (tenant_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;";
 
-    res = PQexec(pg_conn, register_tenant_sql.c_str());
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        // Non-fatal: the tenant's own schema works whether or not it lands
-        // in the global registry. But log loudly so this doesn't hide again.
-        SERVER_LOG_WARN("Database::create_tenant_schema",
-                        "Failed to register tenant '" + tenant_id_to_register +
-                        "' in public.tenants: " + std::string(PQerrorMessage(pg_conn)));
+    PGresult* begin_reg = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_reg) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(begin_reg);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to begin tenant registration transaction: " + error);
     }
+    PQclear(begin_reg);
+
+    auto registration_failed = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
+    std::string register_tenant_sql =
+        "INSERT INTO tenants (tenant_id, schema_name, created_at, updated_at) "
+        "VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+        "ON CONFLICT (tenant_id) DO NOTHING RETURNING tenant_id;";
+    const char* register_params[2] = { tenant_id_to_register.c_str(), escaped_schema.c_str() };
+    res = PQexecParams(pg_conn, register_tenant_sql.c_str(), 2, nullptr, register_params,
+                       nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        return registration_failed("Failed to register tenant '" + tenant_id_to_register +
+                                   "' in public.tenants: " + error);
+    }
+    const bool tenant_is_new = PQntuples(res) > 0;
     PQclear(res);
 
+    std::int64_t hint_seq = 0;
+    if (tenant_is_new) {
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Lifecycle;
+        rec.action        = accountability_action::kTenantCreate;
+        rec.target_type   = "tenant";
+        rec.global_tenant = tenant_id_to_register;
+        rec.detail.set("schema", escaped_schema);
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            // Fail-closed. The schema itself already exists at this point, but
+            // reporting success would leave a tenant the platform cannot say
+            // was ever created, by whom. Returning an error makes the caller
+            // retry, and the retry completes the registration and the record —
+            // the DDL above is all idempotent.
+            return registration_failed("Tenant creation refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    } else {
+        std::string touch_sql = "UPDATE tenants SET updated_at = CURRENT_TIMESTAMP "
+                                "WHERE tenant_id = $1;";
+        const char* touch_params[1] = { tenant_id_to_register.c_str() };
+        res = PQexecParams(pg_conn, touch_sql.c_str(), 1, nullptr, touch_params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            SERVER_LOG_WARN("Database::create_tenant_schema",
+                            "Failed to touch tenant '" + tenant_id_to_register +
+                            "' in public.tenants: " + std::string(PQerrorMessage(pg_conn)));
+        }
+        PQclear(res);
+    }
+
+    PGresult* commit_reg = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_reg) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(commit_reg);
+        return registration_failed("Failed to commit tenant registration: " + error);
+    }
+    PQclear(commit_reg);
+
     connection_pool_->release(conn);
+    // Hint on the GLOBAL chain: that is where the lifecycle record lives.
+    fire_accountability_hint(kGlobalChainKey, hint_seq);
 
     return Result<void>::ok();
 }
@@ -2539,7 +3253,8 @@ Result<bool> Database::tenant_schema_exists(const std::string& tenant) {
     return Result<bool>::ok(schema_exists);
 }
 
-Result<void> Database::cleanup_tenant_data(const std::string& tenant) {
+Result<void> Database::cleanup_tenant_data(const std::string& tenant,
+                                          const AccountabilityContext& ctx) {
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
@@ -2558,7 +3273,44 @@ Result<void> Database::cleanup_tenant_data(const std::string& tenant) {
     }
     PQclear(begin_res);
 
-    // Drop the tenant schema (CASCADE will remove all tables in it)
+    std::int64_t hint_seq = 0;
+    // Record the destruction BEFORE destroying anything, in the global table,
+    // in this same transaction (§7.3).
+    //
+    // Global, because a record inside the schema about to be dropped would
+    // delete itself — and if deleting a tenant erased every trace of it, tenant
+    // deletion would become the cleanest way to destroy evidence: whoever can
+    // delete a tenant could erase the whole record of what happened inside it,
+    // including their own actions. The contents genuinely go; the fact that they
+    // existed and who removed them lives where the deleter cannot reach.
+    //
+    // First, because if the record cannot be written the transaction rolls back
+    // with the tenant intact. The other order would risk the most destructive
+    // operation in the system succeeding silently — which §2.1 found is exactly
+    // what it does today: DROP SCHEMA CASCADE emits no event at all.
+    {
+        std::string tenant_id = tenant.empty() ? "default" : tenant;
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Destruction;
+        rec.action        = accountability_action::kTenantDelete;
+        rec.target_type   = "tenant";
+        rec.global_tenant = tenant_id;
+        rec.detail.set("schema", schema);
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+            if (rb) PQclear(rb);
+            connection_pool_->release(conn);
+            return Result<void>::err("Tenant deletion refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    // Drop the tenant schema (CASCADE will remove all tables in it) — including
+    // the tenant's own accountability_record, by design (§5.2): the record
+    // outlives every destruction of the thing it describes EXCEPT the
+    // destruction of the tenant that owns it.
     std::string drop_schema_sql = "DROP SCHEMA IF EXISTS " + schema + " CASCADE;";
     PGresult* drop_res = PQexec(pg_conn, drop_schema_sql.c_str());
     if (PQresultStatus(drop_res) != PGRES_COMMAND_OK) {
@@ -2597,6 +3349,7 @@ Result<void> Database::cleanup_tenant_data(const std::string& tenant) {
     PQclear(commit_res);
 
     connection_pool_->release(conn);
+    fire_accountability_hint(kGlobalChainKey, hint_seq);
     return Result<void>::ok();
 }
 
@@ -2969,8 +3722,16 @@ Result<std::string> Database::create_file_with_acls(const std::string& uid,
 Result<void> Database::add_acl(const std::string& resource_uid, const std::string& principal,
                                int type, int permissions,
                                const std::string& tenant,
-                               const std::string& performed_by,
+                               const AccountabilityContext& ctx,
                                int effect) {
+    // §5.1: refuse before touching anything. An authorization change that cannot
+    // name who made it is a bug, and recording "" would be worse than recording
+    // nothing because it looks like coverage.
+    if (!ctx.valid()) {
+        return Result<void>::err("Refusing ACL grant with no actor");
+    }
+    const std::string& performed_by = ctx.actor;
+
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
@@ -2980,12 +3741,38 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     // The acls table is created at tenant init time (see create_tenant_schema).
     std::string schema = get_schema_prefix(tenant);
 
+    // One transaction covering the ACL row, its acl_audit row and the
+    // accountability record — so the operation and its record commit together
+    // or not at all (§4.2 guarantee 1).
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN add_acl transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
     std::string type_str = std::to_string(type);
     std::string perms_str = std::to_string(permissions);
     std::string effect_str = std::to_string(effect);
 
     // Capture the prior permissions bitmask for the (principal, type, effect)
     // row so the audit log can record before/after deltas.
+    //
+    // A FAILURE here must abort, not be shrugged off. This read now runs inside
+    // the operation's transaction, and a failed statement poisons the whole
+    // transaction — so ignoring its status would leave every subsequent
+    // statement reporting "current transaction is aborted" and bury the real
+    // cause (an unprovisioned tenant, say) behind a message that explains
+    // nothing.
     std::string select_before_sql =
         "SELECT permissions FROM " + schema + ".acls "
         "WHERE resource_uid = $1 AND principal = $2 AND principal_type = ($3::int) AND effect = ($4::int);";
@@ -2995,7 +3782,13 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     bool had_row = false;
     PGresult* before_res = PQexecParams(pg_conn, select_before_sql.c_str(), 4,
                                         nullptr, before_params, nullptr, nullptr, 0);
-    if (PQresultStatus(before_res) == PGRES_TUPLES_OK && PQntuples(before_res) > 0) {
+    if (PQresultStatus(before_res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to read the existing ACL row: " +
+                            std::string(PQerrorMessage(pg_conn));
+        PQclear(before_res);
+        return rollback_and_fail(error);
+    }
+    if (PQntuples(before_res) > 0) {
         permissions_before = atoi(PQgetvalue(before_res, 0, 0));
         had_row = true;
     }
@@ -3021,13 +3814,12 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to add ACL: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
-        connection_pool_->release(conn);
-        return Result<void>::err(error);
+        return rollback_and_fail(error);
     }
     PQclear(res);
 
-    // Audit row. Failures here are non-fatal — never fail an ACL change just
-    // because the audit log couldn't be written; the caller has bigger problems.
+    // acl_audit row. Still best-effort — it is a convenience view of the same
+    // facts, superseded for accountability purposes by the record below.
     // The action label includes the effect so allow/deny grants are distinct.
     std::string action_label = (effect == 1) ? "grant_deny" : "grant";
     std::string audit_sql =
@@ -3051,15 +3843,60 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) { PQclear(audit_res); }
     else { PQclear(audit_res); }
 
+    // The guaranteed record. PartOfCreation writes skip it deliberately — see
+    // AccountabilityMode: creation-time default and inherited ACLs are already
+    // attributed by the resource's own row, and chaining them would put the
+    // per-tenant serializing lock on the content-creation path.
+    std::int64_t hint_seq = 0;
+    if (ctx.mode == AccountabilityMode::Record) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Authorization;
+        rec.action      = accountability_action::kAclGrant;
+        rec.target_uid  = resource_uid;
+        rec.target_type = "acl";
+        rec.principal   = principal;
+        rec.detail.set("principal_type", type);
+        rec.detail.set("effect", std::string(effect == 1 ? "deny" : "allow"));
+        rec.detail.set("mask", permissions);
+        rec.detail.set("mask_before", before_value);
+        rec.detail.set("mask_after", after_value);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            // Fail-closed (§4.2 guarantee 2). This deliberately inverts the
+            // best-effort posture of the audit path, and is affordable only
+            // because the scope is rare operations.
+            return rollback_and_fail("Permission change refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT add_acl: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
     connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
 }
 
 Result<void> Database::remove_acl(const std::string& resource_uid, const std::string& principal,
                                   int type, int permissions,
                                   const std::string& tenant,
-                                  const std::string& performed_by,
+                                  const AccountabilityContext& ctx,
                                   int effect) {
+    // §5.1 again: a revoke is the operation §2.1 flagged as destroying its own
+    // evidence — the row disappears when the remaining bitmask is zero — so an
+    // unattributed one is the worst case of all.
+    if (!ctx.valid()) {
+        return Result<void>::err("Refusing ACL revoke with no actor");
+    }
+    const std::string& performed_by = ctx.actor;
+
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
         return Result<void>::err("Failed to acquire database connection");
@@ -3072,7 +3909,9 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
     std::string perms_str = std::to_string(permissions);
     std::string effect_str = std::to_string(effect);
 
-    // Capture the prior permissions bitmask for the audit row.
+    // Capture the prior permissions bitmask for the audit row. As in add_acl, a
+    // failure here is fatal to the operation rather than ignored — otherwise the
+    // real cause is replaced by "current transaction is aborted" further down.
     std::string select_before_sql =
         "SELECT permissions FROM " + schema + ".acls "
         "WHERE resource_uid = $1 AND principal = $2 AND principal_type = ($3::int) AND effect = ($4::int);";
@@ -3082,7 +3921,14 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
     bool had_row = false;
     PGresult* before_res = PQexecParams(pg_conn, select_before_sql.c_str(), 4,
                                         nullptr, before_params, nullptr, nullptr, 0);
-    if (PQresultStatus(before_res) == PGRES_TUPLES_OK && PQntuples(before_res) > 0) {
+    if (PQresultStatus(before_res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to read the existing ACL row: " +
+                            std::string(PQerrorMessage(pg_conn));
+        PQclear(before_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    if (PQntuples(before_res) > 0) {
         permissions_before = atoi(PQgetvalue(before_res, 0, 0));
         had_row = true;
     }
@@ -3152,17 +3998,17 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
         PQclear(res);
         return rollback_and_fail(error);
     }
+    const bool row_removed = had_row && ((permissions_before & ~permissions) == 0);
     PQclear(res);
 
-    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
-    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
-        std::string error = "Failed to COMMIT remove_acl: " + std::string(PQerrorMessage(pg_conn));
-        PQclear(commit_res);
-        return rollback_and_fail(error);
-    }
-    PQclear(commit_res);
-
-    // Only audit if there was a row to act on.
+    // The audit + accountability writes moved INSIDE this transaction. They used
+    // to run after COMMIT, which meant a crash in the gap left a committed
+    // revoke with no record of it anywhere — precisely §3.2's gap 3.
+    //
+    // Only record if there was a row to act on: a revoke of permissions the
+    // principal did not hold changed nothing, and a chain entry for it would be
+    // a claim that something was revoked when nothing was.
+    std::int64_t hint_seq = 0;
     if (had_row) {
         int permissions_after = permissions_before & ~permissions;
         std::string after_str = std::to_string(permissions_after);
@@ -3184,9 +4030,42 @@ Result<void> Database::remove_acl(const std::string& resource_uid, const std::st
         PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 7, nullptr, audit_params, nullptr, nullptr, 0);
         if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) { PQclear(audit_res); }
         else { PQclear(audit_res); }
+
+        if (ctx.mode == AccountabilityMode::Record) {
+            AccountabilityRecord rec;
+            rec.ctx         = ctx;
+            rec.category    = AccountabilityCategory::Authorization;
+            rec.action      = accountability_action::kAclRevoke;
+            rec.target_uid  = resource_uid;
+            rec.target_type = "acl";
+            rec.principal   = principal;
+            rec.detail.set("principal_type", type);
+            rec.detail.set("effect", std::string(effect == 1 ? "deny" : "allow"));
+            rec.detail.set("mask", permissions);
+            rec.detail.set("mask_before", permissions_before);
+            rec.detail.set("mask_after", permissions_before & ~permissions);
+            // The §2.1 finding made visible: this is the flag that says the ACL
+            // row itself was destroyed, not merely narrowed. Without the record,
+            // nothing anywhere would show that the access ever existed.
+            rec.detail.set("row_removed", row_removed);
+            auto recorded = append_accountability(pg_conn, tenant, rec);
+            if (!recorded.success) {
+                return rollback_and_fail("Permission change refused: " + recorded.error);
+            }
+            hint_seq = recorded.value.seq;
+        }
     }
 
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT remove_acl: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
     connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
 }
 
@@ -3340,9 +4219,21 @@ Result<std::vector<std::string>> Database::list_claims(const std::string& prefix
 // create_tenant_schema. Local role definitions persisted here are UNIONed
 // with request-supplied roles from AuthenticationContext at permission-check
 // time (see AclManager::check_permission).
-Result<void> Database::create_role(const std::string& role, const std::string& tenant) {
+// The four role operations below share one shape: BEGIN, do the work, write the
+// accountability record, COMMIT — so the record cannot be lost by a crash in
+// between, and a record that cannot be written takes the operation down with it.
+//
+// role.create and role.assign only record when they actually changed something
+// (ON CONFLICT DO NOTHING can make them no-ops). Recording a no-op would put a
+// claim in an immutable, never-culled chain that a membership was granted when
+// it already existed.
+Result<void> Database::create_role(const std::string& role, const std::string& tenant,
+                                   const AccountabilityContext& ctx) {
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
+    }
+    if (!ctx.valid()) {
+        return Result<void>::err("Refusing role creation with no actor");
     }
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
@@ -3351,24 +4242,69 @@ Result<void> Database::create_role(const std::string& role, const std::string& t
     PGconn* pg_conn = conn->get_connection();
     std::string schema = get_schema_prefix(tenant);
 
-    std::string sql = "INSERT INTO " + schema + ".roles (role_name) VALUES ($1) "
-                      "ON CONFLICT (role_name) DO NOTHING;";
-    const char* params[1] = { role.c_str() };
-    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        std::string error = "Failed to create role: " + std::string(PQerrorMessage(pg_conn));
-        PQclear(res);
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN create_role transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
         connection_pool_->release(conn);
         return Result<void>::err(error);
     }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
+    std::string sql = "INSERT INTO " + schema + ".roles (role_name) VALUES ($1) "
+                      "ON CONFLICT (role_name) DO NOTHING RETURNING role_name;";
+    const char* params[1] = { role.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to create role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        return rollback_and_fail(error);
+    }
+    const bool created = PQntuples(res) > 0;
     PQclear(res);
+
+    std::int64_t hint_seq = 0;
+    if (created) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Identity;
+        rec.action      = accountability_action::kRoleCreate;
+        rec.target_type = "role";
+        rec.principal   = role;
+        rec.detail.set("role", role);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Role creation refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT create_role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
     connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
 }
 
-Result<void> Database::delete_role(const std::string& role, const std::string& tenant) {
+Result<void> Database::delete_role(const std::string& role, const std::string& tenant,
+                                   const AccountabilityContext& ctx) {
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
+    }
+    if (!ctx.valid()) {
+        return Result<void>::err("Refusing role deletion with no actor");
     }
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
@@ -3376,6 +4312,26 @@ Result<void> Database::delete_role(const std::string& role, const std::string& t
     }
     PGconn* pg_conn = conn->get_connection();
     std::string schema = get_schema_prefix(tenant);
+
+    // §2.1 site 3: this destroys every membership of the role, outside culling
+    // and with no history of its own. Wrapping it in a transaction with the
+    // record is what makes the destruction accountable — the memberships are
+    // still gone, but who removed them and how many there were is not.
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN delete_role transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
 
     // Deleting a role removes its user_roles mappings; ACL grants that named
     // this role become orphaned (they remain in the acls table but match no
@@ -3388,26 +4344,58 @@ Result<void> Database::delete_role(const std::string& role, const std::string& t
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to clear role assignments: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
-        connection_pool_->release(conn);
-        return Result<void>::err(error);
+        return rollback_and_fail(error);
     }
+    const int memberships_removed = std::atoi(PQcmdTuples(res));
     PQclear(res);
 
     res = PQexecParams(pg_conn, sql_roles.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to delete role: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
-        connection_pool_->release(conn);
-        return Result<void>::err(error);
+        return rollback_and_fail(error);
     }
     PQclear(res);
+
+    std::int64_t hint_seq = 0;
+    {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Identity;
+        rec.action      = accountability_action::kRoleDelete;
+        rec.target_type = "role";
+        rec.principal   = role;
+        rec.detail.set("role", role);
+        // One record describing the batch, not one per membership — both for
+        // contention and because it is one logical act (§5.3.2).
+        rec.detail.set("memberships_removed", memberships_removed);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Role deletion refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT delete_role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
     connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
 }
 
-Result<void> Database::assign_user_to_role(const std::string& user, const std::string& role, const std::string& tenant) {
+Result<void> Database::assign_user_to_role(const std::string& user, const std::string& role,
+                                           const std::string& tenant,
+                                           const AccountabilityContext& ctx) {
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
+    }
+    if (!ctx.valid()) {
+        return Result<void>::err("Refusing role assignment with no actor");
     }
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
@@ -3415,25 +4403,71 @@ Result<void> Database::assign_user_to_role(const std::string& user, const std::s
     }
     PGconn* pg_conn = conn->get_connection();
     std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN assign_user_to_role transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
 
     std::string sql = "INSERT INTO " + schema + ".user_roles (user_name, role_name) VALUES ($1, $2) "
-                      "ON CONFLICT (user_name, role_name) DO NOTHING;";
+                      "ON CONFLICT (user_name, role_name) DO NOTHING RETURNING id;";
     const char* params[2] = { user.c_str(), role.c_str() };
     PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         std::string error = "Failed to assign user to role: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
-        connection_pool_->release(conn);
-        return Result<void>::err(error);
+        return rollback_and_fail(error);
     }
+    const bool assigned = PQntuples(res) > 0;
     PQclear(res);
+
+    std::int64_t hint_seq = 0;
+    if (assigned) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Identity;
+        rec.action      = accountability_action::kRoleAssign;
+        rec.target_type = "principal";
+        rec.principal   = user;
+        rec.detail.set("role", role);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Role assignment refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT assign_user_to_role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
     connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
 }
 
-Result<void> Database::remove_user_from_role(const std::string& user, const std::string& role, const std::string& tenant) {
+Result<void> Database::remove_user_from_role(const std::string& user, const std::string& role,
+                                             const std::string& tenant,
+                                             const AccountabilityContext& ctx) {
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
+    }
+    if (!ctx.valid()) {
+        return Result<void>::err("Refusing role removal with no actor");
     }
     auto conn = acquire(DbOp::Write);
     if (!conn || !conn->is_valid()) {
@@ -3441,6 +4475,25 @@ Result<void> Database::remove_user_from_role(const std::string& user, const std:
     }
     PGconn* pg_conn = conn->get_connection();
     std::string schema = get_schema_prefix(tenant);
+
+    // §2.1 site 4: the membership row is destroyed in place. After this, nothing
+    // in the current state says the access ever existed — which is the whole
+    // reason the record has to commit with it.
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN remove_user_from_role transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
 
     std::string sql = "DELETE FROM " + schema + ".user_roles WHERE user_name = $1 AND role_name = $2;";
     const char* params[2] = { user.c_str(), role.c_str() };
@@ -3448,11 +4501,36 @@ Result<void> Database::remove_user_from_role(const std::string& user, const std:
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = "Failed to remove user from role: " + std::string(PQerrorMessage(pg_conn));
         PQclear(res);
-        connection_pool_->release(conn);
-        return Result<void>::err(error);
+        return rollback_and_fail(error);
     }
+    const bool removed = std::atoi(PQcmdTuples(res)) > 0;
     PQclear(res);
+
+    std::int64_t hint_seq = 0;
+    if (removed) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Identity;
+        rec.action      = accountability_action::kRoleRemove;
+        rec.target_type = "principal";
+        rec.principal   = user;
+        rec.detail.set("role", role);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Role removal refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT remove_user_from_role: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
     connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
 }
 

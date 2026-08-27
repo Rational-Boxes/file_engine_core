@@ -113,12 +113,22 @@ public:
                                   const std::string& tenant = "");
     virtual Result<bool> exists(const std::string& file_uid, const std::string& tenant = "");
 
-    // Resolve audit metadata for a target file/dir in one lookup path: its display
-    // name, and whether it is a hidden child / sidecar (a rendition — parent is a
-    // file, per file_renditions.md). Best-effort: leaves the outputs untouched on
-    // any lookup failure. At most two DB lookups (the target row, then its parent).
-    void resolve_audit_target(const std::string& uid, const std::string& tenant,
-                              std::string& out_name, bool& out_is_hidden_child);
+    // Is this target a hidden child / sidecar (a rendition — its parent is a
+    // file, per file_renditions.md)? Used to keep the conversion service's
+    // thumbnail/preview churn out of the audit log.
+    //
+    // This used to also return the target's display NAME, which the audit
+    // emitters stored in AuditEntry::target_name. That was a leak, not a
+    // feature: filenames are party data ("Acme_Corp_Contract_J_Smith.pdf"), and
+    // the audit log is a structure designed never to release what it holds, so
+    // it was accumulating exactly the class of data an erasure obligation has to
+    // be able to remove. The rule is that the log records identifiers and
+    // structure, never payload — store the uid and resolve the name at read
+    // time, so an erasure automatically stops the log disclosing it.
+    // (PROPOSAL_accountability_record.md §5.4.7.)
+    //
+    // Best-effort: returns false on any lookup failure. At most two DB lookups.
+    bool audit_target_is_hidden_child(const std::string& uid, const std::string& tenant);
 
     // Path operations
     virtual Result<void> move(const std::string& src_uid, const std::string& dst_uid,
@@ -265,6 +275,12 @@ public:
                             const std::string& user) noexcept {
         emit_acl_event(tenant, resource_uid, principal, permissions, user);
     }
+
+    // Emit the accountability freshness hint (§4.3). The Database layer calls
+    // this after a record COMMITS — never before, so the hint can only ever
+    // under-assert, and a consumer that acts on it always finds the record.
+    // No-op when events are disabled; losing it costs latency, not data.
+    void publish_accountability_hint(const std::string& tenant, int64_t seq) noexcept;
 
     // Emit a role-membership event (role.assigned / role.member_removed /
     // role.deleted) from the gRPC role RPCs, which call RoleManager directly.

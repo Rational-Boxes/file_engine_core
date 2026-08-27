@@ -54,7 +54,8 @@ TenantContext* TenantManager::get_tenant_context(const std::string& tenant_id) {
     return nullptr;
 }
 
-bool TenantManager::initialize_tenant(const std::string& tenant_id) {
+bool TenantManager::initialize_tenant(const std::string& tenant_id,
+                                      const AccountabilityContext& ctx) {
     std::string actual_tenant_id = tenant_id;
     if (actual_tenant_id.empty()) {
         actual_tenant_id = "default";  // Use "default" tenant when no tenant is specified
@@ -66,7 +67,7 @@ bool TenantManager::initialize_tenant(const std::string& tenant_id) {
     }
 
     // Create tenant-specific schema using the shared database (which uses connection pooling)
-    auto result = shared_database_->create_tenant_schema(actual_tenant_id);
+    auto result = shared_database_->create_tenant_schema(actual_tenant_id, ctx);
     return result.success;
 }
 
@@ -80,7 +81,8 @@ bool TenantManager::tenant_exists(const std::string& tenant_id) const {
     return tenant_contexts_.find(actual_tenant_id) != tenant_contexts_.end();
 }
 
-Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
+Result<void> TenantManager::remove_tenant(const std::string& tenant_id,
+                                         const AccountabilityContext& ctx) {
     std::string actual_tenant_id = tenant_id;
     if (actual_tenant_id.empty()) {
         actual_tenant_id = "default";  // Use "default" tenant when no tenant is specified
@@ -97,7 +99,7 @@ Result<void> TenantManager::remove_tenant(const std::string& tenant_id) {
     auto context = it->second.get();
 
     if (context->db) {
-        auto db_result = context->db->cleanup_tenant_data(actual_tenant_id);
+        auto db_result = context->db->cleanup_tenant_data(actual_tenant_id, ctx);
         if (!db_result.success) {
             return db_result;
         }
@@ -131,7 +133,10 @@ TenantContext* TenantManager::create_tenant_context(const std::string& tenant_id
         }
 
         // Ensure tenant schema and tables exist - this will create them if they don't exist
-        auto schema_result = shared_database_->create_tenant_schema(tenant_id);
+        // Lazy provisioning: the platform, not a person, is creating this
+        // tenant, and the record says so rather than guessing at a requester.
+        auto schema_result =
+            shared_database_->create_tenant_schema(tenant_id, AccountabilityContext::system());
         if (!schema_result.success) {
             // Log the error but continue - some operations might still work
         }

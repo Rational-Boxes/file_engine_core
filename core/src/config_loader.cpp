@@ -256,6 +256,7 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     if (env_vars.count("FILEENGINE_LOG_LEVEL")) config.log_level = env_vars.at("FILEENGINE_LOG_LEVEL");
     if (env_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = env_vars.at("FILEENGINE_LOG_FILE_PATH");
     if (env_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (env_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
+    if (env_vars.count("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = (env_vars.at("FILEENGINE_LOG_REDACT_NAMES") != "false");
     if (env_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (env_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (env_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(env_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (env_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(env_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -383,6 +384,12 @@ Config ConfigLoader::load_from_env() {
 
     env_value = get_env_var("FILEENGINE_LOG_TO_CONSOLE", "");
     if (!env_value.empty()) config.log_to_console = (env_value == "true");
+
+    // Note the inverted default: absent OR anything but "false" means redact.
+    // A knob that weakens a privacy default must be opted into explicitly, not
+    // reached by a typo.
+    env_value = get_env_var("FILEENGINE_LOG_REDACT_NAMES", "");
+    if (!env_value.empty()) config.log_redact_names = (env_value != "false");
 
     env_value = get_env_var("FILEENGINE_LOG_TO_FILE", "");
     if (!env_value.empty()) config.log_to_file = (env_value == "true");
@@ -620,6 +627,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (default_file_vars.count("FILEENGINE_LOG_LEVEL")) config.log_level = default_file_vars.at("FILEENGINE_LOG_LEVEL");
     if (default_file_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = default_file_vars.at("FILEENGINE_LOG_FILE_PATH");
     if (default_file_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (default_file_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
+    if (default_file_vars.count("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = (default_file_vars.at("FILEENGINE_LOG_REDACT_NAMES") != "false");
     if (default_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (default_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (default_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(default_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (default_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(default_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -753,6 +761,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (cmdline_file_vars.count("FILEENGINE_LOG_LEVEL")) config.log_level = cmdline_file_vars.at("FILEENGINE_LOG_LEVEL");
     if (cmdline_file_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = cmdline_file_vars.at("FILEENGINE_LOG_FILE_PATH");
     if (cmdline_file_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (cmdline_file_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
+    if (cmdline_file_vars.count("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = (cmdline_file_vars.at("FILEENGINE_LOG_REDACT_NAMES") != "false");
     if (cmdline_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (cmdline_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (cmdline_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(cmdline_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (cmdline_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(cmdline_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -789,6 +798,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_has("FILEENGINE_LOG_LEVEL")) config.log_level = env_config.log_level;
     if (env_has("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = env_config.log_file_path;
     if (env_has("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = env_config.log_to_console;
+    if (env_has("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = env_config.log_redact_names;
     if (env_has("FILEENGINE_LOG_TO_FILE")) config.log_to_file = env_config.log_to_file;
     if (env_has("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
     if (env_has("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = env_config.log_retention_days;

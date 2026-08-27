@@ -47,8 +47,11 @@ the **audit_service** drains into a tamper-evident, hash-chained log.
 - **`system_admin` role bypasses all ACL checks** in the core. The SDKs pass roles verbatim, so an untrusted SDK caller can forge it — SDKs are safe only server-side.
 - **Bridges are the security boundary:** LDAP bind → JWT (HS256, `FILEENGINE_JWT_SECRET` shared across services for local verification), tenant resolution, request-size caps, CORS scoping.
 - **Feature services fail-closed:** permission cache (TTL ≤ 5 min, event-invalidated); core unreachable ⇒ deny.
-- **Monitoring endpoints** (`/healthz` `/readyz` `/poolz` `/metrics` `/v1/status` `/v1/version`) are unauthenticated and **must bind loopback-only** (the core's REST monitor defaults to `0.0.0.0:8081` — that is a known exposure to verify per deployment).
+- **Monitoring endpoints** (`/healthz` `/readyz` `/poolz` `/metrics` `/v1/status` `/v1/version`) are unauthenticated and **must bind loopback-only**. The core's REST monitor already defaults to `127.0.0.1:8081` — an earlier version of this note claimed `0.0.0.0`, which was stale and misleading in the dangerous direction, since it invited someone to widen a correct bind to match the documentation.
+- **gRPC still defaults to `0.0.0.0:50051` on this branch**, in `config_loader.h` *and* in the shipped `core.conf` — so on the bare-metal/systemd paths the "never network-exposed" invariant is enforced by the host firewall, not by the application. Containers hold it by topology (the `core` service publishes no ports). The loopback default that inverts this failure mode lives on `security/grpc-loopback-default`; every authorization decision in the core, including the `ERASE` gate, assumes the invariant, so verify it per deployment until that lands.
 - **Audit is tamper-evident** (SHA-256 hash chain) and, for auth events, **fail-closed** (login refused if the audit stream is unreachable).
+- **Security-relevant core operations carry a *guaranteed* record**, separate from the audit stream. ACL grants/revokes, role changes, version culls and tenant lifecycle each write a hash-chained row to `accountability_record` **in the same transaction as the operation**: no configuration disables it, and if the record cannot be written the operation is refused. `audit_service` reads those forward by cursor over `ListAccountabilityRecords` (gated on the dedicated `accountability_reader` role) rather than off Redis, so no broker outage or lost node can lose one. See `design_documents/PROPOSAL_accountability_record.md`.
+- **The audit log records identifiers and structure, never payload.** No filenames, no metadata values: emit the uid and let a viewer resolve the name at read time, so an erasure automatically stops the log disclosing it.
 
 ### Where to look first
 - **Proto contract (source of truth):** `file_engine_core/proto/fileservice.proto` — copied into each bridge/SDK; keep in sync.
@@ -106,7 +109,8 @@ The codebase uses abstract interfaces for dependency injection and testability:
 | `FileSystem` | filesystem.h | Main API: mkdir, rmdir, put, get, stat, move, copy, versions, ACLs. Manages async object store backup worker thread. |
 | `Database` | database.h | PostgreSQL layer: schema management, file/version/ACL/role/metadata CRUD. Uses `ConnectionPool`. |
 | `TenantManager` | tenant_manager.h | Multi-tenant context management. Each tenant gets isolated DB schema, storage dir, and S3 bucket. |
-| `AclManager` | acl_manager.h | POSIX ACL permissions with role-based support. Permissions: READ, WRITE, DELETE, LIST_DELETED, UNDELETE, VIEW_VERSIONS, RETRIEVE_BACK_VERSION, RESTORE_TO_VERSION, EXECUTE. |
+| `AclManager` | acl_manager.h | POSIX ACL permissions with role-based support. Permissions: READ, WRITE, DELETE, LIST_DELETED, UNDELETE, VIEW_VERSIONS, RETRIEVE_BACK_VERSION, RESTORE_TO_VERSION, EXECUTE, MANAGE_ACL, ACL_INHERIT, CULL_VERSIONS, ERASE. **The admin bypass is split:** `system_admin` passes every check; `tenant_admin` passes everything *except* the destroy-data bits (`CULL_VERSIONS`, `ERASE`), which need an explicit grant. |
+| `accountability.h` | accountability.h | The guaranteed accountability record: the closed per-action `detail` schema, the canonical byte form and the chain hash. Mirrored byte-for-byte in `audit_service/src/audit_service/accountability.py` — keep the two in lockstep or every chain verification fails. |
 | `RoleManager` | role_manager.h | RBAC: create/delete roles, assign/remove users, query role memberships. |
 | `Storage` | storage.h | Local filesystem storage with SHA256-based directory desaturation, AES-256-GCM encryption, zlib compression. |
 | `S3Storage` | s3_storage.h | AWS SDK-based S3/MinIO object store. Per-tenant buckets. |
@@ -132,8 +136,10 @@ The codebase uses abstract interfaces for dependency injection and testability:
 
 ### Database Schema
 - Per-tenant schemas (e.g., `tenant_default`, `tenant_tenant_a`)
-- Tables per schema: `files`, `versions`, `metadata`, `acls`, `roles`, `user_roles`
-- Global `tenants` registry table
+- Tables per schema: `files`, `versions`, `metadata`, `acls`, `roles`, `user_roles`,
+  `acl_audit`, `audit_log`, plus `accountability_record` + `accountability_chain_head`
+- Global `tenants` registry, `audit_log_global`, and
+  `accountability_record_global` + `accountability_chain_head_global`
 - UUID-based file identification with path-to-UUID mapping
 
 ### gRPC API (proto/fileservice.proto)
@@ -230,7 +236,7 @@ Numerous ad-hoc `test_*.cpp` files at the project root are standalone integratio
 
 - **Never edit the .env file** — it contains database and S3 connection credentials
 - The `.env` must be symlinked into the build directory so binaries can find it
-- S3 objects are immutable by design — deletion is not supported in the object store
+- S3 objects are treated as immutable by convention, **not by capability**: `S3Storage::delete_file` exists and works. That distinction matters now that erasure is on the roadmap — a compliance feature cannot be designed against a constraint that is not real, nor shipped against one that is. What genuinely cannot be rewritten is object-lock/WORM media, where only per-file keys and crypto-shredding would help, and those do not exist yet (`Storage` takes a deployment-wide `encrypt_data` flag, not a per-object key).
 - All file operations use UUIDs, not paths, for distributed handling
 - ACL tables live in tenant-specific schemas (not PUBLIC) to prevent data leakage
 - Do not create per-tenant connection pools. (Note the intended "all tenants share one pool" invariant is not actually implemented — see `ConnectionPoolManager` above.)

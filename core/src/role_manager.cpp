@@ -21,34 +21,38 @@ namespace fileengine {
 RoleManager::RoleManager(std::shared_ptr<IDatabase> db) : db_(db) {
 }
 
-Result<void> RoleManager::create_role(const std::string& role, const std::string& tenant) {
+Result<void> RoleManager::create_role(const std::string& role, const std::string& tenant,
+                                      const AccountabilityContext& ctx) {
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
     }
-    return db_->create_role(role, tenant);
+    return db_->create_role(role, tenant, ctx);
 }
 
-Result<void> RoleManager::delete_role(const std::string& role, const std::string& tenant) {
+Result<void> RoleManager::delete_role(const std::string& role, const std::string& tenant,
+                                      const AccountabilityContext& ctx) {
     if (role.empty()) {
         return Result<void>::err("Role name cannot be empty");
     }
-    return db_->delete_role(role, tenant);
+    return db_->delete_role(role, tenant, ctx);
 }
 
 Result<void> RoleManager::assign_user_to_role(const std::string& user, const std::string& role,
-                                              const std::string& tenant) {
+                                              const std::string& tenant,
+                                              const AccountabilityContext& ctx) {
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
     }
-    return db_->assign_user_to_role(user, role, tenant);
+    return db_->assign_user_to_role(user, role, tenant, ctx);
 }
 
 Result<void> RoleManager::remove_user_from_role(const std::string& user, const std::string& role,
-                                                const std::string& tenant) {
+                                                const std::string& tenant,
+                                                const AccountabilityContext& ctx) {
     if (user.empty() || role.empty()) {
         return Result<void>::err("User and role names cannot be empty");
     }
-    return db_->remove_user_from_role(user, role, tenant);
+    return db_->remove_user_from_role(user, role, tenant, ctx);
 }
 
 Result<std::vector<std::string>> RoleManager::get_roles_for_user(const std::string& user,

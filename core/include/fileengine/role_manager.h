@@ -17,6 +17,7 @@
 
 #include "types.h"
 #include <string>
+#include "accountability.h"
 #include <vector>
 #include <memory>
 
@@ -28,23 +29,32 @@ class RoleManager {
 public:
     RoleManager(std::shared_ptr<IDatabase> db);
 
+    // Every mutating call carries the acting identity: the DB layer writes an
+    // accountability record in the operation's own transaction, so it has to be
+    // told who is acting rather than inferring it (§5.1).
+    //
     // Assign a user to a role
-    Result<void> assign_user_to_role(const std::string& user, const std::string& role, 
-                                     const std::string& tenant = "");
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant,
+                                     const AccountabilityContext& ctx);
 
     // Remove a user from a role
-    Result<void> remove_user_from_role(const std::string& user, const std::string& role, 
-                                       const std::string& tenant = "");
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant,
+                                       const AccountabilityContext& ctx);
 
     // Get all roles for a user
     Result<std::vector<std::string>> get_roles_for_user(const std::string& user, 
                                                          const std::string& tenant = "");
 
     // Create a new role
-    Result<void> create_role(const std::string& role, const std::string& tenant = "");
+    Result<void> create_role(const std::string& role, const std::string& tenant,
+                             const AccountabilityContext& ctx);
 
-    // Delete a role
-    Result<void> delete_role(const std::string& role, const std::string& tenant = "");
+    // Delete a role — destroys every membership of it, so the record is the
+    // only thing that will say those memberships existed.
+    Result<void> delete_role(const std::string& role, const std::string& tenant,
+                             const AccountabilityContext& ctx);
 
     // Get all users assigned to a role
     Result<std::vector<std::string>> get_users_for_role(const std::string& role, 

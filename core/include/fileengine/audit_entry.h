@@ -47,7 +47,14 @@ struct AuditEntry {
     std::string   actor;
     std::vector<std::string> actor_roles;
     std::string   target_uid;
-    std::string   target_name;
+    // There is deliberately NO target_name. The audit log records identifiers
+    // and structure, never payload: a filename is party data, and this log is
+    // immutable and long-lived, so a name stored here is a name the platform has
+    // committed to keeping and cannot easily remove. Emit the uid; a viewer
+    // joins to the current name at read time, and after an erasure that join
+    // finds nothing and the log stops disclosing it — compliance as a property
+    // of the architecture rather than an operation someone must remember to run.
+    // (PROPOSAL_accountability_record.md §5.4.7.)
     AuditTargetType target_type = AuditTargetType::None;
     std::string   detail;                 // raw JSON text (object), or empty
     std::string   source_iface;           // grpc|rest|webdav|mcp

@@ -91,7 +91,6 @@ std::string to_json(const AuditEntry& e) {
     j["actor"]    = e.actor;
     if (!e.actor_roles.empty()) j["actor_roles"] = e.actor_roles;
     if (!e.target_uid.empty())  j["target_uid"]  = e.target_uid;
-    if (!e.target_name.empty()) j["target_name"] = e.target_name;
     if (e.target_type != AuditTargetType::None) j["target_type"] = to_string(e.target_type);
     if (!e.detail.empty()) {
         // Embed as a JSON value when parseable; otherwise keep the raw text so

@@ -17,6 +17,7 @@
 
 #include "types.h"
 #include <string>
+#include "accountability.h"
 #include <vector>
 #include <memory>
 #include <map>
@@ -24,7 +25,27 @@
 namespace fileengine {
 
 enum class Permission {
-    CULL_VERSIONS = 0x2000, // Permanently purge old versions — the one genuine
+    ERASE = 0x4000,         // True delete: destroy a file's content, every
+                            // version, and everything derived from it, keeping
+                            // only the fact that it existed. Irreversible,
+                            // compliance-driven, and the most destructive
+                            // operation on a file — so it gets its own bit
+                            // rather than riding on CULL_VERSIONS, which exists
+                            // for routine housekeeping and is far more widely
+                            // held. See PROPOSAL_accountability_record.md §5.4.
+                            //
+                            // The erasure OPERATION is not implemented yet (that
+                            // proposal scopes it as separate, larger work, most
+                            // of it outside the core). The bit and its gating
+                            // land here because the gating is what makes the
+                            // permission mean anything, and because getting it
+                            // wrong is a false compliance claim.
+                            //
+                            // Deliberately excluded from kAllPermissions below,
+                            // and never granted by inheritance — granting it on
+                            // a folder must not confer it on every descendant;
+                            // blast radius is the whole point.
+    CULL_VERSIONS = 0x2000, // Permanently purge old versions — the routine
                             // destroy-data operation. Never granted by default;
                             // must be granted explicitly. See plan §2.5.
     ACL_INHERIT = 0x1000, // Marks a rule for parent->child propagation
@@ -57,12 +78,24 @@ inline int operator|(Permission left, int right) {
     return static_cast<int>(left) | right;
 }
 
-// The union of every permission bit — a system_admin's effective permission
+// The two DESTROY-DATA bits. Both irreversibly destroy committed data, and both
+// are documented as "must be granted explicitly" — so neither may be conferred
+// by an admin bypass. See kTenantAdminPermissions.
+inline constexpr int kDestroyDataPermissions =
+      static_cast<int>(Permission::ERASE)
+    | static_cast<int>(Permission::CULL_VERSIONS);
+
+// The union of every permission bit — a **system_admin's** effective permission
 // set, mirroring the check_permission bypass (which passes for any required
-// permission). Control bits (ACL_INHERIT) are included so that
-// (kAllPermissions & required) == required holds for every possible `required`.
+// permission) for that role and that role only. Control bits (ACL_INHERIT) are
+// included so that (kAllPermissions & required) == required holds for every
+// possible `required` — for system_admin.
+//
+// It does NOT hold for tenant_admin: see kTenantAdminPermissions, which is what
+// that role actually gets.
 inline constexpr int kAllPermissions =
-      static_cast<int>(Permission::CULL_VERSIONS)
+      static_cast<int>(Permission::ERASE)
+    | static_cast<int>(Permission::CULL_VERSIONS)
     | static_cast<int>(Permission::ACL_INHERIT)
     | static_cast<int>(Permission::MANAGE_ACL)
     | static_cast<int>(Permission::READ)
@@ -74,6 +107,27 @@ inline constexpr int kAllPermissions =
     | static_cast<int>(Permission::RETRIEVE_BACK_VERSION)
     | static_cast<int>(Permission::RESTORE_TO_VERSION)
     | static_cast<int>(Permission::EXECUTE);
+
+// What a **tenant_admin** gets from the bypass: everything except the
+// destroy-data bits, which require an explicit grant.
+//
+// The bypass used to hand tenant_admin kAllPermissions, which quietly included
+// CULL_VERSIONS — so every tenant administrator already held version-purge
+// authority the proto documents as "destroy-data op; must be granted
+// explicitly". Those two statements cannot both be true, and this is the one
+// that gives way. (PROPOSAL_accountability_record.md §5.4.9.)
+//
+// The distinction that makes this the right split: system_admin is a
+// break-glass deployment-operator identity, deliberately few. tenant_admin maps
+// from a tenant's `administrators` LDAP group — a normal operational
+// population. A new ERASE bit checked through the normal path would otherwise
+// be satisfied automatically for exactly the population it exists to exclude,
+// and would gate nothing while appearing to.
+//
+// A tenant administrator remains fully able to run their tenant. Irreversibly
+// destroying data within it becomes a deliberate, recorded grant rather than a
+// side effect of an LDAP group membership.
+inline constexpr int kTenantAdminPermissions = kAllPermissions & ~kDestroyDataPermissions;
 
 enum class PrincipalType {
     USER,
@@ -131,6 +185,19 @@ class IDatabase;
 // one tenant, not the whole deployment.
 inline constexpr const char* kSystemAdminRole = "system_admin";
 inline constexpr const char* kTenantAdminRole = "tenant_admin";
+
+// The dedicated reader role for the accountability chain
+// (PROPOSAL_accountability_record.md §4.3.1).
+//
+// It is NOT one of the admin roles and confers no other access: the chain is the
+// most sensitive dataset in the system — reading it across tenants reconstructs
+// who did what to whom platform-wide — so least privilege applies even inside
+// the trust boundary. A service that legitimately holds gRPC access does not
+// thereby hold the security log; it has to be given this role specifically.
+//
+// audit_service is the intended holder. A system_admin also qualifies, because
+// break-glass would otherwise be locked out of the one dataset an incident needs.
+inline constexpr const char* kAccountabilityReaderRole = "accountability_reader";
 
 // Human-facing name for the "everyone" principal. A rule whose PrincipalType
 // is OTHER matches every principal regardless of the stored principal string,
@@ -197,16 +264,17 @@ public:
     };
     
     // Grant permission to a principal (user/role/claim/everyone) on a resource.
-    // performed_by is the
-    // last arg so legacy positional callers that pass `tenant` as the 5th
-    // argument still bind to the right slot. effect defaults to ALLOW; pass
-    // DENY to add bits to the deny set instead (DENY wins within its tier).
+    // `ctx` names who is acting; it replaces the old free-standing performed_by
+    // and drives the accountability record the DB layer writes in the same
+    // transaction as the grant. ctx.actor must not be empty. effect defaults to
+    // ALLOW; pass DENY to add bits to the deny set instead (DENY wins within its
+    // tier).
     Result<void> grant_permission(const std::string& resource_uid,
                                   const std::string& principal,
                                   PrincipalType type,
                                   int permissions,
-                                  const std::string& tenant = "",
-                                  const std::string& performed_by = "",
+                                  const std::string& tenant,
+                                  const AccountabilityContext& ctx,
                                   AclEffect effect = AclEffect::ALLOW);
 
     // Revoke permission from a principal (user/role/claim/everyone) on a
@@ -216,8 +284,8 @@ public:
                                    const std::string& principal,
                                    PrincipalType type,
                                    int permissions,
-                                   const std::string& tenant = "",
-                                   const std::string& performed_by = "",
+                                   const std::string& tenant,
+                                   const AccountabilityContext& ctx,
                                    AclEffect effect = AclEffect::ALLOW);
     
     // Check if a user has specific permissions on a resource. `claims` are the

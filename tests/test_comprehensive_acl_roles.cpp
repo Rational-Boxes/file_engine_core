@@ -24,6 +24,16 @@
 #include "fileengine/types.h"
 #include "fileengine/IDatabase.h"
 
+// A stand-in acting identity for the mock-backed suites. The real path refuses
+// an operation whose actor is empty (PROPOSAL_accountability_record.md §5.1), so
+// tests have to name one even though the mocks record nothing.
+static const fileengine::AccountabilityContext kTestCtx = [] {
+    fileengine::AccountabilityContext c;
+    c.actor = "test";
+    c.source_iface = "test";
+    return c;
+}();
+
 using namespace fileengine;
 
 // Mock database implementation for testing
@@ -174,13 +184,13 @@ public:
     }
     
     // Tenant management operations
-    Result<void> create_tenant_schema(const std::string& tenant) override {
+    Result<void> create_tenant_schema(const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     Result<bool> tenant_schema_exists(const std::string& tenant) override {
         return Result<bool>::ok(true);
     }
-    Result<void> cleanup_tenant_data(const std::string& tenant) override {
+    Result<void> cleanup_tenant_data(const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     Result<std::vector<std::string>> list_tenants() override {
@@ -190,8 +200,8 @@ public:
     // ACL operations - these are the important ones for our test
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
-                         const std::string& tenant = "",
-                         const std::string& /*performed_by*/ = "",
+                         const std::string& tenant,
+                         const AccountabilityContext& /*ctx*/,
                          int /*effect*/ = 0) override {
         AclEntry entry;
         entry.resource_uid = resource_uid;
@@ -206,8 +216,8 @@ public:
     
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
-                            const std::string& tenant = "",
-                            const std::string& /*performed_by*/ = "",
+                            const std::string& tenant,
+                            const AccountabilityContext& /*ctx*/,
                             int /*effect*/ = 0) override {
         auto& resource_acls = acls_[resource_uid];
         for (auto& entry : resource_acls) {
@@ -275,21 +285,21 @@ public:
     }
 
     // Role management operations
-    Result<void> create_role(const std::string& role, const std::string& tenant = "") override {
+    Result<void> create_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
-    Result<void> delete_role(const std::string& role, const std::string& tenant = "") override {
+    Result<void> delete_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
-    Result<void> assign_user_to_role(const std::string& user, const std::string& role, 
-                                     const std::string& tenant = "") override {
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
-    Result<void> remove_user_from_role(const std::string& user, const std::string& role, 
-                                       const std::string& tenant = "") override {
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     
@@ -325,7 +335,7 @@ void test_user_permissions() {
     
     // Test 1: Grant READ permission to user
     auto result = acl_manager.grant_permission(resource_uid, user, PrincipalType::USER, 
-                                              static_cast<int>(Permission::READ));
+                                              static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted READ permission to user\n";
     
@@ -341,7 +351,7 @@ void test_user_permissions() {
     
     // Test 4: Grant WRITE permission to user
     result = acl_manager.grant_permission(resource_uid, user, PrincipalType::USER, 
-                                         static_cast<int>(Permission::WRITE));
+                                         static_cast<int>(Permission::WRITE), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted WRITE permission to user\n";
     
@@ -354,7 +364,7 @@ void test_user_permissions() {
     
     // Test 6: Bit-mask revoke — only the READ bit is cleared, WRITE remains.
     result = acl_manager.revoke_permission(resource_uid, user, PrincipalType::USER,
-                                          static_cast<int>(Permission::READ));
+                                          static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Revoked READ from user\n";
 
@@ -381,7 +391,7 @@ void test_role_permissions() {
     
     // Test 1: Grant READ permission to role
     auto result = acl_manager.grant_permission(resource_uid, role, PrincipalType::ROLE, 
-                                              static_cast<int>(Permission::READ));
+                                              static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted READ permission to role\n";
     
@@ -394,7 +404,7 @@ void test_role_permissions() {
     
     // Test 3: Grant WRITE permission to role
     result = acl_manager.grant_permission(resource_uid, role, PrincipalType::ROLE, 
-                                         static_cast<int>(Permission::WRITE));
+                                         static_cast<int>(Permission::WRITE), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted WRITE permission to role\n";
     
@@ -428,7 +438,7 @@ void test_group_permissions() {
     
     // Test 1: Grant READ permission to group
     auto result = acl_manager.grant_permission(resource_uid, group, PrincipalType::GROUP, 
-                                              static_cast<int>(Permission::READ));
+                                              static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted READ permission to group\n";
     
@@ -456,7 +466,7 @@ void test_group_permissions() {
     // The real mechanism, so the coverage this test was reaching for survives:
     // grant to a ROLE and a caller holding that role gets it.
     auto as_role = acl_manager.grant_permission(resource_uid, group, PrincipalType::ROLE,
-                                                static_cast<int>(Permission::READ));
+                                                static_cast<int>(Permission::READ), "", kTestCtx);
     assert(as_role.success);
     auto role_perm = acl_manager.get_effective_permissions(resource_uid, user, {group});
     assert(role_perm.success);
@@ -480,15 +490,15 @@ void test_permission_priority() {
     
     // Test 1: Grant READ to user, WRITE to role, EXECUTE to group
     auto result = acl_manager.grant_permission(resource_uid, user, PrincipalType::USER, 
-                                              static_cast<int>(Permission::READ));
+                                              static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     
     result = acl_manager.grant_permission(resource_uid, role, PrincipalType::ROLE, 
-                                         static_cast<int>(Permission::WRITE));
+                                         static_cast<int>(Permission::WRITE), "", kTestCtx);
     assert(result.success);
     
     result = acl_manager.grant_permission(resource_uid, group, PrincipalType::GROUP, 
-                                         static_cast<int>(Permission::EXECUTE));
+                                         static_cast<int>(Permission::EXECUTE), "", kTestCtx);
     assert(result.success);
     
     std::cout << "  ✓ Set up permissions at different levels\n";
@@ -542,7 +552,7 @@ void test_root_directory_rule() {
     std::cout << "  ✓ Root directory has no ACL permissions by default (handled at FileSystem layer)\n";
 
     // If we explicitly grant READ on root, it works normally
-    acl_manager.grant_permission(root_uid, "other", PrincipalType::OTHER, static_cast<int>(Permission::READ));
+    acl_manager.grant_permission(root_uid, "other", PrincipalType::OTHER, static_cast<int>(Permission::READ), "", kTestCtx);
     perm_result = acl_manager.get_effective_permissions(root_uid, user, {});
     assert(perm_result.success);
     assert((perm_result.value & static_cast<int>(Permission::READ)) == static_cast<int>(Permission::READ));
@@ -571,7 +581,7 @@ void test_permission_combinations() {
                     static_cast<int>(fileengine::Permission::DELETE) |
                     static_cast<int>(fileengine::Permission::EXECUTE);
 
-    auto result = acl_manager.grant_permission(resource_uid, role, PrincipalType::ROLE, all_perms);
+    auto result = acl_manager.grant_permission(resource_uid, role, PrincipalType::ROLE, all_perms, "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted all permissions to role\n";
 
@@ -591,7 +601,7 @@ void test_permission_combinations() {
     // Under the union model, USER and ROLE grants accumulate — the USER grant
     // does NOT suppress role permissions.
     result = acl_manager.grant_permission(resource_uid, user, PrincipalType::USER,
-                                         static_cast<int>(fileengine::Permission::EXECUTE));
+                                         static_cast<int>(fileengine::Permission::EXECUTE), "", kTestCtx);
     assert(result.success);
     std::cout << "  ✓ Granted EXECUTE permission to user (overlapping with role)\n";
 
