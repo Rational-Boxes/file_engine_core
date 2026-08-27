@@ -173,105 +173,122 @@ problem this is meant to reduce.
 
 ---
 
-### 3.5 The map at rest — encrypted, keyed from the secrets store
+### 3.5 Where the map lives
 
-The map lives in a file the core loads at boot, and that file is **encrypted**.
-The key is held in the secrets store and injected at runtime, so **the file is
-useless if it leaks on its own**.
+The map needs a home that is durable, operable, and does not become a liability
+when something leaks. An earlier draft of this section specified an **encrypted
+file on disk**, then spent most of its length listing that approach's drawbacks —
+which is a fair sign it was the wrong answer. Reconsidered:
 
-#### Reuse the mechanism that already exists
+| Option | Assessment |
+|---|---|
+| **Encrypted file on disk** | Works, but the key must reach the process at boot, the file gets copied into backups, images and tickets, it is fixed for the process lifetime, and a wrong key is easily mistaken for an empty map |
+| **Core PostgreSQL** ✅ **recommended** | Adds **no new dependency** — the core already cannot start without it. Transactional, immediately consistent, multi-instance safe, already backed up, and map changes become recordable |
+| **Asymmetric — core stores public keys** | Strictly best on leak-resistance: nothing at rest is a secret at all. More machinery; converges on mTLS (§4) |
 
-This needs no new machinery. `AT_REST_KEY` already does exactly this shape for
-storage encryption: a 32-byte AES-256 key, supplied as 64 hex characters,
-injected from the environment (`AT_REST_KEY: ${AT_REST_KEY}` in the compose
-stack, Ansible Vault in deployments), and required when encryption is on. The
-core's `CryptoUtils` provides AES-256-GCM.
+#### Why PostgreSQL is not a new failure mode
 
-So: `FILEENGINE_SERVICE_MAP_KEY`, same generation (`openssl rand -hex 32`), same
-injection path, same primitives. An operator who already understands
-`AT_REST_KEY` understands this one.
+The usual objection to putting credentials in a database is the added
+dependency. **Here there isn't one.** `server.cpp:101` exits with *"Failed to
+connect to database"* if PostgreSQL is unreachable — the core cannot serve at all
+without it, so a map stored there is available in exactly the situations the core
+is running.
 
-#### What it buys, honestly
+That is precisely the argument that ruled out fetching the key from a vault at
+boot (below): a vault would be a *new* thing that must be reachable before the
+core can serve, and given a core outage takes the platform down, that is a new
+platform-wide single point of failure. PostgreSQL is not new. It is the one
+dependency the core already has absolutely.
 
-The map holds HMACs, not plaintext (§3.3), so a leaked map already yields no
-usable token — inverting HMAC-SHA256 over a 256-bit secret is not a threat model.
-Encryption is therefore **defence in depth rather than the primary control**, and
-worth being precise about what it adds:
+The read-only failover path (`ConnectionPoolManager::server_in_readonly_mode_`)
+also covers the degraded case: reading a map is a read, so authentication keeps
+working when the primary is gone.
 
-- **It conceals the service inventory.** The map names every identity the
-  platform has. That is reconnaissance — which doors exist, what to target — and
-  it is the one thing a leaked map genuinely gives away today.
-- **It contains a future mistake.** If someone later stores a secret in the map
-  in a weaker form, or the hashing is changed carelessly, the encryption is the
-  layer that was already there. Controls that only matter when something else
-  goes wrong are exactly the ones worth having cheaply.
-- **It satisfies "secrets encrypted at rest"** as a posture requirement without
-  argument about whether an HMAC counts.
+#### What moving it to the database fixes
 
-#### Secret zero moves; it does not vanish
+- **No artefact to leak on its own.** The map stops being a separate file that
+  gets copied into container images, backups and support tickets. It folds into
+  the database — which is already the most sensitive artefact the platform has,
+  holding every file's metadata and ACLs, and is already protected accordingly.
+  The map is not the weak link there.
+- **No reload signalling.** The boot-fixed problem disappears. Adding a service
+  or finishing a rotation is a transactional update, picked up by a short-TTL
+  cache. Routine credential administration stops costing a core restart — which,
+  since a core restart is a platform outage, is what would otherwise guarantee it
+  gets deferred.
+- **Multi-instance consistency for free.** A file must be distributed to every
+  core replica and can skew between them. A shared table cannot.
+- **Map changes become accountability records.** Granting a service a capability,
+  or rotating its secret, is exactly the security-relevant act
+  `PROPOSAL_accountability_record.md` exists to record — and a DB write can be
+  recorded in the same transaction (§4.2 there). A file edit cannot be recorded
+  at all; it happens outside the system.
 
-Encrypting the map does not remove the need to protect something — it replaces
-*a file of many identities* with *one key*. That is a real improvement: one thing
-to guard, one thing to rotate, one thing living in a store built for the purpose,
-rather than a config file that gets copied into backups, tickets and container
-images.
+That last point is the strongest. With the map in a file, the most sensitive
+administrative action on the platform leaves no trace in the platform.
 
-But the key still has to reach the process at boot, so the bootstrapping problem
-is relocated rather than solved. It should be stated that way rather than
-described as making the secrets safe, which would be the same overclaim as
-calling a plaintext bearer token protection for a public port (§4).
+#### The pepper is the one secret, and it stays out of the database
+
+The stored values are `HMAC-SHA256(secret, pepper)` (§3.3). The **pepper must not
+live in the database**, or a single dump yields both halves and the hashing stops
+buying anything. It stays in the environment, injected the same way `AT_REST_KEY`
+already is — `openssl rand -hex 32`, compose or Ansible Vault, never fetched at
+runtime.
+
+So secret zero shrinks rather than moves: one short value in the environment,
+instead of a key that decrypts a whole file of identities. And unlike the file
+key, losing the pepper does not lock the core out of its own map — it invalidates
+the hashes, which is a rotation, not an outage.
+
+#### Fallback
+
+Deployments that genuinely cannot put credentials in the application database can
+keep the encrypted-file form: AES-256-GCM via `CryptoUtils`, key in
+`FILEENGINE_SERVICE_MAP_KEY`, same shape and injection path as `AT_REST_KEY`.
+If that path is used, two things matter:
+
+- **Inject the key, never fetch it** — for the single-point-of-failure reason
+  above. Decrypt once at startup, then zero the key.
+- **Fail closed but legibly.** A wrong key and an empty map must not produce the
+  same message. *"No services configured"* for what is actually a key mismatch
+  sends an operator hunting a nonexistent configuration problem during an outage.
 
 #### Two rotations, not one
 
-They are separate operations and both must work:
+Independent operations either way, and both must work without the other:
 
 | Rotating | Means |
 |---|---|
-| A **service token** | Re-encrypt the map with the same key, using the §3.4 overlap so services roll one at a time |
-| The **map key** | Decrypt with the old key, re-encrypt with the new; no service token changes |
+| A **service token** | Update that row (or re-encrypt the file), using the §3.4 overlap so services roll one at a time |
+| The **pepper** (or map key) | Re-hash under the new pepper; no service token changes |
 
 Conflating them turns a routine credential rotation into a platform-wide restart.
 
-#### Fail closed, but legibly
+#### Capabilities stay in code — the reviewed and the operational differ
 
-A missing or wrong key means the core cannot read its map, cannot authenticate
-any caller, and must refuse to serve. That is correct — but **an undecryptable
-map and an empty map must not produce the same message.** "No services
-configured" for what is actually a key mismatch sends an operator hunting a
-configuration problem that does not exist, during an outage. Distinguish them
-explicitly at startup.
+§6.4 keeps capability grouping and per-service assignment in code, and moving the
+secret map into the database does not change that. The split is deliberate:
 
-#### Loaded at core boot — two consequences
+- **What a service may do** is a security decision that should require a code
+  change and a review. Putting it in a table makes it one `UPDATE` away from a
+  bridge holding `destroy` under deployment pressure.
+- **Which secret a service holds** is an operational fact that changes on a
+  rotation schedule and must not require a release.
 
-**Inject the key, never fetch it.** The key arrives in the process environment
-(compose, systemd `EnvironmentFile`, or a systemd credential) rather than being
-retrieved from a secrets service at startup. This matters more here than it
-usually would: `PROPOSAL_accountability_record.md` §7.8 establishes that **a core
-outage takes the platform down**, so anything the core must reach before it can
-serve becomes a platform-wide single point of failure. A vault the core has to
-call at boot would mean a vault outage is a total outage. Injection keeps the
-dependency at deploy time, where it belongs. Decrypt once at startup, then zero
-the key rather than holding it for the process lifetime.
-
-**Provide a reload path.** Loading at boot means the map is fixed for the process
-lifetime, so adding a service or completing a token rotation would otherwise
-require a core restart — and by the same §7.8 reasoning, restarting the core is
-a platform-wide outage. Making routine credential administration cost an outage
-guarantees it is deferred, which is how stale credentials accumulate.
-
-So the map must be re-readable without a restart: `SIGHUP`, or an admin RPC
-gated by the `admin` capability (§6.1). A reload is a strictly additive
-operation — it re-reads and replaces the map, and in-flight calls already past
-authentication are unaffected.
+One friction to acknowledge: a genuinely new *kind* of service then needs a core
+release for its capability set. That is the intended cost — a new door is exactly
+what should be reviewed — but capabilities should key on the service **class**
+rather than a deployment instance, so adding a replica or renaming an environment
+needs no code change.
 
 #### Not the CLI's own token
 
 The `cli` secret (§6.1) stays a plaintext file protected by filesystem
 permissions. Encrypting it would need a key the operator must supply to decrypt
 their own credential — recursion with no gain. The asymmetry is deliberate: the
-core runs unattended and holds many identities, so it gets a key from the store;
-the CLI is interactive and holds one secret, so it gets `0640` and a tool that
-refuses to run when that is wrong.
+core runs unattended and validates many identities, so its map lives in the
+database; the CLI is interactive and holds one secret, so it gets `0640` and a
+tool that refuses to run when that is wrong.
 
 ---
 
@@ -314,11 +331,14 @@ for attribution. The honest sequencing is in §7.
 
 | Setting | Where | Meaning |
 |---|---|---|
-| `FILEENGINE_SERVICE_TOKEN` | each calling service | the secret it presents |
-| `FILEENGINE_SERVICE_MAP` | core | path to the **encrypted** source:secret map (§3.3, §3.5), read at boot |
-| `FILEENGINE_SERVICE_MAP_KEY` | core | AES-256 key for that file, 64 hex chars, injected from the secrets store — same shape as `AT_REST_KEY` |
+| `FILEENGINE_SERVICE_TOKEN` | each calling service | the `fesvc_…` secret it presents (§3.3) |
+| `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | **the one secret** — HMAC pepper for the stored hashes. Injected, never in the database (§3.5) |
 | `FILEENGINE_SERVICE_AUTH_REQUIRED` | core | default **`true`** |
-| `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | HMAC pepper for the stored hashes |
+| `FILEENGINE_SERVICE_MAP_CACHE_TTL` | core | how long the map is cached between reads (§3.5); short, so an update takes effect without a restart |
+| `FILEENGINE_SERVICE_MAP_FILE` / `_KEY` | core | **fallback only** (§3.5) — path to an encrypted map file and its AES-256 key, for deployments that cannot use the database |
+
+The map itself lives in the core's PostgreSQL (§3.5), so it is not configuration:
+adding a service is a transactional update, not a file edit and a restart.
 
 Distribution: compose `.env` for the container stack, Ansible Vault for
 deployments, per the existing secret-handling convention.
@@ -748,15 +768,17 @@ every subsequent step measurable.
       rather than parsed into a partial match.
     - An **unknown service id costs the same time as a valid id with a wrong
       secret**, so timing does not enumerate service names.
-14. **The map at rest is unusable alone (§3.5).** The map file decrypts only with
-    `FILEENGINE_SERVICE_MAP_KEY`, and:
-    - Booting with a **wrong or missing key fails closed with a message naming
-      the key**, distinguishable from an empty map — the operational trap during
-      an outage.
-    - A **reload** (`SIGHUP` / admin RPC) picks up an added service without a
-      restart, and calls already authenticated are unaffected.
-    - Rotating a **service token** and rotating the **map key** are independent:
+14. **The map at rest is unusable alone (§3.5).** A database dump yields no
+    usable token, because the pepper is not in the database.
+    - **Adding a service takes effect without a core restart** — a transactional
+      update, visible within the cache TTL. This is the property that keeps
+      credential rotation from costing a platform outage.
+    - **Map changes are recorded**: granting a service a capability or rotating
+      its secret writes an accountability record in the same transaction.
+    - Rotating a **service token** and rotating the **pepper** are independent:
       either can be done without the other.
+    - On the fallback file path only: a wrong key **fails closed with a message
+      naming the key**, distinguishable from an empty map.
 13. **End-user origin survives every external door (§6.5).** A request through
     `bcf_services` records the caller's real address, not an internal one — the
     one door currently missing it. And an event-driven internal call records an
