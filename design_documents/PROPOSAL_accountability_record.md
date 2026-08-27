@@ -1026,6 +1026,103 @@ would be far too widely held. Recommend a separate `ERASE` permission, restricte
 to administrators, and recorded in the **global** table (§7.3), since a
 tenant-scoped record would destroy itself.
 
+#### 5.4.9 Gating erasure — a bespoke permission, and why a new bit is not enough
+
+Erasure is irreversible, compliance-driven and the most destructive operation on
+a file. It must be gated by its own permission, held by very few people:
+**`Permission::ERASE`** (bit 12), joining the enum after `CULL_VERSIONS`.
+
+Adding the bit is the easy part. **On its own it would gate nothing**, for a
+reason that is worth stating precisely because it also affects an existing
+guarantee.
+
+##### The superuser has everything; the tenant admin is the problem
+
+The platform superuser — **`system_admin`** — holds all permissions including
+`ERASE`, naturally and by design. That is the break-glass identity and nothing
+below changes it.
+
+The issue is that the bypass does not stop there.
+`AclManager::get_effective_permissions` returns `kAllPermissions` for
+**`system_admin` *or* `tenant_admin`**, resolved before any ACL or parent lookup
+(`acl_manager.cpp:218-221`), and `kAllPermissions` is deliberately exhaustive:
+
+> *"Control bits (ACL_INHERIT) are included so that
+> `(kAllPermissions & required) == required` holds for every possible
+> `required`."* — `acl_manager.h:63`
+
+`tenant_admin` maps from a tenant's `administrators` LDAP group — a normal
+operational population, not a break-glass one. So a new `ERASE` bit checked
+through the normal path is satisfied automatically for **every tenant
+administrator**, and the bespoke permission would exist on paper while gating
+nothing against exactly the population it is meant to exclude.
+
+##### The same already applies to `CULL_VERSIONS`
+
+`kAllPermissions` explicitly includes `CULL_VERSIONS` (`acl_manager.h:65`), while
+the proto documents that permission as a *"destroy-data op; must be granted
+explicitly"*. For the superuser that is unremarkable. For `tenant_admin` the two
+statements cannot both hold: every tenant administrator already has version-purge
+authority without it ever having been granted.
+
+A live finding independent of this proposal, and the reason the pattern needs
+establishing rather than following.
+
+##### What actually gates it
+
+**Split the bypass** rather than removing it:
+
+| Role | Effective permissions |
+|---|---|
+| `system_admin` | `kAllPermissions` — everything, unchanged |
+| `tenant_admin` | everything **except the destroy-data bits** (`ERASE`, `CULL_VERSIONS`), which require an explicit grant |
+
+A tenant administrator remains fully able to run their tenant and must be
+*granted* the ability to irreversibly destroy data within it — which is what
+"bespoke permission, very privileged users only" asks for, since it makes the
+grant a deliberate, recorded act rather than a side effect of an LDAP group.
+
+The invariant in `acl_manager.h:63` then holds for `system_admin` but not for
+`tenant_admin`, so its comment must be qualified accordingly. That is the
+substantive change: *"admin passes every check"* stops being uniformly true, and
+the header should say which admin.
+
+##### The superuser is assertable, which shifts the weight to the surface
+
+Roles arrive request-borne in `AuthenticationContext` and the SDKs pass them
+verbatim, so anyone able to reach gRPC directly can simply *claim*
+`system_admin` — and since the superuser legitimately holds `ERASE`, that claim
+carries erasure with it. This is an accepted property of the trust model (gRPC
+must never be network-exposed; the bridges are the security boundary), and it is
+not made worse by anything here.
+
+But it does mean the permission is not the last line of defence for this
+operation, and the surface matters more than the bit:
+
+- The erasure grant should be **resource-explicit and non-inheriting**. Granting
+  it on a folder must not confer it on every descendant; blast radius is the
+  whole point.
+- **Restrict the surface, not just the permission.** Erasure should not be
+  reachable through the file-protocol bridges at all. WebDAV and CMIS are mounted
+  drives and document clients where an accidental or scripted invocation is
+  plausible, and neither protocol has a natural verb for it. Expose it on the
+  admin surface only — the REST admin API and the CLI — so the operation is
+  deliberate by construction. `cmis/SPECIFICATION.md` §12.2 already excludes
+  `CULL_VERSIONS` from `cmis:all`; `ERASE` must be excluded there too, and
+  additionally not mapped to any CMIS operation.
+
+##### Open
+
+- **Does field-level erasure (§5.4.1) share `ERASE`?** A data-protection officer
+  removing a PII property may need that routinely while never needing to destroy
+  a document. A separate, lesser grant serves that — but a lesser grant tends to
+  become widely held, and it still destroys history irreversibly. Recommend one
+  permission until there is evidence of the operational need.
+- **Two-person control?** For an irreversible, legally-motivated operation, a
+  single call from a single credential is thin, and second-approver or
+  out-of-band confirmation is the conventional control. Worth deciding
+  explicitly rather than defaulting to single-call because it is easier.
+
 ---
 
 ## 6. Non-goals
@@ -1319,6 +1416,15 @@ tenant-scoped record would destroy itself.
       name and property values and finding neither.
     - **`detail` cannot carry content:** an attempt to record an unenumerated
       field for an action is rejected by the schema rather than stored.
+16. **Erasure is gated (§5.4.9).**
+    - A `system_admin` can erase — the superuser holds every permission.
+    - A **`tenant_admin` cannot**, until `ERASE` is explicitly granted; the same
+      holds for `CULL_VERSIONS`, closing the gap between the proto's
+      "must be granted explicitly" and the bypass.
+    - A user granted `ERASE` on a folder does **not** thereby hold it on the
+      folder's descendants.
+    - Erasure is unreachable over WebDAV and CMIS, and `ERASE` appears in no
+      CMIS permission mapping.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
