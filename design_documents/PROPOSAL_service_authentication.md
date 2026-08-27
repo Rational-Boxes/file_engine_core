@@ -205,8 +205,8 @@ which is a fair sign it was the wrong answer. Reconsidered:
 
 | Option | Assessment |
 |---|---|
-| **Encrypted file on disk** | Works, but the key must reach the process at boot, the file gets copied into backups, images and tickets, it is fixed for the process lifetime, and a wrong key is easily mistaken for an empty map |
-| **Core PostgreSQL** ✅ **recommended** | Adds **no new dependency** — the core already cannot start without it. Transactional, immediately consistent, multi-instance safe, already backed up, and map changes become recordable |
+| **Encrypted file on disk** | ❌ **rejected** — the key must reach the process at boot, the file gets copied into backups, images and tickets, it is fixed for the process lifetime, a wrong key is easily mistaken for an empty map, and above all **it cannot record its own changes** |
+| **Core PostgreSQL** ✅ **chosen, and the only supported store** | Adds **no new dependency** — the core already cannot start without it. Transactional, immediately consistent, multi-instance safe, already backed up, and map changes become recorded |
 | **Asymmetric — core stores public keys** | Strictly best on leak-resistance: nothing at rest is a secret at all. More machinery; converges on mTLS (§4) |
 
 #### Why PostgreSQL is not a new failure mode
@@ -263,18 +263,27 @@ instead of a key that decrypts a whole file of identities. And unlike the file
 key, losing the pepper does not lock the core out of its own map — it invalidates
 the hashes, which is a rotation, not an outage.
 
-#### Fallback
+#### There is no file fallback
 
-Deployments that genuinely cannot put credentials in the application database can
-keep the encrypted-file form: AES-256-GCM via `CryptoUtils`, key in
-`FILEENGINE_SERVICE_MAP_KEY`, same shape and injection path as `AT_REST_KEY`.
-If that path is used, two things matter:
+An earlier draft kept the encrypted-file form as an option for deployments that
+could not use the database. **Dropped — the database is the only supported
+store.**
 
-- **Inject the key, never fetch it** — for the single-point-of-failure reason
-  above. Decrypt once at startup, then zero the key.
-- **Fail closed but legibly.** A wrong key and an empty map must not produce the
-  same message. *"No services configured"* for what is actually a key mismatch
-  sends an operator hunting a nonexistent configuration problem during an outage.
+The decisive reason is not simplification, it is that **a file cannot record its
+own changes.** §3.6 makes every credential change an accountability record
+written in the same transaction as the change, so modifying the map without
+leaving a trace is impossible. A file path reintroduces exactly that: edit the
+file, restart, and a service's credentials have changed with nothing anywhere
+recording it. Keeping the option would mean keeping a supported way to bypass the
+guarantee the section above exists to provide.
+
+The rest follows the usual fate of optional weaker paths — rarely exercised,
+therefore under-tested, therefore where the bugs live — and it would oblige the
+design to carry the file's drawbacks (key at boot, copies in images and backups,
+no online rotation, wrong-key-versus-empty-map ambiguity) in perpetuity for a
+deployment nobody has asked for. The platform is pre-production; adding the
+option later if a real constraint appears costs far less than supporting it
+speculatively now.
 
 #### Rotation is online, across every node
 
@@ -553,7 +562,6 @@ for attribution. The honest sequencing is in §7.
 | `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | **the one secret** — HMAC pepper for the stored hashes. Injected, never in the database (§3.5) |
 | `FILEENGINE_SERVICE_AUTH_REQUIRED` | core | default **`true`** |
 | `FILEENGINE_SERVICE_MAP_CACHE_TTL` | core | how long the map is cached between reads (§3.5); short, so an update takes effect without a restart |
-| `FILEENGINE_SERVICE_MAP_FILE` / `_KEY` | core | **fallback only** (§3.5) — path to an encrypted map file and its AES-256 key, for deployments that cannot use the database |
 
 The map itself lives in the core's PostgreSQL (§3.5), so it is not configuration:
 adding a service is a transactional update, not a file edit and a restart.
@@ -1034,8 +1042,8 @@ every subsequent step measurable.
       finished" is answerable rather than estimated.
     - The `cli` credential itself is created by **packaging at install**, under
       the same generation rules — there is no unauthenticated bootstrap mode.
-    - On the fallback file path only: a wrong key **fails closed with a message
-      naming the key**, distinguishable from an empty map.
+    - There is **no file-based map path** to configure, so no way to change
+      service credentials without an accountability record (§3.5).
 13. **End-user origin survives every external door (§6.5).** A request through
     `bcf_services` records the caller's real address, not an internal one — the
     one door currently missing it. And an event-driven internal call records an
