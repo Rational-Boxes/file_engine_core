@@ -345,6 +345,91 @@ tool that refuses to run when that is wrong.
 
 ---
 
+### 3.6 Key management belongs to the CLI
+
+All service-credential administration goes through `fileengine_cli`. Direct
+manipulation of the map — `psql`, a migration, a hand-written `UPDATE` — is not a
+supported path.
+
+#### Not convenience. It is what enforces the invariants
+
+The storage design rests on properties that live in the *writing* code, not in
+the schema, and every one of them is silently lost if an operator edits the table
+directly:
+
+| Invariant | How a hand-written `UPDATE` breaks it |
+|---|---|
+| Tokens are **generated, never chosen** (§3.3) | An operator typing a memorable token voids the entropy assumption that makes a fast MAC sufficient — invisibly, since the stored value looks identical |
+| Values are **peppered HMACs** | A plaintext or unpeppered value stores fine and authenticates fine, until a dump leaks it |
+| Changes are **recorded** (§3.5) | A direct write happens outside the system, so the most sensitive administrative action on the platform leaves no trace |
+| Rotation **overlaps** (§3.4) | Replacing a row in place instead of adding one strands every instance still holding the old secret |
+
+So the CLI is the enforcement point, not a nicety. A schema cannot express "this
+value must have come from a CSPRNG".
+
+#### Commands
+
+```
+fileengine_cli service-token issue    <service_id>     # generate, store hash, print ONCE
+fileengine_cli service-token rotate   <service_id>     # issue alongside the old (overlap)
+fileengine_cli service-token prune    <service_id>     # drop the superseded entry post-rollout
+fileengine_cli service-token revoke   <service_id>
+fileengine_cli service-token list                      # ids, created, last-used, pepper version
+fileengine_cli service capabilities   <service_id>     # effective set — read-only (§6.4)
+fileengine_cli pepper rotate                           # begin; both accepted
+fileengine_cli pepper status                           # rows per pepper version — when is it safe to retire
+```
+
+`list` never prints a secret; `issue` and `rotate` print it exactly once, since
+there is nothing to recover it from afterwards. `service capabilities` is
+read-only by construction — assignments live in code (§6.4), so a command to
+change them would imply an authority the design deliberately withholds.
+
+`pepper status` deserves its place: §3.5's online pepper rotation completes when
+no rows remain on the old version, and that is a question an operator must be
+able to *ask* rather than estimate.
+
+#### Scriptable
+
+- `--json` on every read command; human-formatted output is not an API.
+- Meaningful exit codes; no interactive prompts in scripted use.
+- `revoke` and `prune` are idempotent. `issue` is not, and must not be — it
+  generates.
+- **The secret goes to stdout and nowhere else.** Never to a log, never to the
+  audit record, never echoed back by a later command. A caller piping it is fine;
+  a caller running under `set -x` or a CI job archiving stdout is the realistic
+  leak, so the docs must say so plainly.
+
+#### Two consequences worth stating
+
+**Automation runs on the core host.** The `cli` identity is loopback-only
+(§6.1), so token administration cannot be driven from a central CI runner
+reaching in over the network. Scripts run on the box, or via something that does
+— Ansible with a task on the core host, rather than a pipeline calling an API.
+That is a direct consequence of the loopback decision and worth knowing before
+someone designs the pipeline the other way.
+
+**Records name a person, not `cli`.** The `cli` service identity is *what*
+connected; it is not *who* acted. The CLI sets `actor` from the invoking OS user
+(overridable with `--actor` for automation with its own identity), so the
+accountability record for issuing a credential names an administrator. Attributing
+every administrative action to `cli` would make the record technically complete
+and practically useless.
+
+#### Bootstrapping the first credential
+
+The map starts empty, and the CLI needs a credential to talk to the core — so the
+`cli` token cannot be issued by the CLI. **Packaging generates it at install
+time**, writing it `0640` (§6.1) and registering its hash. Every other service
+credential is then issued through the CLI.
+
+This keeps the awkward case where it belongs: one credential created by the
+installer, under the same generation rules, rather than a bootstrap mode that
+accepts unauthenticated calls while the map is empty — which would be a
+permanently exploitable state that only *looks* transient.
+
+---
+
 ## 4. What this buys, and what it does not
 
 Being precise here matters, because the failure mode is believing the port is now
@@ -841,6 +926,16 @@ every subsequent step measurable.
     - **Pepper rotation is online:** with both peppers configured, rows migrate
       to the new one as services authenticate, no token is re-issued, and the
       old pepper is retired only once a query shows no rows remain on it.
+15. **The CLI is the only supported management path (§3.6).**
+    - `issue` prints the secret **once** and never again; `list` never prints one.
+    - Every management command writes an accountability record naming the
+      **invoking operator**, not `cli`.
+    - `--json` output and exit codes make the full issue → rotate → prune cycle
+      scriptable without parsing human text.
+    - `pepper status` reports rows per pepper version, so "is the rotation
+      finished" is answerable rather than estimated.
+    - The `cli` credential itself is created by **packaging at install**, under
+      the same generation rules — there is no unauthenticated bootstrap mode.
     - On the fallback file path only: a wrong key **fails closed with a message
       naming the key**, distinguishable from an empty map.
 13. **End-user origin survives every external door (§6.5).** A request through
