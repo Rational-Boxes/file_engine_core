@@ -29,6 +29,7 @@ set(PROTO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/../core/generated)
 # Add the CLI executable
 add_executable(fileengine_cli
         src/fileengine_cli.cpp
+    src/cli_token.cpp
     src/service_admin.cpp
 )
 
@@ -77,8 +78,15 @@ install(TARGETS fileengine_cli
 option(BUILD_STATIC_CLI "Also build a statically-linked fileengine_cli_static" OFF)
 
 if(BUILD_STATIC_CLI)
-    add_executable(fileengine_cli_static src/fileengine_cli.cpp
-    src/service_admin.cpp)
+    # service_admin.cpp is deliberately NOT built here. Credential
+    # administration talks to the core's DATABASE — it needs ConfigLoader,
+    # ServerLogger and Database — so linking it would drag libfileengine_core
+    # (and with it the AWS SDK) into the one binary whose entire purpose is to
+    # run on a host that has none of that. The static CLI is a portable client;
+    # issuing credentials is an on-host administrative act, done where the core
+    # and its pepper already are.
+    add_executable(fileengine_cli_static src/fileengine_cli.cpp src/cli_token.cpp)
+    target_compile_definitions(fileengine_cli_static PRIVATE FILEENGINE_CLI_NO_SERVICE_ADMIN)
 
     target_include_directories(fileengine_cli_static PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/../core/include

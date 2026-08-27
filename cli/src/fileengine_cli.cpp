@@ -1338,6 +1338,7 @@ int main(int argc, char** argv) {
     // issue x)` must get the token, not the token with a log line stuck to it.
     if (arg_offset < argc) {
         const std::string early = argv[arg_offset];
+#ifndef FILEENGINE_CLI_NO_SERVICE_ADMIN
         if (early == "service-token") {
             return cli::service_token_command(argc - arg_offset, argv + arg_offset);
         }
@@ -1347,6 +1348,20 @@ int main(int argc, char** argv) {
         if (early == "bootstrap") {
             return cli::bootstrap_command(argc - arg_offset, argv + arg_offset);
         }
+#else
+        // The static build is a portable client and carries no database layer,
+        // so it cannot issue or grant. Say that, rather than falling through to
+        // "invalid command" — which would send someone hunting for a typo in a
+        // command that is simply not in this binary.
+        if (early == "service-token" || early == "service" || early == "bootstrap") {
+            std::cerr << "'" << early << "' is not available in the static CLI.\n"
+                      << "Credential administration needs the core's database layer and the\n"
+                      << "token pepper, so run it on the core host with the full fileengine_cli\n"
+                      << "(the fileengine-cli package), or inside the core container:\n"
+                      << "  podman exec <core> fileengine_cli " << early << " ...\n";
+            return 2;
+        }
+#endif
     }
 
     // Load configuration from file and environment
