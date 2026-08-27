@@ -28,6 +28,12 @@
 // Include logging functionality
 #include "../include/logger.h"
 
+// Service-credential administration lives in its own translation unit
+// (service_admin.cpp). Keeping it there is not tidiness: including the core's
+// headers here drags fileengine::FileType into scope alongside the proto's, and
+// every unqualified use in this file silently changes meaning.
+#include "service_admin.h"
+
 using fileengine_rpc::FileService;
 using fileengine_rpc::MakeDirectoryRequest;
 using fileengine_rpc::MakeDirectoryResponse;
@@ -139,6 +145,8 @@ inline const char* perm_name(Permission p) {
     }
 }
 
+
+
 class FileEngineClient {
 private:
     std::unique_ptr<fileengine_rpc::FileService::Stub> stub_;
@@ -178,6 +186,7 @@ public:
 
         MakeDirectoryResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         fileengine::Logger::trace("Mkdir", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->MakeDirectory(&context, request, &response);
@@ -235,6 +244,7 @@ public:
         };
 
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         fileengine::Logger::trace("ListDir", "Created request and context, making gRPC call");
 
         // show_deleted must hit the dedicated RPC; plain ListDirectory filters
@@ -273,6 +283,7 @@ public:
 
         RemoveDirectoryResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->RemoveDirectory(&context, request, &response);
 
@@ -298,6 +309,7 @@ public:
 
         TouchResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         fileengine::Logger::trace("Touch", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->Touch(&context, request, &response);
@@ -321,6 +333,7 @@ public:
 
         RemoveFileResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->RemoveFile(&context, request, &response);
 
@@ -344,6 +357,7 @@ public:
 
         GetFileResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         fileengine::Logger::trace("GetFile", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->GetFile(&context, request, &response);
@@ -375,6 +389,7 @@ public:
 
         PutFileResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         fileengine::Logger::trace("PutFile", "Created request and context, making gRPC call");
 
         grpc::Status status = stub_->PutFile(&context, request, &response);
@@ -399,6 +414,7 @@ public:
 
         StatResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->Stat(&context, request, &response);
 
@@ -447,6 +463,7 @@ public:
 
         ExistsResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->Exists(&context, request, &response);
 
@@ -472,6 +489,7 @@ public:
 
         RenameResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->Rename(&context, request, &response);
 
@@ -493,6 +511,7 @@ public:
 
         MoveResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->Move(&context, request, &response);
 
@@ -514,6 +533,7 @@ public:
 
         CopyResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->Copy(&context, request, &response);
 
@@ -535,6 +555,7 @@ public:
 
         ListVersionsResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         grpc::Status status = stub_->ListVersions(&context, request, &response);
 
         if (status.ok() && response.success()) {
@@ -561,6 +582,7 @@ public:
 
         GetVersionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         grpc::Status status = stub_->GetVersion(&context, request, &response);
 
         if (!(status.ok() && response.success())) {
@@ -589,6 +611,7 @@ public:
 
         RestoreToVersionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
         grpc::Status status = stub_->RestoreToVersion(&context, request, &response);
 
         if (status.ok() && response.success()) {
@@ -606,6 +629,7 @@ public:
 
         RemoveFileResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->RemoveFile(&context, request, &response);
 
@@ -625,6 +649,7 @@ public:
 
         fileengine_rpc::UndeleteFileResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->UndeleteFile(&context, request, &response);
 
@@ -647,6 +672,7 @@ public:
 
         SetMetadataResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->SetMetadata(&context, request, &response);
 
@@ -667,6 +693,7 @@ public:
 
         GetMetadataResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetMetadata(&context, request, &response);
 
@@ -686,6 +713,7 @@ public:
 
         GetAllMetadataResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetAllMetadata(&context, request, &response);
 
@@ -711,6 +739,7 @@ public:
 
         fileengine_rpc::GetMetadataForVersionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetMetadataForVersion(&context, request, &response);
 
@@ -734,6 +763,7 @@ public:
 
         fileengine_rpc::GetAllMetadataForVersionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetAllMetadataForVersion(&context, request, &response);
 
@@ -759,6 +789,7 @@ public:
 
         DeleteMetadataResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->DeleteMetadata(&context, request, &response);
 
@@ -779,6 +810,7 @@ public:
 
         StorageUsageResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetStorageUsage(&context, request, &response);
 
@@ -811,6 +843,7 @@ public:
 
         TriggerSyncResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->TriggerSync(&context, request, &response);
 
@@ -832,6 +865,7 @@ public:
 
         PurgeOldVersionsResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->PurgeOldVersions(&context, request, &response);
 
@@ -890,6 +924,7 @@ public:
 
         GetFileResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetFile(&context, request, &response);
 
@@ -927,6 +962,7 @@ public:
 
         GrantPermissionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GrantPermission(&context, request, &response);
 
@@ -951,6 +987,7 @@ public:
 
         RevokePermissionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->RevokePermission(&context, request, &response);
 
@@ -973,6 +1010,7 @@ public:
 
         CheckPermissionResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->CheckPermission(&context, request, &response);
 
@@ -998,6 +1036,7 @@ public:
 
         CreateRoleResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->CreateRole(&context, request, &response);
 
@@ -1017,6 +1056,7 @@ public:
 
         DeleteRoleResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->DeleteRole(&context, request, &response);
 
@@ -1037,6 +1077,7 @@ public:
 
         AssignUserToRoleResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->AssignUserToRole(&context, request, &response);
 
@@ -1057,6 +1098,7 @@ public:
 
         RemoveUserFromRoleResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->RemoveUserFromRole(&context, request, &response);
 
@@ -1076,6 +1118,7 @@ public:
 
         GetRolesForUserResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetRolesForUser(&context, request, &response);
 
@@ -1102,6 +1145,7 @@ public:
 
         GetUsersForRoleResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetUsersForRole(&context, request, &response);
 
@@ -1127,6 +1171,7 @@ public:
 
         GetAllRolesResponse response;
         grpc::ClientContext context;
+        cli::attach_cli_token(context);
 
         grpc::Status status = stub_->GetAllRoles(&context, request, &response);
 
@@ -1281,6 +1326,29 @@ int main(int argc, char** argv) {
     fileengine::Logger::set_level(log_level);
     fileengine::Logger::debug("Main", "Logging level set to: ", static_cast<int>(log_level));
 
+    // Service-credential administration runs BEFORE anything touches the gRPC
+    // channel, for two reasons.
+    //
+    // Requiring a working core connection to mint the credential the core needs
+    // would be its own chicken-and-egg — bootstrap in particular runs when
+    // nothing can authenticate yet.
+    //
+    // And the connection banner goes to stdout, which is where the secret has to
+    // go and nowhere else. A caller doing `TOKEN=$(fileengine_cli service-token
+    // issue x)` must get the token, not the token with a log line stuck to it.
+    if (arg_offset < argc) {
+        const std::string early = argv[arg_offset];
+        if (early == "service-token") {
+            return cli::service_token_command(argc - arg_offset, argv + arg_offset);
+        }
+        if (early == "service") {
+            return cli::service_command(argc - arg_offset, argv + arg_offset);
+        }
+        if (early == "bootstrap") {
+            return cli::bootstrap_command(argc - arg_offset, argv + arg_offset);
+        }
+    }
+
     // Load configuration from file and environment
     auto config = fileengine::load_config(config_file);
 
@@ -1360,6 +1428,16 @@ int main(int argc, char** argv) {
         std::cout << "  (Use -t or --tenant option to specify tenant)" << std::endl;
         std::cout << std::endl;
         std::cout << "Role management operations:" << std::endl;
+        std::cout << "\n  Service credentials (PROPOSAL_service_authentication.md):" << std::endl;
+        std::cout << "  bootstrap enrol <cli:name>            - First credential; works once, then closes" << std::endl;
+        std::cout << "  service-token issue <service_id>      - Generate + store; prints the secret ONCE" << std::endl;
+        std::cout << "  service-token rotate <service_id>     - Issue alongside the old (overlap)" << std::endl;
+        std::cout << "  service-token prune <service_id>      - Drop superseded secrets after rollout" << std::endl;
+        std::cout << "  service-token revoke <service_id>     - Invalidate every credential" << std::endl;
+        std::cout << "  service-token list                    - ids, pepper version, last use (never a secret)" << std::endl;
+        std::cout << "  service capabilities <service_id>     - Show the granted set" << std::endl;
+        std::cout << "  service grant <service_id> <cap>      - Grant one capability" << std::endl;
+        std::cout << "  service revoke-cap <service_id> <cap> - Remove one capability" << std::endl;
         std::cout << "  create_role <role>                    - Create a new role" << std::endl;
         std::cout << "  delete_role <role>                    - Delete a role" << std::endl;
         std::cout << "  assign_role <user> <role>             - Assign user to a role" << std::endl;

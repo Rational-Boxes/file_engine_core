@@ -18,6 +18,8 @@
 #include <string>
 #include <thread>
 #include "fileengine/rpc_interceptor.h"
+#include "fileengine/service_auth_interceptor.h"
+#include "fileengine/bootstrap_listener.h"
 #include <signal.h>
 #include <csignal>
 #include <cstdlib>
@@ -317,7 +319,81 @@ int main(int argc, char** argv) {
         interceptors;
     interceptors.push_back(
         std::make_unique<fileengine::RpcLifetimeInterceptorFactory>());
+
+    // Service authentication + capability gating
+    // (PROPOSAL_service_authentication.md §3.2, §6). One interceptor for all 42
+    // RPCs: a per-method check would eventually miss one, and the miss would be
+    // silent — a new handler would simply work, for everybody.
+    fileengine::ServiceAuthConfig service_auth;
+    service_auth.required        = config.service_auth_required;
+    service_auth.pepper          = config.service_token_pepper;
+    service_auth.previous_pepper = config.service_token_previous_pepper;
+    service_auth.pepper_version  = config.service_token_pepper_version;
+    service_auth.cache_ttl       = std::chrono::seconds(config.service_map_cache_ttl_seconds);
+
+    if (service_auth.required && service_auth.pepper.empty()) {
+        // Fail at startup rather than at the first call. With auth required and
+        // no pepper, every hash comparison would fail and the core would refuse
+        // every caller — an outage that presents as "all our services broke"
+        // rather than as a missing setting.
+        std::cerr << "FATAL: service authentication is required but "
+                     "FILEENGINE_SERVICE_TOKEN_PEPPER is not set. Set the pepper, or set "
+                     "FILEENGINE_SERVICE_AUTH_REQUIRED=false deliberately during migration."
+                  << std::endl;
+        fileengine::ServerLogger::getInstance().security(
+            "Server", "Refusing to start: service auth required with no pepper configured");
+        return -1;
+    }
+    if (!service_auth.required) {
+        // On EVERY start, not once. A warning seen only in the boot nobody read
+        // is not a warning, and this is the setting that leaves the door open.
+        fileengine::ServerLogger::getInstance().security(
+            "Server",
+            "Service authentication is NOT REQUIRED — any process that can reach the "
+            "gRPC port is accepted, and unauthenticated calls will be recorded as "
+            "source_iface=grpc. This is the migration setting; unset "
+            "FILEENGINE_SERVICE_AUTH_REQUIRED once every caller carries a token.");
+    }
+
+    interceptors.push_back(
+        std::make_unique<fileengine::ServiceAuthInterceptorFactory>(
+            database.get(), service_auth));
     builder.experimental().SetInterceptorCreators(std::move(interceptors));
+
+    // One-shot enrolment (PROPOSAL_service_authentication.md §3.6).
+    //
+    // Started ONLY when bootstrap is incomplete, so on an established system the
+    // socket is never created and the surface is absent rather than merely
+    // closed. The completion marker is deliberately separate from "are there
+    // rows in the map" — conditioning on emptiness would reopen the path for
+    // anyone who can delete rows, turning a one-shot into a permanent back door.
+    std::unique_ptr<fileengine::BootstrapListener> bootstrap;
+    {
+        auto complete = database->service_bootstrap_complete();
+        if (!complete.success) {
+            // Fail closed. If we cannot tell whether bootstrap has been used,
+            // do NOT open the socket: guessing the other way opens an
+            // unauthenticated credential-minting path on a database hiccup.
+            fileengine::ServerLogger::getInstance().security(
+                "Bootstrap", "Could not determine bootstrap state; the enrolment socket "
+                             "will NOT be opened: " + complete.error);
+        } else if (!complete.value) {
+            fileengine::BootstrapConfig bootstrap_config;
+            bootstrap_config.socket_path    = config.bootstrap_socket_path;
+            bootstrap_config.pepper         = config.service_token_pepper;
+            bootstrap_config.pepper_version = config.service_token_pepper_version;
+            if (!bootstrap_config.pepper.empty()) {
+                bootstrap = std::make_unique<fileengine::BootstrapListener>(
+                    database.get(), bootstrap_config);
+                bootstrap->start();
+            } else {
+                fileengine::ServerLogger::getInstance().security(
+                    "Bootstrap", "Bootstrap is incomplete but no pepper is configured, so "
+                                 "no credential could be hashed — the enrolment socket is "
+                                 "not opened. Set FILEENGINE_SERVICE_TOKEN_PEPPER.");
+            }
+        }
+    }
 
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
     if (!server) {

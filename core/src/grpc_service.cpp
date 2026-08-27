@@ -22,6 +22,7 @@
 #include <ctime>
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/database.h"
+#include "fileengine/service_auth_interceptor.h"
 #include <algorithm>
 #include "fileengine/server_logger.h"
 #include "json.hpp"
@@ -29,6 +30,24 @@
 namespace fileengine {
 
 thread_local std::string GRPCFileService::t_audit_source_;
+
+namespace {
+// Which door an action came through (PROPOSAL_service_authentication.md §2).
+//
+// This was hardcoded to "grpc" at all four emit sites — the one thing already
+// implied by the call having reached the core, in a field the schema, the
+// column and the documented intent all provided for. It now carries the
+// authenticated service identity when there is one.
+//
+// Falls back to "grpc" when service auth is not required and no token was
+// presented, which is deliberate: during the migration, records still saying
+// "grpc" are exactly the callers not yet carrying a token, so the rollout is
+// self-tracking rather than needing a separate inventory.
+std::string calling_interface() {
+    const auto& caller = CallerContext::current();
+    return caller.service_id.empty() ? std::string("grpc") : caller.service_id;
+}
+}  // namespace
 
 namespace {
 // The filesystem root may be referenced either as the empty string or as the
@@ -86,7 +105,7 @@ bool GRPCFileService::emit_permission_audit(const std::string& tenant, const std
     e.actor_roles = roles;
     e.target_uid = resource_uid;
     e.target_type = AuditTargetType::Acl;
-    e.source_iface = "grpc";
+    e.source_iface = calling_interface();
     e.source_addr = t_audit_source_;  // client IP forwarded by the bridge (§13)
     nlohmann::json d;
     d["principal"] = principal;
@@ -127,7 +146,7 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
     e.actor_roles = roles;
     e.target_uid = target_uid;
     e.target_type = target_type;
-    e.source_iface = "grpc";
+    e.source_iface = calling_interface();
     e.source_addr = t_audit_source_;
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));  // best-effort; the mutation proceeds regardless (§6)
@@ -166,7 +185,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
             agg.action = "access";
             agg.outcome = AuditOutcome::Ok;
             agg.actor = actor;
-            agg.source_iface = "grpc";
+            agg.source_iface = calling_interface();
     agg.source_addr = t_audit_source_;
             agg.detail = nlohmann::json({{"aggregated", access_interval_}, {"mode", "count"}}).dump();
             audit_sink_->publish(std::move(agg));
@@ -185,7 +204,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
     e.actor_roles = roles;
     e.target_uid = target_uid;
     e.target_type = target_type;
-    e.source_iface = "grpc";
+    e.source_iface = calling_interface();
     e.source_addr = t_audit_source_;
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));
@@ -195,6 +214,11 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
 grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
                                             const fileengine_rpc::MakeDirectoryRequest* request,
                                             fileengine_rpc::MakeDirectoryResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory called - entering method");
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -290,6 +314,11 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
 grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
                                               const fileengine_rpc::RemoveDirectoryRequest* request,
                                               fileengine_rpc::RemoveDirectoryResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "RemoveDirectory called for uid: " + request->uid());
     std::string dir_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -325,6 +354,11 @@ grpc::Status GRPCFileService::RemoveDirectory(grpc::ServerContext* context,
 grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
                                             const fileengine_rpc::ListDirectoryRequest* request,
                                             fileengine_rpc::ListDirectoryResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "ListDirectory called for uid: " + request->uid());
     std::string dir_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -398,6 +432,11 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
 grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* context,
                                                        const fileengine_rpc::ListDirectoryWithDeletedRequest* request,
                                                        fileengine_rpc::ListDirectoryWithDeletedResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "ListDirectoryWithDeleted called for uid: " + request->uid());
     // For now, implement the same as ListDirectory but indicate this functionality would return deleted items too
     std::string dir_uid = canonical_uid(request->uid());
@@ -471,6 +510,11 @@ grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* cont
 grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
                                    const fileengine_rpc::TouchRequest* request,
                                    fileengine_rpc::TouchResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch called - entering method");
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
@@ -558,6 +602,11 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
 grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
                                         const fileengine_rpc::RemoveFileRequest* request,
                                         fileengine_rpc::RemoveFileResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "RemoveFile called for uid: " + request->uid());
     // Check if server is in read-only mode
     if (is_server_in_readonly_mode()) {
@@ -601,6 +650,11 @@ grpc::Status GRPCFileService::RemoveFile(grpc::ServerContext* context,
 grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
                                           const fileengine_rpc::UndeleteFileRequest* request,
                                           fileengine_rpc::UndeleteFileResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "UndeleteFile called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -637,6 +691,11 @@ grpc::Status GRPCFileService::UndeleteFile(grpc::ServerContext* context,
 grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
                                      const fileengine_rpc::PutFileRequest* request,
                                      fileengine_rpc::PutFileResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
               "PutFile called - entering method");
     SERVER_LOG_DEBUG("GRPCService::PutFile", ServerLogger::getInstance().detailed_log_prefix() +
@@ -725,6 +784,11 @@ grpc::Status GRPCFileService::PutFile(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
                                      const fileengine_rpc::GetFileRequest* request,
                                      fileengine_rpc::GetFileResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetFile called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
@@ -764,6 +828,11 @@ grpc::Status GRPCFileService::GetFile(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
                                   const fileengine_rpc::StatRequest* request,
                                   fileengine_rpc::StatResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "Stat called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -830,6 +899,11 @@ grpc::Status GRPCFileService::Stat(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
                                     const fileengine_rpc::ExistsRequest* request,
                                     fileengine_rpc::ExistsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "Exists called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -858,6 +932,11 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
                                     const fileengine_rpc::RenameRequest* request,
                                     fileengine_rpc::RenameResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "Rename called for uid: " + request->uid() + " to " + SERVER_LOG_REDACT(request->new_name()));
     // Check if server is in read-only mode
     if (is_server_in_readonly_mode()) {
@@ -910,6 +989,11 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
                                   const fileengine_rpc::MoveRequest* request,
                                   fileengine_rpc::MoveResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "Move called for source_uid: " + request->source_uid() + " to " + request->destination_parent_uid());
     std::string source_uid = canonical_uid(request->source_uid());
     std::string dest_uid = canonical_uid(request->destination_parent_uid());
@@ -957,6 +1041,11 @@ grpc::Status GRPCFileService::Move(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
                                   const fileengine_rpc::CopyRequest* request,
                                   fileengine_rpc::CopyResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "Copy called for source_uid: " + request->source_uid() + " to " + request->destination_parent_uid());
     std::string source_uid = canonical_uid(request->source_uid());
     std::string dest_uid = canonical_uid(request->destination_parent_uid());
@@ -1005,6 +1094,11 @@ grpc::Status GRPCFileService::Copy(grpc::ServerContext* context,
 grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
                                           const fileengine_rpc::ListVersionsRequest* request,
                                           fileengine_rpc::ListVersionsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "ListVersions called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -1049,6 +1143,11 @@ grpc::Status GRPCFileService::ListVersions(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
                                         const fileengine_rpc::GetVersionRequest* request,
                                         fileengine_rpc::GetVersionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
     std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
@@ -1088,6 +1187,11 @@ grpc::Status GRPCFileService::GetVersion(grpc::ServerContext* context,
 grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
                                               const fileengine_rpc::RestoreToVersionRequest* request,
                                               fileengine_rpc::RestoreToVersionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "RestoreToVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
     std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
@@ -1130,6 +1234,11 @@ grpc::Status GRPCFileService::RestoreToVersion(grpc::ServerContext* context,
 grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
                                          const fileengine_rpc::SetMetadataRequest* request,
                                          fileengine_rpc::SetMetadataResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "SetMetadata called for uid: " + request->uid() + " with key " + request->key());
     std::string file_uid = canonical_uid(request->uid());
     std::string key = request->key();
@@ -1169,6 +1278,11 @@ grpc::Status GRPCFileService::SetMetadata(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
                                          const fileengine_rpc::GetMetadataRequest* request,
                                          fileengine_rpc::GetMetadataResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetMetadata called for uid: " + request->uid() + " with key " + request->key());
     std::string file_uid = canonical_uid(request->uid());
     std::string key = request->key();
@@ -1208,6 +1322,11 @@ grpc::Status GRPCFileService::GetMetadata(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
                                             const fileengine_rpc::GetAllMetadataRequest* request,
                                             fileengine_rpc::GetAllMetadataResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetAllMetadata called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -1246,6 +1365,11 @@ grpc::Status GRPCFileService::GetAllMetadata(grpc::ServerContext* context,
 grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
                                             const fileengine_rpc::DeleteMetadataRequest* request,
                                             fileengine_rpc::DeleteMetadataResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "DeleteMetadata called for uid: " + request->uid() + " with key " + request->key());
     std::string file_uid = canonical_uid(request->uid());
     std::string key = request->key();
@@ -1284,6 +1408,11 @@ grpc::Status GRPCFileService::DeleteMetadata(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context,
                                                    const fileengine_rpc::GetMetadataForVersionRequest* request,
                                                    fileengine_rpc::GetMetadataForVersionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetMetadataForVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
     std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
@@ -1324,6 +1453,11 @@ grpc::Status GRPCFileService::GetMetadataForVersion(grpc::ServerContext* context
 grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* context,
                                                       const fileengine_rpc::GetAllMetadataForVersionRequest* request,
                                                       fileengine_rpc::GetAllMetadataForVersionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetAllMetadataForVersion called for uid: " + request->uid() + " with version " + request->version_timestamp());
     std::string file_uid = canonical_uid(request->uid());
     std::string version_timestamp = request->version_timestamp();
@@ -1361,6 +1495,11 @@ grpc::Status GRPCFileService::GetAllMetadataForVersion(grpc::ServerContext* cont
 grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
                                              const fileengine_rpc::GrantPermissionRequest* request,
                                              fileengine_rpc::GrantPermissionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GrantPermission called for resource_uid: " + request->resource_uid() + " for principal " + request->principal());
     std::string resource_uid = canonical_uid(request->resource_uid());
     std::string principal = request->principal();
@@ -1511,6 +1650,11 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetResourceAcls(grpc::ServerContext* context,
                                              const fileengine_rpc::GetResourceAclsRequest* request,
                                              fileengine_rpc::GetResourceAclsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     (void)context;
     std::string resource_uid = canonical_uid(request->resource_uid());
     auto auth_context = request->auth();
@@ -1557,6 +1701,11 @@ grpc::Status GRPCFileService::GetResourceAcls(grpc::ServerContext* context,
 grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
                                               const fileengine_rpc::RevokePermissionRequest* request,
                                               fileengine_rpc::RevokePermissionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "RevokePermission called for resource_uid: " + request->resource_uid() + " for principal " + request->principal());
     std::string resource_uid = canonical_uid(request->resource_uid());
     std::string principal = request->principal();
@@ -1692,6 +1841,11 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
 grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
                                              const fileengine_rpc::CheckPermissionRequest* request,
                                              fileengine_rpc::CheckPermissionResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "CheckPermission called for resource_uid: " + request->resource_uid() + " for user " + request->auth().user());
     std::string resource_uid = canonical_uid(request->resource_uid());
     fileengine_rpc::Permission required_permission = request->required_permission();
@@ -1763,6 +1917,11 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetEffectivePermissions(grpc::ServerContext* /*context*/,
                                              const fileengine_rpc::GetEffectivePermissionsRequest* request,
                                              fileengine_rpc::GetEffectivePermissionsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     std::string resource_uid = canonical_uid(request->resource_uid());
     auto auth_context = request->auth();
     std::string tenant = get_tenant_from_auth_context(auth_context);
@@ -1813,6 +1972,11 @@ grpc::Status GRPCFileService::GetEffectivePermissions(grpc::ServerContext* /*con
 grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
                                               grpc::ServerReader<fileengine_rpc::PutFileRequest>* reader,
                                               fileengine_rpc::PutFileResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "StreamFileUpload called");
     // Check if server is in read-only mode
     if (is_server_in_readonly_mode()) {
@@ -1879,6 +2043,11 @@ grpc::Status GRPCFileService::StreamFileUpload(grpc::ServerContext* context,
 grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
                                                 const fileengine_rpc::GetFileRequest* request,
                                                 grpc::ServerWriter<fileengine_rpc::GetFileResponse>* writer) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "StreamFileDownload called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     auto auth_context = request->auth();
@@ -1929,6 +2098,11 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
                                             const fileengine_rpc::StorageUsageRequest* request,
                                             fileengine_rpc::StorageUsageResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetStorageUsage called for tenant: " + request->tenant());
     auto auth_context = request->auth();
     std::string tenant = request->tenant().empty() ? "default" : request->tenant();
@@ -1969,6 +2143,11 @@ grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
 grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
                                               const fileengine_rpc::PurgeOldVersionsRequest* request,
                                               fileengine_rpc::PurgeOldVersionsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "PurgeOldVersions called for uid: " + request->uid());
     std::string file_uid = canonical_uid(request->uid());
     int keep_count = request->keep_count();
@@ -2011,6 +2190,11 @@ grpc::Status GRPCFileService::ListAccountabilityRecords(
         grpc::ServerContext* context,
         const fileengine_rpc::ListAccountabilityRecordsRequest* request,
         fileengine_rpc::ListAccountabilityRecordsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     (void)context;
     auto auth_context = request->auth();
     const std::string caller = get_user_from_auth_context(auth_context);
@@ -2126,6 +2310,11 @@ grpc::Status GRPCFileService::ListAccountabilityRecords(
 grpc::Status GRPCFileService::TriggerSync(grpc::ServerContext* context,
                                          const fileengine_rpc::TriggerSyncRequest* request,
                                          fileengine_rpc::TriggerSyncResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "TriggerSync called for tenant: " + request->tenant());
     std::string tenant = request->tenant();
     auto auth_context = request->auth();
@@ -2143,6 +2332,11 @@ grpc::Status GRPCFileService::TriggerSync(grpc::ServerContext* context,
 grpc::Status GRPCFileService::CreateRole(grpc::ServerContext* context,
                                        const fileengine_rpc::CreateRoleRequest* request,
                                        fileengine_rpc::CreateRoleResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "CreateRole called for role: " + request->role());
 
     auto auth_context = request->auth();
@@ -2181,6 +2375,11 @@ grpc::Status GRPCFileService::CreateRole(grpc::ServerContext* context,
 grpc::Status GRPCFileService::DeleteRole(grpc::ServerContext* context,
                                        const fileengine_rpc::DeleteRoleRequest* request,
                                        fileengine_rpc::DeleteRoleResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "DeleteRole called for role: " + request->role());
 
     auto auth_context = request->auth();
@@ -2218,6 +2417,11 @@ grpc::Status GRPCFileService::DeleteRole(grpc::ServerContext* context,
 grpc::Status GRPCFileService::AssignUserToRole(grpc::ServerContext* context,
                                              const fileengine_rpc::AssignUserToRoleRequest* request,
                                              fileengine_rpc::AssignUserToRoleResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "AssignUserToRole called for user: " + request->user() + " to role: " + request->role());
 
     auto auth_context = request->auth();
@@ -2255,6 +2459,11 @@ grpc::Status GRPCFileService::AssignUserToRole(grpc::ServerContext* context,
 grpc::Status GRPCFileService::RemoveUserFromRole(grpc::ServerContext* context,
                                                const fileengine_rpc::RemoveUserFromRoleRequest* request,
                                                fileengine_rpc::RemoveUserFromRoleResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "RemoveUserFromRole called for user: " + request->user() + " from role: " + request->role());
 
     auto auth_context = request->auth();
@@ -2292,6 +2501,11 @@ grpc::Status GRPCFileService::RemoveUserFromRole(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetRolesForUser(grpc::ServerContext* context,
                                            const fileengine_rpc::GetRolesForUserRequest* request,
                                            fileengine_rpc::GetRolesForUserResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetRolesForUser called for user: " + request->user());
 
     auto auth_context = request->auth();
@@ -2325,6 +2539,11 @@ grpc::Status GRPCFileService::GetRolesForUser(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetUsersForRole(grpc::ServerContext* context,
                                            const fileengine_rpc::GetUsersForRoleRequest* request,
                                            fileengine_rpc::GetUsersForRoleResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetUsersForRole called for role: " + request->role());
 
     auto auth_context = request->auth();
@@ -2358,6 +2577,11 @@ grpc::Status GRPCFileService::GetUsersForRole(grpc::ServerContext* context,
 grpc::Status GRPCFileService::GetAllRoles(grpc::ServerContext* context,
                                         const fileengine_rpc::GetAllRolesRequest* request,
                                         fileengine_rpc::GetAllRolesResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     SERVER_LOG_DEBUG("GRPCService", "GetAllRoles called");
 
     auto auth_context = request->auth();
@@ -2391,6 +2615,11 @@ grpc::Status GRPCFileService::GetAllRoles(grpc::ServerContext* context,
 grpc::Status GRPCFileService::ListClaims(grpc::ServerContext* context,
                                         const fileengine_rpc::ListClaimsRequest* request,
                                         fileengine_rpc::ListClaimsResponse* response) {
+    // Service authentication + capability gating. The interceptor made the
+    // decision in one place; this returns it. See CallerContext::verdict —
+    // a gRPC server interceptor cannot reject the RPC itself.
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+
     (void)context;
     SERVER_LOG_DEBUG("GRPCService", "ListClaims called");
 

@@ -145,6 +145,23 @@ inline constexpr const char* kRoleRemove   = "role.remove";
 inline constexpr const char* kCullVersions = "cull.versions";
 inline constexpr const char* kTenantCreate = "tenant.create";
 inline constexpr const char* kTenantDelete = "tenant.delete";
+
+// Service-credential lifecycle (PROPOSAL_service_authentication.md §3.6). These
+// fit §4.1's scope rule exactly — security-relevant, needing a guaranteed
+// record, with no versioned home of their own — and they change who can speak
+// to the core at all.
+//
+// `identity` for the token events rather than `authorization`: what a service
+// MAY DO is a separate axis that these do not touch. What changes is what it
+// can prove it is.
+inline constexpr const char* kServiceTokenIssued   = "service_token.issued";
+inline constexpr const char* kServiceTokenRotated  = "service_token.rotated";
+inline constexpr const char* kServiceTokenPruned   = "service_token.pruned";
+inline constexpr const char* kServiceTokenRevoked  = "service_token.revoked";
+inline constexpr const char* kServiceBootstrapEnrolled = "service_token.bootstrap_enrolled";
+inline constexpr const char* kServiceBootstrapReopened = "service_token.bootstrap_reopened";
+inline constexpr const char* kServiceCapGranted    = "service_capability.granted";
+inline constexpr const char* kServiceCapRevoked    = "service_capability.revoked";
 }  // namespace accountability_action
 
 // ── The record ──────────────────────────────────────────────────────────────

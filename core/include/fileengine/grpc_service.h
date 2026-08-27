@@ -33,6 +33,7 @@
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/storage_tracker.h"
 #include "fileengine/audit_sink.h"
+#include "fileengine/service_auth_interceptor.h"
 
 namespace fileengine {
 
@@ -313,7 +314,11 @@ private:
         AccountabilityContext ctx;
         ctx.actor        = get_user_from_auth_context(auth_ctx);
         ctx.actor_roles  = get_roles_from_auth_context(auth_ctx);
-        ctx.source_iface = "grpc";
+        // The authenticated door, not the transport. Falls back to "grpc" only
+        // while a caller has not yet been migrated onto a service token.
+        ctx.source_iface = CallerContext::current().service_id.empty()
+                               ? std::string("grpc")
+                               : CallerContext::current().service_id;
         ctx.source_addr  = auth_ctx.source_addr().empty() ? t_audit_source_
                                                           : auth_ctx.source_addr();
         return ctx;

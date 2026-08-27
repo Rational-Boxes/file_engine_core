@@ -18,6 +18,7 @@
 
 #include "types.h"
 #include "accountability.h"
+#include "service_credential.h"
 #include "IDatabase.h"
 #include "connection_pool.h"
 #include "connection_router.h"
@@ -187,6 +188,67 @@ public:
     // a consumer that acts on one always finds the record it names.
     using AccountabilityHint = std::function<void(const std::string& tenant, std::int64_t seq)>;
     void set_accountability_hint(AccountabilityHint hint) { accountability_hint_ = std::move(hint); }
+
+    // ── The service map (PROPOSAL_service_authentication.md §3.5) ───────────
+    //
+    // Resolve a presented token to a caller. Returns an empty service_id when
+    // the token names nobody or the secret does not verify — the two are
+    // deliberately indistinguishable to the caller, and cost the same, so a
+    // wrong id cannot be told from a wrong secret by timing.
+    //
+    // `pepper` is the current one; `previous_pepper` may be set during a
+    // rotation, in which case a row that verifies under it is rehashed under
+    // the current one, best-effort, at most once per row (§3.5).
+    Result<ServiceIdentity> resolve_service_token(const std::string& token,
+                                                  const std::string& pepper,
+                                                  const std::string& previous_pepper,
+                                                  int current_pepper_version);
+
+    // Issue a credential and record the act in the same transaction. Returns
+    // the plaintext token, which exists nowhere else and is never stored.
+    Result<std::string> issue_service_credential(const std::string& service_id,
+                                                 const std::string& pepper,
+                                                 int pepper_version,
+                                                 const AccountabilityContext& ctx,
+                                                 bool rotate);
+
+    // Drop credentials. `prune` removes every credential except the newest
+    // (completing a rotation); revoke removes all of them.
+    Result<int> prune_service_credentials(const std::string& service_id,
+                                          const AccountabilityContext& ctx);
+    Result<int> revoke_service_credentials(const std::string& service_id,
+                                           const AccountabilityContext& ctx);
+
+    struct ServiceCredentialInfo {
+        std::string service_id;
+        int         pepper_version = 0;
+        std::string created_at;
+        std::string last_used_at;
+        std::vector<std::string> capabilities;
+    };
+    Result<std::vector<ServiceCredentialInfo>> list_service_credentials();
+
+    // Capability assignment. `grant` refuses a high-risk capability unless the
+    // caller confirms, and never rides along with an issue.
+    Result<void> grant_service_capability(const std::string& service_id,
+                                          Capability capability,
+                                          const AccountabilityContext& ctx);
+    Result<void> revoke_service_capability(const std::string& service_id,
+                                           Capability capability,
+                                           const AccountabilityContext& ctx);
+    Result<std::vector<Capability>> service_capabilities(const std::string& service_id);
+
+    // Bootstrap: one unauthenticated enrolment, permitted only while the map is
+    // empty AND the marker is absent, and closed irreversibly on use.
+    Result<bool> service_bootstrap_complete();
+    Result<std::string> enrol_bootstrap_credential(const std::string& service_id,
+                                                   const std::string& pepper,
+                                                   int pepper_version,
+                                                   const AccountabilityContext& ctx);
+    // Break-glass: reopen enrolment. A deliberate, recorded administrative act
+    // rather than a config flag, because a restore will eventually lose the
+    // credential files and the alternative is hand-written SQL under pressure.
+    Result<void> reopen_service_bootstrap(const AccountabilityContext& ctx);
 
     // The committed position of the last accountability record for a tenant.
     // The queue hint carries this so a consumer can tell "no new records" apart

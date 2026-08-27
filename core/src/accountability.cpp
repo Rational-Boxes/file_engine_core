@@ -132,6 +132,27 @@ const std::vector<ActionSchema>& action_schemas() {
          {"schema"}},
         {accountability_action::kTenantDelete, AccountabilityCategory::Destruction,
          {"schema"}},
+
+        // Service credentials. Note what is NOT enumerated: there is no field
+        // for a secret, a hash or the pepper, so the sharpest possible version
+        // of the §5.4.7 leak — a permanently-retained log holding every service
+        // secret ever issued — is not representable.
+        {accountability_action::kServiceTokenIssued, AccountabilityCategory::Identity,
+         {"service_id", "pepper_version", "capabilities"}},
+        {accountability_action::kServiceTokenRotated, AccountabilityCategory::Identity,
+         {"service_id", "pepper_version", "capabilities"}},
+        {accountability_action::kServiceTokenPruned, AccountabilityCategory::Identity,
+         {"service_id", "removed"}},
+        {accountability_action::kServiceTokenRevoked, AccountabilityCategory::Identity,
+         {"service_id", "removed"}},
+        {accountability_action::kServiceBootstrapEnrolled, AccountabilityCategory::Identity,
+         {"service_id", "pepper_version", "peer_uid"}},
+        {accountability_action::kServiceBootstrapReopened, AccountabilityCategory::Identity,
+         {"service_id"}},
+        {accountability_action::kServiceCapGranted, AccountabilityCategory::Authorization,
+         {"service_id", "capability", "high_risk"}},
+        {accountability_action::kServiceCapRevoked, AccountabilityCategory::Authorization,
+         {"service_id", "capability"}},
     };
     return kSchemas;
 }

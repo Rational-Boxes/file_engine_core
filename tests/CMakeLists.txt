@@ -386,6 +386,21 @@ add_test(NAME load_stress
                  --target core --requests 200 --concurrency 32)
 set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600 SKIP_RETURN_CODE 77)
 
+# Service credentials and capability classification. The load-bearing test here
+# enumerates the compiled service descriptor and fails if any RPC belongs to no
+# capability — so a newly added method cannot ship unclassified, and central
+# enforcement means coverage rather than someone's diligence.
+add_executable(service_credential_tests service_credential_tests.cpp)
+target_include_directories(service_credential_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS})
+target_link_libraries(service_credential_tests
+    fileengine_core proto_lib ${LIBPQ_LIBRARIES} ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
+add_test(NAME service_credential_tests COMMAND service_credential_tests)
+set_tests_properties(service_credential_tests PROPERTIES LABELS "unit" TIMEOUT 60)
+
 # The logger's security-relevant behaviour: a SECURITY entry no configuration
 # can silence, names that never reach the log in clear, and rotation/retention
 # that actually run. No infrastructure — it writes to a scratch directory.

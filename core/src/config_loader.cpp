@@ -257,6 +257,12 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     if (env_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = env_vars.at("FILEENGINE_LOG_FILE_PATH");
     if (env_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (env_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
     if (env_vars.count("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = (env_vars.at("FILEENGINE_LOG_REDACT_NAMES") != "false");
+    if (env_vars.count("FILEENGINE_SERVICE_AUTH_REQUIRED")) config.service_auth_required = (env_vars.at("FILEENGINE_SERVICE_AUTH_REQUIRED") != "false");
+    if (env_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER")) config.service_token_pepper = env_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER");
+    if (env_vars.count("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = env_vars.at("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER");
+    if (env_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = std::stoi(env_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION"));
+    if (env_vars.count("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = std::stoi(env_vars.at("FILEENGINE_SERVICE_MAP_CACHE_TTL"));
+    if (env_vars.count("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = env_vars.at("FILEENGINE_BOOTSTRAP_SOCKET");
     if (env_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (env_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (env_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(env_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (env_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(env_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -390,6 +396,22 @@ Config ConfigLoader::load_from_env() {
     // reached by a typo.
     env_value = get_env_var("FILEENGINE_LOG_REDACT_NAMES", "");
     if (!env_value.empty()) config.log_redact_names = (env_value != "false");
+
+    // Service authentication. Note the inverted default on _REQUIRED, matching
+    // _LOG_REDACT_NAMES: a knob that weakens a security default must be opted
+    // into explicitly, not reached by a typo.
+    env_value = get_env_var("FILEENGINE_SERVICE_AUTH_REQUIRED", "");
+    if (!env_value.empty()) config.service_auth_required = (env_value != "false");
+    env_value = get_env_var("FILEENGINE_SERVICE_TOKEN_PEPPER", "");
+    if (!env_value.empty()) config.service_token_pepper = env_value;
+    env_value = get_env_var("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER", "");
+    if (!env_value.empty()) config.service_token_previous_pepper = env_value;
+    env_value = get_env_var("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION", "");
+    if (!env_value.empty()) config.service_token_pepper_version = std::stoi(env_value);
+    env_value = get_env_var("FILEENGINE_SERVICE_MAP_CACHE_TTL", "");
+    if (!env_value.empty()) config.service_map_cache_ttl_seconds = std::stoi(env_value);
+    env_value = get_env_var("FILEENGINE_BOOTSTRAP_SOCKET", "");
+    if (!env_value.empty()) config.bootstrap_socket_path = env_value;
 
     env_value = get_env_var("FILEENGINE_LOG_TO_FILE", "");
     if (!env_value.empty()) config.log_to_file = (env_value == "true");
@@ -628,6 +650,12 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (default_file_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = default_file_vars.at("FILEENGINE_LOG_FILE_PATH");
     if (default_file_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (default_file_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
     if (default_file_vars.count("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = (default_file_vars.at("FILEENGINE_LOG_REDACT_NAMES") != "false");
+    if (default_file_vars.count("FILEENGINE_SERVICE_AUTH_REQUIRED")) config.service_auth_required = (default_file_vars.at("FILEENGINE_SERVICE_AUTH_REQUIRED") != "false");
+    if (default_file_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER")) config.service_token_pepper = default_file_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER");
+    if (default_file_vars.count("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = default_file_vars.at("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER");
+    if (default_file_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = std::stoi(default_file_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION"));
+    if (default_file_vars.count("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = std::stoi(default_file_vars.at("FILEENGINE_SERVICE_MAP_CACHE_TTL"));
+    if (default_file_vars.count("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = default_file_vars.at("FILEENGINE_BOOTSTRAP_SOCKET");
     if (default_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (default_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (default_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(default_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (default_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(default_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -762,6 +790,12 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (cmdline_file_vars.count("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = cmdline_file_vars.at("FILEENGINE_LOG_FILE_PATH");
     if (cmdline_file_vars.count("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = (cmdline_file_vars.at("FILEENGINE_LOG_TO_CONSOLE") == "true");
     if (cmdline_file_vars.count("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = (cmdline_file_vars.at("FILEENGINE_LOG_REDACT_NAMES") != "false");
+    if (cmdline_file_vars.count("FILEENGINE_SERVICE_AUTH_REQUIRED")) config.service_auth_required = (cmdline_file_vars.at("FILEENGINE_SERVICE_AUTH_REQUIRED") != "false");
+    if (cmdline_file_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER")) config.service_token_pepper = cmdline_file_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER");
+    if (cmdline_file_vars.count("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = cmdline_file_vars.at("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER");
+    if (cmdline_file_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = std::stoi(cmdline_file_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION"));
+    if (cmdline_file_vars.count("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = std::stoi(cmdline_file_vars.at("FILEENGINE_SERVICE_MAP_CACHE_TTL"));
+    if (cmdline_file_vars.count("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = cmdline_file_vars.at("FILEENGINE_BOOTSTRAP_SOCKET");
     if (cmdline_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (cmdline_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (cmdline_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(cmdline_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (cmdline_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(cmdline_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -799,6 +833,12 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_has("FILEENGINE_LOG_FILE_PATH")) config.log_file_path = env_config.log_file_path;
     if (env_has("FILEENGINE_LOG_TO_CONSOLE")) config.log_to_console = env_config.log_to_console;
     if (env_has("FILEENGINE_LOG_REDACT_NAMES")) config.log_redact_names = env_config.log_redact_names;
+    if (env_has("FILEENGINE_SERVICE_AUTH_REQUIRED")) config.service_auth_required = env_config.service_auth_required;
+    if (env_has("FILEENGINE_SERVICE_TOKEN_PEPPER")) config.service_token_pepper = env_config.service_token_pepper;
+    if (env_has("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = env_config.service_token_previous_pepper;
+    if (env_has("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = env_config.service_token_pepper_version;
+    if (env_has("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = env_config.service_map_cache_ttl_seconds;
+    if (env_has("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = env_config.bootstrap_socket_path;
     if (env_has("FILEENGINE_LOG_TO_FILE")) config.log_to_file = env_config.log_to_file;
     if (env_has("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
     if (env_has("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = env_config.log_retention_days;
