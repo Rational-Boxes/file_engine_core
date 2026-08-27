@@ -516,22 +516,55 @@ relevant, needing a guaranteed record, with no versioned home of their own.
 
 #### Bootstrapping the first credential
 
-The map starts empty, and the CLI needs a credential to talk to the core — so the
-first one cannot be issued by the CLI. **Packaging generates a single bootstrap
-identity at install time** — `cli:bootstrap` — writing it `0640` (§6.1) and
-registering its hash. Every other credential, including each administrator's own
-`cli:<name>` (§6.1), is then issued through the CLI.
+There is a genuine chicken-and-egg here, and an earlier draft of this section
+under-specified it. It said packaging generates the bootstrap credential at
+install time *and registers its hash* — but **at install time there is no
+database to register it in.** The core creates its schema on first start, so
+nothing can be written to the service map before the core has run at least once.
 
-The bootstrap identity should be revoked once real administrator credentials
-exist. It is the one credential nobody is individually accountable for, so
-leaving it in place permanently reintroduces the shared-token attribution problem
-the per-administrator design removes — and `service-token list` showing it still
-active is an easy thing to check for.
+##### The core enrols it at first boot
 
-This keeps the awkward case where it belongs: one credential created by the
-installer, under the same generation rules, rather than a bootstrap mode that
-accepts unauthenticated calls while the map is empty — which would be a
-permanently exploitable state that only *looks* transient.
+The secret is generated where it can be, and registered where it must be:
+
+1. **Install** generates a 256-bit `cli:bootstrap` secret and writes it to a
+   `0640 root:fileengine` file — or, for a dev checkout with no installer, the
+   operator sets `FILEENGINE_CLI_BOOTSTRAP_TOKEN`.
+2. **First core boot** connects to PostgreSQL, creates the schema, and — finding
+   the service map newly created — registers that secret's hash as `cli:bootstrap`
+   and writes the accountability record for it (§3.6).
+3. **The CLI** reads the same file and can now talk to the core.
+4. Each administrator's own `cli:<name>` (§6.1) is issued through the CLI, and
+   `cli:bootstrap` is revoked.
+
+The ordering works because the secret exists *before* the database does, handed
+over out of band, and the only component that can write to the map is the one
+that creates it.
+
+##### Why the CLI does not enrol itself
+
+The tempting alternative is for the CLI to generate its own secret on first
+connect. It cannot, without reintroducing precisely what this design excludes.
+
+The CLI speaks gRPC and has no database access, so self-enrolment would require
+the core to accept an **unauthenticated** call while the map is empty. That is a
+window in which any local process — not just an administrator — can claim
+`cli:*` authority, which is the full capability set (§6.1). And it is not
+reliably transient: it reopens for any deployment where the core starts before an
+administrator gets to it, and again for anyone who can empty the table. A
+bootstrap mode that only *looks* temporary is a permanent exploit with good
+manners.
+
+Enrolling at first boot from an out-of-band secret has no such window: at no
+point does the core accept a caller it cannot authenticate.
+
+##### Revoke the bootstrap identity
+
+`cli:bootstrap` is the one credential nobody is individually accountable for, so
+leaving it active permanently reintroduces the shared-token attribution problem
+that per-administrator credentials exist to remove (§6.1). It should be revoked
+once real administrator credentials exist — and `service-token list` showing it
+still active is a simple thing to check, and worth including in a deployment
+checklist rather than trusting to memory.
 
 ---
 
@@ -576,6 +609,7 @@ for attribution. The honest sequencing is in §7.
 |---|---|---|
 | `FILEENGINE_SERVICE_TOKEN` | each calling service | the `fesvc_…` secret it presents (§3.3) |
 | `FILEENGINE_CLI_TOKEN` | CLI, automated use | the `cli` secret when a supervisor injects it; takes precedence over the file (§6.1) |
+| `FILEENGINE_CLI_BOOTSTRAP_TOKEN` | core, first boot only | the install-generated `cli:bootstrap` secret, registered while the schema is created (§3.6). Unused thereafter |
 | `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | **the one secret** — HMAC pepper for the stored hashes. Injected, never in the database (§3.5) |
 | `FILEENGINE_SERVICE_AUTH_REQUIRED` | core | default **`true`** |
 | `FILEENGINE_SERVICE_MAP_CACHE_TTL` | core | how long the map is cached between reads (§3.5); short, so an update takes effect without a restart |
@@ -1285,10 +1319,17 @@ every subsequent step measurable.
       scriptable without parsing human text.
     - `pepper status` reports rows per pepper version, so "is the rotation
       finished" is answerable rather than estimated.
-    - The first credential (`cli:bootstrap`) is created by **packaging at
-      install**, under the same generation rules — there is no unauthenticated
-      bootstrap mode — and can be revoked once per-administrator credentials
-      exist, without locking anyone out.
+    - **Bootstrap works from a clean install with no manual step (§3.6):**
+      install generates `cli:bootstrap`, the core registers it while creating the
+      schema on first boot, and the CLI authenticates immediately afterwards.
+    - **At no point does the core accept an unauthenticated call** — including
+      the window between schema creation and the first administrator credential.
+      Verified by pointing a credential-less client at a freshly initialised core
+      and getting `UNAUTHENTICATED`.
+    - Re-registration is **not** triggered by an emptied service map on an
+      existing install, so the bootstrap path cannot be reopened by deleting rows.
+    - `cli:bootstrap` can be revoked once per-administrator credentials exist,
+      without locking anyone out.
     - There is **no file-based map path** to configure, so no way to change
       service credentials without an accountability record (§3.5).
 13. **End-user origin survives every external door (§6.5).** A request through
