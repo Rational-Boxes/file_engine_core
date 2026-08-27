@@ -238,9 +238,11 @@ allowlist that grants by omission.
 
 #### Every grant is an explicit list. There is no blanket allow.
 
-No service — including the CLI and any future administrative tool — is granted
-"all". The map holds an enumerated set of capabilities for every identity, and
-`*`, `all`, or an implicit "unlisted means permitted" is not representable.
+No network-facing service is granted "all". The map holds an enumerated set of
+capabilities for every identity, and `*`, `all`, or an implicit "unlisted means
+permitted" is not representable for any of them. There is exactly one reserved
+exception, `cli`, which pays for it with a transport constraint instead — see
+below.
 
 Three reasons, the last of which is the one that matters:
 
@@ -263,6 +265,64 @@ for `tenant_admin` is what defeated the bespoke `ERASE` permission; the fix was
 to stop having a blanket. The service map adopts the rule from the start rather
 than having to retract it later.
 
+#### The one exception: `cli`, constrained by transport instead
+
+`cli` is a **reserved identity holding every capability** — and it is the only
+one. The justification is not that the CLI is trusted, but that its access is
+bounded by something stronger than a capability list: **it may connect only over
+loopback.**
+
+An administrator on the box already has full system access. They can read the
+PostgreSQL tables, the storage tree, the config and the secrets directly, without
+going near the CLI. Restricting what the CLI may ask the core to do would not
+withhold anything from them — it would only make the supported tool weaker than
+the unsupported paths sitting next to it, which is how operators end up doing
+delicate work with `psql` instead. **A control that controls nothing is worse
+than no control**, because it invites the belief that a boundary exists there.
+
+The real boundary is host access, so that is where the constraint is placed.
+
+Two things keep this from re-opening what §6.1 closes:
+
+**1. "Every capability" means every *classified* capability — never a
+classification bypass.** The distinction is load-bearing:
+
+| Reading | Effect on an unclassified RPC |
+|---|---|
+| `cli` permits any method | **Reachable.** Re-opens the fail-closed hole exactly as described above |
+| `cli` holds all nine capabilities | **Still denied.** An RPC belonging to no capability belongs to none of `cli`'s either |
+
+The second is the intended reading. `cli` is granted the full set, not exempted
+from the mechanism, so a newly added and unclassified RPC remains unreachable by
+everyone — which was the property worth having.
+
+**2. Loopback is enforced, not assumed.** The bind default is now `127.0.0.1`
+(`security/grpc-loopback-default`), but containers widen it to `0.0.0.0`, so the
+bind alone does not constrain `cli` there. The interceptor therefore checks the
+peer address directly: **a call presenting the `cli` identity from a non-loopback
+peer is refused**, whatever the server is bound to.
+
+This is a real control rather than a declared one — the peer address of an
+established TCP connection is not something the caller can assert, unlike a
+header. And the CLI still presents its token: loopback alone would let *any*
+local process act as `cli`, so the most powerful identity carries the most
+conditions, not the fewest.
+
+Requiring both has a useful consequence: **a leaked `cli` token is not
+catastrophic.** Copied into a remote service's config, committed to a repository,
+or pulled from a shared secret store, it still cannot be used from off the host —
+the transport constraint holds independently of who knows the secret. The one
+identity whose compromise would matter most is the one whose credential matters
+least on its own.
+
+> **Stronger variant worth considering: a Unix domain socket.** gRPC supports
+> `unix:` addresses, and a UDS restricted to the `fileengine` user or group makes
+> `cli` access local-only *by construction* and adds OS-level identity —
+> filesystem permissions decide who may connect at all, before any token is
+> examined. It removes the loopback check rather than implementing it, and cannot
+> be widened by a misconfigured bind. The cost is a second listener and a small
+> amount of packaging work.
+
 ### 6.2 Deriving the assignments — measure, do not guess
 
 The temptation is to write the service-to-capability matrix from intuition. That
@@ -283,7 +343,7 @@ A few assignments are clear enough to state now, and they illustrate the value:
 | `mcp` | `read`, `write` — no `delete`, no `destroy` | See §6.3 |
 | `cmis`, `webdav_bridge` | no `destroy` | §5.4.9 of the accountability proposal restricts erasure to the admin surface **by convention**; this makes it a property of the core |
 | `csai`, `difference`, `discussion` | `read` + narrow `write` for their own derived output | None has business managing ACLs or roles |
-| CLI / admin surface | `read`, `write`, `delete`, `restore`, `acl`, `roles`, `admin`, `destroy` — enumerated, **not** "all" | The one place irreversible operations belong. Note what writing it out reveals: it does **not** get `accountability`. The admin tool has no business reading the security log; that is `audit_service`'s job, and a blanket grant would have handed it over without anyone noticing |
+| `cli` | **all nine capabilities**, reserved — the sole exception to §6.1, bounded by loopback-only transport instead | The one place irreversible operations belong. It gets `accountability` too: someone on the host can already read the audit tables directly, so withholding it would be theatre rather than a control |
 
 ### 6.3 The MCP case
 
@@ -386,11 +446,16 @@ every subsequent step measurable.
 9. **Config cannot widen.** A configuration attempting to grant a service a
    capability outside its compiled set is rejected at startup rather than
    honoured (§6.4).
-10. **No blanket grant is representable.** There is no `*` / `all` form; every
-    identity, the CLI included, carries an enumerated list. A test asserts that
-    no identity holds every capability, and that an unclassified RPC is refused
-    to *all* identities — including administrative ones, which is where a
-    wildcard would otherwise have hidden.
+10. **No blanket grant is representable**, with `cli` the sole reserved
+    exception. No `*` form exists for any other identity, and:
+    - An **unclassified RPC is refused to every identity including `cli`** —
+      proving `cli` holds the full capability set rather than bypassing
+      classification, which is the distinction that keeps §6.1 intact.
+    - A call presenting `cli` **from a non-loopback peer is refused**, tested
+      against a server bound to `0.0.0.0` so the check is proven independent of
+      the bind address.
+    - A local process presenting **no token cannot act as `cli`** — loopback and
+      the token are both required, not either.
 11. Comparison is constant-time, and the core stores no plaintext secret.
 12. **The map resolves the source correctly:** each service's token yields that
     service's name and no other, and a token whose secret half is altered by one
