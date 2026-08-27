@@ -24,6 +24,14 @@ namespace fileengine {
 
 std::shared_ptr<IAuditSink> make_audit_sink(const Config& config) {
     if (!config.audit_enabled) {
+        // Announced, not silent. This branch returning quietly is what let a
+        // core run for a full deployment emitting no audit events while looking
+        // healthy: no line said auditing was off, and the absence of records
+        // read as a filtering problem rather than a disabled sink.
+        SERVER_LOG_WARN("AuditSink",
+                        "durable audit emission is DISABLED (audit_enabled=false) — "
+                        "no file access or mutation will be recorded. Set "
+                        "FILEENGINE_AUDIT_ENABLED=true to enable it.");
         return std::make_shared<NullAuditSink>();
     }
 

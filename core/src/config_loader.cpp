@@ -422,8 +422,23 @@ Config ConfigLoader::load_from_env() {
     env_value = get_env_var("FILEENGINE_LOG_RETENTION_DAYS", "");
     if (!env_value.empty()) config.log_retention_days = std::stoi(env_value);
 
-    // Event queueing (optional) from process environment. Collect the keys we
-    // care about into a map and reuse the shared applier.
+    // Event queueing and the durable audit stream, from the process
+    // environment. Collect the keys we care about into a map and reuse the
+    // shared applier.
+    //
+    // THIS LIST IS THE GATE. apply_events_config only sees keys that appear
+    // here, so a key it knows how to parse is still invisible to a
+    // process configured by environment variables until it is named. The
+    // FILEENGINE_AUDIT_* keys were missing, which meant audit_enabled could
+    // never become true from the environment — every containerised core ran
+    // with a NullAuditSink and recorded no file access or mutation whatsoever,
+    // while starting cleanly and reporting healthy. Only the services that
+    // publish to Redis themselves showed up in the audit log, so it read as
+    // "file events are being filtered" rather than "the sink was never built".
+    //
+    // Adding a FILEENGINE_* key takes three edits, not one: this list, the
+    // applier, and the env_has merge in load_config. Miss any and the key is
+    // silently ignored.
     {
         std::map<std::string, std::string> ev;
         for (const char* key : {"FILEENGINE_EVENTS_ENABLED",
@@ -431,7 +446,11 @@ Config ConfigLoader::load_from_env() {
                                 "FILEENGINE_REDIS_HOST", "FILEENGINE_REDIS_PORT",
                                 "FILEENGINE_REDIS_PASSWORD", "FILEENGINE_REDIS_DB",
                                 "FILEENGINE_EVENTS_STREAM", "FILEENGINE_EVENTS_STREAM_MAXLEN",
-                                "FILEENGINE_EVENTS_OUTBOX_CAPACITY"}) {
+                                "FILEENGINE_EVENTS_OUTBOX_CAPACITY",
+                                "FILEENGINE_AUDIT_ENABLED", "FILEENGINE_AUDIT_STREAM",
+                                "FILEENGINE_AUDIT_STREAM_MAXLEN", "FILEENGINE_AUDIT_WAL_PATH",
+                                "FILEENGINE_AUDIT_ACCESS_MODE",
+                                "FILEENGINE_AUDIT_HIDDEN_CHILDREN"}) {
             const char* v = std::getenv(key);
             if (v && *v) ev[key] = v;
         }
@@ -868,6 +887,32 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_config.events_stream != "fileengine:events") config.events_stream = env_config.events_stream;
     if (env_config.events_stream_maxlen != 100000) config.events_stream_maxlen = env_config.events_stream_maxlen;
     if (env_config.events_outbox_capacity != 10000) config.events_outbox_capacity = env_config.events_outbox_capacity;
+
+    // Durable audit stream.
+    //
+    // These were missing entirely. apply_events_config() parsed every
+    // FILEENGINE_AUDIT_* key into env_config, and then nothing copied them back
+    // here — so audit_enabled fell back to its default of false and
+    // make_audit_sink returned a NullAuditSink WITHOUT logging anything, since
+    // the disabled branch returns before either the enabled or the
+    // compiled-out message. A core configured entirely by environment
+    // variables, which is every containerised deployment, therefore emitted no
+    // audit events at all while reporting a healthy start. Only the services
+    // that publish to Redis themselves — the bridges, ldap_manager — appeared
+    // in the audit log, which made it look like file access specifically was
+    // being filtered rather than like the core's sink was never built.
+    //
+    // env_has rather than a comparison against the default: the events_* lines
+    // above cannot express "explicitly set to the default value", so
+    // FILEENGINE_EVENTS_STREAM=fileengine:events is indistinguishable from
+    // unset. That is survivable for a stream name and not for a boolean —
+    // FILEENGINE_AUDIT_ENABLED=false must be able to mean false.
+    if (env_has("FILEENGINE_AUDIT_ENABLED")) config.audit_enabled = env_config.audit_enabled;
+    if (env_has("FILEENGINE_AUDIT_STREAM")) config.audit_stream = env_config.audit_stream;
+    if (env_has("FILEENGINE_AUDIT_STREAM_MAXLEN")) config.audit_stream_maxlen = env_config.audit_stream_maxlen;
+    if (env_has("FILEENGINE_AUDIT_WAL_PATH")) config.audit_wal_path = env_config.audit_wal_path;
+    if (env_has("FILEENGINE_AUDIT_ACCESS_MODE")) config.audit_access_mode = env_config.audit_access_mode;
+    if (env_has("FILEENGINE_AUDIT_HIDDEN_CHILDREN")) config.audit_hidden_children = env_config.audit_hidden_children;
 
     // 5. Load from command-line arguments (highest priority)
     Config cmd_config = load_from_cmd_args(argc, argv);
