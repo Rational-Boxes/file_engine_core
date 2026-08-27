@@ -33,6 +33,7 @@ const char* to_string(FileEventType type) {
         case FileEventType::RoleAssigned:      return "role.assigned";
         case FileEventType::RoleMemberRemoved: return "role.member_removed";
         case FileEventType::RoleDeleted:       return "role.deleted";
+        case FileEventType::AccountabilityCommitted: return "accountability.committed";
     }
     return "unknown";
 }
@@ -62,6 +63,11 @@ std::string to_json(const FileEvent& e) {
         e.type == FileEventType::RoleDeleted) {
         j["role"]   = e.role;
         j["member"] = e.member;
+    }
+    if (e.type == FileEventType::AccountabilityCommitted) {
+        // The whole payload: "at least this seq exists for this tenant". A
+        // consumer must not act on it directly — it reads the core table.
+        j["accountability_seq"] = e.accountability_seq;
     }
     return j.dump();
 }

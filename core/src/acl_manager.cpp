@@ -86,10 +86,10 @@ Result<void> AclManager::grant_permission(const std::string& resource_uid,
                                           PrincipalType type,
                                           int permissions,
                                           const std::string& tenant,
-                                          const std::string& performed_by,
+                                          const AccountabilityContext& ctx,
                                           AclEffect effect) {
     auto result = db_->add_acl(resource_uid, principal, static_cast<int>(type), permissions,
-                               tenant, performed_by, static_cast<int>(effect));
+                               tenant, ctx, static_cast<int>(effect));
     // Invalidate any cached read of this resource's ACLs so subsequent checks
     // in the same scope see the new grant.
     invalidate_cache_entry(resource_uid, tenant);
@@ -101,12 +101,12 @@ Result<void> AclManager::revoke_permission(const std::string& resource_uid,
                                            PrincipalType type,
                                            int permissions,
                                            const std::string& tenant,
-                                           const std::string& performed_by,
+                                           const AccountabilityContext& ctx,
                                            AclEffect effect) {
     // Bit-mask revoke: only the requested bits are cleared. If the principal's
     // remaining bitmask is zero the row is deleted by the DB layer.
     auto result = db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions,
-                                  tenant, performed_by, static_cast<int>(effect));
+                                  tenant, ctx, static_cast<int>(effect));
     invalidate_cache_entry(resource_uid, tenant);
     return result;
 }
@@ -119,15 +119,34 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
                                           const std::map<std::string, std::string>& claims) {
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
 
-    // Admin bypass: kSystemAdminRole (global operator) OR kTenantAdminRole
-    // (admin of THIS tenant). tenant_admin's scope is structural — this
-    // AclManager resolves against a single tenant's schema (db_), so it can
-    // never reach another tenant. No server-side enable flag — upstream is
-    // trusted to attach these only to legitimately admin requests. (Finding H2.)
-    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()
-        || std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
+    // Admin bypass, SPLIT by role (PROPOSAL_accountability_record.md §5.4.9).
+    //
+    // kSystemAdminRole (global operator) still passes every check — that is the
+    // break-glass identity and nothing here changes it.
+    //
+    // kTenantAdminRole (admin of THIS tenant) passes everything EXCEPT the
+    // destroy-data bits. It maps from a tenant's `administrators` LDAP group, a
+    // normal operational population, so a blanket bypass meant every tenant
+    // administrator silently held CULL_VERSIONS — a permission the proto
+    // documents as needing an explicit grant — and would have silently held
+    // ERASE too. A tenant admin now needs those granted, which makes holding
+    // them a deliberate, recorded act.
+    //
+    // tenant_admin's scope remains structural — this AclManager resolves against
+    // a single tenant's schema (db_), so it can never reach another tenant. No
+    // server-side enable flag: upstream is trusted to attach these roles only to
+    // legitimately admin requests. (Finding H2.)
+    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()) {
         return Result<bool>::ok(true);
     }
+    const bool is_tenant_admin_caller =
+        std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
+    if (is_tenant_admin_caller &&
+        (required_permissions & kDestroyDataPermissions) == 0) {
+        return Result<bool>::ok(true);
+    }
+    // A tenant_admin asking for a destroy-data bit falls through to the normal
+    // ACL evaluation below, where an explicit grant can satisfy it.
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
@@ -211,13 +230,25 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
                                                  const std::map<std::string, std::string>& claims) {
     auto effective_roles = resolve_effective_roles(user, roles, tenant);
 
-    // Admin bypass (system_admin OR tenant_admin) grants every bit — mirroring
-    // check_permission. Resolved before any ACL/parent lookup so an admin's
-    // answer never depends on (or is collapsed by) the resource's ACLs or an
-    // unreadable ancestor. tenant_admin is tenant-scoped by db_. (Finding H2.)
-    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()
-        || std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
+    // Admin bypass, mirroring check_permission's split (§5.4.9): system_admin
+    // gets every bit; tenant_admin gets everything except the destroy-data bits.
+    // Resolved before any ACL/parent lookup so an admin's answer never depends
+    // on (or is collapsed by) the resource's ACLs or an unreadable ancestor.
+    // tenant_admin is tenant-scoped by db_. (Finding H2.)
+    if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()) {
         return Result<int>::ok(kAllPermissions);
+    }
+    if (std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
+        // Union the bypass with anything explicitly granted, so a tenant_admin
+        // who HAS been granted CULL_VERSIONS or ERASE sees it here. Reporting
+        // the bare bypass set would tell the caller they lack a bit that
+        // check_permission would in fact allow.
+        int granted = 0;
+        auto acls_result = get_acls_for_resource(resource_uid, tenant);
+        if (acls_result.success) {
+            granted = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
+        }
+        return Result<int>::ok(kTenantAdminPermissions | (granted & kDestroyDataPermissions));
     }
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
@@ -264,6 +295,18 @@ std::vector<std::string> AclManager::resolve_effective_roles(const std::string& 
 Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
                                            const std::string& creator,
                                            const std::string& tenant) {
+    // PartOfCreation, not Record. These grants are the shape of "the creator
+    // owns what they created", already attributed by the resource's own row —
+    // they are not an act of granting anyone access they were not being given
+    // by the creation itself. Chaining them would also put the per-tenant
+    // serializing accountability lock on the content-creation path, which
+    // §5.3.2 rules out and §8's acceptance 17 tests for. Deliberate grants and
+    // revokes (GrantPermission / RevokePermission) use Record.
+    AccountabilityContext ctx;
+    ctx.actor        = creator;
+    ctx.source_iface = "grpc";
+    ctx.mode         = AccountabilityMode::PartOfCreation;
+
     // Creator gets FULL control on the resource they created — so they can manage
     // their own content end to end: delete + list-deleted/undelete, and the full
     // version lifecycle (view/retrieve/restore), plus MANAGE_ACL to share it.
@@ -281,7 +324,7 @@ Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
                                         | static_cast<int>(Permission::RESTORE_TO_VERSION)
                                         | static_cast<int>(Permission::MANAGE_ACL)
                                         | static_cast<int>(Permission::ACL_INHERIT),
-                                        tenant, creator);
+                                        tenant, ctx);
     if (!grant_result.success) {
         return grant_result;
     }
@@ -290,7 +333,7 @@ Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
     if (default_world_readable_) {
         return grant_permission(resource_uid, "other", PrincipalType::OTHER,
                                 static_cast<int>(Permission::READ),
-                                tenant, creator);
+                                tenant, ctx);
     }
 
     return Result<void>::ok();
@@ -307,6 +350,14 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
 
     const int inherit_bit = static_cast<int>(Permission::ACL_INHERIT);
 
+    // PartOfCreation for the same reason as apply_default_acls: propagating an
+    // inherited rule to a new child grants nobody anything the parent rule did
+    // not already say, and it runs on every resource creation.
+    AccountabilityContext ctx;
+    ctx.actor        = performed_by.empty() ? std::string("system") : performed_by;
+    ctx.source_iface = "grpc";
+    ctx.mode         = AccountabilityMode::PartOfCreation;
+
     // Copy only rules marked with ACL_INHERIT. The bit is preserved on the
     // child so inheritance cascades to grandchildren; callers can break the
     // chain at any level by revoking the bit. Fail-loud: any per-rule failure
@@ -315,8 +366,16 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
         if ((rule.permissions & inherit_bit) == 0) {
             continue;
         }
+        // ERASE never inherits (§5.4.9). Granting the strongest destroy-data
+        // permission on a folder must not confer it on every descendant — blast
+        // radius is the entire reason it is a separate bit. It has to be granted
+        // on the resource it applies to, explicitly.
+        const int inheritable = rule.permissions & ~static_cast<int>(Permission::ERASE);
+        if (inheritable == 0 || inheritable == inherit_bit) {
+            continue;   // nothing left to copy once ERASE is stripped
+        }
         auto result = grant_permission(child_uid, rule.principal, rule.type,
-                                       rule.permissions, tenant, performed_by);
+                                       inheritable, tenant, ctx);
         if (!result.success) {
             return Result<void>::err("inherit_acls: failed to copy rule for "
                                      + rule.principal + ": " + result.error);

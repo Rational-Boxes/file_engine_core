@@ -1,6 +1,8 @@
 # Proposal: a guaranteed accountability record in the core
 
-**Status:** Draft / research — for review
+**Status:** IMPLEMENTED (§4, §5.1–§5.3, §7.2 partial, §7.3, §5.4.9's gating) — see
+"What landed" below. §5.4's erasure operation remains unbuilt, and is the highest
+priority of the work this document implies.
 **Branch:** `feat/accountability-record` (file_engine_core)
 **Author:** follows the subsystem parity sweep prompted by `PROPOSAL_metadata_change_events.md` (2026-08-26)
 **Scope:** `file_engine_core` (schema + service layer); `audit_service` (consumer, unchanged contract)
@@ -14,6 +16,69 @@
 >
 > The platform is dev/alpha — no production data, no compatibility obligations.
 > This is the window in which findings like these cost a schema change.
+
+---
+
+## 0. What landed
+
+Implemented on this branch, with the acceptance criteria in §8 as the test plan.
+
+**Core (`file_engine_core`)**
+
+| Piece | Where |
+|---|---|
+| `accountability_record` + `accountability_chain_head` per tenant; `accountability_record_global` + head for tenant lifecycle | `database.cpp::create_tenant_schema` / `create_schema` |
+| The closed per-action `detail` schema, canonical byte form, chain hash | `accountability.{h,cpp}` |
+| The transactional append: locked head, `seq = last_seq + 1`, `ts = GREATEST(clock_timestamp(), last_ts + 1µs)`, `hash = H(prev ‖ canonical)` | `Database::append_accountability` |
+| ACL grant/revoke, role create/delete/assign/remove, version cull, tenant create/delete — each recorded **fail-closed inside the operation's own transaction** | `database.cpp` |
+| `ListAccountabilityRecords`, gated on the dedicated `accountability_reader` role, tenant-scoped, global chain restricted to `system_admin` | `proto/fileservice.proto`, `grpc_service.cpp` |
+| `accountability.committed` freshness hint on the fail-open event stream | `event.{h,cpp}`, `filesystem.cpp`, `server.cpp` |
+| `Permission::ERASE` (0x4000), excluded from inheritance and from the `tenant_admin` bypass | `acl_manager.{h,cpp}` |
+| **The split admin bypass** — `system_admin` keeps every bit; `tenant_admin` loses `CULL_VERSIONS` and `ERASE` | `acl_manager.cpp` |
+| `AuditEntry::target_name` **removed** — the §5.4.7 leak | `audit_entry.h`, `grpc_service.cpp`, `filesystem.cpp` |
+| `recorded_at` alongside `ts` on both audit tables (§4.3.4) | `database.cpp` |
+
+**Consumer (`audit_service`)**
+
+`accountability.py` (the canonical form and chain hash, mirrored from the C++ and
+pinned to the same literal digest on both sides), `core_client.py` (the gRPC
+pull), `cursors.py` (per-tenant `recorded_until`), `puller.py` (drain → verify →
+append → advance, plus tenant-deletion handling), `poller.py` (the scheduled
+drain and hint reaction, `audit-accountability`), and the precedence rule in
+`consumer.py` — the core is drained before any queue event is recorded.
+
+**Tests**
+
+`tests/accountability_tests.cpp` (the cross-repo byte contract),
+`tests/accountability_live_tests.cpp` (atomicity both directions, fail-closed
+refusal, a gap-free commit-ordered `seq` under 8 concurrent writers, a strictly
+monotonic `ts` across a simulated backwards clock step, the cull and tenant
+lifecycle records, the cursor read), `audit_service/src/tests/test_accountability.py`
+and `test_puller.py`, and `audit_service/scripts/e2e_accountability.py` — a real
+core with **auditing disabled and Redis unreachable**, proving the record exists
+and reaches the consumer anyway.
+
+**Deliberately not done**
+
+- **Erasure itself (§5.4).** The permission and its gating landed because the
+  gating is what makes the permission mean anything; the operation, the
+  per-service purge, the sweep and the attestation job did not. §6 already scopes
+  this as separate, larger work, most of it outside the core.
+- **§7.2's append-only ACL/role history.** Decided, not built. The
+  accountability record covers the *act*; reconstructing *state* at a past
+  instant still needs the log, and §7.2 flags a benchmark as a precondition.
+- **Redaction-tolerant chaining (§5.4.7).** Recommended "from the start", and it
+  is not here. The chain is append-only with no redaction path, so an identity
+  cannot yet be removed from it. Worth landing before the table has history
+  anyone would need to redact.
+
+### One correction to §5.4.9
+
+That section reports the gRPC loopback default as **done**. On this branch it is
+not: `config_loader.h` and the shipped `core.conf` both still bind `0.0.0.0`. The
+change lives on `security/grpc-loopback-default` and has not merged here. Every
+authorization decision in the core assumes the invariant, so it holds today by
+container topology and host firewall, not by the application.
 
 ---
 

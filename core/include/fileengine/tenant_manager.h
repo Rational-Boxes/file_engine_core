@@ -17,6 +17,7 @@
 #define TENANT_MANAGER_H
 
 #include "IDatabase.h"
+#include "accountability.h"
 #include "IStorage.h"
 #include "IObjectStore.h"
 #include <map>
@@ -58,9 +59,21 @@ public:
     ~TenantManager();
 
     TenantContext* get_tenant_context(const std::string& tenant_id);
-    bool initialize_tenant(const std::string& tenant_id);
+
+    // `ctx` attributes the tenant's creation in the global accountability
+    // record. It defaults to the system identity because that is the honest
+    // answer for the two paths that reach here — server startup provisioning
+    // "default", and lazy provisioning triggered by the first request for a
+    // tenant. Neither is a person deciding to create a tenant; when an
+    // administrative path to create one exists, it should pass the operator.
+    bool initialize_tenant(const std::string& tenant_id,
+                           const AccountabilityContext& ctx = AccountabilityContext::system());
     bool tenant_exists(const std::string& tenant_id) const;
-    Result<void> remove_tenant(const std::string& tenant_id);
+
+    // The platform's most destructive operation. `ctx` must name a real
+    // operator — the global record of the deletion is all that will survive it.
+    Result<void> remove_tenant(const std::string& tenant_id,
+                               const AccountabilityContext& ctx);
     const TenantConfig& get_config() const { return config_; }
 
 private:

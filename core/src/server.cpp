@@ -186,6 +186,23 @@ int main(int argc, char** argv) {
     // nullptr when disabled/not compiled in, so this is a no-op by default.
     if (auto event_sink = fileengine::make_event_sink(config)) {
         filesystem->set_event_sink(event_sink);
+
+        // Route accountability freshness hints (§4.3) onto that same stream.
+        // The hint is a trigger and nothing more: it says "at least seq N
+        // exists", the consumer reacts by reading the core table out of
+        // schedule, and a lost hint costs latency only because the scheduled
+        // poll collects the record regardless. Which is exactly why this rides
+        // the fail-open, trimmed, drop-oldest event stream rather than the
+        // durable audit path — those properties are correct for a notification
+        // and unacceptable for a system of record.
+        //
+        // Wired only when events are enabled: with no sink there are no hints,
+        // and the pull path is unaffected.
+        std::weak_ptr<fileengine::FileSystem> fs_weak = filesystem;
+        database->set_accountability_hint(
+            [fs_weak](const std::string& tenant, std::int64_t seq) {
+                if (auto fs = fs_weak.lock()) fs->publish_accountability_hint(tenant, seq);
+            });
     }
 
     // Durable audit emitter (§5). Never null: a NullAuditSink when disabled/not

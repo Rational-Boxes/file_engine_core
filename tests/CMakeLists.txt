@@ -386,6 +386,35 @@ add_test(NAME load_stress
                  --target core --requests 200 --concurrency 32)
 set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600 SKIP_RETURN_CODE 77)
 
+# ---------------------------------------------------------------------------
+# The guaranteed accountability record (PROPOSAL_accountability_record.md)
+# ---------------------------------------------------------------------------
+
+# Pure unit tests over the canonical byte form, the chain hash and the closed
+# detail schema. No infrastructure. These pin a CROSS-REPO contract:
+# audit_service re-derives the same canonical form and hash in Python to verify
+# every record it reads, so a silent change here would not produce a subtle bug,
+# it would fail every chain verification in the platform.
+add_executable(accountability_tests accountability_tests.cpp)
+target_include_directories(accountability_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)
+target_link_libraries(accountability_tests fileengine_core ${LIBPQ_LIBRARIES})
+add_test(NAME accountability_tests COMMAND accountability_tests)
+set_tests_properties(accountability_tests PROPERTIES LABELS "unit" TIMEOUT 60)
+
+# The guarantees that only a real database can demonstrate: atomicity with the
+# operation, fail-closed refusal, a gap-free commit-ordered seq under
+# concurrency, a strictly monotonic ts across a backwards clock step, and the
+# cursor read. Skips cleanly (exit 77) without Postgres.
+add_executable(accountability_live_tests accountability_live_tests.cpp)
+target_include_directories(accountability_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)
+target_link_libraries(accountability_live_tests
+    fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
+add_test(NAME accountability_live_tests COMMAND accountability_live_tests)
+set_tests_properties(accountability_live_tests PROPERTIES
+    LABELS "lifecycle" TIMEOUT 300 SKIP_RETURN_CODE 77)
+
 # Configuration precedence: environment > .env > .conf > built-in default.
 # Uses a temporary working directory, so the repository's own .env is untouched.
 add_executable(test_config_precedence test_config_precedence.cpp)

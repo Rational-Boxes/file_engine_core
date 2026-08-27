@@ -17,6 +17,7 @@
 #define FILEENGINE_DATABASE_H
 
 #include "types.h"
+#include "accountability.h"
 #include "IDatabase.h"
 #include "connection_pool.h"
 #include "connection_router.h"
@@ -32,6 +33,7 @@
 #include <cstdint>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 
 namespace fileengine {
 
@@ -49,7 +51,8 @@ public:
     // Schema management
     Result<void> create_schema() override;
     Result<void> create_global_schema();
-    Result<void> create_tenant_schema(const std::string& tenant) override;
+    Result<void> create_tenant_schema(const std::string& tenant,
+                                      const AccountabilityContext& ctx) override;
     Result<bool> tenant_schema_exists(const std::string& tenant) override;
     Result<void> drop_schema() override;
 
@@ -120,19 +123,20 @@ public:
     Result<int64_t> get_storage_capacity(const std::string& tenant = "") override;
 
     // Tenant management operations
-    Result<void> cleanup_tenant_data(const std::string& tenant) override;
+    Result<void> cleanup_tenant_data(const std::string& tenant,
+                                     const AccountabilityContext& ctx) override;
     Result<std::vector<std::string>> list_tenants() override;
 
     // ACL operations
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
-                         const std::string& tenant = "",
-                         const std::string& performed_by = "",
+                         const std::string& tenant,
+                         const AccountabilityContext& ctx,
                          int effect = 0) override;
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
-                            const std::string& tenant = "",
-                            const std::string& performed_by = "",
+                            const std::string& tenant,
+                            const AccountabilityContext& ctx,
                             int effect = 0) override;
     Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                         const std::string& tenant = "") override;
@@ -145,17 +149,49 @@ public:
                                                  const std::string& tenant = "") override;
 
     // Role management operations
-    Result<void> create_role(const std::string& role, const std::string& tenant = "") override;
-    Result<void> delete_role(const std::string& role, const std::string& tenant = "") override;
+    Result<void> create_role(const std::string& role, const std::string& tenant,
+                             const AccountabilityContext& ctx) override;
+    Result<void> delete_role(const std::string& role, const std::string& tenant,
+                             const AccountabilityContext& ctx) override;
     Result<void> assign_user_to_role(const std::string& user, const std::string& role,
-                                     const std::string& tenant = "") override;
+                                     const std::string& tenant,
+                                     const AccountabilityContext& ctx) override;
     Result<void> remove_user_from_role(const std::string& user, const std::string& role,
-                                       const std::string& tenant = "") override;
+                                       const std::string& tenant,
+                                       const AccountabilityContext& ctx) override;
     Result<std::vector<std::string>> get_roles_for_user(const std::string& user,
                                                         const std::string& tenant = "") override;
     Result<std::vector<std::string>> get_users_for_role(const std::string& role,
                                                         const std::string& tenant = "") override;
     Result<std::vector<std::string>> get_all_roles(const std::string& tenant = "") override;
+
+    Result<int> purge_versions(const std::string& file_uid,
+                               const std::vector<std::string>& version_timestamps,
+                               const std::string& cut_version_timestamp,
+                               int keep_count,
+                               const std::string& tenant,
+                               const AccountabilityContext& ctx) override;
+
+    // The pull surface (§4.3.1). Ordered by ts, which under the chain lock is
+    // also seq order; `has_more` tells the consumer to come straight back
+    // rather than wait out its poll interval.
+    Result<std::vector<StoredAccountabilityRecord>> list_accountability_records(
+            const std::string& tenant, std::int64_t newer_than_micros,
+            int limit, bool& has_more) override;
+
+    // The freshness-hint callback (§4.3). Set by the server once the event sink
+    // exists; unset means no hints, which costs latency only — the pull path is
+    // the guarantee and does not depend on it.
+    //
+    // Fired AFTER the commit, never before, so a hint can only under-assert:
+    // a consumer that acts on one always finds the record it names.
+    using AccountabilityHint = std::function<void(const std::string& tenant, std::int64_t seq)>;
+    void set_accountability_hint(AccountabilityHint hint) { accountability_hint_ = std::move(hint); }
+
+    // The committed position of the last accountability record for a tenant.
+    // The queue hint carries this so a consumer can tell "no new records" apart
+    // from "I am reading a replica that has not caught up" (§4.3).
+    Result<std::int64_t> accountability_head_seq(const std::string& tenant);
 
     // Connection info access for administrative operations
     std::string get_connection_info() const;
@@ -236,6 +272,28 @@ private:
     std::atomic<std::int64_t>  monitor_last_probe_epoch_{0};
     std::atomic<std::int64_t>  monitor_last_probe_ms_{0}; // how long the last probe took
     std::atomic<bool>          monitor_probe_in_flight_{false};
+
+    // Append one accountability record INSIDE the caller's already-open
+    // transaction on `conn`. This is the whole guarantee: the record and the
+    // operation commit together or not at all. A failure here must be treated
+    // as fatal by the caller — roll back and fail the operation rather than
+    // proceed unrecorded (§4.2 guarantee 2).
+    //
+    // Locks the tenant's chain-head row, so appends serialize per tenant. That
+    // is affordable only because the scope is rare operations (§4.1).
+    struct AccountabilityCommit {
+        std::int64_t seq = 0;
+        std::int64_t ts_micros = 0;
+    };
+    Result<AccountabilityCommit> append_accountability(PGconn* conn,
+                                                       const std::string& tenant,
+                                                       const AccountabilityRecord& rec);
+
+    // Fire the post-commit hint, swallowing anything it throws. seq == 0 means
+    // "nothing was recorded" (a no-op operation), and emits nothing.
+    void fire_accountability_hint(const std::string& tenant, std::int64_t seq) noexcept;
+
+    AccountabilityHint accountability_hint_;
 
     Result<void> check_connection() const;
     std::string escape_string(const std::string& str, PGconn* conn) const;

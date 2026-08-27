@@ -47,6 +47,16 @@
 #include "fileengine/acl_manager.h"
 #include "fileengine/types.h"
 
+// A stand-in acting identity for the mock-backed suites. The real path refuses
+// an operation whose actor is empty (PROPOSAL_accountability_record.md §5.1), so
+// tests have to name one even though the mocks record nothing.
+static const fileengine::AccountabilityContext kTestCtx = [] {
+    fileengine::AccountabilityContext c;
+    c.actor = "test";
+    c.source_iface = "test";
+    return c;
+}();
+
 using namespace fileengine;
 
 // ---------------------------------------------------------------------------
@@ -134,18 +144,20 @@ public:
     Result<std::vector<std::string>> get_infrequently_accessed_files(int = 30, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
     Result<int64_t> get_storage_usage(const std::string& = "") override { return Result<int64_t>::ok(0); }
     Result<int64_t> get_storage_capacity(const std::string& = "") override { return Result<int64_t>::ok(0); }
-    Result<void> create_tenant_schema(const std::string&) override { return Result<void>::ok(); }
+    Result<void> create_tenant_schema(const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<bool> tenant_schema_exists(const std::string&) override { return Result<bool>::ok(true); }
-    Result<void> cleanup_tenant_data(const std::string&) override { return Result<void>::ok(); }
+    Result<void> cleanup_tenant_data(const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<std::vector<std::string>> list_tenants() override { return Result<std::vector<std::string>>::ok({}); }
-    Result<void> add_acl(const std::string& r, const std::string& p, int t, int perm, const std::string& = "", const std::string& = "", int eff = 0) override { AclEntry e; e.resource_uid = r; e.principal = p; e.type = t; e.permissions = perm; e.effect = eff; acls_[r].push_back(e); return Result<void>::ok(); }
-    Result<void> remove_acl(const std::string&, const std::string&, int, int, const std::string& = "", const std::string& = "", int = 0) override { return Result<void>::ok(); }
+    Result<void> add_acl(const std::string& r, const std::string& p, int t, int perm, const std::string&, const AccountabilityContext&, int eff = 0) override { AclEntry e; e.resource_uid = r; e.principal = p; e.type = t; e.permissions = perm; e.effect = eff; acls_[r].push_back(e); return Result<void>::ok(); }
+    Result<void> remove_acl(const std::string&, const std::string&, int, int, const std::string&, const AccountabilityContext&, int = 0) override { return Result<void>::ok(); }
     Result<std::vector<AclEntry>> get_user_acls(const std::string& r, const std::string& p, int t, const std::string& = "") override { std::vector<AclEntry> out; auto it = acls_.find(r); if (it != acls_.end()) for (auto& e : it->second) if (e.principal == p && e.type == t) out.push_back(e); return Result<std::vector<AclEntry>>::ok(out); }
     Result<std::vector<std::string>> list_claims(const std::string&, int, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
-    Result<void> create_role(const std::string&, const std::string& = "") override { return Result<void>::ok(); }
-    Result<void> delete_role(const std::string&, const std::string& = "") override { return Result<void>::ok(); }
-    Result<void> assign_user_to_role(const std::string&, const std::string&, const std::string& = "") override { return Result<void>::ok(); }
-    Result<void> remove_user_from_role(const std::string&, const std::string&, const std::string& = "") override { return Result<void>::ok(); }
+    Result<void> create_role(const std::string&, const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
+    Result<void> delete_role(const std::string&, const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
+    Result<void> assign_user_to_role(const std::string&, const std::string&,
+                                     const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
+    Result<void> remove_user_from_role(const std::string&, const std::string&,
+                                       const std::string&, const AccountabilityContext&) override { return Result<void>::ok(); }
     Result<std::vector<std::string>> get_users_for_role(const std::string&, const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
     Result<std::vector<std::string>> get_all_roles(const std::string& = "") override { return Result<std::vector<std::string>>::ok({}); }
 };
@@ -169,6 +181,7 @@ const int P_VIEWV   = static_cast<int>(Permission::VIEW_VERSIONS);
 const int P_RESTORE = static_cast<int>(Permission::RESTORE_TO_VERSION);
 const int P_MANAGE  = static_cast<int>(Permission::MANAGE_ACL);
 const int P_CULL    = static_cast<int>(Permission::CULL_VERSIONS);
+const int P_ERASE   = static_cast<int>(Permission::ERASE);
 
 bool can(AclManager& acl, const std::string& uid, const std::string& user,
          const std::vector<std::string>& roles, int perm,
@@ -191,7 +204,7 @@ void test_write_does_not_imply_destructive() {
     db->add_node("F", "", false);
     AclManager acl(db);
     acl.set_default_read(false);  // strict: only explicit grants count
-    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE);
+    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE, "", kTestCtx);
 
     CHECK(can(acl, "F", "alice", {}, P_WRITE),  "WRITE grant confers WRITE");
     CHECK(!can(acl, "F", "alice", {}, P_DELETE),  "WRITE must NOT confer DELETE");
@@ -209,7 +222,7 @@ void test_write_does_not_imply_manage_acl() {
     db->add_node("F", "", false);
     AclManager acl(db);
     acl.set_default_read(false);
-    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE | P_READ);
+    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE | P_READ, "", kTestCtx);
     CHECK(!can(acl, "F", "alice", {}, P_MANAGE), "WRITE+READ must NOT confer MANAGE_ACL");
 }
 
@@ -250,7 +263,7 @@ void test_purge_requires_cull_versions() {
           "owner must NOT be able to purge without CULL_VERSIONS");
 
     // The dedicated grant is necessary and sufficient to authorize purge.
-    acl.grant_permission("F", "owner", PrincipalType::USER, P_CULL);
+    acl.grant_permission("F", "owner", PrincipalType::USER, P_CULL, "", kTestCtx);
     CHECK(can(acl, "F", "owner", {}, P_CULL),
           "explicit CULL_VERSIONS grant authorizes purge");
 }
@@ -262,8 +275,8 @@ void test_deny_wins_within_tier() {
     auto db = std::make_shared<MockDatabase>();
     db->add_node("F", "", false);
     AclManager acl(db);
-    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE, "", "", AclEffect::ALLOW);
-    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE, "", "", AclEffect::DENY);
+    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE, "", kTestCtx, AclEffect::ALLOW);
+    acl.grant_permission("F", "alice", PrincipalType::USER, P_WRITE, "", kTestCtx, AclEffect::DENY);
     CHECK(!can(acl, "F", "alice", {}, P_WRITE),
           "same-tier DENY must override same-tier ALLOW");
 }
@@ -289,7 +302,7 @@ void test_claim_abac_exact_match() {
     db->add_node("F", "", false);
     AclManager acl(db);
     acl.set_default_read(false);
-    acl.grant_permission("F", "department=eng", PrincipalType::CLAIM, P_READ);
+    acl.grant_permission("F", "department=eng", PrincipalType::CLAIM, P_READ, "", kTestCtx);
     CHECK(can(acl,  "F", "bob", {}, P_READ, {{"department", "eng"}}),
           "matching claim grants access");
     CHECK(!can(acl, "F", "bob", {}, P_READ, {{"department", "sales"}}),
@@ -328,29 +341,29 @@ void test_hierarchical_precedence() {
 
     // USER ALLOW overrides ROLE DENY (USER tier 0 settles before ROLE tier 2).
     db->add_node("u_over_r", "", false);
-    acl.grant_permission("u_over_r", "alice", PrincipalType::USER, P_WRITE, "", "", AclEffect::ALLOW);
-    acl.grant_permission("u_over_r", "contractors", PrincipalType::ROLE, P_WRITE, "", "", AclEffect::DENY);
+    acl.grant_permission("u_over_r", "alice", PrincipalType::USER, P_WRITE, "", kTestCtx, AclEffect::ALLOW);
+    acl.grant_permission("u_over_r", "contractors", PrincipalType::ROLE, P_WRITE, "", kTestCtx, AclEffect::DENY);
     CHECK(can(acl, "u_over_r", "alice", {"contractors"}, P_WRITE),
           "USER ALLOW overrides ROLE DENY");
 
     // CLAIM ALLOW overrides ROLE DENY (CLAIM tier 1 more specific than ROLE tier 2).
     db->add_node("c_over_r", "", false);
-    acl.grant_permission("c_over_r", "dept=eng", PrincipalType::CLAIM, P_WRITE, "", "", AclEffect::ALLOW);
-    acl.grant_permission("c_over_r", "contractors", PrincipalType::ROLE, P_WRITE, "", "", AclEffect::DENY);
+    acl.grant_permission("c_over_r", "dept=eng", PrincipalType::CLAIM, P_WRITE, "", kTestCtx, AclEffect::ALLOW);
+    acl.grant_permission("c_over_r", "contractors", PrincipalType::ROLE, P_WRITE, "", kTestCtx, AclEffect::DENY);
     CHECK(can(acl, "c_over_r", "bob", {"contractors"}, P_WRITE, {{"dept", "eng"}}),
           "CLAIM ALLOW overrides ROLE DENY");
 
     // USER DENY overrides CLAIM ALLOW (USER is the most specific tier).
     db->add_node("u_deny", "", false);
-    acl.grant_permission("u_deny", "carol", PrincipalType::USER, P_WRITE, "", "", AclEffect::DENY);
-    acl.grant_permission("u_deny", "dept=eng", PrincipalType::CLAIM, P_WRITE, "", "", AclEffect::ALLOW);
+    acl.grant_permission("u_deny", "carol", PrincipalType::USER, P_WRITE, "", kTestCtx, AclEffect::DENY);
+    acl.grant_permission("u_deny", "dept=eng", PrincipalType::CLAIM, P_WRITE, "", kTestCtx, AclEffect::ALLOW);
     CHECK(!can(acl, "u_deny", "carol", {}, P_WRITE, {{"dept", "eng"}}),
           "USER DENY overrides CLAIM ALLOW");
 
     // ROLE ALLOW overrides everyone(OTHER) DENY; a user without the role is still denied.
     db->add_node("r_over_o", "", false);
-    acl.grant_permission("r_over_o", "staff", PrincipalType::ROLE, P_READ, "", "", AclEffect::ALLOW);
-    acl.grant_permission("r_over_o", "everyone", PrincipalType::OTHER, P_READ, "", "", AclEffect::DENY);
+    acl.grant_permission("r_over_o", "staff", PrincipalType::ROLE, P_READ, "", kTestCtx, AclEffect::ALLOW);
+    acl.grant_permission("r_over_o", "everyone", PrincipalType::OTHER, P_READ, "", kTestCtx, AclEffect::DENY);
     CHECK(can(acl, "r_over_o", "dave", {"staff"}, P_READ),
           "ROLE ALLOW overrides everyone(OTHER) DENY");
     CHECK(!can(acl, "r_over_o", "eve", {}, P_READ),
@@ -381,7 +394,16 @@ void test_tenant_admin_is_scoped_not_global() {
     CHECK(!acl.is_admin("bob", {"users"}, "acme"), "plain user is not an admin");
 }
 
-// Both admin roles fully bypass ACLs within the tenant; a plain user does not.
+// The admin bypass is SPLIT (PROPOSAL_accountability_record.md §5.4.9).
+//
+// system_admin still passes every check — break-glass, unchanged. tenant_admin
+// passes everything EXCEPT the destroy-data bits, which need an explicit grant.
+//
+// This test previously asserted the opposite for CULL_VERSIONS, which is the
+// finding: kAllPermissions included CULL_VERSIONS while the proto documents that
+// permission as "destroy-data op; must be granted explicitly", and tenant_admin
+// maps from a tenant's `administrators` LDAP group — a normal operational
+// population. Both statements could not be true; this is which one gave way.
 void test_admin_roles_bypass_within_tenant() {
     std::cout << "test_admin_roles_bypass_within_tenant\n";
     auto db = std::make_shared<MockDatabase>();
@@ -389,13 +411,36 @@ void test_admin_roles_bypass_within_tenant() {
     AclManager acl(db);
     acl.set_default_read(false);    // strict: nothing allowed without a grant
 
-    // tenant_admin and system_admin both get full control, incl. the destructive
-    // CULL_VERSIONS bit that is never granted by default.
-    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_CULL), "tenant_admin bypasses to CULL within tenant");
-    CHECK(can(acl, "F", "root",  {"system_admin"}, P_CULL), "system_admin bypasses to CULL");
+    // Ordinary administration: both roles pass without any grant.
+    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_MANAGE), "tenant_admin bypasses to MANAGE_ACL");
+    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_DELETE), "tenant_admin bypasses to DELETE");
+    CHECK(can(acl, "F", "root",  {"system_admin"}, P_MANAGE), "system_admin bypasses to MANAGE_ACL");
+
+    // Destroy-data bits: system_admin yes, tenant_admin no.
+    CHECK(can(acl, "F", "root",  {"system_admin"}, P_CULL),  "system_admin bypasses to CULL");
+    CHECK(can(acl, "F", "root",  {"system_admin"}, P_ERASE), "system_admin bypasses to ERASE");
+    CHECK(!can(acl, "F", "carol", {"tenant_admin"}, P_CULL),
+          "tenant_admin must NOT reach CULL_VERSIONS by bypass");
+    CHECK(!can(acl, "F", "carol", {"tenant_admin"}, P_ERASE),
+          "tenant_admin must NOT reach ERASE by bypass");
+
     int eff = acl.get_effective_permissions("F", "carol", {"tenant_admin"}, "acme").value;
-    CHECK((eff & P_CULL) && (eff & P_MANAGE) && (eff & P_DELETE),
-          "tenant_admin effective permission set is all bits");
+    CHECK((eff & P_MANAGE) && (eff & P_DELETE),
+          "tenant_admin effective set still carries the ordinary admin bits");
+    CHECK(!(eff & P_CULL) && !(eff & P_ERASE),
+          "tenant_admin effective set excludes the destroy-data bits");
+
+    // An EXPLICIT grant is what a tenant_admin needs — and it works, so the
+    // split restricts the bypass without taking the capability away.
+    acl.grant_permission("F", "carol", PrincipalType::USER, P_CULL | P_ERASE, "", kTestCtx);
+    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_CULL),
+          "tenant_admin with an explicit CULL grant may cull");
+    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_ERASE),
+          "tenant_admin with an explicit ERASE grant may erase");
+    int eff2 = acl.get_effective_permissions("F", "carol", {"tenant_admin"}, "").value;
+    CHECK((eff2 & P_CULL) && (eff2 & P_ERASE),
+          "the explicit grant shows up in the effective set, matching check_permission");
+
     // a plain user with no grant is denied in strict mode
     CHECK(!can(acl, "F", "bob", {"users"}, P_READ), "plain user denied without a grant");
 }
@@ -412,7 +457,7 @@ void test_tenant_admin_boundary_is_per_manager() {
     AclManager aclA(tenantA), aclB(tenantB);
     aclA.set_default_read(false);
     aclB.set_default_read(false);
-    aclB.grant_permission("docB", "secret=1", PrincipalType::CLAIM, P_READ);  // a grant only in tenant B
+    aclB.grant_permission("docB", "secret=1", PrincipalType::CLAIM, P_READ, "", kTestCtx);  // a grant only in tenant B
 
     // A tenant_admin has full control of the tenant whose manager handles the
     // request (here, tenant A's own node):
@@ -440,14 +485,14 @@ void test_group_type_matches_nobody() {
     const int USER  = static_cast<int>(PrincipalType::USER);
 
     // A GROUP ALLOW READ injected directly must grant no one.
-    db->add_acl("F", "anygroup", GROUP, P_READ, "", "", 0 /*ALLOW*/);
+    db->add_acl("F", "anygroup", GROUP, P_READ, "", kTestCtx, 0 /*ALLOW*/);
     CHECK(!can(acl, "F", "alice", {}, P_READ), "GROUP ALLOW grants nobody (fail-closed)");
     CHECK(!can(acl, "F", "bob", {"anygroup"}, P_READ),
           "GROUP ALLOW grants nobody even when a role of the same name is held");
 
     // A GROUP DENY must affect no one — a legitimately granted user still passes.
-    db->add_acl("F", "carol", USER,  P_READ, "", "", 0 /*ALLOW*/);
-    db->add_acl("F", "anygrp", GROUP, P_READ, "", "", 1 /*DENY*/);
+    db->add_acl("F", "carol", USER,  P_READ, "", kTestCtx, 0 /*ALLOW*/);
+    db->add_acl("F", "anygrp", GROUP, P_READ, "", kTestCtx, 1 /*DENY*/);
     CHECK(can(acl, "F", "carol", {}, P_READ), "GROUP DENY affects nobody; USER ALLOW stands");
 }
 

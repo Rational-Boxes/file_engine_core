@@ -1675,18 +1675,39 @@ Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int kee
         return Result<void>::ok();  // nothing old enough to purge
     }
 
-    // Drop everything older than the newest `keep` versions. The local storage
-    // payload is removed best-effort; object-store copies are immutable by
-    // design and are intentionally left untouched.
-    for (size_t i = keep; i < versions.size(); ++i) {
-        const std::string& vts = versions[i];
-        if (context->storage) {
+    // Drop everything older than the newest `keep` versions.
+    //
+    // The metadata rows go in ONE transaction together with the accountability
+    // record that describes the cull (PROPOSAL_accountability_record.md §5.2):
+    // culling erases history by design, so a record written separately — or not
+    // at all — would erase the evidence *of* the cull. It is one logical act, so
+    // it is one chained record naming the actor, the target, the keep-count and
+    // the cut, not one per destroyed version.
+    //
+    // The DB transaction runs BEFORE the storage payloads are removed. The
+    // previous order deleted bytes first, which meant a failure partway left
+    // version rows pointing at content that no longer existed — unreadable
+    // history that still looks intact. This way a failure leaves orphaned bytes
+    // instead, which are recoverable and which the object-store sync already
+    // reconciles. The payload removal itself stays best-effort; object-store
+    // copies are intentionally left untouched.
+    std::vector<std::string> to_purge(versions.begin() + keep, versions.end());
+    const std::string cut_version = versions[keep - 1];   // oldest version RETAINED
+
+    AccountabilityContext ctx;
+    ctx.actor        = user;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = "grpc";
+
+    auto purged = context->db->purge_versions(file_uid, to_purge, cut_version, keep, tenant, ctx);
+    if (!purged.success) {
+        return Result<void>::err("Failed to purge versions: " + purged.error);
+    }
+
+    if (context->storage) {
+        for (const auto& vts : to_purge) {
             std::string path = context->storage->get_storage_path(file_uid, vts, tenant);
             context->storage->delete_file(path, tenant);  // best-effort
-        }
-        auto del = context->db->delete_version(file_uid, vts, tenant);
-        if (!del.success) {
-            return Result<void>::err("Failed to purge version " + vts + ": " + del.error);
         }
     }
 
@@ -1851,8 +1872,12 @@ Result<void> FileSystem::grant_permission(const std::string& resource_uid,
         return Result<void>::err("User does not have permission to grant permissions");
     }
 
+    AccountabilityContext ctx;
+    ctx.actor        = user;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = "grpc";
     auto result = acl_manager_->grant_permission(resource_uid, principal, PrincipalType::USER,
-                                                 permissions, tenant, user);
+                                                 permissions, tenant, ctx);
     if (result.success) {
         emit_acl_event(tenant, resource_uid, principal, permissions, user);
     }
@@ -1875,8 +1900,12 @@ Result<void> FileSystem::revoke_permission(const std::string& resource_uid,
         return Result<void>::err("User does not have permission to revoke permissions");
     }
     
+    AccountabilityContext ctx;
+    ctx.actor        = user;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = "grpc";
     auto result = acl_manager_->revoke_permission(resource_uid, principal, PrincipalType::USER,
-                                                  permissions, tenant, user);
+                                                  permissions, tenant, ctx);
     if (result.success) {
         emit_acl_event(tenant, resource_uid, principal, permissions, user);
     }
@@ -1898,27 +1927,30 @@ Result<bool> FileSystem::check_permission(const std::string& resource_uid,
     return result;
 }
 
-void FileSystem::resolve_audit_target(const std::string& uid, const std::string& tenant,
-                                      std::string& out_name, bool& out_is_hidden_child) {
-    // Best-effort enrichment for the audit log — never let it disturb the caller.
-    if (uid.empty()) return;
+bool FileSystem::audit_target_is_hidden_child(const std::string& uid, const std::string& tenant) {
+    // Best-effort classification for the audit log — never let it disturb the
+    // caller. Note what this deliberately does NOT do: read the target's name.
+    // The row's name is fetched only to reach its parent_uid, and is discarded
+    // (§5.4.7 — the log stores the uid and a viewer resolves the name at read
+    // time, so an erasure stops the log disclosing it with no cleanup step).
+    if (uid.empty()) return false;
     try {
         auto* context = get_tenant_context(tenant);
-        if (!context || !context->db) return;
+        if (!context || !context->db) return false;
         auto info = context->db->get_file_by_uid_include_deleted(uid, tenant);
-        if (!info.success || !info.value.has_value()) return;
-        out_name = info.value.value().name;
+        if (!info.success || !info.value.has_value()) return false;
         // A rendition/sidecar is a hidden child of a *file*: detect via parent type
         // (mirrors the is_rendition enrichment on the event envelope).
         const std::string& parent_uid = info.value.value().parent_uid;
-        if (parent_uid.empty()) return;
+        if (parent_uid.empty()) return false;
         auto parent = context->db->get_file_by_uid_include_deleted(parent_uid, tenant);
         if (parent.success && parent.value.has_value()) {
-            out_is_hidden_child = (parent.value.value().type == FileType::REGULAR_FILE);
+            return parent.value.value().type == FileType::REGULAR_FILE;
         }
     } catch (...) {
-        // leave outputs unchanged on failure
+        // fall through to "not hidden" on failure
     }
+    return false;
 }
 
 void FileSystem::shutdown() {
@@ -2006,6 +2038,24 @@ void FileSystem::emit_acl_event(const std::string& tenant, const std::string& re
         event_sink_->publish(ev);
     } catch (...) {
         // fail-open
+    }
+}
+
+void FileSystem::publish_accountability_hint(const std::string& tenant, int64_t seq) noexcept {
+    if (!event_sink_ || seq <= 0) return;
+    try {
+        FileEvent ev;
+        ev.event_id = Utils::generate_uuid();
+        ev.type = FileEventType::AccountabilityCommitted;
+        ev.tenant = tenant.empty() ? "default" : tenant;
+        ev.actor = "system";     // the hint is emitted by the core, not by a user
+        ev.accountability_seq = seq;
+        ev.ts = Utils::get_timestamp_string();
+        event_sink_->publish(ev);
+    } catch (...) {
+        // fail-open, deliberately: the record is already committed and the
+        // scheduled poll will collect it. A hint that failed to publish is a
+        // latency cost, never a correctness one.
     }
 }
 

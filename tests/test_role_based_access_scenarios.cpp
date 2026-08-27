@@ -23,6 +23,16 @@
 #include "fileengine/types.h"
 #include "fileengine/IDatabase.h"
 
+// A stand-in acting identity for the mock-backed suites. The real path refuses
+// an operation whose actor is empty (PROPOSAL_accountability_record.md §5.1), so
+// tests have to name one even though the mocks record nothing.
+static const fileengine::AccountabilityContext kTestCtx = [] {
+    fileengine::AccountabilityContext c;
+    c.actor = "test";
+    c.source_iface = "test";
+    return c;
+}();
+
 using namespace fileengine;
 
 // Mock database implementation for testing
@@ -173,13 +183,13 @@ public:
     }
     
     // Tenant management operations
-    Result<void> create_tenant_schema(const std::string& tenant) override {
+    Result<void> create_tenant_schema(const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     Result<bool> tenant_schema_exists(const std::string& tenant) override {
         return Result<bool>::ok(true);
     }
-    Result<void> cleanup_tenant_data(const std::string& tenant) override {
+    Result<void> cleanup_tenant_data(const std::string& tenant, const AccountabilityContext&) override {
         return Result<void>::ok();
     }
     Result<std::vector<std::string>> list_tenants() override {
@@ -189,8 +199,8 @@ public:
     // ACL operations
     Result<void> add_acl(const std::string& resource_uid, const std::string& principal,
                          int type, int permissions,
-                         const std::string& tenant = "",
-                         const std::string& /*performed_by*/ = "",
+                         const std::string& tenant,
+                         const AccountabilityContext& /*ctx*/,
                          int /*effect*/ = 0) override {
         AclEntry entry;
         entry.resource_uid = resource_uid;
@@ -205,8 +215,8 @@ public:
     
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
-                            const std::string& tenant = "",
-                            const std::string& /*performed_by*/ = "",
+                            const std::string& tenant,
+                            const AccountabilityContext& /*ctx*/,
                             int /*effect*/ = 0) override {
         auto& resource_acls = acls_[resource_uid];
         for (auto& entry : resource_acls) {
@@ -274,30 +284,30 @@ public:
     }
 
     // Role management operations (corrected implementation - no persistent storage)
-    Result<void> create_role(const std::string& role, const std::string& tenant = "") override {
+    Result<void> create_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         if (role.empty()) {
             return Result<void>::err("Role name cannot be empty");
         }
         return Result<void>::ok();
     }
     
-    Result<void> delete_role(const std::string& role, const std::string& tenant = "") override {
+    Result<void> delete_role(const std::string& role, const std::string& tenant, const AccountabilityContext&) override {
         if (role.empty()) {
             return Result<void>::err("Role name cannot be empty");
         }
         return Result<void>::ok();
     }
     
-    Result<void> assign_user_to_role(const std::string& user, const std::string& role, 
-                                     const std::string& tenant = "") override {
+    Result<void> assign_user_to_role(const std::string& user, const std::string& role,
+                                     const std::string& tenant, const AccountabilityContext&) override {
         if (user.empty() || role.empty()) {
             return Result<void>::err("User and role names cannot be empty");
         }
         return Result<void>::ok();
     }
     
-    Result<void> remove_user_from_role(const std::string& user, const std::string& role, 
-                                       const std::string& tenant = "") override {
+    Result<void> remove_user_from_role(const std::string& user, const std::string& role,
+                                       const std::string& tenant, const AccountabilityContext&) override {
         if (user.empty() || role.empty()) {
             return Result<void>::err("User and role names cannot be empty");
         }
@@ -345,14 +355,14 @@ void test_role_based_access_scenarios() {
     // Test 1: Grant READ permission to 'users' role on root directory
     std::cout << "Test 1: Granting READ permission to 'users' role on root directory...\n";
     auto result = acl_manager.grant_permission(root_uid, users_role, PrincipalType::ROLE, 
-                                              static_cast<int>(Permission::READ));
+                                              static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     std::cout << "  Granted READ permission to 'users' role: OK\n";
     
     // Test 2: Grant READ and WRITE permissions to 'contributors' role on root directory
     std::cout << "Test 2: Granting READ and WRITE permissions to 'contributors' role on root directory...\n";
     result = acl_manager.grant_permission(root_uid, contributors_role, PrincipalType::ROLE, 
-                                         static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE));
+                                         static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE), "", kTestCtx);
     assert(result.success);
     std::cout << "  Granted READ and WRITE permissions to 'contributors' role: OK\n";
     
@@ -360,27 +370,27 @@ void test_role_based_access_scenarios() {
     std::cout << "Test 3: Granting ALL permissions to 'administrators' role on root directory...\n";
     int all_permissions = static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE) |
                           static_cast<int>(Permission::DELETE) | static_cast<int>(Permission::EXECUTE);
-    result = acl_manager.grant_permission(root_uid, admins_role, PrincipalType::ROLE, all_permissions);
+    result = acl_manager.grant_permission(root_uid, admins_role, PrincipalType::ROLE, all_permissions, "", kTestCtx);
     assert(result.success);
     std::cout << "  Granted ALL permissions to 'administrators' role: OK\n";
 
     // Test 4: Grant READ permission to 'users' role on a specific folder
     std::cout << "Test 4: Granting READ permission to 'users' role on test folder...\n";
     result = acl_manager.grant_permission(folder_uid, users_role, PrincipalType::ROLE,
-                                         static_cast<int>(Permission::READ));
+                                         static_cast<int>(Permission::READ), "", kTestCtx);
     assert(result.success);
     std::cout << "  Granted READ permission to 'users' role on folder: OK\n";
 
     // Test 5: Grant READ and WRITE permissions to 'contributors' role on the same folder
     std::cout << "Test 5: Granting READ and WRITE permissions to 'contributors' role on test folder...\n";
     result = acl_manager.grant_permission(folder_uid, contributors_role, PrincipalType::ROLE,
-                                         static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE));
+                                         static_cast<int>(Permission::READ) | static_cast<int>(Permission::WRITE), "", kTestCtx);
     assert(result.success);
     std::cout << "  Granted READ and WRITE permissions to 'contributors' role on folder: OK\n";
 
     // Test 6: Grant ALL permissions to 'administrators' role on the same folder
     std::cout << "Test 6: Granting ALL permissions to 'administrators' role on test folder...\n";
-    result = acl_manager.grant_permission(folder_uid, admins_role, PrincipalType::ROLE, all_permissions);
+    result = acl_manager.grant_permission(folder_uid, admins_role, PrincipalType::ROLE, all_permissions, "", kTestCtx);
     assert(result.success);
     std::cout << "  Granted ALL permissions to 'administrators' role on folder: OK\n";
 

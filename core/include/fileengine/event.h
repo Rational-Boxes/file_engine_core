@@ -36,6 +36,23 @@ enum class FileEventType {
     RoleAssigned,       // a user was added to a role
     RoleMemberRemoved,  // a user was removed from a role
     RoleDeleted,        // a role was deleted (all members lose its grants)
+
+    // A freshness HINT, never a data source (PROPOSAL_accountability_record.md
+    // §4.3). It says only "at least seq N now exists for this tenant"; the
+    // consumer reacts by reading the core's accountability table immediately,
+    // out of schedule, rather than acting on the payload.
+    //
+    // This stream's own properties are exactly right for that job and exactly
+    // wrong for anything more: fail-open, trimmed, drop-oldest. A lost hint
+    // costs latency only, because the scheduled poll collects the record
+    // regardless. Nothing is EVER only on the queue.
+    //
+    // The seq also gives the consumer a staleness check it otherwise could not
+    // have: if the table read does not show N, it is reading state that has not
+    // caught up — a replica behind the primary, say — and must retry rather than
+    // advance its cursor. Without the assertion that condition is invisible,
+    // because it looks identical to "no new records".
+    AccountabilityCommitted,
 };
 
 // Contract string for an event type (e.g. "file.updated").
@@ -71,6 +88,9 @@ struct FileEvent {
     // invalidate cached decisions for the member (or all members of the role).
     std::string   role;
     std::string   member;
+
+    // AccountabilityCommitted only: the committed chain position being asserted.
+    int64_t       accountability_seq = 0;
 };
 
 // Serialize to the contract JSON envelope.

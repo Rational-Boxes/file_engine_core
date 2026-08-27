@@ -217,6 +217,10 @@ public:
                                  const fileengine_rpc::PurgeOldVersionsRequest* request,
                                  fileengine_rpc::PurgeOldVersionsResponse* response) override;
 
+    grpc::Status ListAccountabilityRecords(grpc::ServerContext* context,
+                                          const fileengine_rpc::ListAccountabilityRecordsRequest* request,
+                                          fileengine_rpc::ListAccountabilityRecordsResponse* response) override;
+
     grpc::Status TriggerSync(grpc::ServerContext* context,
                             const fileengine_rpc::TriggerSyncRequest* request,
                             fileengine_rpc::TriggerSyncResponse* response) override;
@@ -295,6 +299,24 @@ private:
             roles.push_back(role);
         }
         return roles;
+    }
+
+    // The acting identity, as the accountability write path needs it. Built
+    // from the same auth context every handler already reads, so a record can
+    // never disagree with the permission check that let the operation through.
+    //
+    // t_audit_source_ is read rather than auth_ctx.source_addr() directly so
+    // this is correct whether or not the caller has been through
+    // get_tenant_from_auth_context yet.
+    inline AccountabilityContext accountability_ctx(
+            const fileengine_rpc::AuthenticationContext& auth_ctx) {
+        AccountabilityContext ctx;
+        ctx.actor        = get_user_from_auth_context(auth_ctx);
+        ctx.actor_roles  = get_roles_from_auth_context(auth_ctx);
+        ctx.source_iface = "grpc";
+        ctx.source_addr  = auth_ctx.source_addr().empty() ? t_audit_source_
+                                                          : auth_ctx.source_addr();
+        return ctx;
     }
 
     // Helper function to get the principal's claims (key->value) from the auth

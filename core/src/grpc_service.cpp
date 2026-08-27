@@ -21,6 +21,8 @@
 #include <chrono>
 #include <ctime>
 #include "fileengine/connection_pool_manager.h"
+#include "fileengine/database.h"
+#include <algorithm>
 #include "fileengine/server_logger.h"
 #include "json.hpp"
 
@@ -101,17 +103,17 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
                                         const std::string& target_uid, AuditTargetType target_type,
                                         const std::string& detail_json) {
     if (!audit_sink_) return;
-    // Resolve the target's display name (and detect rendition/sidecar hidden
-    // children) for file/dir/version targets in a single lookup path.
-    std::string resolved_name;
+    // Classify rendition/sidecar hidden children so their writes can be dropped.
+    // The target's NAME is deliberately not resolved or stored — see
+    // AuditEntry's comment and §5.4.7: the log carries the uid, and a viewer
+    // joins to the current name at read time.
     if (filesystem_ && (target_type == AuditTargetType::File ||
                         target_type == AuditTargetType::Dir ||
                         target_type == AuditTargetType::Version)) {
-        bool is_hidden = false;
-        filesystem_->resolve_audit_target(target_uid, tenant, resolved_name, is_hidden);
         // Drop hidden-child / sidecar (rendition) writes unless explicitly enabled
         // — the conversion service's thumbnail/preview output is noise, not signal.
-        if (!audit_hidden_children_ && target_type == AuditTargetType::File && is_hidden) {
+        if (!audit_hidden_children_ && target_type == AuditTargetType::File &&
+            filesystem_->audit_target_is_hidden_child(target_uid, tenant)) {
             return;
         }
     }
@@ -124,7 +126,6 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
     e.actor = actor;
     e.actor_roles = roles;
     e.target_uid = target_uid;
-    e.target_name = resolved_name;
     e.target_type = target_type;
     e.source_iface = "grpc";
     e.source_addr = t_audit_source_;
@@ -139,16 +140,13 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
                                         const std::string& detail_json) {
     if (!audit_sink_) return;
 
-    // Resolve the target's display name (and detect rendition/sidecar hidden
-    // children) for file/dir/version targets. Done before the sampling valve so a
-    // hidden child never consumes a sample and reads of them can be dropped.
-    std::string resolved_name;
+    // Classify rendition/sidecar hidden children before the sampling valve, so a
+    // hidden child never consumes a sample. As above, the name is not resolved.
     if (filesystem_ && (target_type == AuditTargetType::File ||
                         target_type == AuditTargetType::Dir ||
                         target_type == AuditTargetType::Version)) {
-        bool is_hidden = false;
-        filesystem_->resolve_audit_target(target_uid, tenant, resolved_name, is_hidden);
-        if (!audit_hidden_children_ && target_type == AuditTargetType::File && is_hidden) {
+        if (!audit_hidden_children_ && target_type == AuditTargetType::File &&
+            filesystem_->audit_target_is_hidden_child(target_uid, tenant)) {
             return;
         }
     }
@@ -186,7 +184,6 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
     e.actor = actor;
     e.actor_roles = roles;
     e.target_uid = target_uid;
-    e.target_name = resolved_name;
     e.target_type = target_type;
     e.source_iface = "grpc";
     e.source_addr = t_audit_source_;
@@ -1435,6 +1432,9 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::CULL_VERSIONS:
             converted_permissions = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
             break;
+        case fileengine_rpc::Permission::ERASE:
+            converted_permissions = static_cast<int>(fileengine::Permission::ERASE);
+            break;
         default:
             converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1456,10 +1456,15 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
+    // The accountability record is written by the DB layer inside this grant's
+    // own transaction (PROPOSAL_accountability_record.md §5.1), so a failure to
+    // record fails the grant. That is the point: unlike the write-ahead above —
+    // which is durable-but-separate — this cannot leave a committed permission
+    // change with no record of it.
     auto result = acl_manager_->grant_permission(resource_uid, principal,
                                                  principal_type,
                                                  converted_permissions, tenant,
-                                                 /*performed_by=*/user,
+                                                 accountability_ctx(auth_context),
                                                  rule_effect);
 
     response->set_success(result.success);
@@ -1605,6 +1610,9 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::CULL_VERSIONS:
             converted_permissions = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
             break;
+        case fileengine_rpc::Permission::ERASE:
+            converted_permissions = static_cast<int>(fileengine::Permission::ERASE);
+            break;
         default:
             converted_permissions = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
             break;
@@ -1627,7 +1635,7 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     auto result = acl_manager_->revoke_permission(resource_uid, principal,
                                                   principal_type,
                                                   converted_permissions, tenant,
-                                                  /*performed_by=*/user,
+                                                  accountability_ctx(auth_context),
                                                   rule_effect);
 
     response->set_success(result.success);
@@ -1964,6 +1972,111 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+grpc::Status GRPCFileService::ListAccountabilityRecords(
+        grpc::ServerContext* context,
+        const fileengine_rpc::ListAccountabilityRecordsRequest* request,
+        fileengine_rpc::ListAccountabilityRecordsResponse* response) {
+    (void)context;
+    auto auth_context = request->auth();
+    const std::string caller = get_user_from_auth_context(auth_context);
+    const std::vector<std::string> caller_roles = get_roles_from_auth_context(auth_context);
+    // NOTE: read the requested tenant from the REQUEST, not from the caller's
+    // auth context. The consumer is one service polling every tenant's chain in
+    // turn, so its own auth context names one tenant while it asks about
+    // another. get_tenant_from_auth_context is still called for its side effect
+    // of stashing source_addr for the audit trail.
+    (void)get_tenant_from_auth_context(auth_context);
+    const std::string tenant = request->tenant().empty() ? std::string("default")
+                                                          : request->tenant();
+
+    const bool is_reader = std::find(caller_roles.begin(), caller_roles.end(),
+                                     kAccountabilityReaderRole) != caller_roles.end();
+    const bool is_system_admin = std::find(caller_roles.begin(), caller_roles.end(),
+                                           kSystemAdminRole) != caller_roles.end();
+
+    // Gated on a dedicated role, not on ordinary gRPC reachability (§4.3.1).
+    // Everything inside the boundary is trusted; that is not a reason to let
+    // everything inside it read the security log.
+    if (!is_reader && !is_system_admin) {
+        response->set_success(false);
+        response->set_error("Reading accountability records requires the "
+                            + std::string(kAccountabilityReaderRole) + " role");
+        SERVER_LOG_WARN("GRPCService", "ListAccountabilityRecords denied for user " + caller +
+                                       " (tenant " + tenant + ")");
+        // A denied attempt to read the security log is itself a security signal.
+        emit_permission_audit(tenant, "accountability_read", AuditOutcome::Denied, caller,
+                              caller_roles, /*resource_uid=*/"", /*principal=*/caller,
+                              /*principal_type=*/0, "allow", 0);
+        return grpc::Status::OK;
+    }
+
+    const bool is_global = (request->tenant() == kGlobalChainKey);
+    if (is_global && !is_system_admin) {
+        // The global chain spans every tenant, so it is a strictly higher grant
+        // than reading one tenant's — a per-tenant reader must not get it by
+        // asking for a different tenant name.
+        response->set_success(false);
+        response->set_error("Only system_admin may read the global accountability chain");
+        emit_permission_audit(kGlobalChainKey, "accountability_read", AuditOutcome::Denied, caller,
+                              caller_roles, "", caller, 0, "allow", 0);
+        return grpc::Status::OK;
+    }
+
+    auto tenant_context = tenant_manager_->get_tenant_context(is_global ? "default" : tenant);
+    if (!tenant_context || !tenant_context->db) {
+        response->set_success(false);
+        response->set_error("Tenant context not found or database unavailable");
+        return grpc::Status::OK;
+    }
+
+    bool has_more = false;
+    auto records = tenant_context->db->list_accountability_records(
+        is_global ? std::string(kGlobalChainKey) : tenant,
+        request->newer_than_ts_micros(), request->limit(), has_more);
+    if (!records.success) {
+        response->set_success(false);
+        response->set_error(records.error);
+        SERVER_LOG_ERROR("GRPCService", "ListAccountabilityRecords failed for tenant " + tenant +
+                                        ": " + records.error);
+        return grpc::Status::OK;
+    }
+
+    for (const auto& r : records.value) {
+        auto* out = response->add_records();
+        out->set_seq(r.seq);
+        out->set_ts_micros(r.ts_micros);
+        out->set_ts(r.ts_iso);
+        out->set_actor(r.record.ctx.actor);
+        for (const auto& role : r.record.ctx.actor_roles) out->add_actor_roles(role);
+        out->set_source_iface(r.record.ctx.source_iface);
+        out->set_source_addr(r.record.ctx.source_addr);
+        out->set_category(to_string(r.record.category));
+        out->set_action(r.record.action);
+        out->set_target_uid(r.record.target_uid);
+        out->set_target_type(r.record.target_type);
+        out->set_principal(r.record.principal);
+        // Canonical JSON, not a re-serialization: the consumer hashes these bytes.
+        out->set_detail(r.record.detail.empty() ? std::string("{}")
+                                                : r.record.detail.canonical_json());
+        out->set_prev_hash(std::string(r.prev_hash.begin(), r.prev_hash.end()));
+        out->set_hash(std::string(r.hash.begin(), r.hash.end()));
+        out->set_global_tenant(r.record.global_tenant);
+    }
+    response->set_has_more(has_more);
+
+    // The head position, so a consumer can distinguish "nothing new" from
+    // "I am reading state that has not caught up" (§4.3). Best-effort: a failure
+    // here leaves head_seq at 0, which the consumer reads as "unknown" rather
+    // than as an assertion, so it never manufactures a false staleness alarm.
+    if (auto* db = dynamic_cast<Database*>(tenant_context->db.get())) {
+        auto head = db->accountability_head_seq(is_global ? std::string(kGlobalChainKey) : tenant);
+        if (head.success) response->set_head_seq(head.value);
+    }
+
+    response->set_success(true);
+    return grpc::Status::OK;
+}
+
 grpc::Status GRPCFileService::TriggerSync(grpc::ServerContext* context,
                                          const fileengine_rpc::TriggerSyncRequest* request,
                                          fileengine_rpc::TriggerSyncResponse* response) {
@@ -2005,7 +2118,8 @@ grpc::Status GRPCFileService::CreateRole(grpc::ServerContext* context,
     }
 
     auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
-    auto result = role_manager->create_role(request->role(), tenant);
+    auto result = role_manager->create_role(request->role(), tenant,
+                                            accountability_ctx(auth_context));
 
     response->set_success(result.success);
     if (!result.success) {
@@ -2038,7 +2152,8 @@ grpc::Status GRPCFileService::DeleteRole(grpc::ServerContext* context,
     }
 
     auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
-    auto result = role_manager->delete_role(request->role(), tenant);
+    auto result = role_manager->delete_role(request->role(), tenant,
+                                            accountability_ctx(auth_context));
 
     response->set_success(result.success);
     if (!result.success) {
@@ -2074,7 +2189,8 @@ grpc::Status GRPCFileService::AssignUserToRole(grpc::ServerContext* context,
     }
 
     auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
-    auto result = role_manager->assign_user_to_role(request->user(), request->role(), tenant);
+    auto result = role_manager->assign_user_to_role(request->user(), request->role(), tenant,
+                                                    accountability_ctx(auth_context));
 
     response->set_success(result.success);
     if (!result.success) {
@@ -2110,7 +2226,8 @@ grpc::Status GRPCFileService::RemoveUserFromRole(grpc::ServerContext* context,
     }
 
     auto role_manager = std::make_shared<RoleManager>(tenant_context->db);
-    auto result = role_manager->remove_user_from_role(request->user(), request->role(), tenant);
+    auto result = role_manager->remove_user_from_role(request->user(), request->role(), tenant,
+                                                      accountability_ctx(auth_context));
 
     response->set_success(result.success);
     if (!result.success) {
