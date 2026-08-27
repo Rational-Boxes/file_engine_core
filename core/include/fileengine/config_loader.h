@@ -50,6 +50,28 @@ struct Config {
     // Tenant configuration
     bool multi_tenant_enabled = true;
     
+    // ── Service authentication (PROPOSAL_service_authentication.md §5) ──────
+    //
+    // Required by default, consistent with the loopback-bind decision: the safe
+    // configuration is the default, and getting it wrong fails loudly at
+    // startup rather than silently leaving the door open. The escape hatch
+    // exists for the migration and warns on EVERY start.
+    bool service_auth_required = true;
+    // THE one secret. Peppers the stored hashes and deliberately never enters
+    // the database, so a dump yields no usable token. Losing it is total
+    // lockout — every stored hash becomes unverifiable — which makes it the
+    // artefact most likely to be missed in a restore, because it is one
+    // environment variable rather than a file anyone thinks to back up.
+    std::string service_token_pepper;
+    // Set only during a pepper rotation: rows verified under it are rehashed
+    // under the current pepper as services authenticate.
+    std::string service_token_previous_pepper;
+    int service_token_pepper_version = 1;
+    // Short by design. The map lives in the database precisely so adding a
+    // service or finishing a rotation takes effect without a core restart; a
+    // long cache would hand that back.
+    int service_map_cache_ttl_seconds = 30;
+
     // Server configuration
     //
     // Loopback by default. The gRPC interface is the trusted-access path: the

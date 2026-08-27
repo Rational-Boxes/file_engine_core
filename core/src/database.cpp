@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <functional>
 
 namespace fileengine {
 
@@ -220,6 +221,79 @@ Result<void> Database::create_schema() {
 
         INSERT INTO accountability_chain_head_global (tenant) VALUES ('*global*')
         ON CONFLICT (tenant) DO NOTHING;
+
+        -- Per-service gRPC credentials (PROPOSAL_service_authentication.md §3.5).
+        --
+        -- NAMED service_auth_*, NOT service_credential. `public.service_credential`
+        -- already exists and belongs to ldap_manager — it holds END-USER service
+        -- credentials (the fesk_/fesks_ key:secret pairs for the WebDAV and MCP
+        -- doors) in this same database. Colliding was silent in the worst way:
+        -- CREATE TABLE IF NOT EXISTS simply skipped, leaving the core pointed at
+        -- another service's store with a shape it does not share. Different
+        -- concern, different owner, different name.
+        --
+        -- Global, not per-tenant: a service identity spans the deployment. The
+        -- map lives in PostgreSQL rather than an encrypted file for one decisive
+        -- reason — a file cannot record its own changes, and credential
+        -- lifecycle is exactly the class of act the accountability record
+        -- exists to capture. It also adds no new dependency: the core already
+        -- cannot start without this database, so the map is available in
+        -- precisely the situations the core is running.
+        --
+        -- MULTIPLE ROWS PER SERVICE ARE THE POINT. Rotation is: add the new
+        -- secret alongside the old, roll the service onto it, drop the old.
+        -- Without overlap, rotating means restarting every service at once,
+        -- which means in practice it never happens — and a credential that is
+        -- never rotated is the problem this exists to reduce. So the primary
+        -- key is the hash, not the service_id.
+        --
+        -- The hash is HMAC-SHA256(secret, pepper) and the PEPPER IS NOT HERE:
+        -- it lives in the environment, so a database dump yields no usable
+        -- token. pepper_version records which pepper a row was hashed under, so
+        -- rotation can migrate rows opportunistically as services authenticate
+        -- (the plaintext is available at exactly that moment and nowhere else).
+        CREATE TABLE IF NOT EXISTS service_auth_credential (
+            hash            BYTEA        PRIMARY KEY,
+            service_id      VARCHAR(255) NOT NULL,
+            pepper_version  INTEGER      NOT NULL DEFAULT 1,
+            created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+            last_used_at    TIMESTAMPTZ
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_service_credential_id
+            ON service_auth_credential(service_id);
+
+        -- Capability ASSIGNMENTS live here; the definitions (which RPCs make up
+        -- `destroy`, `acl`, `read`) stay compiled, because those describe the
+        -- API rather than a deployment. Adding a service is therefore a row, and
+        -- it takes effect on every node within the cache TTL with no release and
+        -- no restart — which matters because a core restart is a platform
+        -- outage, and a process that expensive gets worked around rather than
+        -- followed.
+        --
+        -- One row per (service, capability). There is deliberately no way to
+        -- represent `*` or "all": a blanket grant cannot be reviewed, grows
+        -- silently when a capability is split, and would bypass the
+        -- default-deny property at the one identity most likely to hold it.
+        CREATE TABLE IF NOT EXISTS service_auth_capability (
+            service_id  VARCHAR(255) NOT NULL,
+            capability  VARCHAR(32)  NOT NULL,
+            granted_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+            granted_by  VARCHAR(255),
+            PRIMARY KEY (service_id, capability)
+        );
+
+        -- Bootstrap completion. Deliberately NOT "are there rows in
+        -- service_auth_credential": condition-on-emptiness would reopen the
+        -- unauthenticated enrolment path for anyone who can delete rows, which
+        -- turns a one-shot into a permanent back door. A separate marker means
+        -- emptying the map does not reopen it.
+        CREATE TABLE IF NOT EXISTS service_auth_bootstrap (
+            id            BOOLEAN     PRIMARY KEY DEFAULT TRUE,
+            completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            enrolled_id   VARCHAR(255) NOT NULL,
+            CONSTRAINT service_bootstrap_single_row CHECK (id)
+        );
     )SQL";
 
     // Execute global schema SQL statements
@@ -2326,6 +2400,809 @@ void Database::fire_accountability_hint(const std::string& tenant, std::int64_t 
         // shortens the consumer's latency, so a failure here must never surface
         // as a failed operation.
     }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The service map (PROPOSAL_service_authentication.md §3.5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Accountability records for credential lifecycle. §3.6: each operation writes
+// one in the SAME TRANSACTION as the map change — if the record cannot be
+// written, the credential change does not happen.
+//
+// The record NEVER contains the credential. Not the secret, not its hash, not
+// the pepper. That rule matters more here than anywhere: the alternative is a
+// tamper-evident, never-culled, permanently-retained log containing every
+// service secret ever issued. service_id, action, operator and pepper version
+// answer "who granted what, when"; nothing else is needed.
+AccountabilityRecord credential_record(const AccountabilityContext& ctx,
+                                       const char* action,
+                                       AccountabilityCategory category,
+                                       const std::string& service_id) {
+    AccountabilityRecord rec;
+    rec.ctx           = ctx;
+    rec.category      = category;
+    rec.action        = action;
+    rec.target_type   = "service";
+    rec.principal     = service_id;
+    rec.global_tenant = service_id;   // global chain: the record is ABOUT a service
+    return rec;
+}
+
+}  // namespace
+
+Result<ServiceIdentity> Database::resolve_service_token(const std::string& token,
+                                                        const std::string& pepper,
+                                                        const std::string& previous_pepper,
+                                                        int current_pepper_version) {
+    ServiceIdentity identity;
+    const ParsedToken parsed = parse_service_token(token);
+    if (!parsed.valid) {
+        // Malformed. Still burn the work so a bad shape does not return faster
+        // than a bad secret.
+        dummy_verify(pepper);
+        return Result<ServiceIdentity>::ok(identity);
+    }
+
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<ServiceIdentity>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    // Index by service_id, then verify the secret half in constant time. The
+    // lookup is O(1); only the comparison is security-sensitive.
+    const std::string sql =
+        "SELECT hash, pepper_version FROM service_auth_credential WHERE service_id = $1;";
+    const char* params[1] = { parsed.service_id.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<ServiceIdentity>::err("Failed to read the service map: " + err);
+    }
+
+    const int rows = PQntuples(res);
+    if (rows == 0) {
+        PQclear(res);
+        connection_pool_->release(conn);
+        // Unknown service id. Same cost as a wrong secret, so the miss path
+        // cannot be used to enumerate valid service names.
+        dummy_verify(pepper);
+        return Result<ServiceIdentity>::ok(identity);
+    }
+
+    // A service legitimately holds SEVERAL credentials during a rotation, so
+    // every row is a candidate. Iterate all of them rather than stopping at the
+    // first mismatch — stopping early would make a rotating service's second
+    // secret cheaper to test than its first.
+    const auto current_hash  = hash_service_secret(pepper, parsed.secret);
+    const auto previous_hash = previous_pepper.empty()
+                                   ? std::vector<std::uint8_t>()
+                                   : hash_service_secret(previous_pepper, parsed.secret);
+    std::vector<std::uint8_t> matched_hash;
+    int  matched_version = 0;
+    bool matched_on_previous_pepper = false;
+
+    for (int i = 0; i < rows; ++i) {
+        const auto stored = parse_bytea_hex(PQgetvalue(res, i, 0));
+        const int  version = std::atoi(PQgetvalue(res, i, 1));
+        if (constant_time_equals(stored, current_hash)) {
+            matched_hash = stored;
+            matched_version = version;
+        } else if (!previous_hash.empty() && constant_time_equals(stored, previous_hash)) {
+            matched_hash = stored;
+            matched_version = version;
+            matched_on_previous_pepper = true;
+        }
+    }
+    PQclear(res);
+
+    if (matched_hash.empty()) {
+        connection_pool_->release(conn);
+        return Result<ServiceIdentity>::ok(identity);   // authenticated nobody
+    }
+
+    identity.service_id     = parsed.service_id;
+    identity.pepper_version = matched_version;
+
+    // Opportunistic pepper migration (§3.5). The core stores only the hash and
+    // never the plaintext, so it cannot re-key a row on its own — but at a
+    // SUCCESSFUL authentication the caller has just presented the plaintext,
+    // which is the one moment re-keying is possible. Rows therefore migrate on
+    // their own as services authenticate, and the old pepper is retired when a
+    // query says none remain.
+    //
+    // Best-effort and once-per-row: this is a write on the authentication path,
+    // and a failure here must never fail the call. Two nodes racing to rehash
+    // the same row is harmless — both compute the same value.
+    if (matched_on_previous_pepper && !current_hash.empty()) {
+        const std::string rehash_sql =
+            "UPDATE service_auth_credential SET hash = $2::bytea, pepper_version = $3::int "
+            "WHERE hash = $1::bytea;";
+        const std::string old_hex = bytea_hex(matched_hash);
+        const std::string new_hex = bytea_hex(current_hash);
+        const std::string version_str = std::to_string(current_pepper_version);
+        const char* rehash_params[3] = { old_hex.c_str(), new_hex.c_str(), version_str.c_str() };
+        PGresult* rehash_res = PQexecParams(pg_conn, rehash_sql.c_str(), 3, nullptr,
+                                            rehash_params, nullptr, nullptr, 0);
+        if (rehash_res) PQclear(rehash_res);
+        identity.pepper_version = current_pepper_version;
+    }
+
+    // last_used_at, best-effort. Useful for spotting a credential nothing is
+    // presenting any more — the safe ones to prune.
+    {
+        const std::string touch_sql =
+            "UPDATE service_auth_credential SET last_used_at = now() WHERE hash = $1::bytea;";
+        const std::string hex = bytea_hex(matched_hash);
+        const char* touch_params[1] = { hex.c_str() };
+        PGresult* touch_res = PQexecParams(pg_conn, touch_sql.c_str(), 1, nullptr,
+                                           touch_params, nullptr, nullptr, 0);
+        if (touch_res) PQclear(touch_res);
+    }
+
+    // Capabilities. `cli:*` is the reserved class holding every capability —
+    // and holding them as CAPABILITIES, not as an exemption from the mechanism,
+    // so an unclassified RPC stays unreachable by it too.
+    if (identity.is_cli()) {
+        identity.capabilities = all_capabilities();
+    } else {
+        const std::string cap_sql =
+            "SELECT capability FROM service_auth_capability WHERE service_id = $1;";
+        const char* cap_params[1] = { parsed.service_id.c_str() };
+        PGresult* cap_res = PQexecParams(pg_conn, cap_sql.c_str(), 1, nullptr,
+                                         cap_params, nullptr, nullptr, 0);
+        if (PQresultStatus(cap_res) == PGRES_TUPLES_OK) {
+            for (int i = 0; i < PQntuples(cap_res); ++i) {
+                Capability c;
+                if (parse_capability(PQgetvalue(cap_res, i, 0), c)) {
+                    identity.capabilities.push_back(c);
+                }
+                // An unparseable capability string is ignored rather than
+                // treated as a wildcard. A row naming a capability this build
+                // does not know must never widen access.
+            }
+        }
+        PQclear(cap_res);
+    }
+
+    connection_pool_->release(conn);
+    return Result<ServiceIdentity>::ok(identity);
+}
+
+Result<std::string> Database::issue_service_credential(const std::string& service_id,
+                                                       const std::string& pepper,
+                                                       int pepper_version,
+                                                       const AccountabilityContext& ctx,
+                                                       bool rotate) {
+    if (service_id.empty()) return Result<std::string>::err("service_id cannot be empty");
+    if (pepper.empty()) {
+        return Result<std::string>::err(
+            "FILEENGINE_SERVICE_TOKEN_PEPPER is not set — refusing to store an "
+            "unpeppered hash, which would verify perfectly and be worthless the "
+            "moment the database leaked");
+    }
+    if (!ctx.valid()) return Result<std::string>::err("Refusing a credential change with no actor");
+
+    const std::string secret = generate_service_secret();
+    if (secret.empty()) return Result<std::string>::err("Could not generate a secret");
+    const auto hash = hash_service_secret(pepper, secret);
+    if (hash.empty()) return Result<std::string>::err("Could not hash the secret");
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::string>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<std::string>::err("Failed to BEGIN: " + err);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<std::string>::err(msg);
+    };
+
+    // Rotation ADDS alongside; an issue for a service that already holds one is
+    // rejected unless rotating, because replacing in place would strand every
+    // instance still holding the old secret.
+    if (!rotate) {
+        const std::string count_sql =
+            "SELECT count(*) FROM service_auth_credential WHERE service_id = $1;";
+        const char* count_params[1] = { service_id.c_str() };
+        PGresult* count_res = PQexecParams(pg_conn, count_sql.c_str(), 1, nullptr,
+                                           count_params, nullptr, nullptr, 0);
+        const bool exists = PQresultStatus(count_res) == PGRES_TUPLES_OK &&
+                            PQntuples(count_res) == 1 &&
+                            std::atoi(PQgetvalue(count_res, 0, 0)) > 0;
+        PQclear(count_res);
+        if (exists) {
+            return rollback_and_fail(
+                "'" + service_id + "' already holds a credential. Use `rotate` to add one "
+                "alongside it — replacing in place would strand every instance still "
+                "presenting the old secret.");
+        }
+    }
+
+    {
+        const std::string sql =
+            "INSERT INTO service_auth_credential (hash, service_id, pepper_version) "
+            "VALUES ($1::bytea, $2, $3::int);";
+        const std::string hex = bytea_hex(hash);
+        const std::string version_str = std::to_string(pepper_version);
+        const char* params[3] = { hex.c_str(), service_id.c_str(), version_str.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(pg_conn);
+        PQclear(res);
+        if (!ok) return rollback_and_fail("Failed to store the credential: " + err);
+    }
+
+    {
+        auto rec = credential_record(ctx,
+                                     rotate ? accountability_action::kServiceTokenRotated
+                                            : accountability_action::kServiceTokenIssued,
+                                     AccountabilityCategory::Identity, service_id);
+        rec.detail.set("service_id", service_id);
+        rec.detail.set("pepper_version", pepper_version);
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Credential change refused: " + recorded.error);
+        }
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+
+    // The plaintext exists here and nowhere else. It goes to the caller once;
+    // there is nothing to recover it from afterwards.
+    return Result<std::string>::ok(format_service_token(service_id, secret));
+}
+
+
+namespace {
+
+// prune and revoke differ only in which rows go and what gets recorded, so they
+// share the mechanism. Both are idempotent: removing nothing is a success, not
+// an error, because a retry after a partial failure must not report failure for
+// work already done.
+Result<int> remove_service_credentials(Database& db, PGconn* pg_conn,
+                                       ConnectionPool& pool,
+                                       std::shared_ptr<DatabaseConnection> conn,
+                                       const std::string& service_id,
+                                       const AccountabilityContext& ctx,
+                                       bool keep_newest,
+                                       const char* action,
+                                       // Returns only success/error: the commit's seq and ts
+                                       // are not needed here, and taking the private
+                                       // AccountabilityCommit through a free function would
+                                       // mean widening its visibility for no benefit.
+                                       std::function<Result<void>(
+                                           PGconn*, const std::string&, const AccountabilityRecord&)> append) {
+    (void)db;
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        pool.release(conn);
+        return Result<int>::err(msg);
+    };
+
+    // keep_newest is what makes prune the completion of a rotation rather than
+    // a revocation: the credential the service has already rolled onto stays,
+    // every superseded one goes.
+    const std::string sql =
+        keep_newest
+            ? "DELETE FROM service_auth_credential WHERE service_id = $1 AND hash <> ("
+              "  SELECT hash FROM service_auth_credential WHERE service_id = $1 "
+              "  ORDER BY created_at DESC, hash DESC LIMIT 1);"
+            : "DELETE FROM service_auth_credential WHERE service_id = $1;";
+    const char* params[1] = { service_id.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        return rollback_and_fail("Failed to remove credentials: " + err);
+    }
+    const int removed = std::atoi(PQcmdTuples(res));
+    PQclear(res);
+
+    // Record even when nothing was removed. "revoke was run against a service
+    // that held nothing" is a fact worth having; silence would make an
+    // ineffective revocation indistinguishable from an effective one.
+    AccountabilityRecord rec;
+    rec.ctx           = ctx;
+    rec.category      = AccountabilityCategory::Identity;
+    rec.action        = action;
+    rec.target_type   = "service";
+    rec.principal     = service_id;
+    rec.global_tenant = service_id;
+    rec.detail.set("service_id", service_id);
+    rec.detail.set("removed", removed);
+    auto recorded = append(pg_conn, kGlobalChainKey, rec);
+    if (!recorded.success) {
+        return rollback_and_fail("Credential change refused: " + recorded.error);
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    pool.release(conn);
+    return Result<int>::ok(removed);
+}
+
+}  // namespace
+
+Result<int> Database::prune_service_credentials(const std::string& service_id,
+                                                const AccountabilityContext& ctx) {
+    if (!ctx.valid()) return Result<int>::err("Refusing a credential change with no actor");
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<int>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    return remove_service_credentials(
+        *this, pg_conn, *connection_pool_, conn, service_id, ctx, /*keep_newest=*/true,
+        accountability_action::kServiceTokenPruned,
+        [this](PGconn* c, const std::string& t, const AccountabilityRecord& r) -> Result<void> {
+            auto out = append_accountability(c, t, r);
+            return out.success ? Result<void>::ok() : Result<void>::err(out.error);
+        });
+}
+
+Result<int> Database::revoke_service_credentials(const std::string& service_id,
+                                                 const AccountabilityContext& ctx) {
+    if (!ctx.valid()) return Result<int>::err("Refusing a credential change with no actor");
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<int>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    return remove_service_credentials(
+        *this, pg_conn, *connection_pool_, conn, service_id, ctx, /*keep_newest=*/false,
+        accountability_action::kServiceTokenRevoked,
+        [this](PGconn* c, const std::string& t, const AccountabilityRecord& r) -> Result<void> {
+            auto out = append_accountability(c, t, r);
+            return out.success ? Result<void>::ok() : Result<void>::err(out.error);
+        });
+}
+
+Result<std::vector<Database::ServiceCredentialInfo>> Database::list_service_credentials() {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<ServiceCredentialInfo>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    // Deliberately selects no hash. `list` must never print a secret, and the
+    // simplest way to keep that true is for the query not to carry one.
+    const char* sql =
+        "SELECT c.service_id, c.pepper_version, "
+        "       to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'), "
+        "       COALESCE(to_char(c.last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SSZ'), ''), "
+        "       COALESCE(string_agg(DISTINCT s.capability, ',' ORDER BY s.capability), '') "
+        "FROM service_auth_credential c "
+        "LEFT JOIN service_auth_capability s ON s.service_id = c.service_id "
+        "GROUP BY c.hash, c.service_id, c.pepper_version, c.created_at, c.last_used_at "
+        "ORDER BY c.service_id, c.created_at;";
+    PGresult* res = PQexec(pg_conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<ServiceCredentialInfo>>::err("Failed to list credentials: " + err);
+    }
+    std::vector<ServiceCredentialInfo> out;
+    for (int i = 0; i < PQntuples(res); ++i) {
+        ServiceCredentialInfo info;
+        info.service_id     = PQgetvalue(res, i, 0);
+        info.pepper_version = std::atoi(PQgetvalue(res, i, 1));
+        info.created_at     = PQgetvalue(res, i, 2);
+        info.last_used_at   = PQgetvalue(res, i, 3);
+        const std::string caps = PQgetvalue(res, i, 4);
+        std::size_t start = 0;
+        while (!caps.empty() && start <= caps.size()) {
+            const std::size_t comma = caps.find(',', start);
+            info.capabilities.push_back(caps.substr(start, comma == std::string::npos
+                                                              ? std::string::npos
+                                                              : comma - start));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        out.push_back(std::move(info));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<ServiceCredentialInfo>>::ok(out);
+}
+
+Result<void> Database::grant_service_capability(const std::string& service_id,
+                                                Capability capability,
+                                                const AccountabilityContext& ctx) {
+    if (!ctx.valid()) return Result<void>::err("Refusing a capability change with no actor");
+    // `cli:*` holds every capability by reservation, in code. Storing grants for
+    // it would make the reserved-identity rule one UPDATE from being untrue.
+    if (service_id.rfind(kCliIdentityPrefix, 0) == 0) {
+        return Result<void>::err(
+            "cli identities hold every capability by reservation and cannot be granted "
+            "individually — the reservation lives in code precisely so it is not one "
+            "UPDATE away from being false");
+    }
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<void>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
+    const std::string cap_name = to_string(capability);
+    {
+        const std::string sql =
+            "INSERT INTO service_auth_capability (service_id, capability, granted_by) "
+            "VALUES ($1, $2, $3) ON CONFLICT (service_id, capability) DO NOTHING;";
+        const char* params[3] = { service_id.c_str(), cap_name.c_str(), ctx.actor.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(pg_conn);
+        PQclear(res);
+        if (!ok) return rollback_and_fail("Failed to grant the capability: " + err);
+    }
+    {
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Authorization;
+        rec.action        = accountability_action::kServiceCapGranted;
+        rec.target_type   = "service";
+        rec.principal     = service_id;
+        rec.global_tenant = service_id;
+        rec.detail.set("service_id", service_id);
+        rec.detail.set("capability", cap_name);
+        // Flagged in the record itself, so "who armed this service" is
+        // answerable without cross-referencing which capabilities were
+        // high-risk at the time.
+        rec.detail.set("high_risk", is_high_risk(capability));
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Capability change refused: " + recorded.error);
+        }
+    }
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+    return Result<void>::ok();
+}
+
+Result<void> Database::revoke_service_capability(const std::string& service_id,
+                                                 Capability capability,
+                                                 const AccountabilityContext& ctx) {
+    if (!ctx.valid()) return Result<void>::err("Refusing a capability change with no actor");
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<void>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
+    const std::string cap_name = to_string(capability);
+    {
+        const std::string sql =
+            "DELETE FROM service_auth_capability WHERE service_id = $1 AND capability = $2;";
+        const char* params[2] = { service_id.c_str(), cap_name.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(pg_conn);
+        PQclear(res);
+        if (!ok) return rollback_and_fail("Failed to revoke the capability: " + err);
+    }
+    {
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Authorization;
+        rec.action        = accountability_action::kServiceCapRevoked;
+        rec.target_type   = "service";
+        rec.principal     = service_id;
+        rec.global_tenant = service_id;
+        rec.detail.set("service_id", service_id);
+        rec.detail.set("capability", cap_name);
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Capability change refused: " + recorded.error);
+        }
+    }
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+    return Result<void>::ok();
+}
+
+Result<std::vector<Capability>> Database::service_capabilities(const std::string& service_id) {
+    std::vector<Capability> out;
+    if (service_id.rfind(kCliIdentityPrefix, 0) == 0) {
+        return Result<std::vector<Capability>>::ok(all_capabilities());
+    }
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<Capability>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string sql = "SELECT capability FROM service_auth_capability WHERE service_id = $1;";
+    const char* params[1] = { service_id.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<Capability>>::err("Failed to read capabilities: " + err);
+    }
+    for (int i = 0; i < PQntuples(res); ++i) {
+        Capability c;
+        if (parse_capability(PQgetvalue(res, i, 0), c)) out.push_back(c);
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<Capability>>::ok(out);
+}
+
+// ── Bootstrap (§3.6) ────────────────────────────────────────────────────────
+
+Result<bool> Database::service_bootstrap_complete() {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) return Result<bool>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* res = PQexec(pg_conn, "SELECT count(*) FROM service_auth_bootstrap;");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        // Fail CLOSED: if we cannot tell whether bootstrap is complete, treat it
+        // as complete. Guessing the other way would open an unauthenticated
+        // enrolment path on a database hiccup.
+        return Result<bool>::err("Could not determine bootstrap state: " + err);
+    }
+    const bool complete = std::atoi(PQgetvalue(res, 0, 0)) > 0;
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<bool>::ok(complete);
+}
+
+Result<std::string> Database::enrol_bootstrap_credential(const std::string& service_id,
+                                                         const std::string& pepper,
+                                                         int pepper_version,
+                                                         const AccountabilityContext& ctx) {
+    // Only a cli identity may be enrolled. The enrolment exists to give the
+    // deployment one credential with which to mint everything else; enrolling a
+    // service directly would skip the capability grant that should accompany it.
+    if (service_id.rfind(kCliIdentityPrefix, 0) != 0) {
+        return Result<std::string>::err(
+            "bootstrap enrolment creates a cli identity (cli:<name>) — it exists to give "
+            "the deployment one credential with which to issue the rest");
+    }
+    if (pepper.empty()) {
+        return Result<std::string>::err("FILEENGINE_SERVICE_TOKEN_PEPPER is not set");
+    }
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<std::string>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<std::string>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<std::string>::err(msg);
+    };
+
+    // Both conditions, inside the transaction, so two concurrent enrolments
+    // cannot both pass. The marker insert below is what actually serialises
+    // them — its primary key admits one row — but checking here gives the loser
+    // a comprehensible error rather than a constraint violation.
+    {
+        PGresult* res = PQexec(pg_conn,
+            "SELECT (SELECT count(*) FROM service_auth_bootstrap), "
+            "       (SELECT count(*) FROM service_auth_credential);");
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            const std::string err = PQerrorMessage(pg_conn);
+            PQclear(res);
+            return rollback_and_fail("Could not check bootstrap state: " + err);
+        }
+        const int marker = std::atoi(PQgetvalue(res, 0, 0));
+        const int creds  = std::atoi(PQgetvalue(res, 0, 1));
+        PQclear(res);
+        if (marker > 0) {
+            return rollback_and_fail(
+                "bootstrap enrolment has already been used. It is single-shot by design, "
+                "and the marker is separate from the credential rows precisely so that "
+                "emptying the map does not reopen it.");
+        }
+        if (creds > 0) {
+            return rollback_and_fail(
+                "the service map is not empty — enrolment is permitted only on a system "
+                "that has never had a credential");
+        }
+    }
+
+    const std::string secret = generate_service_secret();
+    const auto hash = hash_service_secret(pepper, secret);
+    if (secret.empty() || hash.empty()) return rollback_and_fail("Could not generate a credential");
+
+    {
+        const std::string sql =
+            "INSERT INTO service_auth_credential (hash, service_id, pepper_version) "
+            "VALUES ($1::bytea, $2, $3::int);";
+        const std::string hex = bytea_hex(hash);
+        const std::string version_str = std::to_string(pepper_version);
+        const char* params[3] = { hex.c_str(), service_id.c_str(), version_str.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(pg_conn);
+        PQclear(res);
+        if (!ok) return rollback_and_fail("Failed to store the credential: " + err);
+    }
+    {
+        const std::string sql =
+            "INSERT INTO service_auth_bootstrap (id, enrolled_id) VALUES (TRUE, $1);";
+        const char* params[1] = { service_id.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(pg_conn);
+        PQclear(res);
+        if (!ok) return rollback_and_fail("Failed to close the bootstrap path: " + err);
+    }
+    {
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Identity;
+        rec.action        = accountability_action::kServiceBootstrapEnrolled;
+        rec.target_type   = "service";
+        rec.principal     = service_id;
+        rec.global_tenant = service_id;
+        rec.detail.set("service_id", service_id);
+        rec.detail.set("pepper_version", pepper_version);
+        // The peer uid the kernel reported, which is unforgeable in a way no
+        // credential is — and the only evidence about WHO enrolled, since by
+        // definition no credential was presented.
+        if (!ctx.source_addr.empty()) rec.detail.set("peer_uid", ctx.source_addr);
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Enrolment refused: " + recorded.error);
+        }
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+    return Result<std::string>::ok(format_service_token(service_id, secret));
+}
+
+Result<void> Database::reopen_service_bootstrap(const AccountabilityContext& ctx) {
+    if (!ctx.valid()) return Result<void>::err("Refusing to reopen enrolment with no actor");
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<void>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<void>::err(msg);
+    };
+
+    PGresult* res = PQexec(pg_conn, "DELETE FROM service_auth_bootstrap;");
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        return rollback_and_fail("Failed to clear the bootstrap marker: " + err);
+    }
+    PQclear(res);
+
+    {
+        // Recorded so a recovery that happened is visible afterwards. An
+        // operator restoring service is not the same as an attacker regaining
+        // it, and the log should be able to tell the difference by showing when
+        // and by whom.
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Identity;
+        rec.action        = accountability_action::kServiceBootstrapReopened;
+        rec.target_type   = "service";
+        rec.global_tenant = "*bootstrap*";
+        rec.detail.set("service_id", std::string("*bootstrap*"));
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Reopen refused: " + recorded.error);
+        }
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+    return Result<void>::ok();
 }
 
 // Cull a file's old versions and record the cull, in one transaction (§5.2).

@@ -17,6 +17,7 @@
 #include "fileengine/utils.h"
 #include "fileengine/server_logger.h"
 #include "fileengine/crypto_utils.h"
+#include "fileengine/service_auth_interceptor.h"
 #include <algorithm>
 #include <optional>
 #include <fstream>
@@ -1697,7 +1698,9 @@ Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int kee
     AccountabilityContext ctx;
     ctx.actor        = user;
     ctx.actor_roles  = roles;
-    ctx.source_iface = "grpc";
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
 
     auto purged = context->db->purge_versions(file_uid, to_purge, cut_version, keep, tenant, ctx);
     if (!purged.success) {
@@ -1875,7 +1878,9 @@ Result<void> FileSystem::grant_permission(const std::string& resource_uid,
     AccountabilityContext ctx;
     ctx.actor        = user;
     ctx.actor_roles  = roles;
-    ctx.source_iface = "grpc";
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
     auto result = acl_manager_->grant_permission(resource_uid, principal, PrincipalType::USER,
                                                  permissions, tenant, ctx);
     if (result.success) {
@@ -1903,7 +1908,9 @@ Result<void> FileSystem::revoke_permission(const std::string& resource_uid,
     AccountabilityContext ctx;
     ctx.actor        = user;
     ctx.actor_roles  = roles;
-    ctx.source_iface = "grpc";
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
     auto result = acl_manager_->revoke_permission(resource_uid, principal, PrincipalType::USER,
                                                   permissions, tenant, ctx);
     if (result.success) {

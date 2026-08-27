@@ -22,6 +22,7 @@
 #include <ctime>
 #include "fileengine/connection_pool_manager.h"
 #include "fileengine/database.h"
+#include "fileengine/service_auth_interceptor.h"
 #include <algorithm>
 #include "fileengine/server_logger.h"
 #include "json.hpp"
@@ -29,6 +30,24 @@
 namespace fileengine {
 
 thread_local std::string GRPCFileService::t_audit_source_;
+
+namespace {
+// Which door an action came through (PROPOSAL_service_authentication.md §2).
+//
+// This was hardcoded to "grpc" at all four emit sites — the one thing already
+// implied by the call having reached the core, in a field the schema, the
+// column and the documented intent all provided for. It now carries the
+// authenticated service identity when there is one.
+//
+// Falls back to "grpc" when service auth is not required and no token was
+// presented, which is deliberate: during the migration, records still saying
+// "grpc" are exactly the callers not yet carrying a token, so the rollout is
+// self-tracking rather than needing a separate inventory.
+std::string calling_interface() {
+    const auto& caller = CallerContext::current();
+    return caller.service_id.empty() ? std::string("grpc") : caller.service_id;
+}
+}  // namespace
 
 namespace {
 // The filesystem root may be referenced either as the empty string or as the
@@ -86,7 +105,7 @@ bool GRPCFileService::emit_permission_audit(const std::string& tenant, const std
     e.actor_roles = roles;
     e.target_uid = resource_uid;
     e.target_type = AuditTargetType::Acl;
-    e.source_iface = "grpc";
+    e.source_iface = calling_interface();
     e.source_addr = t_audit_source_;  // client IP forwarded by the bridge (§13)
     nlohmann::json d;
     d["principal"] = principal;
@@ -127,7 +146,7 @@ void GRPCFileService::emit_mutate_audit(const std::string& tenant, const std::st
     e.actor_roles = roles;
     e.target_uid = target_uid;
     e.target_type = target_type;
-    e.source_iface = "grpc";
+    e.source_iface = calling_interface();
     e.source_addr = t_audit_source_;
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));  // best-effort; the mutation proceeds regardless (§6)
@@ -166,7 +185,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
             agg.action = "access";
             agg.outcome = AuditOutcome::Ok;
             agg.actor = actor;
-            agg.source_iface = "grpc";
+            agg.source_iface = calling_interface();
     agg.source_addr = t_audit_source_;
             agg.detail = nlohmann::json({{"aggregated", access_interval_}, {"mode", "count"}}).dump();
             audit_sink_->publish(std::move(agg));
@@ -185,7 +204,7 @@ void GRPCFileService::emit_access_audit(const std::string& tenant, const std::st
     e.actor_roles = roles;
     e.target_uid = target_uid;
     e.target_type = target_type;
-    e.source_iface = "grpc";
+    e.source_iface = calling_interface();
     e.source_addr = t_audit_source_;
     e.detail = detail_json;
     audit_sink_->publish(std::move(e));

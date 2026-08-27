@@ -169,6 +169,8 @@ add_library(fileengine_core SHARED
     src/event_sink.cpp         # Async bounded-outbox sink base
     src/event_sink_factory.cpp # Builds the configured sink (or none)
     src/accountability.cpp     # Guaranteed accountability record: canonical form + chain
+    src/service_credential.cpp # Per-service gRPC credentials + capability definitions
+    src/service_auth_interceptor.cpp # Authenticate the caller; gate the method
     src/audit_entry.cpp        # Audit record model + envelope JSON (§4)
     src/audit_sink_factory.cpp # Builds the durable audit sink (or a null sink)
 )
