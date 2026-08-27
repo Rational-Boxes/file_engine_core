@@ -1105,6 +1105,47 @@ anyway.
 That being settled, the surface restriction below is **not** a hedge against
 forged identity. It rests on a plainer argument: blast radius and ergonomics.
 
+##### The invariant this rests on, and how well it is enforced
+
+**The gRPC interface must never be reachable by an untrusted client, and must be
+blocked from outside connections.** Every authorization decision in the core —
+including the erasure gate above — assumes it. If the invariant fails, the
+permission model fails with it, because the core does not authenticate.
+
+How well it currently holds depends entirely on how the platform is deployed:
+
+| Deployment | Enforcement | Assessment |
+|---|---|---|
+| `docker_unified` | The `core` service publishes **no ports**; peers reach it as `FILEENGINE_GRPC_HOST: core` over the compose network | **Holds.** Verified — there is no `50051:` host publish anywhere in the stack |
+| Bare metal / systemd (the `.deb`, `.rpm`, `PKGBUILD` and Ansible paths) | `server_address` defaults to **`0.0.0.0`** (`config_loader.h:54`) with `InsecureServerCredentials()` | **Depends on a host firewall.** The process itself listens on every interface |
+
+So the invariant is enforced by **deployment topology, not by the application**.
+That is adequate in containers and fragile everywhere else — the same shape as
+the known monitoring-listener exposure, where the core's REST monitor defaults to
+`0.0.0.0:8081` and is left to be verified per deployment.
+
+Two changes make the safe case the default rather than the careful one:
+
+- **Default `server_address` to `127.0.0.1`**, requiring an explicit opt-in to
+  bind wider. Containers set `0.0.0.0` deliberately — they must, to be reachable
+  across the compose network, and there the network provides the isolation — while
+  a bare-metal install stops listening to the world by accident. This inverts the
+  failure mode: today, forgetting the firewall exposes the system; afterwards,
+  forgetting the config merely breaks connectivity, which is discovered
+  immediately.
+- **Firewall the port explicitly in the Ansible deploy**, rather than relying on
+  whatever the host happens to have.
+
+> **Worth considering, not required: mTLS on gRPC.** The channel currently uses
+> `InsecureServerCredentials()`, so "the caller is a trusted bridge" is a claim
+> the topology makes, never one the core verifies. Client certificates would make
+> the trust boundary cryptographic instead of positional, so that a
+> misconfiguration or a network mistake is no longer immediately a total
+> compromise. The cost is certificate management across every service. Given the
+> platform explicitly assumes trustworthy world-facing services, this is
+> defence-in-depth rather than a correction — but it is the difference between an
+> invariant that is *assumed* and one that is *checked*.
+
 - The erasure grant should be **resource-explicit and non-inheriting**. Granting
   it on a folder must not confer it on every descendant; blast radius is the
   whole point.
@@ -1436,6 +1477,10 @@ forged identity. It rests on a plainer argument: blast radius and ergonomics.
       folder's descendants.
     - Erasure is unreachable over WebDAV and CMIS, and `ERASE` appears in no
       CMIS permission mapping.
+    - **The gRPC port is not reachable from outside the trust boundary** — no
+      host publish in the container stack, and a bare-metal install binds
+      loopback unless explicitly configured otherwise. Checked as a deployment
+      test, since this is the invariant every permission decision rests on.
 15. **Tenant destruction is total but not silent (§7.3).** After deleting a
     tenant:
     - Its accountability records are gone with its schema, and every other
