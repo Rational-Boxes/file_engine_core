@@ -2162,12 +2162,30 @@ std::string text_array_literal(const std::vector<std::string>& values) {
 // makes a gap in `seq` an unambiguous integrity alarm rather than routine noise.
 Result<Database::AccountabilityCommit> Database::append_accountability(
         PGconn* conn, const std::string& tenant, const AccountabilityRecord& rec) {
-    auto fail = [](const std::string& msg) {
+    auto fail = [&tenant](const std::string& msg) {
+        // Reaching here means an operation is about to be rolled back because
+        // its record could not be written. That is the fail-closed guarantee
+        // doing its job — and the single most important thing an operator can
+        // know, because the alternative design would have let the operation
+        // through unrecorded and said nothing at all.
+        SERVER_LOG_SECURITY("Accountability",
+                            "Accountability write FAILED for tenant '" + tenant +
+                            "' — the operation will be refused: " + msg);
         return Result<AccountabilityCommit>::err("accountability: " + msg);
     };
 
     auto validated = validate_record(rec);
-    if (!validated.success) return fail(validated.error);
+    if (!validated.success) {
+        // A record the code could not honestly write — no actor, an action out
+        // of scope, a detail field no schema enumerates. Every one of those is a
+        // programming error on a security path, and the operation is about to be
+        // refused because of it, so it goes on the unsuppressable channel rather
+        // than being returned as a bare string nobody reads.
+        SERVER_LOG_SECURITY("Accountability",
+                            "Refusing to write an invalid accountability record for tenant '" +
+                            tenant + "' (action=" + rec.action + "): " + validated.error);
+        return fail(validated.error);
+    }
 
     const bool is_global = (tenant == kGlobalChainKey);
     if (is_global && rec.global_tenant.empty()) {

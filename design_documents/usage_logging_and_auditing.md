@@ -42,21 +42,44 @@ all**; and nothing is immutable or tamper-evident. Critically, the trail is
 **distributed** — file activity lives in the core, but user and auth activity
 lives in `ldap_manager` and the authenticating doors (§5).
 
+> **Since written: one gap turned out to be structural, not just unbuilt.**
+> Everything above is about *coverage* — what is and is not emitted. A later
+> sweep found that the pipeline this document designs cannot **guarantee** a
+> record even for what it does cover: it is best-effort for mutations, silently
+> absent when unconfigured, non-transactional (the DB commit and the WAL append
+> are separate, so a crash between them loses the record for a committed
+> operation) and node-local. No amount of added coverage fixes that shape.
+>
+> The answer is a third pipeline (§2) rather than a fix to this one:
+> `accountability_record`, written in the same transaction as the operation it
+> describes. See `PROPOSAL_accountability_record.md`. The sections below are
+> unchanged in intent; where the accountability record supersedes a decision
+> here, it is called out inline.
+
 ---
 
-## 2. Audit ≠ Events (two pipelines, on purpose)
+## 2. Three pipelines, on purpose
 
-| | **Audit log** (new) | **Event stream** (exists) |
-|---|---|---|
-| Purpose | Compliance evidence | Notifications, search index, digests |
-| Delivery | **Complete + durable** (buffered, spooled, never silently dropped) | Best-effort, **fail-open** |
-| Reads | **Yes** (access is the point) | No |
-| Mutability | Append-only, tamper-evident | Ephemeral queue |
-| Consumer | Tenant admin / auditor, gated | Discussion service, CSAI indexer, dashboard |
+| | **Accountability record** (core-local) | **Audit log** | **Event stream** |
+|---|---|---|---|
+| Purpose | The guarantee: who did what, provably | Compliance evidence, cross-service correlation | Notifications, search index, digests |
+| Delivery | **Transactional** — commits with the operation | Complete + durable (buffered, spooled) | Best-effort, **fail-open** |
+| Scope | Authorization, identity, destruction, tenant lifecycle | Everything, incl. reads | Mutations |
+| Reads | No (volume) | **Yes** (access is the point) | No |
+| Mutability | Append-only, hash-chained, never culled | Append-only, tamper-evident | Ephemeral queue |
+| Disableable | **No** | Yes (configuration) | Yes (configuration) |
+| Consumer | `audit_service`, by **pull** | Tenant admin / auditor, gated | Discussion service, CSAI indexer, dashboard |
+
+Three pipelines, and the third is not a duplicate of the second. The distinction
+that matters is the **Disableable** row: an audit log that can be switched off,
+or that silently accepts entries into a null sink, is evidence only in the
+deployments that configured it. The accountability record is a table the
+operation writes to as part of committing, so there is no configuration under
+which the operation happens and the record does not.
 
 They share emit points but are independent sinks. A failure to enqueue an event
-must never block an op; a failure to *durably* record an audit entry is a
-policy decision (§6), not a silent drop.
+must never block an op; a failure to write the accountability record **rolls the
+operation back** (§6).
 
 ---
 
@@ -96,6 +119,17 @@ Every entry also records the **outcome**: `ok` | `denied` | `error`.
 ---
 
 ## 4. Record schema (per-tenant `audit_log`)
+
+> Two column notes since this was written. `target_name` is retained but
+> **permanently NULL** (§7.1) — names are resolved at read time. `recorded_at`
+> was added alongside `ts`: `ts` is when the event *occurred*, `recorded_at` is
+> when it was appended to the chain. The chain is ordered by the latter, and the
+> former can legitimately run slightly backwards between adjacent entries from
+> different sources, because cross-source ordering is only accurate to within the
+> queue latency. Recording both makes that explicable instead of looking like
+> clock corruption to a later reader — or worse, prompting someone to "fix" it by
+> reordering a tamper-evident structure. `recorded_at` is not part of the hash:
+> it describes delivery, not the event.
 
 Provisioned into every tenant schema alongside `acl_audit` (same code path).
 Append-only.
@@ -220,12 +254,31 @@ Audit must be **complete**, but reads are high-volume. Design:
   is committed to the WAL or accepted by the queue, not that the row has reached
   `audit_log`.
 - **Failure policy is per-category, configurable:**
-  - `permission`, `user`, `auth`, `admin` → **fail-closed (decided, §13):** the
-    sensitive operation is **blocked if its security event fails to enqueue** — if
-    the entry can't be durably captured (queue-accepted *or* WAL-committed), the
-    *operation* itself is rejected. These are rare and security-critical (a
-    permission change, a role grant, or a password reset must never happen
-    silently or un-recorded).
+  - `permission`, `user`, `auth`, `admin` → **fail-closed**, but the gate has
+    **moved** for the operations the core owns.
+
+    As originally designed, the sensitive operation was blocked if its *audit
+    entry* failed to enqueue. That gate existed because nothing else guaranteed a
+    record. Something else does now: for ACL grants and revokes, role changes,
+    version culls and tenant lifecycle, the fail-closed point is the
+    **accountability record**, which commits in the same transaction as the
+    operation rather than durably-but-separately, cannot be turned off by
+    configuration, and lives in PostgreSQL rather than a node-local WAL.
+
+    Keeping the old gate on top of it would not have added a guarantee — only a
+    second way for the operation to fail, on a path whose entire purpose is that
+    permission changes get recorded. It was also close to vacuous already: with
+    auditing unconfigured the sink is a `NullAuditSink` that "pretends every
+    entry is durable", so it returned success and blocked nothing in the default
+    deployment.
+
+    The audit entry itself still goes out, best-effort. It feeds cross-service
+    correlation and the rules engine, which a core-local table cannot.
+
+    **Still fail-closed on the audit path:** `auth` and `user` events emitted by
+    `ldap_manager` and the authenticating doors. Those have no accountability
+    record behind them — the core never sees a failed login — so for them the
+    audit entry remains the only record, and the original policy stands.
   - `mutate` → spooled durably; op proceeds (WAL guarantees eventual capture).
   - `access` → **full-fidelity by default (decided, §13):** `AUDIT_ACCESS_MODE`
     defaults to `full` — every read/list/stat/version-read is recorded, denials
@@ -260,6 +313,81 @@ Audit must be **complete**, but reads are high-volume. Design:
   remains optional and is **out of scope for this version** (§13).
 
 ---
+
+### 7.1 What the log must never hold
+
+Tamper-evidence and retention are about keeping the record safe. This is the
+opposite constraint: some things must never enter it in the first place.
+
+**The rule: the log records identifiers and structure, never payload.** It is
+append-only, hash-chained and long-lived, so anything captured is something the
+platform has committed to keeping — which makes *what goes in* a compliance
+decision rather than a convenience one. The cleanest way to survive an erasure
+request is to have nothing to erase.
+
+| Never captured | Necessarily captured |
+|---|---|
+| File content, or anything extracted from it | `target_uid` — an opaque identifier |
+| **Filenames** | `actor`, `actor_roles`, `source_addr` |
+| Metadata **values** | the principal whose access changed |
+| Checkin comments, discussion text, any free-text user input | action, outcome, timestamps |
+| Anything the platform stores on a customer's behalf | permission masks, keep-counts, cut timestamps |
+
+**This was violated in two places, and both are now fixed.** The emitters
+resolved the target's display name into `AuditEntry::target_name`, and several
+`detail` payloads carried `{"name": …}` on create and `{"new_name": …}` on
+rename. Filenames are party data — `Acme_Corp_Contract_J_Smith.pdf` is the
+canonical example — so the log was accumulating exactly the class of data it is
+designed never to release.
+
+**Store references, resolve for display.** The uid is recorded; a viewer joins to
+the current name at read time. Before an erasure the log reads exactly as it did;
+after one, the join finds nothing and the log stops disclosing the name on its
+own. Compliance becomes a property of the architecture rather than an operation
+someone must remember to run. The `target_name` column survives as nullable and
+permanently NULL, so existing rows and the hash chain's canonical form are
+unaffected.
+
+**The operational log has the same problem for a different reason.** The server
+log is rotated, shipped and archived, so a name that lands there is equally out
+of reach — but it is *not* immutable, and a support engineer genuinely needs to
+follow one file through a trace. So it takes the other answer: `ServerLogger`
+replaces a name with a short, stable, non-reversible tag (`name#3f9c1a2e`),
+salted per process so tags cannot be dictionary-matched or joined across runs.
+`FILEENGINE_LOG_REDACT_NAMES=false` turns it off for debugging, and that choice
+is itself announced on the security channel (§7.2).
+
+Metadata **keys** are deliberately kept. They are usually schema-shaped, and
+retaining them is what makes the trace useful — one can still establish that a
+field was set four times and then deleted without any way to recover what it
+said. Where a key name is itself disclosive (`patient_name`, `claimant_ssn`) the
+same default should apply, and that remains open.
+
+### 7.2 The security channel — an alarm configuration cannot silence
+
+The operational log gained a level above `FATAL`: **`SECURITY`**, which
+`shouldLog` never filters and which is written to console *and* file regardless
+of `FILEENGINE_LOG_TO_CONSOLE`, flushed immediately.
+
+The reasoning is the same one that makes the accountability record
+non-disableable. An operator raising the log level to quieten a noisy service
+must not thereby silence the one signal that says the guarantee is not holding —
+because the absence of that signal is indistinguishable from health. Reserved
+for: an operation refused because its accountability record could not be
+written, a denied or failed read of the security log, and a deployment opting
+out of name redaction. It is not a louder `ERROR`.
+
+`ServerLogger::security_event_count()` exposes the count for scraping, because a
+log line nobody greps is not an alarm.
+
+> **A related finding, fixed.** `ServerLogger::initialize()` was **commented out
+> in `server.cpp`**, so the logger ran on compiled-in defaults and the entire
+> logging configuration surface was inert: level, file path and file logging were
+> parsed, validated, threaded through four precedence layers — and ignored. That
+> is worse than having no knobs, because the configuration reads as though it is
+> in effect. Rotation and retention were likewise dead code (`rotate_log_file()`
+> was never called; `retention_days_` was unused), so a log file, once enabled,
+> would have grown without bound.
 
 ## 8. Access control on the audit itself + tenancy
 
@@ -541,9 +669,25 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
 
 ### Still open
 
-*(None — the calls above close every decision needed to start Phase 1. Items
-explicitly deferred to later phases: cross-rule/nested DSL logic and behavioural
-baselines (§11), external hash-anchoring (§7), and MCP consolidation (§9).)*
+- **Disclosive metadata keys (§7.1).** Values never enter the log; keys do, and
+  are usually schema-shaped and safe. A key like `patient_name` discloses by
+  existing. Redactable keys, with retention the explicit choice, is the same
+  default applied one level down — not yet decided.
+- **Does the WAL survive for the categories the accountability record now
+  covers?** `RedisAuditSink`'s WAL still serves *access* audits, which are
+  sampled and stay push-only. For the permission/admin categories the WAL is now
+  a delivery buffer behind a record that is already guaranteed. Confirm that is
+  the intended split rather than a staging post toward retiring it for those
+  categories outright.
+- **Is the queue hint worth keeping?** `accountability.committed` exists purely
+  so the rules engine reacts faster than a poll interval. If the interval is
+  short enough for the rules that exist, it is dead weight and one delivery
+  mechanism is fewer moving parts. Decide against the actual alerting
+  requirements rather than keeping both by default.
+
+*(Everything needed to start Phase 1 was closed above. Items explicitly deferred
+to later phases: cross-rule/nested DSL logic and behavioural baselines (§11),
+external hash-anchoring (§7), and MCP consolidation (§9).)*
 
 ---
 

@@ -198,7 +198,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory called - entering method");
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
-              "MakeDirectory - parent_uid: '" + request->parent_uid() + "', name: '" + request->name() + "'");
+              "MakeDirectory - parent_uid: '" + request->parent_uid() + "', " + SERVER_LOG_REDACT(request->name()));
 
     // Check if server is in read-only mode
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -218,7 +218,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
     std::string name = request->name();
     auto auth_context = request->auth();
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
-              "MakeDirectory - extracted request parameters - parent_uid: '" + parent_uid + "', name: '" + name + "'");
+              "MakeDirectory - extracted request parameters - parent_uid: '" + parent_uid + "', " + SERVER_LOG_REDACT(name));
 
     // Determine tenant from auth context
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -241,9 +241,13 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
         response->set_error("User does not have permission to create directory in this location");
         SERVER_LOG_ERROR("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
                   "MakeDirectory failed: User " + user + " does not have permission to create directory in " + parent_uid);
+        // No name in the detail. §5.4.7: the chain records identifiers and
+        // structure, never payload — and a name supplied for a directory that
+        // was never created is still party data. The parent uid says where the
+        // attempt was made, which is the accountability-relevant fact.
         emit_mutate_audit(tenant, "create_dir", AuditOutcome::Denied, user, roles,
                           parent_uid, AuditTargetType::Dir,
-                          nlohmann::json({{"name", name}}).dump());
+                          nlohmann::json({{"parent", parent_uid}}).dump());
         return grpc::Status::OK;
     }
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
@@ -251,7 +255,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
 
     // Call the filesystem to create the directory
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
-              "MakeDirectory - calling filesystem mkdir with parent_uid: '" + parent_uid + "', name: '" + name + "', tenant: '" + tenant + "', user: '" + user + "'");
+              "MakeDirectory - calling filesystem mkdir with parent_uid: '" + parent_uid + "', " + SERVER_LOG_REDACT(name) + ", tenant: '" + tenant + "', user: '" + user + "'");
     auto result = filesystem_->mkdir(parent_uid, name, user, roles, request->permissions(), tenant);
     SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
               "MakeDirectory - filesystem mkdir completed, success: " + (result.success ? "true" : "false"));
@@ -261,7 +265,7 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
         response->set_uid(result.value);
         response->set_error("");
         SERVER_LOG_INFO("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
-                 "MakeDirectory successful for parent_uid: " + request->parent_uid() + ", name: " + request->name() + ", UID: " + result.value);
+                 "MakeDirectory successful for parent_uid: " + request->parent_uid() + ", " + SERVER_LOG_REDACT(request->name()) + ", UID: " + result.value);
         SERVER_LOG_DEBUG("GRPCService::MakeDirectory", ServerLogger::getInstance().detailed_log_prefix() +
                   "MakeDirectory - exiting successfully");
     } else {
@@ -276,7 +280,10 @@ grpc::Status GRPCFileService::MakeDirectory(grpc::ServerContext* context,
 
     emit_mutate_audit(tenant, "create_dir", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
                       user, roles, result.success ? result.value : parent_uid, AuditTargetType::Dir,
-                      nlohmann::json({{"parent", parent_uid}, {"name", name}}).dump());
+                      // The created uid is the target, so a viewer resolves the
+                      // current name at read time; storing it here would put a
+                      // name in a structure designed never to release it.
+                      nlohmann::json({{"parent", parent_uid}}).dump());
     return grpc::Status::OK;
 }
 
@@ -467,7 +474,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch called - entering method");
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
-              "Touch - parent_uid: '" + request->parent_uid() + "', name: '" + request->name() + "'");
+              "Touch - parent_uid: '" + request->parent_uid() + "', " + SERVER_LOG_REDACT(request->name()));
 
     // Check if server is in read-only mode
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
@@ -486,7 +493,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
     std::string name = request->name();
     auto auth_context = request->auth();
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
-              "Touch - extracted request parameters - parent_uid: '" + parent_uid + "', name: '" + name + "'");
+              "Touch - extracted request parameters - parent_uid: '" + parent_uid + "', " + SERVER_LOG_REDACT(name));
 
     std::string tenant = get_tenant_from_auth_context(auth_context);
     std::string user = get_user_from_auth_context(auth_context);
@@ -510,7 +517,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
                   "Touch - exiting with permission error");
         emit_mutate_audit(tenant, "create_file", AuditOutcome::Denied, user, roles,
                           parent_uid, AuditTargetType::File,
-                          nlohmann::json({{"name", name}}).dump());
+                          nlohmann::json({{"parent", parent_uid}}).dump());
         return grpc::Status::OK;
     }
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
@@ -518,7 +525,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
 
     // Call the filesystem to create the file
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
-              "Touch - calling filesystem touch with parent_uid: '" + parent_uid + "', name: '" + name + "', tenant: '" + tenant + "', user: '" + user + "'");
+              "Touch - calling filesystem touch with parent_uid: '" + parent_uid + "', " + SERVER_LOG_REDACT(name) + ", tenant: '" + tenant + "', user: '" + user + "'");
     auto result = filesystem_->touch(parent_uid, name, user, roles, tenant);
     SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
               "Touch - filesystem touch completed, success: " + (result.success ? "true" : "false"));
@@ -528,14 +535,14 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
         response->set_uid(result.value);
         response->set_error("");
         SERVER_LOG_INFO("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
-                 "Touch successful for parent_uid: " + parent_uid + ", name: " + name + ", UID: " + result.value);
+                 "Touch successful for parent_uid: " + parent_uid + ", " + SERVER_LOG_REDACT(name) + ", UID: " + result.value);
         SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
                   "Touch - exiting successfully");
     } else {
         response->set_uid("");
         response->set_error(result.error);
         SERVER_LOG_ERROR("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
-                  "Touch failed for parent_uid: " + parent_uid + ", name: " + name + " with error: " + result.error);
+                  "Touch failed for parent_uid: " + parent_uid + ", " + SERVER_LOG_REDACT(name) + " with error: " + result.error);
         SERVER_LOG_DEBUG("GRPCService::Touch", ServerLogger::getInstance().detailed_log_prefix() +
                   "Touch - exiting with filesystem error: " + result.error);
     }
@@ -544,7 +551,7 @@ grpc::Status GRPCFileService::Touch(grpc::ServerContext* context,
               "Touch - returning status OK");
     emit_mutate_audit(tenant, "create_file", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
                       user, roles, result.success ? result.value : parent_uid, AuditTargetType::File,
-                      nlohmann::json({{"name", name}}).dump());
+                      nlohmann::json({{"parent", parent_uid}}).dump());
     return grpc::Status::OK;
 }
 
@@ -851,7 +858,7 @@ grpc::Status GRPCFileService::Exists(grpc::ServerContext* context,
 grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
                                     const fileengine_rpc::RenameRequest* request,
                                     fileengine_rpc::RenameResponse* response) {
-    SERVER_LOG_DEBUG("GRPCService", "Rename called for uid: " + request->uid() + " to " + request->new_name());
+    SERVER_LOG_DEBUG("GRPCService", "Rename called for uid: " + request->uid() + " to " + SERVER_LOG_REDACT(request->new_name()));
     // Check if server is in read-only mode
     if (is_server_in_readonly_mode()) {
         response->set_success(false);
@@ -874,7 +881,10 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
         response->set_error("User does not have permission to rename file");
         SERVER_LOG_ERROR("GRPCService", "Rename failed: User " + user + " does not have permission to rename file " + uid);
         emit_mutate_audit(tenant, "rename", AuditOutcome::Denied, user, roles, uid, AuditTargetType::File,
-                          nlohmann::json({{"new_name", new_name}}).dump());
+                          // A rename's new name is the payload of the operation. The target
+                          // uid is recorded, so a viewer resolves whatever the
+                          // file is called now; the chain keeps the act, not the text.
+                          nlohmann::json({{"renamed", true}}).dump());
         return grpc::Status::OK;
     }
 
@@ -890,7 +900,10 @@ grpc::Status GRPCFileService::Rename(grpc::ServerContext* context,
 
     emit_mutate_audit(tenant, "rename", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
                       user, roles, uid, AuditTargetType::File,
-                      nlohmann::json({{"new_name", new_name}}).dump());
+                      // A rename's new name is the payload of the operation. The target
+                          // uid is recorded, so a viewer resolves whatever the
+                          // file is called now; the chain keeps the act, not the text.
+                          nlohmann::json({{"renamed", true}}).dump());
     return grpc::Status::OK;
 }
 
@@ -1444,17 +1457,27 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
     const char* effect_str = (rule_effect == AclEffect::DENY) ? "deny" : "allow";
-    // Fail-closed write-ahead (§6): durably record the intended change BEFORE it
-    // applies. If the audit entry cannot be durably captured, refuse to mutate
-    // rather than leave an un-audited permission change.
-    if (!emit_permission_audit(tenant, "acl_grant", AuditOutcome::Ok, user, roles,
-                               resource_uid, principal, static_cast<int>(principal_type),
-                               effect_str, converted_permissions)) {
-        response->set_success(false);
-        response->set_error("Permission change refused: audit log unavailable");
-        SERVER_LOG_ERROR("GRPCService", "GrantPermission refused (audit not durable) for " + resource_uid);
-        return grpc::Status::OK;
-    }
+    // Best-effort now, and deliberately so — this used to be a fail-closed
+    // WRITE-AHEAD that refused the operation if the audit entry could not be
+    // durably captured (usage_logging_and_auditing.md §6). That gate existed
+    // because nothing else guaranteed a record. Something else does now.
+    //
+    // The accountability record below is strictly stronger: it commits in the
+    // SAME TRANSACTION as the ACL change rather than durably-but-separately, it
+    // cannot be turned off by configuration, and it lives in PostgreSQL rather
+    // than a node-local WAL. Keeping the old gate on top of it would not add a
+    // guarantee — it would only add a second way for the operation to fail, on a
+    // path whose whole purpose is that permission changes are recorded.
+    //
+    // It was also close to vacuous already: with auditing unconfigured the sink
+    // is a NullAuditSink that "pretends every entry is durable", so the gate
+    // returned true and blocked nothing in the default deployment.
+    //
+    // The entry itself stays. It feeds cross-service correlation and the rules
+    // engine, which the core-local record cannot do.
+    emit_permission_audit(tenant, "acl_grant", AuditOutcome::Ok, user, roles,
+                          resource_uid, principal, static_cast<int>(principal_type),
+                          effect_str, converted_permissions);
 
     // The accountability record is written by the DB layer inside this grant's
     // own transaction (PROPOSAL_accountability_record.md §5.1), so a failure to
@@ -1622,15 +1645,27 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
     const char* effect_str = (rule_effect == AclEffect::DENY) ? "deny" : "allow";
-    // Fail-closed write-ahead (§6): durably record the intended change first.
-    if (!emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Ok, user, roles,
-                               resource_uid, principal, static_cast<int>(principal_type),
-                               effect_str, converted_permissions)) {
-        response->set_success(false);
-        response->set_error("Permission change refused: audit log unavailable");
-        SERVER_LOG_ERROR("GRPCService", "RevokePermission refused (audit not durable) for " + resource_uid);
-        return grpc::Status::OK;
-    }
+    // Best-effort now, and deliberately so — this used to be a fail-closed
+    // WRITE-AHEAD that refused the operation if the audit entry could not be
+    // durably captured (usage_logging_and_auditing.md §6). That gate existed
+    // because nothing else guaranteed a record. Something else does now.
+    //
+    // The accountability record below is strictly stronger: it commits in the
+    // SAME TRANSACTION as the ACL change rather than durably-but-separately, it
+    // cannot be turned off by configuration, and it lives in PostgreSQL rather
+    // than a node-local WAL. Keeping the old gate on top of it would not add a
+    // guarantee — it would only add a second way for the operation to fail, on a
+    // path whose whole purpose is that permission changes are recorded.
+    //
+    // It was also close to vacuous already: with auditing unconfigured the sink
+    // is a NullAuditSink that "pretends every entry is durable", so the gate
+    // returned true and blocked nothing in the default deployment.
+    //
+    // The entry itself stays. It feeds cross-service correlation and the rules
+    // engine, which the core-local record cannot do.
+    emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Ok, user, roles,
+                          resource_uid, principal, static_cast<int>(principal_type),
+                          effect_str, converted_permissions);
 
     auto result = acl_manager_->revoke_permission(resource_uid, principal,
                                                   principal_type,
@@ -2001,8 +2036,12 @@ grpc::Status GRPCFileService::ListAccountabilityRecords(
         response->set_success(false);
         response->set_error("Reading accountability records requires the "
                             + std::string(kAccountabilityReaderRole) + " role");
-        SERVER_LOG_WARN("GRPCService", "ListAccountabilityRecords denied for user " + caller +
-                                       " (tenant " + tenant + ")");
+        // Someone reached the security log's door without the key. That is a
+        // security event whether it is a misconfiguration or a probe, and it
+        // must not be suppressible by log level.
+        SERVER_LOG_SECURITY("GRPCService",
+                            "Accountability read DENIED — user=" + caller + " tenant=" + tenant +
+                            " lacks " + std::string(kAccountabilityReaderRole));
         // A denied attempt to read the security log is itself a security signal.
         emit_permission_audit(tenant, "accountability_read", AuditOutcome::Denied, caller,
                               caller_roles, /*resource_uid=*/"", /*principal=*/caller,
@@ -2010,17 +2049,21 @@ grpc::Status GRPCFileService::ListAccountabilityRecords(
         return grpc::Status::OK;
     }
 
+    // The global (tenant-lifecycle) chain is readable by the SAME dedicated
+    // role, not by system_admin alone.
+    //
+    // An earlier version restricted it to system_admin on the theory that a
+    // cross-tenant chain is a strictly higher grant. That was wrong twice over.
+    // It bought nothing — the reader role already permits asking for any tenant
+    // by name, so iterating tenants was never blocked — and it broke the one
+    // consumer the endpoint exists for: audit_service has to drain the global
+    // chain to see tenant deletions, without which it polls vanished schemas
+    // forever and retains history the platform believes it destroyed (§7.3).
+    //
+    // What the chain actually holds is also the least sensitive thing in the
+    // system: that a tenant was created or destroyed, by whom, when. No tenant
+    // contents ever reach it.
     const bool is_global = (request->tenant() == kGlobalChainKey);
-    if (is_global && !is_system_admin) {
-        // The global chain spans every tenant, so it is a strictly higher grant
-        // than reading one tenant's — a per-tenant reader must not get it by
-        // asking for a different tenant name.
-        response->set_success(false);
-        response->set_error("Only system_admin may read the global accountability chain");
-        emit_permission_audit(kGlobalChainKey, "accountability_read", AuditOutcome::Denied, caller,
-                              caller_roles, "", caller, 0, "allow", 0);
-        return grpc::Status::OK;
-    }
 
     auto tenant_context = tenant_manager_->get_tenant_context(is_global ? "default" : tenant);
     if (!tenant_context || !tenant_context->db) {
@@ -2036,8 +2079,11 @@ grpc::Status GRPCFileService::ListAccountabilityRecords(
     if (!records.success) {
         response->set_success(false);
         response->set_error(records.error);
-        SERVER_LOG_ERROR("GRPCService", "ListAccountabilityRecords failed for tenant " + tenant +
-                                        ": " + records.error);
+        // Not necessarily tampering, but the consumer cannot verify what it
+        // cannot read, and a chain that stops being readable stops being
+        // evidence. Loud, and on the unsuppressable channel.
+        SERVER_LOG_SECURITY("GRPCService", "Accountability read FAILED for tenant " + tenant +
+                                           ": " + records.error);
         return grpc::Status::OK;
     }
 

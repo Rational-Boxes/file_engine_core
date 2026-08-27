@@ -93,6 +93,12 @@ struct Config {
     bool log_to_file = false;
     size_t log_rotation_size_mb = 10;
     int log_retention_days = 7;
+    // Replace names and paths in the operational log with a stable,
+    // non-reversible tag. ON by default: the log is rotated, shipped and
+    // archived, so a name that reaches it is a name an erasure obligation
+    // cannot follow. Set FILEENGINE_LOG_REDACT_NAMES=false to debug something
+    // that genuinely needs the literal name. See ServerLogger::redact.
+    bool log_redact_names = true;
 
     // Event queueing (optional; see design_documents/redis_event_queueing_plan.md
     // and convert_search_ai/design_documents/EVENT_CONTRACT.md). Disabled by

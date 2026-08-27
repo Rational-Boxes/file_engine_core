@@ -70,17 +70,42 @@ int main(int argc, char** argv) {
     // Load configuration from environment or config file
     fileengine::Config config = fileengine::ConfigLoader::load_config(argc, argv);
 
-    // Initialize logging system
-    // fileengine::ServerLogger::getInstance().initialize(
-    //     config.log_level,
-    //     config.log_file_path,
-    //     config.log_to_console,
-    //     config.log_to_file,
-    //     config.log_rotation_size_mb,
-    //     config.log_retention_days
-    // );
+    // Initialize the logging system.
     //
-    // fileengine::ServerLogger::getInstance().info("Server", "Logger initialized with level: " + config.log_level);
+    // This call used to be commented out, which meant the logger ran on its
+    // compiled-in defaults and the ENTIRE logging configuration surface was
+    // inert: FILEENGINE_LOG_LEVEL, _LOG_FILE_PATH and _LOG_TO_FILE were parsed,
+    // validated, threaded through four precedence layers — and then ignored.
+    // Setting the level to debug did nothing; file logging never happened at
+    // all. That is worse than having no knobs, because the configuration reads
+    // as though it is in effect.
+    //
+    // It matters more now that the logger carries the SECURITY channel: an
+    // operator who configures a log file expects a refused permission change to
+    // land in it, and until this line was restored it never would have.
+    fileengine::ServerLogger::getInstance().initialize(
+        config.log_level,
+        config.log_file_path,
+        config.log_to_console,
+        config.log_to_file,
+        config.log_rotation_size_mb,
+        config.log_retention_days,
+        config.log_redact_names
+    );
+
+    fileengine::ServerLogger::getInstance().info(
+        "Server", "Logger initialized — level=" + config.log_level +
+                  ", file=" + (config.log_to_file ? config.log_file_path : std::string("(none)")) +
+                  ", name redaction=" + (config.log_redact_names ? "on" : "OFF"));
+    if (!config.log_redact_names) {
+        // Worth a security-channel line of its own: someone has opted the
+        // operational log back into holding party data, and the decision should
+        // be visible in the same stream that would later carry the consequences.
+        fileengine::ServerLogger::getInstance().security(
+            "Server", "Log name redaction is DISABLED — filenames and paths will be "
+                      "written to the operational log in clear. Intended for debugging "
+                      "only; the log is rotated, shipped and archived.");
+    }
 
     std::cout << "Config loaded:" << std::endl;
     std::cout << "  DB Host: " << config.db_host << std::endl;

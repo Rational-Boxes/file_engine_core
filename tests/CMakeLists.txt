@@ -386,6 +386,16 @@ add_test(NAME load_stress
                  --target core --requests 200 --concurrency 32)
 set_tests_properties(load_stress PROPERTIES LABELS "stress" TIMEOUT 600 SKIP_RETURN_CODE 77)
 
+# The logger's security-relevant behaviour: a SECURITY entry no configuration
+# can silence, names that never reach the log in clear, and rotation/retention
+# that actually run. No infrastructure — it writes to a scratch directory.
+add_executable(logger_tests logger_tests.cpp)
+target_include_directories(logger_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)
+target_link_libraries(logger_tests fileengine_core ${LIBPQ_LIBRARIES})
+add_test(NAME logger_tests COMMAND logger_tests)
+set_tests_properties(logger_tests PROPERTIES LABELS "unit" TIMEOUT 120)
+
 # ---------------------------------------------------------------------------
 # The guaranteed accountability record (PROPOSAL_accountability_record.md)
 # ---------------------------------------------------------------------------

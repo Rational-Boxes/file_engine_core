@@ -81,7 +81,7 @@ Result<std::string> FileSystem::mkdir(const std::string& parent_uid, const std::
     // Detailed debug logging for entry
     SERVER_LOG_DEBUG("FileSystem::mkdir", ServerLogger::getInstance().detailed_log_prefix() +
               "Entering mkdir operation - parent_uid: " + parent_uid +
-              ", name: " + name + ", user: " + user + ", tenant: " + tenant);
+              ", " + SERVER_LOG_REDACT(name) + ", user: " + user + ", tenant: " + tenant);
 
     auto context = get_tenant_context(tenant);
     if (!context || !context->db) {
