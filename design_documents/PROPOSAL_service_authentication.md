@@ -199,28 +199,92 @@ entry announcing it.
 
 ---
 
-## 6. The payoff — least privilege between services
+## 6. Capability gating — the payoff
 
-Once the core knows the caller, it can bound what that caller may do. A
-per-service **method allowlist** turns several conventions into enforcement:
+Once the core knows the caller, it can bound what that caller may do. **Each
+service identity is granted a set of API capabilities, and anything outside that
+set is refused** — a second authorization axis (*may this service perform this
+operation?*) in front of the existing one (*may this user perform it on this
+resource?*). Both must pass.
 
-| Service | Should not be able to |
+It is deliberately coarse — method-level, not resource-level — because its job is
+blast-radius containment, not access control.
+
+### 6.1 Capabilities, not method lists
+
+Enumerating 41 RPCs per service across ~13 services is 500-odd cells that will
+drift and be got wrong. Instead each RPC belongs to exactly one **capability**,
+and services are granted capabilities:
+
+| Capability | Covers |
 |---|---|
-| `cmis`, `webdav_bridge` | invoke erasure — `PROPOSAL_accountability_record.md` §5.4.9 restricts this by *convention* today |
-| `convert_search_ai`, `difference`, `folder_actions` | manage roles or ACLs |
-| `mcp` | anything destructive; the AI door should be the most tightly bounded of all |
-| `audit_service` | write anything — it is a reader |
+| `read` | `Stat`, `Exists`, `ListDirectory`, `GetFile`, `GetVersion`, `ListVersions`, `GetMetadata*`, `CheckPermission`, `GetEffectivePermissions` |
+| `write` | `Touch`, `MakeDirectory`, `PutFile`, `StreamFileUpload`, `Rename`, `Move`, `Copy`, `SetMetadata`, `DeleteMetadata` |
+| `delete` | `RemoveFile`, `RemoveDirectory`, `UndeleteFile`, `ListDirectoryWithDeleted` |
+| `restore` | `RestoreToVersion` |
+| `acl` | `GrantPermission`, `RevokePermission`, `GetResourceAcls` |
+| `roles` | `CreateRole`, `DeleteRole`, `AssignUserToRole`, `RemoveUserFromRole`, `Get*ForRole/User`, `GetAllRoles`, `ListClaims` |
+| `admin` | `GetStorageUsage`, `TriggerSync` |
+| `destroy` | `PurgeOldVersions`, and erasure when it lands |
+| `accountability` | `ListAccountabilityRecords` |
 
-This is the strongest argument for the whole proposal. §5.4.9 recommends erasure
-be unreachable over the file-protocol bridges, and today that is enforced only by
-those bridges choosing not to implement it. With service identity it becomes a
-property of the core: the `cmis` token cannot invoke erasure regardless of what
-the CMIS service's code does or what an attacker who compromises it wants.
+Nine sets instead of five hundred cells, and each maps to a section the proto is
+already organised into.
 
-Scope note: this is a second authorization axis (*may this service perform this
-operation?*) sitting in front of the existing one (*may this user perform it on
-this resource?*). Both must pass. It is deliberately coarse — method-level, not
-resource-level — because its job is blast-radius containment, not access control.
+**Default deny, including for new RPCs.** An RPC that belongs to no capability is
+callable by nobody. So adding a method and forgetting to classify it fails
+loudly at first use rather than silently defaulting to open — the opposite of an
+allowlist that grants by omission.
+
+### 6.2 Deriving the assignments — measure, do not guess
+
+The temptation is to write the service-to-capability matrix from intuition. That
+produces a matrix that is subtly wrong in the permissive direction, because
+guessing errs toward "it probably needs that".
+
+Derive it instead: **start every service at deny-all, run its existing E2E
+suite, and add only the capabilities the failures demand.** The suites already
+exist and are the regression gate for each service, so the result is grounded in
+observed behaviour and stays self-documenting — a later capability addition
+shows up as a test that needed it.
+
+A few assignments are clear enough to state now, and they illustrate the value:
+
+| Service | Capability set | Why it matters |
+|---|---|---|
+| `audit_service` | `accountability` only | It is a reader. Today it could write files; nothing stops it |
+| `mcp` | `read`, `write` — no `delete`, no `destroy` | See §6.3 |
+| `cmis`, `webdav_bridge` | no `destroy` | §5.4.9 of the accountability proposal restricts erasure to the admin surface **by convention**; this makes it a property of the core |
+| `csai`, `difference`, `discussion` | `read` + narrow `write` for their own derived output | None has business managing ACLs or roles |
+| CLI / admin surface | everything, including `destroy` | The one place irreversible operations belong |
+
+### 6.3 The MCP case
+
+`mcp` is documented as *"append-only, recoverable"* — an AI agent should be able
+to add and revise, never to destroy. Today that property lives entirely in the
+MCP service's own code: it holds full core authority and simply chooses not to
+use the destructive parts.
+
+Granting it `read` and `write` and withholding `delete` and `destroy` moves that
+guarantee into the core. A prompt-injected agent, or a bug in tool dispatch, then
+cannot delete a document however convincingly it is instructed to — the core
+refuses the call before any handler sees it.
+
+Of every caller on the platform, the AI door is the one whose behaviour is least
+predictable from its code. It is the strongest case for enforcing intent rather
+than trusting it.
+
+### 6.4 Config may narrow, never widen
+
+The **grouping** of RPCs into capabilities is a property of the API and belongs
+in code. The **assignment** of capabilities to services is more tempting to put
+in config — but a config-granted capability is one deployment-pressure change
+away from a bridge holding `destroy`.
+
+So: assignments live in code, and configuration may only **subtract**. An
+operator can tighten a service below its compiled set for a hardened deployment;
+nobody can widen one without a code change and a review. This supersedes the
+looser "code for destructive operations, config for the rest" in §8.4.
 
 ---
 
@@ -260,9 +324,9 @@ every subsequent step measurable.
 3. **One token per service, or per instance?** Per-instance narrows revocation
    blast radius and identifies *which* replica acted, at the cost of managing
    many more secrets. Recommend per-service until there is an operational reason.
-4. **Should the allowlist live in config or in code?** Config is flexible and
-   auditable; code is harder to weaken accidentally under deployment pressure.
-   Recommend code for the destructive operations and config for the rest.
+4. ~~**Should the allowlist live in config or in code?**~~ **Answered in §6.4:**
+   capability *grouping* and service *assignments* both live in code, and config
+   may only subtract. Widening requires a code change and a review.
 5. **Rate limiting / lockout on repeated bad tokens?** Cheap to add at the
    interceptor and a useful signal, but on a private network it may be noise.
 
@@ -283,10 +347,19 @@ every subsequent step measurable.
    service presenting either succeeds; after the old is removed, it fails.
 6. Secrets never appear in logs, error messages, or audit records — including on
    the rejection path, which is where they are most likely to be echoed.
-7. With the allowlist active, a service invoking a method outside it is refused
-   with `PERMISSION_DENIED` **even when the end-user identity it presents would
-   otherwise be authorized** — proving the two axes are independent.
-8. Comparison is constant-time, and the core stores no plaintext secret.
-9. **The map resolves the source correctly:** each service's token yields that
-   service's name and no other, and a token whose secret half is altered by one
-   character resolves to nothing rather than to a neighbouring entry.
+7. With capability gating active, a service invoking a method outside its set is
+   refused with `PERMISSION_DENIED` **even when the end-user identity it presents
+   would otherwise be authorized** — proving the two axes are independent.
+   Specifically: the `mcp` identity cannot call `RemoveFile` while presenting a
+   user who holds `DELETE` on that file (§6.3), and `audit_service` cannot call
+   `PutFile` at all.
+8. **Every RPC is classified.** A test enumerates the service descriptor and
+   fails if any method belongs to no capability — so a newly added RPC cannot
+   reach production unclassified, and is denied to everyone until it is.
+9. **Config cannot widen.** A configuration attempting to grant a service a
+   capability outside its compiled set is rejected at startup rather than
+   honoured (§6.4).
+10. Comparison is constant-time, and the core stores no plaintext secret.
+11. **The map resolves the source correctly:** each service's token yields that
+    service's name and no other, and a token whose secret half is altered by one
+    character resolves to nothing rather than to a neighbouring entry.
