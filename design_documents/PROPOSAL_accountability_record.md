@@ -72,13 +72,23 @@ and reaches the consumer anyway.
   cannot yet be removed from it. Worth landing before the table has history
   anyone would need to redact.
 
-### One correction to §5.4.9
+### §5.4.9's loopback default — now actually true
 
-That section reports the gRPC loopback default as **done**. On this branch it is
-not: `config_loader.h` and the shipped `core.conf` both still bind `0.0.0.0`. The
-change lives on `security/grpc-loopback-default` and has not merged here. Every
-authorization decision in the core assumes the invariant, so it holds today by
-container topology and host firewall, not by the application.
+That section reported the gRPC loopback default as done while it was still
+sitting unmerged on `security/grpc-loopback-default`, which for a while made this
+document describe an invariant the code did not hold. It has since merged:
+`config_loader.h` and the shipped `core.conf` both bind `127.0.0.1`, so the
+bare-metal and systemd paths no longer depend on a host firewall being right, and
+forgetting to widen the bind now breaks connectivity loudly instead of exposing
+the port silently.
+
+Containers widen it deliberately — the core image sets
+`FILEENGINE_GRPC_HOST=0.0.0.0` in its own ENV, the compose stack sets it on the
+`core` service, and the Ansible role sets it explicitly — because there the
+container network supplies the isolation and 50051 is never published to the
+host. Every authorization decision in the core, including the `ERASE` gate,
+rests on that invariant, so those three places are the ones to check when
+changing the deployment shape.
 
 ---
 

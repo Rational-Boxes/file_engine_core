@@ -51,7 +51,18 @@ struct Config {
     bool multi_tenant_enabled = true;
     
     // Server configuration
-    std::string server_address = "0.0.0.0";
+    //
+    // Loopback by default. The gRPC interface is the trusted-access path: the
+    // core does not authenticate, it authorizes whatever identity the caller
+    // presents, so every authorization decision assumes only trusted
+    // world-facing services can reach this port. Binding all interfaces by
+    // default made that invariant depend on a host firewall being right.
+    //
+    // Deployments that must accept connections from another host — containers,
+    // where the compose/pod network provides the isolation instead — set
+    // FILEENGINE_GRPC_HOST=0.0.0.0 explicitly. Getting that wrong now breaks
+    // connectivity loudly rather than exposing the port silently.
+    std::string server_address = "127.0.0.1";
     int server_port = 50051;
     int thread_pool_size = 10;
 
