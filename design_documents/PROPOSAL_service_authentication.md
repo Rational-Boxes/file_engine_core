@@ -472,6 +472,39 @@ as a defect to be "fixed" by substituting the peer address. Doing so would
 manufacture a plausible-looking external origin for work no external user asked
 for — worse than the blank it replaced.
 
+#### Worked example: rendition generation
+
+A user uploads a document through `http_bridge`. That write records the user and
+their address. csai then consumes the resulting event and writes a rendition back
+into the core.
+
+**The rendition write should carry no `source_addr`.** Copying the user's address
+forward would be redundant — it is already recorded on the upload that caused it —
+and worse, it would be *false in a specific way*: it asserts the user made a
+request from that address at that moment, when what actually happened is a
+service reacting to an event, possibly minutes later. One user action would
+produce several records all claiming the same origin, and the log would overstate
+how much the user did.
+
+The three fields then tell the true story, which none of them could alone:
+
+| Field | Rendition write | Meaning |
+|---|---|---|
+| `actor` | the user | csai acts **on the user's authority** — feature services re-check access as the end user |
+| `source_iface` | `csai` | the work was done **by csai**, not by a door the user was holding |
+| `source_addr` | *empty* | **no user connection originated it** |
+
+Read together: *"csai did this on the user's authority, not from a user
+connection."* Copying the IP would collapse that into *"the user did this from
+their browser"*, which is the one reading that is untrue.
+
+**The general rule: `source_addr` records where a request came *from*, never what
+caused it.** Causation is a different relation. If the link between an upload and
+its derived writes is ever wanted explicitly, the right mechanism is a causation
+id — the triggering event already carries an `event_id` a derived write could
+reference — not a copied address. Not proposed here; noted so that the need, if
+it arises, is not met by overloading this field.
+
 ### 6.5.3 Why it stays in the message, not a metadata header
 
 The service token goes in call metadata (§3.1); `source_addr` stays in
@@ -578,3 +611,7 @@ every subsequent step measurable.
     one door currently missing it. And an event-driven internal call records an
     **empty** `source_addr` rather than a substituted peer address, so
     "not user-initiated" stays distinguishable from "user at 10.0.0.4".
+14. **Derived writes do not inherit the originator's address (§6.5.2).** After a
+    user uploads a file and csai writes its rendition, exactly **one** record
+    carries the user's address — the upload. The rendition record shows the user
+    as `actor`, `csai` as `source_iface`, and an empty `source_addr`.
