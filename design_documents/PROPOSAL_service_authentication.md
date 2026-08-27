@@ -786,13 +786,46 @@ the unattended case, but should be understood as a *service* credential —
 **File permissions are therefore load-bearing for the interactive path**, and
 must be specified rather than left to the installer:
 
-- A per-administrator file is `0600`, owned by that administrator. A system-wide
-  one for unattended use is `0640 root:fileengine`, installed by the `.deb`,
-  `.rpm` and `PKGBUILD` packaging. Neither is ever world-readable.
-- **The CLI refuses to use a world-readable secret file**, in the manner `ssh`
-  refuses a world-readable private key. A permission mistake should stop the tool
-  rather than silently widen the boundary — precisely the failure that is
-  invisible until someone exploits it.
+**The CLI enforces exactly `0600` on its own credential file** — it does not
+merely object to a wrong mode, it makes the mode right. Owner read/write and
+**nothing else**:
+
+- **Group access is the point, not just world access.** `0640` is as
+  unacceptable as `0644` here. On many systems a user's primary group is shared
+  — `users`, `staff`, a team group — so group-readable can mean readable by
+  every other administrator on the box, which is precisely the separation
+  per-administrator credentials exist to create (§6.1). Any bit beyond owner
+  `rw` is stripped.
+- **Created correctly, not corrected afterwards.** The file is opened
+  `O_CREAT|O_EXCL` with mode `0600` explicitly, so it is never briefly readable
+  and then tightened. A create-then-`chmod` sequence leaves a window in which the
+  secret is exposed, and that window is enough.
+- **`umask`-proof.** An operator's `umask` must not be able to widen it — and
+  `umask 002`, common in shared-development environments, yields group-writable
+  files by default. So the mode is specified at creation and verified afterwards
+  rather than inherited from the process default.
+- **Containing directory `0700`.** Defence in depth — the file mode is the
+  control, but a group-writable directory invites replacement and rename games
+  even when the file itself is `0600`.
+- **Tightened on read.** If the file is found with any bit beyond owner `rw`, the
+  CLI narrows it to `0600` and continues.
+
+> **Tightening is not remediation, and the tool must say so.** A file that sat at
+> `0644` for a week may have been read; `chmod` afterwards does not un-expose the
+> secret. So the CLI warns loudly and **recommends rotating that credential**,
+> rather than reporting a quiet fix. A tool that silently repairs permissions
+> teaches operators that the problem was cosmetic, which is the opposite of
+> true — and rotation is one recorded command away (§3.6).
+
+This is stronger than the `ssh` model of refusing to proceed. Refusing is right
+for a key `ssh` did not create; here the CLI **owns** the file it writes, so
+getting the mode right is its responsibility rather than the operator's homework.
+
+The system-wide file for unattended use is a different artefact: `0640
+root:fileengine`, installed by the `.deb`, `.rpm` and `PKGBUILD` packaging, and
+deliberately group-readable so the service account can use it. The CLI does not
+rewrite that one — it is not its file — but it applies the same read-time check
+and warning.
 
 > **The failure mode to warn about explicitly:
 > `FILEENGINE_CLI_TOKEN=fesvc_… fileengine_cli …` on a command line.** That lands
@@ -1163,8 +1196,13 @@ every subsequent step measurable.
     - A local process presenting **no token cannot act as `cli`** — loopback and
       the token are both required, not either. Tested as an *unprivileged* local
       user, since that is the population the token exists to exclude.
-    - The CLI **refuses to run against a world-readable secret file**, and the
-      packaging installs it non-world-readable.
+    - The CLI **enforces `0600`** on its own credential file: created with that
+      mode atomically, unaffected by the invoking `umask`, and narrowed on read
+      if wider. Specifically **`0640` is rejected too** — group access is the
+      case that matters, since a shared primary group would otherwise expose one
+      administrator's credential to the others.
+    - Narrowing a wide file emits a warning **recommending rotation**, not a
+      silent fix.
     - `FILEENGINE_CLI_TOKEN` **takes precedence** over the file when both are
       present, so an automated invocation needs no file at all — and the secret
       appears in neither the process's own log output nor any error message.
