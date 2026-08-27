@@ -807,25 +807,44 @@ merely object to a wrong mode, it makes the mode right. Owner read/write and
 - **Containing directory `0700`.** Defence in depth — the file mode is the
   control, but a group-writable directory invites replacement and rename games
   even when the file itself is `0600`.
-- **Tightened on read.** If the file is found with any bit beyond owner `rw`, the
-  CLI narrows it to `0600` and continues.
+- **Refused on read.** If the file is found with any bit beyond owner `rw`, the
+  CLI **exits non-zero and does nothing else.** It does not tighten the mode and
+  proceed.
 
-> **Tightening is not remediation, and the tool must say so.** A file that sat at
-> `0644` for a week may have been read; `chmod` afterwards does not un-expose the
-> secret. So the CLI warns loudly and **recommends rotating that credential**,
-> rather than reporting a quiet fix. A tool that silently repairs permissions
-> teaches operators that the problem was cosmetic, which is the opposite of
-> true — and rotation is one recorded command away (§3.6).
+> **Why refuse rather than fix.** An earlier draft of this section had the CLI
+> narrow the mode and continue with a warning. That is the weaker choice, because
+> tightening is **not remediation**: a file that sat at `0640` for a week may
+> already have been read, and `chmod` afterwards does not un-expose the secret.
+> Repairing it silently teaches the operator that the problem was cosmetic —
+> exactly the wrong lesson — and a warning on stderr is invisible in a scripted
+> context, whereas a non-zero exit is not.
+>
+> So the refusal message states the real remedy: **the credential should be
+> rotated**, which is one recorded command away (§3.6). Fixing the permissions is
+> the operator's deliberate act, taken alongside deciding whether the secret is
+> still trustworthy — a judgement the tool should not make on their behalf by
+> quietly carrying on.
 
-This is stronger than the `ssh` model of refusing to proceed. Refusing is right
-for a key `ssh` did not create; here the CLI **owns** the file it writes, so
-getting the mode right is its responsibility rather than the operator's homework.
+This is the `ssh` model, and deliberately so: administrators already know
+*"Permissions 0644 for 'id_rsa' are too open… this private key will be ignored"*,
+and already know it means fix it and consider the key burned. There is **no
+override flag.** An escape hatch for a permission check becomes the documented
+workaround within a release, and the automation path (`FILEENGINE_CLI_TOKEN`,
+§6.1) already needs no file at all — so nothing legitimate is blocked by having
+none.
+
+The two rules are not in tension: on *write* the CLI owns the file and creates it
+`0600`; on *read* it enforces a policy it cannot verify the history of. Creating
+correctly is its responsibility; deciding whether an exposed secret is still safe
+is not.
 
 The system-wide file for unattended use is a different artefact: `0640
 root:fileengine`, installed by the `.deb`, `.rpm` and `PKGBUILD` packaging, and
-deliberately group-readable so the service account can use it. The CLI does not
-rewrite that one — it is not its file — but it applies the same read-time check
-and warning.
+deliberately group-readable so the service account can use it. So its expected
+mode differs, and the check is against *that* expectation — `0640
+root:fileengine` passes, anything wider is refused on the same terms. What is
+never permitted for either file is **world** access, or group access beyond the
+one group the file is meant for.
 
 > **The failure mode to warn about explicitly:
 > `FILEENGINE_CLI_TOKEN=fesvc_… fileengine_cli …` on a command line.** That lands
@@ -1196,13 +1215,17 @@ every subsequent step measurable.
     - A local process presenting **no token cannot act as `cli`** — loopback and
       the token are both required, not either. Tested as an *unprivileged* local
       user, since that is the population the token exists to exclude.
-    - The CLI **enforces `0600`** on its own credential file: created with that
-      mode atomically, unaffected by the invoking `umask`, and narrowed on read
-      if wider. Specifically **`0640` is rejected too** — group access is the
-      case that matters, since a shared primary group would otherwise expose one
-      administrator's credential to the others.
-    - Narrowing a wide file emits a warning **recommending rotation**, not a
-      silent fix.
+    - The CLI creates its credential file `0600` **atomically**, unaffected by
+      the invoking `umask`, in a `0700` directory.
+    - It **refuses to run** — non-zero exit, no other action — when the file has
+      any bit beyond owner `rw`. Specifically **`0640` is refused too**, since a
+      shared primary group would otherwise expose one administrator's credential
+      to the others.
+    - The refusal **names rotation as the remedy**, and the file's mode is left
+      untouched: the tool does not tighten-and-continue, so an exposure cannot be
+      mistaken for a cosmetic fix.
+    - There is **no override flag**, and automation is unaffected because the
+      env-var path uses no file.
     - `FILEENGINE_CLI_TOKEN` **takes precedence** over the file when both are
       present, so an automated invocation needs no file at all — and the secret
       appears in neither the process's own log output nor any error message.
