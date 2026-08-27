@@ -74,9 +74,16 @@ Minimum viable configuration for a single-node deployment:
    FILEENGINE_PG_USER=fileengine_user
    FILEENGINE_PG_PASSWORD=change_me
    FILEENGINE_STORAGE_BASE=/var/lib/fileengine/storage
-   FILEENGINE_GRPC_HOST=0.0.0.0
+   FILEENGINE_GRPC_HOST=127.0.0.1
    FILEENGINE_GRPC_PORT=50051
    ```
+
+   > **Bind loopback unless you must not.** The gRPC interface is the
+   > trusted-access path — the core authorizes the identity a caller presents
+   > rather than authenticating it — so the port must only ever be reachable by
+   > the trusted world-facing services. Set `0.0.0.0` only when those services
+   > run on other hosts *and* the network already isolates the port (a container
+   > network, or a firewall you have verified).
 
 4. Start the server: `fileengine_server` (or `systemctl start fileengine`).
    On first start it **auto-creates the database schema** — the PostgreSQL user
@@ -200,7 +207,7 @@ preview / AI pipeline to work automatically.**
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `FILEENGINE_GRPC_HOST` | `0.0.0.0` | Address the gRPC server binds to |
+| `FILEENGINE_GRPC_HOST` | `127.0.0.1` | Address the gRPC server binds to. Loopback by default; set `0.0.0.0` only where the network isolates the port (see above) |
 | `FILEENGINE_GRPC_PORT` | `50051` | gRPC port |
 | `FILEENGINE_HTTP_THREAD_POOL` | `10` | Server worker thread-pool size (also the DB connection-pool size) |
 
