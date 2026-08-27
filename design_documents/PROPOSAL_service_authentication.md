@@ -308,7 +308,39 @@ header. And the CLI still presents its token: loopback alone would let *any*
 local process act as `cli`, so the most powerful identity carries the most
 conditions, not the fewest.
 
-Requiring both has a useful consequence: **a leaked `cli` token is not
+The two conditions are not redundant — **each blocks a population the other does
+not**, and together they land on exactly the intended boundary:
+
+| Constraint | Excludes |
+|---|---|
+| Loopback-only | Everyone off the host |
+| The secret, in a non-world-readable file | **Unprivileged users *on* the host** |
+
+That second row is the one it would be easy to miss. A host is not only its
+administrator: service accounts, a shared login, a compromised unprivileged
+process — any of them can open a loopback connection, because loopback is not a
+privilege. What they cannot do is read a config file they have no permission to
+read. So loopback narrows access to the host, and the secret narrows it to
+privileged users on that host. The result is "the administrator", which is the
+boundary the reasoning above assumed all along.
+
+**This makes the file permissions load-bearing, so they must be specified rather
+than left to the installer's judgement:**
+
+- The file holding the `cli` secret is installed `0640 root:fileengine` (or
+  `0600`), never world-readable, by the `.deb`, `.rpm` and `PKGBUILD` packaging.
+- **The CLI refuses to use a world-readable secret file**, in the manner `ssh`
+  refuses a world-readable private key. A permission mistake should stop the tool
+  rather than silently widen the boundary — this is precisely the failure that is
+  invisible until someone exploits it.
+
+There is also a useful asymmetry: **the core stores only the hash** (§3.3), while
+the plaintext lives solely in the CLI's own config. Reading the core's
+configuration — which the `fileengine` service user necessarily can — does not
+yield a usable `cli` token. The most privileged credential is not present in the
+most widely-read file.
+
+Requiring both conditions has one more consequence: **a leaked `cli` token is not
 catastrophic.** Copied into a remote service's config, committed to a repository,
 or pulled from a shared secret store, it still cannot be used from off the host —
 the transport constraint holds independently of who knows the secret. The one
@@ -320,8 +352,13 @@ least on its own.
 > `cli` access local-only *by construction* and adds OS-level identity —
 > filesystem permissions decide who may connect at all, before any token is
 > examined. It removes the loopback check rather than implementing it, and cannot
-> be widened by a misconfigured bind. The cost is a second listener and a small
-> amount of packaging work.
+> be widened by a misconfigured bind.
+>
+> Note it collapses both constraints above into one mechanism: the socket's
+> permissions exclude off-host callers *and* unprivileged local ones, using the
+> same filesystem permissions that would otherwise be protecting the secret file.
+> The token becomes belt-and-braces rather than load-bearing. The cost is a second
+> listener and a small amount of packaging work.
 
 ### 6.2 Deriving the assignments — measure, do not guess
 
@@ -455,7 +492,10 @@ every subsequent step measurable.
       against a server bound to `0.0.0.0` so the check is proven independent of
       the bind address.
     - A local process presenting **no token cannot act as `cli`** — loopback and
-      the token are both required, not either.
+      the token are both required, not either. Tested as an *unprivileged* local
+      user, since that is the population the token exists to exclude.
+    - The CLI **refuses to run against a world-readable secret file**, and the
+      packaging installs it non-world-readable.
 11. Comparison is constant-time, and the core stores no plaintext secret.
 12. **The map resolves the source correctly:** each service's token yields that
     service's name and no other, and a token whose secret half is altered by one
