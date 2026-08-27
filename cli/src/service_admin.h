@@ -26,7 +26,20 @@
 // Each takes argv positioned at the command word, and returns a process exit
 // code: 0 success, 1 operational failure, 2 usage error.
 
+namespace grpc { class ClientContext; }
+
 namespace cli {
+
+// Attach the operator's cli credential to an outgoing call.
+//
+// Read from FILEENGINE_CLI_TOKEN when a supervisor injects it, otherwise from
+// ~/.config/fileengine/credentials — a per-administrator file the CLI refuses
+// to use unless it is 0600, because on the identity permitted every capability
+// the file permissions are the control (§6.1).
+//
+// A no-op when no credential is configured, so the CLI still works against a
+// core running with service auth not required.
+void attach_cli_token(grpc::ClientContext& context);
 
 int service_token_command(int argc, char** argv);
 int service_command(int argc, char** argv);

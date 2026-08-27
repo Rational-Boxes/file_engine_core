@@ -262,6 +262,7 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     if (env_vars.count("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = env_vars.at("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER");
     if (env_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = std::stoi(env_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION"));
     if (env_vars.count("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = std::stoi(env_vars.at("FILEENGINE_SERVICE_MAP_CACHE_TTL"));
+    if (env_vars.count("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = env_vars.at("FILEENGINE_BOOTSTRAP_SOCKET");
     if (env_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (env_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (env_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(env_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (env_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(env_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -654,6 +655,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (default_file_vars.count("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = default_file_vars.at("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER");
     if (default_file_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = std::stoi(default_file_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION"));
     if (default_file_vars.count("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = std::stoi(default_file_vars.at("FILEENGINE_SERVICE_MAP_CACHE_TTL"));
+    if (default_file_vars.count("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = default_file_vars.at("FILEENGINE_BOOTSTRAP_SOCKET");
     if (default_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (default_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (default_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(default_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (default_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(default_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -793,6 +795,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (cmdline_file_vars.count("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = cmdline_file_vars.at("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER");
     if (cmdline_file_vars.count("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = std::stoi(cmdline_file_vars.at("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION"));
     if (cmdline_file_vars.count("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = std::stoi(cmdline_file_vars.at("FILEENGINE_SERVICE_MAP_CACHE_TTL"));
+    if (cmdline_file_vars.count("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = cmdline_file_vars.at("FILEENGINE_BOOTSTRAP_SOCKET");
     if (cmdline_file_vars.count("FILEENGINE_LOG_TO_FILE")) config.log_to_file = (cmdline_file_vars.at("FILEENGINE_LOG_TO_FILE") == "true");
     if (cmdline_file_vars.count("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = std::stoul(cmdline_file_vars.at("FILEENGINE_LOG_ROTATION_SIZE_MB"));
     if (cmdline_file_vars.count("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = std::stoi(cmdline_file_vars.at("FILEENGINE_LOG_RETENTION_DAYS"));
@@ -835,6 +838,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_has("FILEENGINE_SERVICE_TOKEN_PREVIOUS_PEPPER")) config.service_token_previous_pepper = env_config.service_token_previous_pepper;
     if (env_has("FILEENGINE_SERVICE_TOKEN_PEPPER_VERSION")) config.service_token_pepper_version = env_config.service_token_pepper_version;
     if (env_has("FILEENGINE_SERVICE_MAP_CACHE_TTL")) config.service_map_cache_ttl_seconds = env_config.service_map_cache_ttl_seconds;
+    if (env_has("FILEENGINE_BOOTSTRAP_SOCKET")) config.bootstrap_socket_path = env_config.bootstrap_socket_path;
     if (env_has("FILEENGINE_LOG_TO_FILE")) config.log_to_file = env_config.log_to_file;
     if (env_has("FILEENGINE_LOG_ROTATION_SIZE_MB")) config.log_rotation_size_mb = env_config.log_rotation_size_mb;
     if (env_has("FILEENGINE_LOG_RETENTION_DAYS")) config.log_retention_days = env_config.log_retention_days;

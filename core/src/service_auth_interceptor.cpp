@@ -25,11 +25,23 @@ namespace fileengine {
 
 namespace {
 thread_local ServiceIdentity t_caller;
+thread_local grpc::Status    t_verdict = grpc::Status::OK;
 }  // namespace
 
 const ServiceIdentity& CallerContext::current() { return t_caller; }
 void CallerContext::set(const ServiceIdentity& identity) { t_caller = identity; }
-void CallerContext::clear() { t_caller = ServiceIdentity{}; }
+void CallerContext::clear() {
+    t_caller = ServiceIdentity{};
+    // Reset the verdict too. gRPC reuses worker threads, so a refusal left
+    // behind would refuse the NEXT unrelated call on that thread — a failure
+    // that would appear only under concurrency and look entirely random.
+    t_verdict = grpc::Status::OK;
+}
+
+const grpc::Status& CallerContext::verdict() { return t_verdict; }
+void CallerContext::set_verdict(const grpc::Status& status) { t_verdict = status; }
+
+grpc::Status service_auth_guard() { return CallerContext::verdict(); }
 
 // ── Cache ───────────────────────────────────────────────────────────────────
 
@@ -237,13 +249,9 @@ void ServiceAuthInterceptor::Intercept(grpc::experimental::InterceptorBatchMetho
         static const std::multimap<grpc::string_ref, grpc::string_ref> kEmpty;
         const grpc::Status status = authorize(method, metadata ? *metadata : kEmpty, peer);
 
-        if (!status.ok()) {
-            // Hijack: the RPC is completed here with this status and the handler
-            // is never invoked.
-            methods->ModifySendStatus(status);
-            methods->Hijack();
-            return;
-        }
+        // Record the verdict for the handler to return. Deliberately NOT
+        // Hijack(): see CallerContext::verdict.
+        CallerContext::set_verdict(status);
     }
     methods->Proceed();
 }

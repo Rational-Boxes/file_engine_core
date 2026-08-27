@@ -18,19 +18,30 @@
 // Authenticate the calling service, and gate what it may call
 // (PROPOSAL_service_authentication.md §3.2, §6).
 //
-// ONE interceptor, not 42 handlers. The core has 42 RPCs; any per-method check
-// will eventually miss one, and the miss will be silent — a new handler simply
-// works, for everybody. Enforcing centrally means coverage is a property of the
-// mechanism rather than of anyone's diligence, and the acceptance test can prove
-// it by enumerating the service descriptor instead of trusting a hand-written
-// list.
+// ONE place decides, for all 42 RPCs. Any per-method DECISION would eventually
+// miss one and the miss would be silent — a new handler simply works, for
+// everybody.
 //
-// A rejected call never reaches a handler.
+// The decision could not also be ENFORCED here, and the reason is worth stating
+// because the design reads as though it should be: gRPC C++ supports hijacking
+// in client interceptors only. Calling Hijack() in a server interceptor corrupts
+// the RPC and drops the connection — the symptom is every call failing as
+// UNAVAILABLE with the server apparently listening, which reads as a network
+// fault rather than an auth decision, and it took an end-to-end run to see.
+//
+// So the interceptor resolves the caller, gates the method, and stashes a
+// verdict; each handler returns it as its first statement. That distributes the
+// returning but not the deciding, and the property that mattered — coverage
+// being a matter of mechanism rather than diligence — is preserved by an
+// acceptance test that drives EVERY method in the service descriptor and asserts
+// each refuses. A handler that forgot its guard answers normally there and fails
+// the test, rather than shipping open.
 
 #include "fileengine/database.h"
 #include "fileengine/service_credential.h"
 
 #include <grpcpp/support/server_interceptor.h>
+#include <grpcpp/support/status.h>
 
 #include <chrono>
 #include <memory>
@@ -53,7 +64,29 @@ struct CallerContext {
     static const ServiceIdentity& current();
     static void set(const ServiceIdentity& identity);
     static void clear();
+
+    // The verdict the interceptor reached for this call, if it was a refusal.
+    //
+    // The interceptor CANNOT reject the RPC itself. gRPC C++ supports hijacking
+    // in client interceptors only; calling Hijack() in a server interceptor
+    // corrupts the RPC and drops the connection — the symptom is every call
+    // failing as UNAVAILABLE with the server apparently listening, which reads
+    // as a network fault rather than as an auth decision.
+    //
+    // So the interceptor decides, and the handler returns. The decision is still
+    // made in ONE place; only the returning is distributed, and coverage of that
+    // is guaranteed by an acceptance test that drives EVERY method in the
+    // service descriptor and asserts each one refuses — the same
+    // descriptor-driven approach that guarantees every RPC is classified. A
+    // handler that forgot the guard fails that test rather than shipping open.
+    static const grpc::Status& verdict();
+    static void set_verdict(const grpc::Status& status);
 };
+
+// Returns non-OK when this call must be refused. Placed at the top of every
+// handler; see CallerContext::verdict for why it is here rather than in the
+// interceptor.
+grpc::Status service_auth_guard();
 
 // Caches the service map so authentication is not a database round trip per RPC.
 //

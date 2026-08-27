@@ -20,7 +20,10 @@
 #include "fileengine/server_logger.h"
 #include "fileengine/service_credential.h"
 
+#include <grpcpp/client_context.h>
+
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -28,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -146,6 +150,54 @@ void print_secret_once(const std::string& token) {
     std::cerr << "\nThis is the only time this secret is shown. Store it now.\n"
               << "It is not recoverable: the database holds only HMAC(secret, pepper).\n"
               << "Beware `set -x` and CI jobs that archive stdout — that is the realistic leak.\n";
+}
+
+// ── The CLI's own credential (§6.1) ─────────────────────────────────────────
+
+namespace {
+
+// Loaded once. Returns empty when there is none, which keeps the CLI usable
+// against a core that does not require service auth.
+const std::string& cli_token() {
+    static const std::string token = [] {
+        if (const char* env = std::getenv("FILEENGINE_CLI_TOKEN")) {
+            if (*env) return std::string(env);
+        }
+        const char* home = std::getenv("HOME");
+        if (home == nullptr || *home == 0) return std::string();
+        const std::string path = std::string(home) + "/.config/fileengine/credentials";
+
+        // The permissions are LOAD-BEARING, not hygiene: this file holds the
+        // plaintext for an identity that carries every capability. Refuse
+        // rather than fix — silently tightening someone's file would hide that
+        // it had been readable, and by whom, for however long.
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0) return std::string();
+        if ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+            std::cerr << "Refusing to read " << path << ": mode is "
+                      << std::oct << (st.st_mode & 07777) << std::dec
+                      << ", which is readable beyond your account.\n"
+                      << "This file holds a credential with every capability. Run:\n"
+                      << "  chmod 600 " << path << "\n";
+            return std::string();
+        }
+        std::ifstream in(path);
+        std::string line;
+        std::getline(in, line);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        return line;
+    }();
+    return token;
+}
+
+}  // namespace
+
+void attach_cli_token(grpc::ClientContext& context) {
+    if (!cli_token().empty()) {
+        context.AddMetadata("x-fe-service-token", cli_token());
+    }
 }
 
 int service_token_command(int argc, char** argv) {
