@@ -302,10 +302,24 @@ another service's schema would couple it to the core's internals, bypass the
 core's own access control, and make any future schema change a cross-repo
 release.
 
-Instead the core exposes a pull endpoint — `ListAccountabilityRecords(tenant,
-newer_than_ts, limit)` over the existing gRPC surface, or an `/internal` REST
-route alongside the monitoring listener — returning records in `ts` order (which
-is also `seq` order) with a `has_more` flag. The consumer advances its cursor only after its own durable
+Instead the core exposes a pull endpoint over the **existing gRPC surface** —
+`ListAccountabilityRecords(tenant, newer_than_ts, limit)`, returning records in
+`ts` order (which is also `seq` order) with a `has_more` flag.
+
+gRPC is the right channel and needs no new one: the logging service runs inside
+the system network like the bridges, is within the trust boundary (§5.4.9), and
+can already reach the core. So the `/internal` REST route an earlier draft
+offered as an alternative is unnecessary — it would be a second door onto the
+same data, with its own auth surface to get right.
+
+**The endpoint still needs its own authorization.** Everything inside the
+boundary is trusted, but the accountability table is the most sensitive dataset
+in the system — reading it across tenants reconstructs who did what to whom
+platform-wide. Least privilege applies even among trusted callers: gate the read
+on a dedicated service role, so a compromised or misbehaving service that
+legitimately holds gRPC access does not thereby hold the security log. The core
+should also scope each call to the requested tenant rather than allowing an
+unbounded "everything" read. The consumer advances its cursor only after its own durable
 write, which makes redelivery-on-crash at-least-once; `(tenant, seq)` is the
 idempotency key, and `audit_service` already de-duplicates on a comparable key.
 
