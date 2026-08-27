@@ -276,16 +276,46 @@ If that path is used, two things matter:
   same message. *"No services configured"* for what is actually a key mismatch
   sends an operator hunting a nonexistent configuration problem during an outage.
 
-#### Two rotations, not one
+#### Rotation is online, across every node
 
-Independent operations either way, and both must work without the other:
+This is where database storage pays off most, because rotation stops being a
+deployment event:
 
-| Rotating | Means |
-|---|---|
-| A **service token** | Update that row (or re-encrypt the file), using the §3.4 overlap so services roll one at a time |
-| The **pepper** (or map key) | Re-hash under the new pepper; no service token changes |
+**Rotating a service token.** Insert the new secret so the service has two valid
+entries (§3.4 overlap), roll that service's instances onto it at leisure, then
+delete the old row. Every core node observes both changes within the cache TTL —
+**no restart, no coordination between nodes, no file to distribute.** With a
+file, each of those two steps would mean copying to every core host and reloading
+each one, in order.
 
-Conflating them turns a routine credential rotation into a platform-wide restart.
+**Rotating the pepper — corrected.** An earlier draft of this section said the
+pepper is rotated by re-hashing the stored values under the new one. **That is
+impossible:** the core holds `HMAC(secret, pepper)` and never the plaintext, so
+it cannot recompute anything. Taken at face value it would have meant pepper
+rotation requires re-issuing every service token — a genuine outage-shaped
+operation.
+
+It does not, because of *when* the plaintext is available: **at successful
+authentication the caller has just presented it.** So the standard
+upgrade-on-login pattern applies:
+
+1. Store a `pepper_version` alongside each hash.
+2. Accept the old and new pepper during the transition, trying the row's own
+   version first.
+3. On a successful authentication against the old pepper, recompute the hash
+   under the new one and update that row.
+4. Services authenticate constantly, so rows migrate on their own. Retire the old
+   pepper once none remain — which is a query, not a guess.
+
+Online, node-agnostic, and no token re-issue. Two implementation notes: the
+rehash is a write on the authentication path, so it must be best-effort and
+strictly once-per-row-per-rotation rather than per call; and two nodes rehashing
+the same row concurrently is harmless, since both compute the same value.
+
+The two rotations stay independent — either can be done without the other — and
+neither requires a core restart, which matters because a core restart is a
+platform outage (`PROPOSAL_accountability_record.md` §7.8). **A credential
+lifecycle that costs an outage is one that gets skipped.**
 
 #### Capabilities stay in code — the reviewed and the operational differ
 
@@ -803,7 +833,14 @@ every subsequent step measurable.
     - **Map changes are recorded**: granting a service a capability or rotating
       its secret writes an accountability record in the same transaction.
     - Rotating a **service token** and rotating the **pepper** are independent:
-      either can be done without the other.
+      either can be done without the other, and **neither requires a core
+      restart** (§3.5).
+    - **Multi-node rotation:** with two core instances running, a token added on
+      one is accepted by both within the cache TTL, and a token removed is
+      rejected by both — no per-node action.
+    - **Pepper rotation is online:** with both peppers configured, rows migrate
+      to the new one as services authenticate, no token is re-issued, and the
+      old pepper is retired only once a query shows no rows remain on it.
     - On the fallback file path only: a wrong key **fails closed with a message
       naming the key**, distinguishable from an empty map.
 13. **End-user origin survives every external door (§6.5).** A request through
