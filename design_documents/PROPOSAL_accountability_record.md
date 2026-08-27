@@ -1087,17 +1087,23 @@ The invariant in `acl_manager.h:63` then holds for `system_admin` but not for
 substantive change: *"admin passes every check"* stops being uniformly true, and
 the header should say which admin.
 
-##### The superuser is assertable, which shifts the weight to the surface
+##### The trust boundary, and what the permission is actually worth
 
-Roles arrive request-borne in `AuthenticationContext` and the SDKs pass them
-verbatim, so anyone able to reach gRPC directly can simply *claim*
-`system_admin` — and since the superuser legitimately holds `ERASE`, that claim
-carries erasure with it. This is an accepted property of the trust model (gRPC
-must never be network-exposed; the bridges are the security boundary), and it is
-not made worse by anything here.
+The world-facing services — the bridges — are the trust boundary, and they are
+assumed trustworthy. They authenticate the caller and present the resolved
+identity to the core, which does not re-authenticate; gRPC is never
+network-exposed.
 
-But it does mean the permission is not the last line of defence for this
-operation, and the surface matters more than the bit:
+So the `ERASE` check is a **real gate**, not a formality: every call that reaches
+the core arrives with an identity a trusted service established, and the split
+bypass above genuinely determines who can erase. Role assertion by an untrusted
+direct gRPC caller would require either network exposure or a compromised
+bridge — both of which are failures of the boundary itself, outside this
+operation's threat model and not something an in-core permission could fix
+anyway.
+
+That being settled, the surface restriction below is **not** a hedge against
+forged identity. It rests on a plainer argument: blast radius and ergonomics.
 
 - The erasure grant should be **resource-explicit and non-inheriting**. Granting
   it on a folder must not confer it on every descendant; blast radius is the
@@ -1258,10 +1264,15 @@ operation, and the surface matters more than the bit:
    index and embeddings above all — under the attestation in §5.4.3. A
    `DROP SCHEMA CASCADE` alone destroys the core's copy and leaves the tenant's
    documents legible in the search index.
-4. **Does the bridge-supplied identity need strengthening?** The core trusts
-   `AuthenticationContext` entirely, so `actor` is only as good as the bridge that
-   set it. That is the existing trust model and this proposal does not change it —
-   but a guaranteed record of an unverifiable actor is worth being explicit about.
+4. ~~**Does the bridge-supplied identity need strengthening?**~~ **Settled: no.**
+   The world-facing services are the trust boundary and are assumed trustworthy;
+   they authenticate and present the resolved identity, and gRPC is never
+   network-exposed. `actor` is therefore exactly as trustworthy as the boundary
+   the platform already relies on for every other authorization decision, and a
+   record of it is as good as the platform's identity model is — no better and no
+   worse. Nothing about guaranteeing the *record* changes what the record
+   attests. Recorded here only so the question is visibly answered rather than
+   left hanging over a document about accountability.
 5. **Backfill.** None is possible; history that was never written cannot be
    recovered. The table starts at deployment. Worth stating so nobody expects
    otherwise.
