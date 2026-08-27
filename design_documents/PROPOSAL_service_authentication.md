@@ -420,12 +420,17 @@ reaching in over the network. Scripts run on the box, or via something that does
 That is a direct consequence of the loopback decision and worth knowing before
 someone designs the pipeline the other way.
 
-**Records name a person, not `cli`.** The `cli` service identity is *what*
-connected; it is not *who* acted. The CLI sets `actor` from the invoking OS user
-(overridable with `--actor` for automation with its own identity), so the
-accountability record for issuing a credential names an administrator. Attributing
-every administrative action to `cli` would make the record technically complete
-and practically useless.
+**Records name a person, on evidence.** The `actor` comes from the **credential
+presented**, not from the invoking OS username — `cli:alice`'s secret records
+`alice` (§6.1). Attributing every administrative action to a generic `cli` would
+make the record technically complete and practically useless; attributing it to a
+self-reported username would make it forgeable by anyone holding the same token,
+which on the identity permitted every capability is the worst possible place for
+that weakness.
+
+There is no `--actor` override for a human credential. Automation identities
+(`cli:ansible`) are separate credentials, so an unattended job is already named by
+the secret it presents and needs no flag to say so.
 
 #### Every credential change is a recorded event
 
@@ -512,9 +517,16 @@ relevant, needing a guaranteed record, with no versioned home of their own.
 #### Bootstrapping the first credential
 
 The map starts empty, and the CLI needs a credential to talk to the core — so the
-`cli` token cannot be issued by the CLI. **Packaging generates it at install
-time**, writing it `0640` (§6.1) and registering its hash. Every other service
-credential is then issued through the CLI.
+first one cannot be issued by the CLI. **Packaging generates a single bootstrap
+identity at install time** — `cli:bootstrap` — writing it `0640` (§6.1) and
+registering its hash. Every other credential, including each administrator's own
+`cli:<name>` (§6.1), is then issued through the CLI.
+
+The bootstrap identity should be revoked once real administrator credentials
+exist. It is the one credential nobody is individually accountable for, so
+leaving it in place permanently reintroduces the shared-token attribution problem
+the per-administrator design removes — and `service-token list` showing it still
+active is an easy thing to check for.
 
 This keeps the awkward case where it belongs: one credential created by the
 installer, under the same generation rules, rather than a bootstrap mode that
@@ -653,10 +665,11 @@ than having to retract it later.
 
 #### The one exception: `cli`, constrained by transport instead
 
-`cli` is a **reserved identity holding every capability** — and it is the only
-one. The justification is not that the CLI is trusted, but that its access is
-bounded by something stronger than a capability list: **it may connect only over
-loopback.**
+`cli:*` is a **reserved class of identities holding every capability** — one per
+administrator and per automation account (§6.1 below), and the only identities
+permitted the full set. The justification is not that the CLI is trusted, but
+that its access is bounded by something stronger than a capability list: **it may
+connect only over loopback.**
 
 An administrator on the box already has full system access. They can read the
 PostgreSQL tables, the storage tree, the config and the secrets directly, without
@@ -712,33 +725,70 @@ boundary the reasoning above assumed all along.
 
 ##### Where the `cli` secret comes from
 
-**The secrets store is the source of truth**, exactly as for every other secret
-on the platform — vaulted with `AT_REST_KEY`, `FILEENGINE_SERVICE_TOKEN_PEPPER`
-and the rest, distributed by Ansible Vault, rotated on the same footing. There is
-no reason for this credential to be special in *origin*.
+**Treat it exactly as `FILEENGINE_PG_PASSWORD` is treated** — same sensitivity
+class, same handling, same machinery. The platform already has a well-worn answer
+for a credential of this weight: vaulted in Ansible Vault, injected from `.env`
+in the compose stack, present in the root-owned config on a packaged install,
+never committed, never logged. Nothing about this credential warrants inventing a
+new class, and inventing one would mean a second set of habits for operators to
+get right.
 
-Delivery is where it differs, and for a reason worth stating rather than
-papering over: **the CLI is the only credential consumer with no supervisor.**
-Services receive their environment from systemd or compose. A human at a shell
-prompt does not, so "inject it into the environment" has to mean *somebody puts
-it there* — and for an interactive session that usually degrades into a shell
-profile, which is a file with worse permissions than the one below, or into a
-command line, which is worse still.
+That parity also settles delivery, because the database password already faces
+the same split: a supervised service receives it in its environment, while an
+administrator running `psql` reads it from the root-owned config. **The CLI is
+simply the interactive case of a pattern that already exists.** It needs both
+routes for the same reason — services get an environment from systemd or compose;
+a human at a shell prompt does not, so "inject it into the environment" means
+somebody puts it there, which interactively degrades into a shell profile or a
+command line.
 
 So both, with different jobs:
 
 | Invocation | Source |
 |---|---|
 | **Automated** — an Ansible task on the core host, a timer, a systemd unit | `FILEENGINE_CLI_TOKEN` in the environment, injected by the supervisor. Identical to every other service credential |
-| **Interactive** — an administrator at a shell | A root-owned file the vault materialises on the host, read directly by the CLI |
+| **Interactive** — an administrator at a shell | A configuration file **owned by that administrator**, mode `0600` — `~/.config/fileengine/credentials` |
 
 The env var takes precedence when both are present.
+
+##### Per-administrator, not one shared token
+
+The per-user file is the better location, and not only for permissions. It makes
+the natural unit **one credential per administrator** rather than one shared
+`cli` token — which fixes a real weakness in the design as written.
+
+With a single shared secret, the accountability record's `actor` comes from the
+invoking OS username, which the CLI *asserts* rather than proves — and §3.6 makes
+it overridable with `--actor` for automation. So any administrator holding the
+shared token can attribute an action to a colleague. That is a poor property
+anywhere; on the identity permitted **every capability**, it is the worst place
+on the platform to have it.
+
+So `cli` becomes a small class of identities — `cli:alice`, `cli:bob`,
+`cli:ansible` — each with its own secret and each carrying the reserved full
+capability set (§6.1) and the loopback constraint. Nothing about the authority
+changes; what changes is that **the secret proves who acted**, so the
+accountability record for a credential grant or an erasure names a person on
+evidence rather than on assertion.
+
+It also makes revocation proportionate. An administrator leaves, and you revoke
+their credential — one CLI command, recorded, affecting nobody else. Under a
+shared token the same event means rotating for everyone and re-distributing, so
+in practice it is deferred, and the credential of a departed administrator stays
+valid.
+
+This follows the convention administrators already expect from `ssh`, `aws` and
+`kubectl`: a per-user credential file under their own home directory, at `0600`,
+that identifies them. A system-wide `/etc/fileengine` token remains available for
+the unattended case, but should be understood as a *service* credential —
+`cli:ansible` — rather than a human one.
 
 **File permissions are therefore load-bearing for the interactive path**, and
 must be specified rather than left to the installer:
 
-- Installed `0640 root:fileengine` (or `0600`) by the `.deb`, `.rpm` and
-  `PKGBUILD` packaging, never world-readable.
+- A per-administrator file is `0600`, owned by that administrator. A system-wide
+  one for unattended use is `0640 root:fileengine`, installed by the `.deb`,
+  `.rpm` and `PKGBUILD` packaging. Neither is ever world-readable.
 - **The CLI refuses to use a world-readable secret file**, in the manner `ssh`
   refuses a world-readable private key. A permission mistake should stop the tool
   rather than silently widen the boundary — precisely the failure that is
@@ -756,6 +806,25 @@ because a file *cannot record its own changes*, so keeping it meant keeping a wa
 to bypass a guarantee. Here both paths deliver the same credential to the same
 tool and neither weakens anything — the choice is about how a secret reaches a
 process that has no supervisor, not about two different sources of truth.
+
+##### A note on relative danger
+
+Calibrating the `cli` token against the database password is right for
+*handling*, but the two are not equally dangerous, and it is worth saying which
+way round:
+
+| | `FILEENGINE_PG_PASSWORD` | `cli` token |
+|---|---|---|
+| Reach | Every tenant's data, ACLs and audit tables | Every capability, but only through the core |
+| Constrained by transport | No — any host that can reach PostgreSQL | **Yes** — loopback only (§6.1) |
+| Actions recorded | **No** — direct SQL bypasses the accountability record entirely | **Yes** — every operation, attributed to the operator (§3.6) |
+
+So the more dangerous credential of the two is the one that already exists. That
+is not an argument for treating the `cli` token casually; it is a reminder that
+the controls in this proposal — transport constraint, capability set, recorded
+actions — apply to the CLI and do not apply to a `psql` session, which is why
+§3.6 makes direct database manipulation unsupported rather than merely
+discouraged.
 
 There is also a useful asymmetry: **the core stores only the hash** (§3.3), while
 the plaintext lives solely in the CLI's own config. Reading the core's
@@ -1099,6 +1168,9 @@ every subsequent step measurable.
     - `FILEENGINE_CLI_TOKEN` **takes precedence** over the file when both are
       present, so an automated invocation needs no file at all — and the secret
       appears in neither the process's own log output nor any error message.
+    - **Per-administrator identity is proven, not asserted:** an action run with
+      `cli:alice`'s credential records `alice` even when invoked with
+      `--actor bob`, and revoking `cli:alice` leaves `cli:bob` working.
 11. Comparison is constant-time, and the core stores no plaintext secret.
     Guardrail (§3.3): **no code path accepts an operator-supplied service
     token** — issuing one always generates 256 bits, so the entropy assumption
@@ -1152,8 +1224,10 @@ every subsequent step measurable.
       scriptable without parsing human text.
     - `pepper status` reports rows per pepper version, so "is the rotation
       finished" is answerable rather than estimated.
-    - The `cli` credential itself is created by **packaging at install**, under
-      the same generation rules — there is no unauthenticated bootstrap mode.
+    - The first credential (`cli:bootstrap`) is created by **packaging at
+      install**, under the same generation rules — there is no unauthenticated
+      bootstrap mode — and can be revoked once per-administrator credentials
+      exist, without locking anyone out.
     - There is **no file-based map path** to configure, so no way to change
       service credentials without an accountability record (§3.5).
 13. **End-user origin survives every external door (§6.5).** A request through
