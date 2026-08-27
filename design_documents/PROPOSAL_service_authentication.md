@@ -338,12 +338,17 @@ node within the cache TTL with no release and no restart.
 
 #### Not the CLI's own token
 
-The `cli` secret (§6.1) stays a plaintext file protected by filesystem
-permissions. Encrypting it would need a key the operator must supply to decrypt
-their own credential — recursion with no gain. The asymmetry is deliberate: the
-core runs unattended and validates many identities, so its map lives in the
-database; the CLI is interactive and holds one secret, so it gets `0640` and a
-tool that refuses to run when that is wrong.
+The `cli` secret comes from the secrets store like every other (§6.1), but is
+*delivered* differently: injected as `FILEENGINE_CLI_TOKEN` for automated use,
+and materialised as a `0640` root-owned file for interactive use, because the CLI
+is the one credential consumer with no supervisor to inject for it. Encrypting
+that file separately would need a key the operator must supply to decrypt their
+own credential — recursion with no gain.
+
+The asymmetry is deliberate: the core runs unattended and validates many
+identities, so its map lives in the database; the CLI holds one secret and is
+often driven by a human, so it gets filesystem permissions and a tool that
+refuses to run when they are wrong.
 
 ---
 
@@ -558,6 +563,7 @@ for attribution. The honest sequencing is in §7.
 | Setting | Where | Meaning |
 |---|---|---|
 | `FILEENGINE_SERVICE_TOKEN` | each calling service | the `fesvc_…` secret it presents (§3.3) |
+| `FILEENGINE_CLI_TOKEN` | CLI, automated use | the `cli` secret when a supervisor injects it; takes precedence over the file (§6.1) |
 | `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | **the one secret** — HMAC pepper for the stored hashes. Injected, never in the database (§3.5) |
 | `FILEENGINE_SERVICE_AUTH_REQUIRED` | core | default **`true`** |
 | `FILEENGINE_SERVICE_MAP_CACHE_TTL` | core | how long the map is cached between reads (§3.5); short, so an update takes effect without a restart |
@@ -704,15 +710,52 @@ read. So loopback narrows access to the host, and the secret narrows it to
 privileged users on that host. The result is "the administrator", which is the
 boundary the reasoning above assumed all along.
 
-**This makes the file permissions load-bearing, so they must be specified rather
-than left to the installer's judgement:**
+##### Where the `cli` secret comes from
 
-- The file holding the `cli` secret is installed `0640 root:fileengine` (or
-  `0600`), never world-readable, by the `.deb`, `.rpm` and `PKGBUILD` packaging.
+**The secrets store is the source of truth**, exactly as for every other secret
+on the platform — vaulted with `AT_REST_KEY`, `FILEENGINE_SERVICE_TOKEN_PEPPER`
+and the rest, distributed by Ansible Vault, rotated on the same footing. There is
+no reason for this credential to be special in *origin*.
+
+Delivery is where it differs, and for a reason worth stating rather than
+papering over: **the CLI is the only credential consumer with no supervisor.**
+Services receive their environment from systemd or compose. A human at a shell
+prompt does not, so "inject it into the environment" has to mean *somebody puts
+it there* — and for an interactive session that usually degrades into a shell
+profile, which is a file with worse permissions than the one below, or into a
+command line, which is worse still.
+
+So both, with different jobs:
+
+| Invocation | Source |
+|---|---|
+| **Automated** — an Ansible task on the core host, a timer, a systemd unit | `FILEENGINE_CLI_TOKEN` in the environment, injected by the supervisor. Identical to every other service credential |
+| **Interactive** — an administrator at a shell | A root-owned file the vault materialises on the host, read directly by the CLI |
+
+The env var takes precedence when both are present.
+
+**File permissions are therefore load-bearing for the interactive path**, and
+must be specified rather than left to the installer:
+
+- Installed `0640 root:fileengine` (or `0600`) by the `.deb`, `.rpm` and
+  `PKGBUILD` packaging, never world-readable.
 - **The CLI refuses to use a world-readable secret file**, in the manner `ssh`
   refuses a world-readable private key. A permission mistake should stop the tool
-  rather than silently widen the boundary — this is precisely the failure that is
+  rather than silently widen the boundary — precisely the failure that is
   invisible until someone exploits it.
+
+> **The failure mode to warn about explicitly:
+> `FILEENGINE_CLI_TOKEN=fesvc_… fileengine_cli …` on a command line.** That lands
+> in shell history, and is visible in `ps` and `/proc/<pid>/environ` for the life
+> of the process. The file path exists precisely so an administrator never has to
+> do that; the documentation should say so, because the env var is otherwise the
+> obvious thing to reach for.
+
+**Why this is not the fallback pattern rejected in §3.5.** That one was dropped
+because a file *cannot record its own changes*, so keeping it meant keeping a way
+to bypass a guarantee. Here both paths deliver the same credential to the same
+tool and neither weakens anything — the choice is about how a secret reaches a
+process that has no supervisor, not about two different sources of truth.
 
 There is also a useful asymmetry: **the core stores only the hash** (§3.3), while
 the plaintext lives solely in the CLI's own config. Reading the core's
@@ -1053,6 +1096,9 @@ every subsequent step measurable.
       user, since that is the population the token exists to exclude.
     - The CLI **refuses to run against a world-readable secret file**, and the
       packaging installs it non-world-readable.
+    - `FILEENGINE_CLI_TOKEN` **takes precedence** over the file when both are
+      present, so an automated invocation needs no file at all — and the secret
+      appears in neither the process's own log output nor any error message.
 11. Comparison is constant-time, and the core stores no plaintext secret.
     Guardrail (§3.3): **no code path accepts an operator-supplied service
     token** — issuing one always generates 256 bits, so the entropy assumption
