@@ -432,6 +432,7 @@ written, the credential change does not happen.
 | `service_token.revoked` | `identity` | a credential is invalidated |
 | `pepper.rotation_started` / `…_completed` | `identity` | the map-wide re-key begins / finishes |
 | `service_capability.narrowed` | `authorization` | configuration subtracts a capability (§6.4) |
+| `service_capability.changed` | `authorization` | a service's **effective** set differs from the last recorded one, detected at startup — this is what catches deploy-time changes |
 
 `identity` rather than `authorization` for the token events: what a service *may
 do* lives in code and does not change here (§6.4). What changes is what it can
@@ -450,6 +451,40 @@ the migration in between is bookkeeping.
 > never-culled, permanently-retained log containing every service secret ever
 > issued. Record the `service_id`, the action, the operator and the pepper
 > version. Nothing else is needed to answer "who granted what, when".
+
+**Record the capability set with every credential event.** Each record carries
+the service's **effective** capabilities at that moment — post config-narrowing
+(§6.4), not the compiled set — so the log answers not just *"`cmis` got a
+credential on the 14th"* but *"…and that credential could do these nine things"*.
+
+The reason this matters more than it first appears: **capabilities are the one
+part of the authorization picture that does not live in the database.** ACLs,
+roles and the token map are all queryable historically. Capability assignments
+are compiled into the binary (§6.4), so without recording them the audit trail
+has a permanent blind spot exactly where the coarse authorization axis sits —
+reconstructing what a service could do last March would mean finding the commit
+that was deployed and reading it.
+
+##### That alone is not sufficient — capabilities change on deploy, not on issue
+
+Recording only at credential events snapshots the set at arbitrary moments and
+misses the moments that matter. If a release grants `cmis` a new capability and
+no credential operation happens for six months, nothing records the change, and
+the log confidently shows a stale set the whole time — worse than showing none.
+
+So the core also records **on change, at startup**: it compares each service's
+effective set against the last recorded one and writes a
+`service_capability.changed` record only where they differ.
+
+- **Only on difference**, so ordinary restarts — which are frequent, and are a
+  platform outage besides — do not fill the log with identical snapshots.
+- It catches the *actual* change moment, which is the deploy.
+- It also catches an unintended widening: a capability appearing that nobody
+  meant to grant shows up as a record at the release that introduced it, rather
+  than being discovered later by reading code.
+
+Capabilities are structure, not payload, so recording them is consistent with
+§5.4.7's rule.
 
 One useful property falls out of the core writing these rather than the CLI:
 **revoking a service's credential is recorded independently of that service.**
@@ -986,6 +1021,13 @@ every subsequent step measurable.
     - Pepper rotation emits **exactly two** records (start, completion) however
       many services migrate in between.
     - Revoking `audit_service`'s own credential still produces a durable record.
+    - Every credential record carries the service's **effective capability set**
+      at that moment, so the log shows what the credential could do without
+      consulting the deployed binary.
+    - **Deploy-time capability changes are caught:** a release that widens a
+      service's set produces a `service_capability.changed` record at first
+      startup, and a restart with **no** change produces none — so the log is not
+      filled with identical snapshots by ordinary restarts.
     - `--json` output and exit codes make the full issue → rotate → prune cycle
       scriptable without parsing human text.
     - `pepper status` reports rows per pepper version, so "is the rotation
