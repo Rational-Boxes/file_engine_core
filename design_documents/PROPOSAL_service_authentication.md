@@ -705,7 +705,7 @@ looser "code for destructive operations, config for the rest" in §8.4.
 
 ---
 
-## 6.5 The end user's IP — already built, one door short
+### 6.5 The end user's IP — already built, one door short
 
 Recording the *external* client's address, rather than the internal peer, is the
 natural companion to `source_iface`. Together the three fields answer the whole
@@ -812,6 +812,10 @@ inconsistency:
 Splitting one request's identity across two transports invites the state where a
 call carries a user but not their origin, or vice versa. And it already works
 where it is — moving it would be churn against a live audit path for no gain.
+
+---
+
+## 7. Rollout
 
 This touches every caller, so sequencing matters more than usual.
 
