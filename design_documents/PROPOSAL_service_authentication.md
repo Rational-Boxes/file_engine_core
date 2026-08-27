@@ -617,6 +617,58 @@ For Ansible the equivalent is a play between the `fileengine_core` role and the
 service roles, templating each issued token into that service's environment file
 before its container is started.
 
+##### Backup and restore must cover three artefacts, not one
+
+**Restoring the database alone leaves an unusable system**, and the failure is
+total rather than partial: the map holds only hashes (§3.3), so a restored
+database plus a fresh host means every credential is unverifiable and no path
+exists to create a new one — the enrolment route closed on first use (§3.6).
+
+Three things must be in the disaster-recovery scope, and losing each costs
+something different:
+
+| Artefact | Where | Cost of losing it |
+|---|---|---|
+| **The pepper** (`FILEENGINE_SERVICE_TOKEN_PEPPER`) | Environment / Ansible Vault, deliberately **not** in the database (§3.5) | **Total lockout.** Every stored hash becomes unverifiable, so no service can authenticate. The most severe of the three |
+| **Credential files** (`~/.config/fileengine/credentials`, the unattended `/etc` one) | Host filesystem | Administration is lost — services keep working from their own tokens, but nothing can issue, rotate or revoke |
+| **The database** | PostgreSQL backup | Everything, but that is already understood |
+
+The pepper is the one most likely to be missed, because it is a single
+environment variable rather than a file anyone thinks to back up — and it is the
+one whose loss stops the whole platform rather than just its administration.
+Vaulting it is not the same as having it in the restore runbook.
+
+> **A calibration worth correcting.** It is natural to assume the database dump
+> is the sensitive artefact and the config files are incidental. Here it is the
+> other way round: the dump holds **peppered hashes**, which are useless alone
+> (§3.3), while the credential files hold **plaintext secrets**. Backup
+> protection should be set accordingly — a credential file in an unencrypted
+> backup is a worse exposure than the database beside it.
+
+##### Break-glass, because a restore will eventually miss one
+
+The above will not always be followed, so the recovery path should be specified
+rather than improvised at three in the morning.
+
+An operator with root on the host can already reach the database directly — the
+password is in `core.conf` — so re-opening the enrolment path is within their
+reach whatever this document says. Better that it is a **documented, deliberate
+operation** than hand-written SQL under pressure:
+
+- Clearing the bootstrap-complete marker requires **root on the core host**, and
+  is a distinct administrative act, not a config flag.
+- It reopens the enrolment path for exactly one operation, under the same
+  constraints as first boot (§3.6) — loopback, single-shot, recorded.
+- The re-enrolment is **recorded**, so a recovery that happened is visible
+  afterwards. An operator restoring service is not the same as an attacker
+  regaining it, and the log should be able to tell the difference by showing when
+  and by whom.
+
+This does not weaken the "does not reopen on an empty map" rule (§3.6). That rule
+prevents the path reopening *automatically*, from a condition an attacker could
+create by deleting rows. This is a deliberate act by someone who already holds
+the host — a party who, per §6.1, has full access regardless.
+
 ##### Delivering tokens to services that are not running yet
 
 A one-shot cannot inject environment variables into containers that Compose has
@@ -1393,6 +1445,17 @@ every subsequent step measurable.
     - **A non-loopback caller is refused** even while the path is open.
     - The enrolment writes an accountability record, so the first credential's
       creation is as attributable as every later one.
+16. **Disaster recovery is exercised, not assumed (§3.6).**
+    - Restoring **the database alone** onto a fresh host is demonstrated to be
+      unusable — the point being that this is discovered in a drill rather than
+      in an incident.
+    - Restoring **database + pepper + credential files** yields a working
+      system with every service authenticating and administration available.
+    - Restoring **without the pepper** fails every service's authentication,
+      not just the CLI's — the severity ordering the runbook must reflect.
+    - The **break-glass re-enrolment** works from root on the host, is
+      single-shot under the same constraints as first boot, and leaves a record
+      showing a recovery occurred.
     - There is **no file-based map path** to configure, so no way to change
       service credentials without an accountability record (§3.5).
 13. **End-user origin survives every external door (§6.5).** A request through
