@@ -236,6 +236,33 @@ callable by nobody. So adding a method and forgetting to classify it fails
 loudly at first use rather than silently defaulting to open — the opposite of an
 allowlist that grants by omission.
 
+#### Every grant is an explicit list. There is no blanket allow.
+
+No service — including the CLI and any future administrative tool — is granted
+"all". The map holds an enumerated set of capabilities for every identity, and
+`*`, `all`, or an implicit "unlisted means permitted" is not representable.
+
+Three reasons, the last of which is the one that matters:
+
+- **"Everything" cannot be reviewed.** A grant reading `all` conveys nothing to
+  a reader; nine named capabilities can be checked against what the service
+  actually does.
+- **"Everything" grows silently.** Split `destroy` into `purge` and `erase`
+  later, and a blanket-allow identity acquires the new one without anyone
+  deciding. An enumerated list must be amended, which forces the decision into
+  the open.
+- **"Everything" re-opens the fail-closed guarantee.** The default-deny property
+  above works because an unclassified RPC reaches nobody. A blanket allow
+  implemented as "permit all methods" bypasses classification entirely, so the
+  one identity most likely to hold it — the admin tool — becomes the one place a
+  forgotten RPC is reachable. The blanket silently undoes the protection.
+
+This is the same principle already applied one layer down. In
+`PROPOSAL_accountability_record.md` §5.4.9, `kAllPermissions` returning every bit
+for `tenant_admin` is what defeated the bespoke `ERASE` permission; the fix was
+to stop having a blanket. The service map adopts the rule from the start rather
+than having to retract it later.
+
 ### 6.2 Deriving the assignments — measure, do not guess
 
 The temptation is to write the service-to-capability matrix from intuition. That
@@ -256,7 +283,7 @@ A few assignments are clear enough to state now, and they illustrate the value:
 | `mcp` | `read`, `write` — no `delete`, no `destroy` | See §6.3 |
 | `cmis`, `webdav_bridge` | no `destroy` | §5.4.9 of the accountability proposal restricts erasure to the admin surface **by convention**; this makes it a property of the core |
 | `csai`, `difference`, `discussion` | `read` + narrow `write` for their own derived output | None has business managing ACLs or roles |
-| CLI / admin surface | everything, including `destroy` | The one place irreversible operations belong |
+| CLI / admin surface | `read`, `write`, `delete`, `restore`, `acl`, `roles`, `admin`, `destroy` — enumerated, **not** "all" | The one place irreversible operations belong. Note what writing it out reveals: it does **not** get `accountability`. The admin tool has no business reading the security log; that is `audit_service`'s job, and a blanket grant would have handed it over without anyone noticing |
 
 ### 6.3 The MCP case
 
@@ -359,7 +386,12 @@ every subsequent step measurable.
 9. **Config cannot widen.** A configuration attempting to grant a service a
    capability outside its compiled set is rejected at startup rather than
    honoured (§6.4).
-10. Comparison is constant-time, and the core stores no plaintext secret.
-11. **The map resolves the source correctly:** each service's token yields that
+10. **No blanket grant is representable.** There is no `*` / `all` form; every
+    identity, the CLI included, carries an enumerated list. A test asserts that
+    no identity holds every capability, and that an unclassified RPC is refused
+    to *all* identities — including administrative ones, which is where a
+    wildcard would otherwise have hidden.
+11. Comparison is constant-time, and the core stores no plaintext secret.
+12. **The map resolves the source correctly:** each service's token yields that
     service's name and no other, and a token whose secret half is altered by one
     character resolves to nothing rather than to a neighbouring entry.
