@@ -173,6 +173,108 @@ problem this is meant to reduce.
 
 ---
 
+### 3.5 The map at rest — encrypted, keyed from the secrets store
+
+The map lives in a file the core loads at boot, and that file is **encrypted**.
+The key is held in the secrets store and injected at runtime, so **the file is
+useless if it leaks on its own**.
+
+#### Reuse the mechanism that already exists
+
+This needs no new machinery. `AT_REST_KEY` already does exactly this shape for
+storage encryption: a 32-byte AES-256 key, supplied as 64 hex characters,
+injected from the environment (`AT_REST_KEY: ${AT_REST_KEY}` in the compose
+stack, Ansible Vault in deployments), and required when encryption is on. The
+core's `CryptoUtils` provides AES-256-GCM.
+
+So: `FILEENGINE_SERVICE_MAP_KEY`, same generation (`openssl rand -hex 32`), same
+injection path, same primitives. An operator who already understands
+`AT_REST_KEY` understands this one.
+
+#### What it buys, honestly
+
+The map holds HMACs, not plaintext (§3.3), so a leaked map already yields no
+usable token — inverting HMAC-SHA256 over a 256-bit secret is not a threat model.
+Encryption is therefore **defence in depth rather than the primary control**, and
+worth being precise about what it adds:
+
+- **It conceals the service inventory.** The map names every identity the
+  platform has. That is reconnaissance — which doors exist, what to target — and
+  it is the one thing a leaked map genuinely gives away today.
+- **It contains a future mistake.** If someone later stores a secret in the map
+  in a weaker form, or the hashing is changed carelessly, the encryption is the
+  layer that was already there. Controls that only matter when something else
+  goes wrong are exactly the ones worth having cheaply.
+- **It satisfies "secrets encrypted at rest"** as a posture requirement without
+  argument about whether an HMAC counts.
+
+#### Secret zero moves; it does not vanish
+
+Encrypting the map does not remove the need to protect something — it replaces
+*a file of many identities* with *one key*. That is a real improvement: one thing
+to guard, one thing to rotate, one thing living in a store built for the purpose,
+rather than a config file that gets copied into backups, tickets and container
+images.
+
+But the key still has to reach the process at boot, so the bootstrapping problem
+is relocated rather than solved. It should be stated that way rather than
+described as making the secrets safe, which would be the same overclaim as
+calling a plaintext bearer token protection for a public port (§4).
+
+#### Two rotations, not one
+
+They are separate operations and both must work:
+
+| Rotating | Means |
+|---|---|
+| A **service token** | Re-encrypt the map with the same key, using the §3.4 overlap so services roll one at a time |
+| The **map key** | Decrypt with the old key, re-encrypt with the new; no service token changes |
+
+Conflating them turns a routine credential rotation into a platform-wide restart.
+
+#### Fail closed, but legibly
+
+A missing or wrong key means the core cannot read its map, cannot authenticate
+any caller, and must refuse to serve. That is correct — but **an undecryptable
+map and an empty map must not produce the same message.** "No services
+configured" for what is actually a key mismatch sends an operator hunting a
+configuration problem that does not exist, during an outage. Distinguish them
+explicitly at startup.
+
+#### Loaded at core boot — two consequences
+
+**Inject the key, never fetch it.** The key arrives in the process environment
+(compose, systemd `EnvironmentFile`, or a systemd credential) rather than being
+retrieved from a secrets service at startup. This matters more here than it
+usually would: `PROPOSAL_accountability_record.md` §7.8 establishes that **a core
+outage takes the platform down**, so anything the core must reach before it can
+serve becomes a platform-wide single point of failure. A vault the core has to
+call at boot would mean a vault outage is a total outage. Injection keeps the
+dependency at deploy time, where it belongs. Decrypt once at startup, then zero
+the key rather than holding it for the process lifetime.
+
+**Provide a reload path.** Loading at boot means the map is fixed for the process
+lifetime, so adding a service or completing a token rotation would otherwise
+require a core restart — and by the same §7.8 reasoning, restarting the core is
+a platform-wide outage. Making routine credential administration cost an outage
+guarantees it is deferred, which is how stale credentials accumulate.
+
+So the map must be re-readable without a restart: `SIGHUP`, or an admin RPC
+gated by the `admin` capability (§6.1). A reload is a strictly additive
+operation — it re-reads and replaces the map, and in-flight calls already past
+authentication are unaffected.
+
+#### Not the CLI's own token
+
+The `cli` secret (§6.1) stays a plaintext file protected by filesystem
+permissions. Encrypting it would need a key the operator must supply to decrypt
+their own credential — recursion with no gain. The asymmetry is deliberate: the
+core runs unattended and holds many identities, so it gets a key from the store;
+the CLI is interactive and holds one secret, so it gets `0640` and a tool that
+refuses to run when that is wrong.
+
+---
+
 ## 4. What this buys, and what it does not
 
 Being precise here matters, because the failure mode is believing the port is now
@@ -213,7 +315,8 @@ for attribution. The honest sequencing is in §7.
 | Setting | Where | Meaning |
 |---|---|---|
 | `FILEENGINE_SERVICE_TOKEN` | each calling service | the secret it presents |
-| `FILEENGINE_SERVICE_TOKENS` | core | the source:secret map (§3.3) as `name:hash` pairs, or a path to a file of them |
+| `FILEENGINE_SERVICE_MAP` | core | path to the **encrypted** source:secret map (§3.3, §3.5), read at boot |
+| `FILEENGINE_SERVICE_MAP_KEY` | core | AES-256 key for that file, 64 hex chars, injected from the secrets store — same shape as `AT_REST_KEY` |
 | `FILEENGINE_SERVICE_AUTH_REQUIRED` | core | default **`true`** |
 | `FILEENGINE_SERVICE_TOKEN_PEPPER` | core | HMAC pepper for the stored hashes |
 
@@ -645,6 +748,15 @@ every subsequent step measurable.
       rather than parsed into a partial match.
     - An **unknown service id costs the same time as a valid id with a wrong
       secret**, so timing does not enumerate service names.
+14. **The map at rest is unusable alone (§3.5).** The map file decrypts only with
+    `FILEENGINE_SERVICE_MAP_KEY`, and:
+    - Booting with a **wrong or missing key fails closed with a message naming
+      the key**, distinguishable from an empty map — the operational trap during
+      an outage.
+    - A **reload** (`SIGHUP` / admin RPC) picks up an added service without a
+      restart, and calls already authenticated are unaffected.
+    - Rotating a **service token** and rotating the **map key** are independent:
+      either can be done without the other.
 13. **End-user origin survives every external door (§6.5).** A request through
     `bcf_services` records the caller's real address, not an internal one — the
     one door currently missing it. And an event-driven internal call records an
