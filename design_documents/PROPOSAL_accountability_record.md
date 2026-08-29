@@ -286,9 +286,10 @@ versioned home of its own**:
 | Recorded | Not recorded | Because |
 |---|---|---|
 | ACL grant / revoke | content writes | the version series already records who and when |
-| Role create / delete / assign / remove | metadata writes | the metadata log will (its own proposal) |
-| Version culls, metadata culls | reads | volume; the audit sink samples these by design |
-| **Erasures** — file, field and tenant (§5.4) | listings, stats | no accountability content |
+| Role create / delete / assign / remove | metadata **value** writes | the metadata log records them, and raises its own commit hint |
+| **Metadata management** — key/shape catalog administration, batch operations | reads | volume; the audit sink samples these by design |
+| Version culls, metadata culls | listings, stats | no accountability content |
+| **Erasures** — file, field and tenant (§5.4) | | |
 | Tenant create / delete | | |
 | **Service-credential lifecycle** — issue, rotate, prune, revoke, pepper rotation, capability grant/revoke | | |
 
@@ -302,8 +303,8 @@ the call.
 
 **The organising rule: an operation belongs here if it is security-relevant and
 needs a guaranteed, chained, never-culled record — not merely because it lacks a
-history elsewhere.** Content and metadata writes are excluded because their
-versioned stores answer the question asked of them; authorization changes are
+history elsewhere.** Content and metadata *value* writes are excluded because
+their versioned stores answer the question asked of them; authorization changes are
 included even though §7.2 gives them their own append-only history, because they
 are the canonical security event and the two records serve different purposes:
 
@@ -316,6 +317,24 @@ A versioned store cannot answer the second (it records values, not the act of
 changing them, and it is culled with the resource it describes). An
 accountability log cannot answer the first without becoming the store. Both are
 needed, and for authorization changes both are kept.
+
+**Amended 2026-08-28 — metadata management.** The row above originally read
+"metadata writes → the metadata log will (its own proposal)", which collapsed two
+different things into one word. *Changing a value* is state, and the metadata log
+answers for it. *Changing what metadata may exist* — administering the key/shape
+catalog, running a batch operation over it, culling or erasing it — is an act,
+and it is the same kind of act as an ACL change: security-relevant, rare, with no
+versioned home of its own. It belongs here, and it now is here.
+
+The line is drawn at volume as much as at meaning. Per-object value writes are a
+hot path once CMIS `updateProperties` exists, and §4.2's fail-closed guarantee is
+affordable *only* while the scope stays rare — routing them here would put the
+per-tenant chain lock on that path and roll back a user's edit because a hash
+chain was contended. That is the same reasoning that already excludes
+inherited-ACL propagation via `AccountabilityMode::PartOfCreation`.
+
+See `PROPOSAL_metadata_change_events.md` §0 for the destination split and the
+hint contract that carries it.
 
 ### 4.2 Guarantees
 
