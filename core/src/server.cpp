@@ -407,7 +407,10 @@ int main(int argc, char** argv) {
     std::unique_ptr<fileengine::RestServer> rest_listener;
     if (config.http_metrics_enabled) {
         rest_listener = std::make_unique<fileengine::RestServer>(
-            database, cache_manager.get(), file_culler.get());
+            database, cache_manager.get(), file_culler.get(),
+            // Null when there is no object store: the sync metrics are then not
+            // emitted at all, rather than reported as a healthy zero.
+            s3_init_result.success ? object_store_sync.get() : nullptr);
         // Optional client-IP allowlist for the unauthenticated monitor (L2):
         // split FILEENGINE_HTTP_METRICS_ALLOW_IPS on commas, trimming blanks.
         if (!config.http_metrics_allow_ips.empty()) {

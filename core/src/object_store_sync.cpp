@@ -107,7 +107,8 @@ Result<void> ObjectStoreSync::perform_sync(std::function<void(const std::string&
     }
     
     Result<void> result = Result<void>::ok();
-    
+    begin_scan();
+
     try {
         // Get tenant list for multi-tenant sync
         auto tenant_result = get_tenant_list();
@@ -134,7 +135,11 @@ Result<void> ObjectStoreSync::perform_sync(std::function<void(const std::string&
     } catch (const std::exception& e) {
         result = Result<void>::err(std::string("Sync failed: ") + e.what());
     }
-    
+
+    // Published even when the pass errored partway. A scan that half-completed
+    // still tells you more than a number frozen at whatever it was an hour ago,
+    // and the age gauge is what says how much to trust it.
+    end_scan();
     sync_in_progress_ = false;
     return result;
 }
@@ -361,6 +366,10 @@ void ObjectStoreSync::monitoring_loop() {
     while (running_.load()) {
         // Check connection health
         bool is_healthy = is_connection_healthy();
+        // Cached for the metrics endpoint. is_connection_healthy() performs a
+        // bucket_exists() call, so a scrape must never invoke it directly — this
+        // loop is already paying for the answer.
+        connection_healthy_.store(is_healthy);
 
         if (!is_healthy) {
             if (!connection_lost) {
@@ -401,6 +410,34 @@ void ObjectStoreSync::monitoring_loop() {
 }
 
 
+void ObjectStoreSync::begin_scan() {
+    pending_scratch_ = 0;
+}
+
+void ObjectStoreSync::end_scan() {
+    pending_count_ = pending_scratch_.load();
+    last_scan_epoch_s_ = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+size_t ObjectStoreSync::get_pending_count() const {
+    return pending_count_.load();
+}
+
+int64_t ObjectStoreSync::get_last_scan_age_seconds() const {
+    const long long then = last_scan_epoch_s_.load();
+    if (then < 0) return -1;   // nothing has completed a scan yet
+    const long long now = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    return static_cast<int64_t>(now > then ? now - then : 0);
+}
+
+bool ObjectStoreSync::get_connection_healthy() const {
+    return connection_healthy_.load();
+}
+
 Result<void> ObjectStoreSync::sync_files(const std::string& tenant) {
     // Get list of files to sync
     auto files_result = get_files_to_sync(tenant);
@@ -409,7 +446,11 @@ Result<void> ObjectStoreSync::sync_files(const std::string& tenant) {
                                           Result<void>::err(files_result.error);
     }
     
-    int total_files = files_result.value.size();
+    // The backlog, as measured by the scan that just ran. Accumulated across
+    // tenants and published by end_scan(), so the gauge is a whole-deployment
+    // number rather than whichever tenant was scanned last.
+    pending_scratch_ += files_result.value.size();
+
     int synced_files = 0;
     int failed_files = 0;
     

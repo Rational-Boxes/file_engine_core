@@ -27,6 +27,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <cstdint>
 
 namespace fileengine {
 
@@ -74,6 +75,34 @@ public:
     // Check if the sync service is running
     bool is_sync_running() const;
 
+    // --- Observability -------------------------------------------------------
+    //
+    // All three are CHEAP: they read atomics the sync pass itself writes. That is
+    // deliberate, not an optimisation. The honest answer to "how many versions
+    // are not in the object store" costs one existence check per version — 585
+    // network round trips on a modest deployment — so computing it on a /metrics
+    // scrape would turn a 15-second scrape interval into sustained load against
+    // the bucket, and a slow bucket into a scrape timeout that looks like the
+    // core is down. The sync loop already pays that cost once a minute because
+    // it has to; these publish what it found.
+    //
+    // Staleness is therefore part of the reading, which is why the age is
+    // exposed alongside the count. A pending count that has stopped changing
+    // looks identical to a healthy one until you can see nothing has scanned in
+    // an hour.
+
+    // Versions found needing sync at the last completed scan. The backlog.
+    size_t get_pending_count() const;
+
+    // Seconds since that scan finished; -1 if none has completed. Rising without
+    // bound means the sync loop itself has stopped, which the count alone cannot
+    // distinguish from "nothing to do".
+    int64_t get_last_scan_age_seconds() const;
+
+    // The last observed result of is_connection_healthy(), which performs a
+    // bucket_exists() call and so must never be invoked from a scrape.
+    bool get_connection_healthy() const;
+
     // Perform comprehensive sync of all local files (for startup)
     Result<void> perform_comprehensive_local_sync(const std::string& tenant = "");
 
@@ -102,6 +131,18 @@ private:
 
     std::atomic<size_t> synced_file_count_;
     std::atomic<size_t> failed_sync_count_;
+
+    // Published by the sync pass, read by the metrics endpoint. See the note on
+    // the getters above for why these are cached rather than computed on demand.
+    std::atomic<size_t> pending_count_{0};
+    std::atomic<size_t> pending_scratch_{0};
+    std::atomic<long long> last_scan_epoch_s_{-1};
+    std::atomic<bool> connection_healthy_{false};
+
+    // Bracket a full pass so the published count is a whole-fleet number rather
+    // than whichever tenant happened to be scanned last.
+    void begin_scan();
+    void end_scan();
 
     // Background thread for monitoring and recovery
     void monitoring_loop();

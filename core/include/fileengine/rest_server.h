@@ -43,11 +43,18 @@ class FileCuller;
 // IP allowlist (set_allowed_ips) enforced before routing. The deployment still
 // relies on the network perimeter (firewall / VPC security groups). See
 // design_documents/monitoring_and_telemetry.md §10 for the rationale.
+class ObjectStoreSync;
+
 class RestServer {
 public:
+    // object_store_sync may be null: a deployment with no object store
+    // configured has no sync engine, and the sync metrics are then simply not
+    // emitted rather than reported as zero. Zero pending and "no object store at
+    // all" are different states and must not look alike on a dashboard.
     RestServer(std::shared_ptr<IDatabase> db,
                CacheManager* cache_manager,
-               FileCuller* file_culler);
+               FileCuller* file_culler,
+               ObjectStoreSync* object_store_sync = nullptr);
     ~RestServer();
 
     RestServer(const RestServer&) = delete;
@@ -74,6 +81,10 @@ private:
     std::shared_ptr<IDatabase> db_;
     CacheManager* cache_manager_;
     FileCuller* file_culler_;
+    // Borrowed, not owned. server.cpp stops this listener before destroying the
+    // sync engine (rest_listener->stop() precedes object_store_sync.reset()),
+    // which is the same ordering cache_manager_ and file_culler_ rely on.
+    ObjectStoreSync* object_store_sync_;
 
     std::unique_ptr<httplib::Server> http_;
     std::vector<std::string> allow_ips_;

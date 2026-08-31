@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "fileengine/rest_server.h"
+#include "fileengine/object_store_sync.h"
 #include "fileengine/transfer_tracker.h"
 #include "fileengine/cache_manager.h"
 #include "fileengine/file_culler.h"
@@ -41,10 +42,12 @@ using json = nlohmann::json;
 
 RestServer::RestServer(std::shared_ptr<IDatabase> db,
                        CacheManager* cache_manager,
-                       FileCuller* file_culler)
+                       FileCuller* file_culler,
+                       ObjectStoreSync* object_store_sync)
     : db_(std::move(db)),
       cache_manager_(cache_manager),
       file_culler_(file_culler),
+      object_store_sync_(object_store_sync),
       http_(std::make_unique<httplib::Server>()) {
     install_routes();
 }
@@ -351,6 +354,54 @@ void RestServer::install_routes() {
             for (const auto& [method, count] : rpc.by_method) {
                 m.emit("fileengine_rpc_in_flight", "method=\"" + esc(method) + "\"", count);
             }
+        }
+
+        // --- object store sync ---------------------------------------------
+        //
+        // THE GAP THIS CLOSES. The core does not write to the object store
+        // inline: FileSystem::put stores the payload locally, records the
+        // version row and returns, and the object is written afterwards by the
+        // sync loop. So the database is briefly ahead of the bucket — and a
+        // backup taken during a STUCK sync captures metadata referencing content
+        // that does not exist, which is the one pairing a restore must never be
+        // given. Until now nothing surfaced that condition: rpc_in_flight goes to
+        // zero while a backlog sits undrained, because the RPC finished long
+        // before the object was written.
+        //
+        // Every value here is read from an atomic the sync pass published. None
+        // of them touch the object store — see the note on the getters, and do
+        // not be tempted to call is_connection_healthy() or get_files_to_sync()
+        // from this function.
+        if (object_store_sync_) {
+            const auto age = object_store_sync_->get_last_scan_age_seconds();
+            m.gauge("fileengine_object_sync_pending",
+                    "File versions the database knows about that are not yet in the object "
+                    "store, as of the last scan. Seconds' worth is normal on a busy server; "
+                    "a number that stays high is a sync that is not draining, and a backup "
+                    "taken then references content the bucket does not have",
+                    static_cast<double>(object_store_sync_->get_pending_count()));
+            // Alert on THIS as well as on pending. A stalled loop leaves the
+            // pending gauge frozen at its last value, which is indistinguishable
+            // from a healthy deployment with nothing to do.
+            m.gauge("fileengine_object_sync_last_scan_age_seconds",
+                    "Age of the pending figure above. Climbing without bound means the sync "
+                    "loop has stopped and the count beside it is stale, not calm. -1 until "
+                    "the first scan completes",
+                    static_cast<double>(age));
+            m.gauge("fileengine_object_sync_connection_healthy",
+                    "1 when the object store answered the last reachability check. 0 with a "
+                    "rising pending count is the shape of expired credentials or a bucket "
+                    "that stopped answering",
+                    object_store_sync_->get_connection_healthy() ? 1.0 : 0.0);
+            m.gauge("fileengine_object_sync_in_progress",
+                    "1 while a sync pass is executing", 
+                    object_store_sync_->is_sync_running() ? 1.0 : 0.0);
+            m.counter("fileengine_object_sync_synced_total",
+                      "File versions written to the object store since boot",
+                      static_cast<double>(object_store_sync_->get_synced_file_count()));
+            m.counter("fileengine_object_sync_failed_total",
+                      "Attempts to write a version to the object store that failed since boot",
+                      static_cast<double>(object_store_sync_->get_failed_sync_count()));
         }
 
         // --- database connection pool -------------------------------------
