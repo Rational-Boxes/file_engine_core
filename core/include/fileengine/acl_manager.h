@@ -129,6 +129,25 @@ inline constexpr int kAllPermissions =
 // side effect of an LDAP group membership.
 inline constexpr int kTenantAdminPermissions = kAllPermissions & ~kDestroyDataPermissions;
 
+// What an **erasure_admin** gets: everything a tenant_admin gets, plus ERASE.
+//
+// The role exists because erasure is a legal obligation somebody has to be able
+// to discharge. Requiring a per-file ACL grant is right for an ordinary
+// administrator — it keeps an irreversible power from riding along with an LDAP
+// group — but it is unworkable as the ONLY path, because the person answering a
+// right-to-erasure request needs to act on any object in the tenant, including
+// files they do not own and cannot self-grant on. Without this role the
+// obligation is technically unmeetable, which §5.4 is explicit is itself the
+// violation.
+//
+// CULL_VERSIONS is deliberately NOT included, even though erasure is strictly
+// more destructive. The two bits are separate precisely so each is granted for
+// its own reason: this role answers erasure requests, not storage housekeeping,
+// and bundling a permission nobody asked for is how tenant_admin came to hold
+// CULL_VERSIONS silently in the first place.
+inline constexpr int kErasureAdminPermissions =
+      kTenantAdminPermissions | static_cast<int>(Permission::ERASE);
+
 enum class PrincipalType {
     USER,
     ROLE,      // Role-based permissions. Roles ARE the group mechanism —
@@ -179,12 +198,20 @@ class IDatabase;
 //     inherently tenant-scoped: this AclManager resolves against a single
 //     tenant's schema (db_), so a tenant_admin can never reach another tenant's
 //     resources. The bridges map a tenant's "administrators" group to this role.
+//   kErasureAdminRole — a tenant_admin who may additionally ERASE. Tenant-scoped
+//     by the same mechanism. Mapped from its own per-tenant group, deliberately
+//     separate from "administrators" so that being an administrator does not
+//     confer it: the whole point is that this is a smaller population who have
+//     been given a specific legal authority, and moving someone into it is a
+//     visible act in the directory rather than a side effect of an admin role.
 //
-// Separating the two contains the blast radius of a per-tenant admin (finding
+// Separating them contains the blast radius of a per-tenant admin (finding
 // H2): a mis-placed or attacker-created "administrators" group grants control of
-// one tenant, not the whole deployment.
+// one tenant, not the whole deployment — and now, not the ability to
+// irreversibly destroy its contents either.
 inline constexpr const char* kSystemAdminRole = "system_admin";
 inline constexpr const char* kTenantAdminRole = "tenant_admin";
+inline constexpr const char* kErasureAdminRole = "erasure_admin";
 
 // The dedicated reader role for the accountability chain
 // (PROPOSAL_accountability_record.md §4.3.1).

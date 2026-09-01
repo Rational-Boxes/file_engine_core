@@ -1156,6 +1156,31 @@ tenant-scoped record would destroy itself.
 
 #### 5.4.9 Gating erasure — a bespoke permission, and why a new bit is not enough
 
+> **The `erasure_admin` role — added because the per-file grant is not a
+> sufficient path on its own.**
+>
+> Requiring an explicit ACL grant is the right gate for an ordinary
+> administrator: it stops an irreversible power riding along with an LDAP group,
+> which is what this section is about. But as the ONLY path it does not work.
+> The person answering a right-to-erasure request has to act on any object in the
+> tenant — files they do not own, cannot self-grant on, and may not be able to
+> see. Leaving them to hand-grant themselves ERASE per file makes the obligation
+> impractical, and §5.4 opens by saying that being technically unable to erase is
+> itself the violation.
+>
+> So there is a third role: `erasure_admin` = `tenant_admin` + `ERASE`. It is
+> tenant-scoped by the same structural mechanism (one AclManager per tenant
+> schema), and it does **not** include `CULL_VERSIONS` — the two destroy-data
+> bits stay separate so each is granted for its own reason. This role answers
+> erasure requests; it is not a storage-housekeeping licence.
+>
+> The bridges map a per-tenant `erasure_admins` group to it, deliberately NOT
+> implied by `administrators`. That is the gate: **an administrator GRANTS it by
+> editing that group's membership, and does not hold it by being an
+> administrator.** Moving somebody into it is a visible act in the directory, the
+> population stays small, and a mis-placed or attacker-created `administrators`
+> group still cannot destroy the tenant's contents.
+
 > **Deployment step — erasure does not work until these are granted.** The
 > `ERASE` permission gates the USER; the service-auth capability gates the DOOR,
 > and both must be satisfied. Out of the box no service holds either capability,

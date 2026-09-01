@@ -139,14 +139,28 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
     if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()) {
         return Result<bool>::ok(true);
     }
+    // erasure_admin is a tenant_admin who may additionally ERASE — the person
+    // who has to be able to discharge a right-to-erasure request against any
+    // object in the tenant, including files they do not own. Checked BEFORE the
+    // tenant_admin arm because it is a superset of it: a member of both (the
+    // normal case, since they administer the tenant too) must get the wider set.
+    const bool is_erasure_admin_caller =
+        std::find(effective_roles.begin(), effective_roles.end(), kErasureAdminRole) != effective_roles.end();
+    if (is_erasure_admin_caller &&
+        (required_permissions & ~kErasureAdminPermissions) == 0) {
+        return Result<bool>::ok(true);
+    }
+
     const bool is_tenant_admin_caller =
         std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
     if (is_tenant_admin_caller &&
         (required_permissions & kDestroyDataPermissions) == 0) {
         return Result<bool>::ok(true);
     }
-    // A tenant_admin asking for a destroy-data bit falls through to the normal
-    // ACL evaluation below, where an explicit grant can satisfy it.
+    // An admin asking for a destroy-data bit their role does not cover falls
+    // through to the normal ACL evaluation below, where an explicit grant can
+    // still satisfy it — CULL_VERSIONS for an erasure_admin, either bit for a
+    // plain tenant_admin.
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
@@ -238,17 +252,23 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
     if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()) {
         return Result<int>::ok(kAllPermissions);
     }
-    if (std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
-        // Union the bypass with anything explicitly granted, so a tenant_admin
-        // who HAS been granted CULL_VERSIONS or ERASE sees it here. Reporting
-        // the bare bypass set would tell the caller they lack a bit that
-        // check_permission would in fact allow.
+    const bool erasure_admin =
+        std::find(effective_roles.begin(), effective_roles.end(), kErasureAdminRole) != effective_roles.end();
+    const bool tenant_admin =
+        std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
+    if (erasure_admin || tenant_admin) {
+        // Union the bypass with anything explicitly granted, so an admin who HAS
+        // been granted a destroy-data bit sees it here. Reporting the bare bypass
+        // set would tell the caller they lack a bit that check_permission would
+        // in fact allow — and this answer drives the UI, so an under-report hides
+        // an affordance the user actually has.
         int granted = 0;
         auto acls_result = get_acls_for_resource(resource_uid, tenant);
         if (acls_result.success) {
             granted = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
         }
-        return Result<int>::ok(kTenantAdminPermissions | (granted & kDestroyDataPermissions));
+        const int bypass = erasure_admin ? kErasureAdminPermissions : kTenantAdminPermissions;
+        return Result<int>::ok(bypass | (granted & kDestroyDataPermissions));
     }
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
