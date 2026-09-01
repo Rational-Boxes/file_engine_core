@@ -28,6 +28,7 @@ const char* to_string(FileEventType type) {
         case FileEventType::FileMoved:    return "file.moved";
         case FileEventType::FileRenamed:  return "file.renamed";
         case FileEventType::FileDeleted:  return "file.deleted";
+        case FileEventType::FileErased:   return "file.erased";
         case FileEventType::FileRestored: return "file.restored";
         case FileEventType::AclChanged:        return "acl.changed";
         case FileEventType::RoleAssigned:      return "role.assigned";

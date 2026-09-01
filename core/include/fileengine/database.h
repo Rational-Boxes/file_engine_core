@@ -173,6 +173,25 @@ public:
                                const std::string& tenant,
                                const AccountabilityContext& ctx) override;
 
+    // Erasure (§5.4) — see IDatabase for the semantics and why each of these is
+    // shaped the way it is.
+    Result<ErasureInit> begin_erasure(const std::string& file_uid,
+                                      const std::string& reason,
+                                      bool retain_name,
+                                      const std::vector<std::string>& participants,
+                                      const std::string& tenant,
+                                      const AccountabilityContext& ctx) override;
+    Result<std::vector<PendingErasureRow>> list_pending_erasures(
+            const std::string& participant, int limit, const std::string& tenant) override;
+    Result<ErasureStatusRow> acknowledge_erasure(const std::string& erasure_id,
+                                                 const std::string& participant,
+                                                 bool complied,
+                                                 const std::string& detail,
+                                                 const std::string& tenant,
+                                                 const AccountabilityContext& ctx) override;
+    Result<ErasureStatusRow> get_erasure(const std::string& erasure_id,
+                                         const std::string& tenant) override;
+
     // The pull surface (§4.3.1). Ordered by ts, which under the chain lock is
     // also seq order; `has_more` tells the consumer to come straight back
     // rather than wait out its poll interval.

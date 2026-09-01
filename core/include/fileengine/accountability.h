@@ -143,6 +143,15 @@ inline constexpr const char* kRoleDelete   = "role.delete";
 inline constexpr const char* kRoleAssign   = "role.assign";
 inline constexpr const char* kRoleRemove   = "role.remove";
 inline constexpr const char* kCullVersions = "cull.versions";
+// Erasure (§5.4). Three actions, not one, because the value of the feature is
+// being able to demonstrate compliance and that is a story with a beginning and
+// an end: what was destroyed and by whom, who confirmed destroying their copy,
+// and the moment the obligation was actually met. An erasure that never reaches
+// `erase.complete` is an unmet contractual obligation, and the chain is where
+// that is visible.
+inline constexpr const char* kErase          = "erase.initiated";
+inline constexpr const char* kEraseAck       = "erase.acknowledged";
+inline constexpr const char* kEraseComplete  = "erase.complete";
 inline constexpr const char* kTenantCreate = "tenant.create";
 inline constexpr const char* kTenantDelete = "tenant.delete";
 

@@ -209,6 +209,44 @@ int main(int argc, char** argv) {
     auto filesystem = std::make_shared<fileengine::FileSystem>(tenant_manager);
     filesystem->set_acl_manager(acl_manager);
 
+    // Who must acknowledge an erasure before it counts as complete (§5.4.3).
+    //
+    // Deliberately configuration and not inference. The platform is à-la-carte,
+    // so the core cannot know which derived-data services a deployment runs —
+    // and being wrong either way is bad in a specific direction: listing a
+    // service that is absent leaves every erasure permanently incomplete (an
+    // alarm that cries wolf), while omitting one that IS running certifies
+    // erasures complete with the extracted text and embeddings still in place.
+    // The second is a false compliance claim, so it is worth the noise of
+    // requiring deployments to state it.
+    {
+        std::vector<std::string> participants;
+        const std::string& raw = config.erasure_participants;
+        std::string cur;
+        for (char c : raw) {
+            if (c == ',') {
+                if (!cur.empty()) participants.push_back(cur);
+                cur.clear();
+            } else if (!std::isspace(static_cast<unsigned char>(c))) {
+                cur.push_back(c);
+            }
+        }
+        if (!cur.empty()) participants.push_back(cur);
+        filesystem->set_erasure_participants(participants);
+        if (participants.empty()) {
+            SERVER_LOG_WARN("Server",
+                "FILEENGINE_ERASURE_PARTICIPANTS is unset: an erasure will be reported COMPLETE "
+                "once the core's own content is destroyed. That is correct only if this deployment "
+                "runs no services holding derived data (csai, discussion, difference). If it does, "
+                "list them or erasures will be certified complete while extracted text and "
+                "embeddings remain.");
+        } else {
+            std::string joined;
+            for (const auto& p : participants) joined += (joined.empty() ? "" : ",") + p;
+            SERVER_LOG_INFO("Server", "Erasure participants: " + joined);
+        }
+    }
+
     // Optional file-activity event emission (Redis). make_event_sink returns
     // nullptr when disabled/not compiled in, so this is a no-op by default.
     if (auto event_sink = fileengine::make_event_sink(config)) {

@@ -1717,6 +1717,156 @@ Result<void> FileSystem::purge_old_versions(const std::string& file_uid, int kee
     return Result<void>::ok();
 }
 
+// Erasure — "true delete" (PROPOSAL_accountability_record.md §5.4).
+//
+// What this does NOT do is as important as what it does: it destroys the core's
+// copy and nothing else. Extracted text, embeddings, rendered pages, comment
+// text quoting the document and comparison manifests all live in other services
+// (§5.4.2), and an erasure that cleared only core storage would be a FALSE
+// GUARANTEE. That is why this returns an INITIATED erasure rather than success,
+// and why the caller must not present it to a user as a completed one.
+Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_uid,
+                                                        const std::string& reason,
+                                                        bool retain_name,
+                                                        const std::string& user,
+                                                        const std::vector<std::string>& roles,
+                                                        const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<EraseOutcome>::err("Database not available for tenant: " + tenant);
+    }
+
+    // ERASE, never WRITE and never DELETE. Enforced here as well as at the gRPC
+    // boundary so no in-process caller can reach it by another route. Note that
+    // validate_user_permissions applies only the system_admin bypass: a tenant
+    // admin does NOT get this for free, and must hold an explicit grant
+    // (§5.4.9), which is what makes holding it a deliberate, recorded act.
+    auto perm_result = validate_user_permissions(file_uid, user, roles,
+                                                 static_cast<int>(fileengine::Permission::ERASE), tenant);
+    if (!perm_result.success || !perm_result.value) {
+        return Result<EraseOutcome>::err(
+            "User does not have permission to erase this file (requires ERASE)");
+    }
+
+    EraseOutcome outcome;
+
+    // Renditions are hidden children under the file's uid — rendered pages,
+    // thumbnails, previews, markup — and every one is derived from the content
+    // being erased (§5.4.2). Leaving them would leave a readable copy of the
+    // document in image form, which is not a subtle failure.
+    //
+    // Collected before the parent is erased, and erased first, so a failure
+    // partway leaves children whose parent still exists rather than orphans.
+    std::vector<std::string> child_uids;
+    {
+        auto children = context->db->list_files_in_directory_with_deleted(file_uid, tenant);
+        if (children.success) {
+            for (const auto& c : children.value) child_uids.push_back(c.uid);
+        }
+    }
+
+    // Both copies, each by its OWN key. The object store is keyed
+    // <tenant>/<uid>/<version> while local storage is sharded
+    // <tenant>/xx/yy/zz/<uid>/<version>, so passing the local path to the bucket
+    // deletes nothing and reports no error — the content would survive in the
+    // durable copy after the platform had certified it destroyed.
+    //
+    // Best-effort in the same sense culling is: the rows are already gone, so a
+    // failure here leaves orphaned bytes (which the object-store sync
+    // reconciles) rather than metadata pointing at content that is not there.
+    auto destroy_bytes = [&](const std::string& uid, const ErasureInit& init) {
+        for (const auto& path : init.storage_paths) {
+            if (cache_manager_) cache_manager_->remove_file(path);
+            if (context->storage) context->storage->delete_file(path, tenant);
+        }
+        if (context->object_store) {
+            for (const auto& vts : init.version_timestamps) {
+                const std::string key = context->object_store->get_storage_path(uid, vts, tenant);
+                context->object_store->delete_file(key, tenant);
+            }
+        }
+    };
+
+    AccountabilityContext ctx;
+    ctx.actor        = user;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
+
+    // Children carry no participants of their own: they are part of the parent's
+    // erasure, and asking every service to acknowledge each rendition separately
+    // would multiply the attestation without adding to it.
+    for (const auto& child : child_uids) {
+        auto child_result = context->db->begin_erasure(child, reason, retain_name, {}, tenant, ctx);
+        if (!child_result.success) {
+            return Result<EraseOutcome>::err(
+                "Failed to erase a derived child (" + child + "): " + child_result.error);
+        }
+        destroy_bytes(child, child_result.value);
+        ++outcome.renditions_destroyed;
+    }
+
+    auto erased = context->db->begin_erasure(file_uid, reason, retain_name,
+                                             erasure_participants_, tenant, ctx);
+    if (!erased.success) {
+        return Result<EraseOutcome>::err(erased.error);
+    }
+    destroy_bytes(file_uid, erased.value);
+
+    outcome.erasure_id                = erased.value.erasure_id;
+    outcome.versions_destroyed        = erased.value.versions_destroyed;
+    outcome.metadata_values_destroyed = erased.value.metadata_values_destroyed;
+    outcome.complete                  = erased.value.complete;
+    outcome.awaiting                  = erasure_participants_;
+
+    // Push, for latency — a service purges within milliseconds. It is not the
+    // guarantee: the bus is fail-open and drop-oldest, so a dropped event would
+    // leave a service holding data the platform has certified destroyed, and do
+    // it silently. ListPendingErasures is the guarantee path.
+    emit_fs_event(tenant, FileEventType::FileErased, file_uid, user);
+
+    return Result<EraseOutcome>::ok(outcome);
+}
+
+Result<std::vector<PendingErasureRow>> FileSystem::list_pending_erasures(
+        const std::string& participant, int limit, const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<std::vector<PendingErasureRow>>::err("Database not available for tenant: " + tenant);
+    }
+    return context->db->list_pending_erasures(participant, limit, tenant);
+}
+
+Result<ErasureStatusRow> FileSystem::acknowledge_erasure(const std::string& erasure_id,
+                                                         const std::string& participant,
+                                                         bool complied,
+                                                         const std::string& detail,
+                                                         const std::string& actor,
+                                                         const std::vector<std::string>& roles,
+                                                         const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<ErasureStatusRow>::err("Database not available for tenant: " + tenant);
+    }
+    AccountabilityContext ctx;
+    ctx.actor        = actor;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
+    return context->db->acknowledge_erasure(erasure_id, participant, complied, detail, tenant, ctx);
+}
+
+Result<ErasureStatusRow> FileSystem::get_erasure_status(const std::string& erasure_id,
+                                                        const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<ErasureStatusRow>::err("Database not available for tenant: " + tenant);
+    }
+    return context->db->get_erasure(erasure_id, tenant);
+}
+
 void FileSystem::update_cache_threshold(double threshold, const std::string& tenant) {
     if (cache_manager_) {
         cache_manager_->set_cache_threshold(threshold);

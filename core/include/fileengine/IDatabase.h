@@ -28,6 +28,53 @@ namespace fileengine {
 struct FileInfo;
 enum class FileType;
 
+// ── Erasure records (§5.4) ─────────────────────────────────────────────────
+
+// What begin_erasure destroyed, and what the caller must still destroy.
+struct ErasureInit {
+    std::string erasure_id;
+    // Storage paths whose bytes are now unreferenced. Removed AFTER the commit:
+    // a failure then leaves orphaned bytes (recoverable, and reconciled by the
+    // object-store sync) rather than rows pointing at content that is gone.
+    std::vector<std::string> storage_paths;
+    // The object store keys off a DIFFERENT layout — <tenant>/<uid>/<version>,
+    // where local storage is sharded <tenant>/xx/yy/zz/<uid>/<version> — so the
+    // local path cannot be reused to delete the durable copy. It would simply
+    // miss, silently, leaving the content in the bucket after the platform
+    // reported it destroyed. The caller re-derives the key from these.
+    std::vector<std::string> version_timestamps;
+    int versions_destroyed = 0;
+    int metadata_values_destroyed = 0;
+    // True when there is nobody to wait for, so the erasure is already complete.
+    bool complete = false;
+};
+
+struct PendingErasureRow {
+    std::string erasure_id;
+    std::string file_uid;
+    std::int64_t initiated_at = 0;   // epoch seconds
+};
+
+struct ErasureAckRow {
+    std::string participant;
+    std::int64_t acked_at = 0;
+    bool complied = false;
+    std::string detail;
+};
+
+struct ErasureStatusRow {
+    std::string erasure_id;
+    std::string file_uid;
+    std::string actor;
+    std::string reason;
+    std::string state;               // initiated|complete|failed
+    bool name_retained = false;
+    std::int64_t initiated_at = 0;
+    std::int64_t completed_at = 0;   // 0 while incomplete
+    std::vector<ErasureAckRow> acks;
+    std::vector<std::string> awaiting;
+};
+
 class IDatabase {
 public:
     virtual ~IDatabase() = default;
@@ -241,6 +288,66 @@ public:
                                        const std::string& /*tenant*/,
                                        const AccountabilityContext& /*ctx*/) {
         return Result<int>::err("version culling is not available from this database implementation");
+    }
+
+    // ── Erasure (§5.4) ──────────────────────────────────────────────────────
+    //
+    // True delete. The payload is destroyed; the fact is retained.
+    //
+    // Distinct from remove_file, which is a SOFT delete that undelete reverses.
+    // The distinction is not cosmetic: a consumer treats a soft delete as
+    // recoverable and may reasonably keep its derived data, so routing erasure
+    // through that path would leave extracted text and embeddings exactly where
+    // they were — the failure §5.4.2 exists to prevent.
+    //
+    // Destroys, in one transaction with the record that describes it: every
+    // version row, the whole metadata VALUE HISTORY (not just current values —
+    // superseded values remain readable otherwise, and PII sits one query away),
+    // and, unless retain_name, the filename. Returns the storage paths whose
+    // bytes the caller must then destroy, in commit-then-bytes order for the
+    // same reason culling uses it: a failure should leave orphaned bytes, which
+    // are recoverable and which the object-store sync reconciles, rather than
+    // rows pointing at content that no longer exists.
+    //
+    // `participants` is the roster frozen at initiation. Config changes; an
+    // erasure whose required participants shifted underneath it could complete
+    // without the service that actually held the data ever having been asked.
+    virtual Result<ErasureInit> begin_erasure(const std::string& /*file_uid*/,
+                                              const std::string& /*reason*/,
+                                              bool /*retain_name*/,
+                                              const std::vector<std::string>& /*participants*/,
+                                              const std::string& /*tenant*/,
+                                              const AccountabilityContext& /*ctx*/) {
+        return Result<ErasureInit>::err("erasure is not available from this database implementation");
+    }
+
+    // The guarantee path (§5.4.5): erasures this participant has not
+    // acknowledged. A service that missed the fail-open event, was down, or was
+    // restored from a backup converges through this without the instruction
+    // being redelivered.
+    virtual Result<std::vector<PendingErasureRow>> list_pending_erasures(
+            const std::string& /*participant*/, int /*limit*/, const std::string& /*tenant*/) {
+        return Result<std::vector<PendingErasureRow>>::err(
+            "erasure is not available from this database implementation");
+    }
+
+    // Records one participant's outcome and, when it was the last outstanding
+    // one, closes the erasure. `complied == false` is recorded rather than
+    // retried into silence: a service that cannot comply is an unmet obligation
+    // and must be visible as one.
+    virtual Result<ErasureStatusRow> acknowledge_erasure(const std::string& /*erasure_id*/,
+                                                         const std::string& /*participant*/,
+                                                         bool /*complied*/,
+                                                         const std::string& /*detail*/,
+                                                         const std::string& /*tenant*/,
+                                                         const AccountabilityContext& /*ctx*/) {
+        return Result<ErasureStatusRow>::err("erasure is not available from this database implementation");
+    }
+
+    // What an auditor is shown: participants, timestamps, outcome.
+    virtual Result<ErasureStatusRow> get_erasure(const std::string& /*erasure_id*/,
+                                                 const std::string& /*tenant*/) {
+        return Result<ErasureStatusRow>::err("erasure is not available from this database implementation");
     }
 
     // ── The accountability pull surface (§4.3) ──────────────────────────────
