@@ -342,7 +342,8 @@ Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
 Result<void> AclManager::inherit_acls(const std::string& parent_uid,
                                      const std::string& child_uid,
                                      const std::string& tenant,
-                                     const std::string& performed_by) {
+                                     const std::string& performed_by,
+                                     const std::string& child_owner) {
     auto parent_acls_result = get_acls_for_resource(parent_uid, tenant);
     if (!parent_acls_result.success) {
         return Result<void>::err(parent_acls_result.error);
@@ -366,11 +367,30 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
         if ((rule.permissions & inherit_bit) == 0) {
             continue;
         }
-        // ERASE never inherits (§5.4.9). Granting the strongest destroy-data
-        // permission on a folder must not confer it on every descendant — blast
-        // radius is the entire reason it is a separate bit. It has to be granted
-        // on the resource it applies to, explicitly.
-        const int inheritable = rule.permissions & ~static_cast<int>(Permission::ERASE);
+        // ERASE inherits to the OWNER of the new resource, and to nobody else.
+        //
+        // §5.4.9's rule is that granting ERASE on a folder must not confer it on
+        // every descendant — blast radius is the entire reason it is a separate
+        // bit. That concern is about reaching OTHER PEOPLE'S content: a grant on
+        // a shared folder must not let the grantee erase what colleagues put
+        // there. It is not about your own.
+        //
+        // A user's home is a sandbox, and full control there means full control:
+        // without this, a user could not erase their own file in their own home,
+        // because the grant provisioning puts on the home folder would never
+        // reach anything inside it. Tying inheritance to ownership gives that,
+        // while keeping the blast radius exactly where §5.4.9 wants it — the
+        // grant follows what you own, not what you can reach.
+        //
+        // Still gated: this only propagates an ERASE that someone deliberately
+        // granted on the parent, which today is home provisioning and nothing
+        // else. A folder with no ERASE on it confers none.
+        const bool owner_rule = !child_owner.empty() &&
+                                rule.type == PrincipalType::USER &&
+                                rule.principal == child_owner;
+        const int inheritable = owner_rule
+                                    ? rule.permissions
+                                    : rule.permissions & ~static_cast<int>(Permission::ERASE);
         if (inheritable == 0 || inheritable == inherit_bit) {
             continue;   // nothing left to copy once ERASE is stripped
         }

@@ -751,12 +751,22 @@ So the platform needs a second destructive operation, with a different shape:
 | Driven by | storage/retention housekeeping | contractual or legal obligation |
 | Permission | `CULL_VERSIONS` | a distinct, stronger grant (below) |
 
-> **Amendment required.** `PROPOSAL_metadata_change_events.md` §1.1 states that
-> *culling is the only permissible destructive operation*. That must become
-> **culling and erasure are the only two**, with erasure defined here. The rule's
-> intent is unchanged — destruction happens only through named, permissioned,
-> recorded operations — but it is no longer a single one. The metadata proposal
-> is on a separate branch; this amendment should land when the two merge.
+> **Amendment required — still outstanding.** `PROPOSAL_metadata_change_events.md`
+> §1.1 states that *culling is the only permissible destructive operation*. That
+> must become **culling and erasure are the only two**, with erasure defined here.
+> The rule's intent is unchanged — destruction happens only through named,
+> permissioned, recorded operations — but it is no longer a single one.
+>
+> It could not be applied when erasure landed: that proposal exists only on the
+> unmerged `design/metadata-change-events` and `design/metadata-events-on-system-log`
+> branches, which have diverged from each other and from `main`. Amending one of
+> them would put the correction on a branch that may not be the one that merges.
+> **This amendment must be made as part of merging whichever branch wins**, and is
+> recorded here so it is not lost in the meantime.
+>
+> The same rule is now stated on `main` where it is actually enforceable —
+> `CLAUDE.md`'s Critical Rules — so the platform-wide retention stance is written
+> down in a place that does not depend on an unmerged design branch.
 
 #### 5.4.1 What erasure destroys, and what survives
 
@@ -886,7 +896,9 @@ Two findings from the code, one of which contradicts the documentation:
   supported in the object store"*, which is either stale or describes a policy
   stance rather than a capability. Worth correcting either way, because an
   erasure feature cannot be designed against a constraint that is not real — nor
-  shipped against one that is.
+  shipped against one that is. **Corrected as implemented**: that line now reads
+  write-once rather than undeletable, and names the two operations that do
+  delete.
 - **Encryption is deployment-wide, not per-file.** `Storage` takes a
   `bool encrypt_data` flag; the key is not per object. So **crypto-shredding —
   destroying a per-file key to render its ciphertext unrecoverable — is not
@@ -1143,6 +1155,23 @@ to administrators, and recorded in the **global** table (§7.3), since a
 tenant-scoped record would destroy itself.
 
 #### 5.4.9 Gating erasure — a bespoke permission, and why a new bit is not enough
+
+> **As implemented: ERASE inherits to the OWNER of a new resource, and to nobody
+> else.** The rule below — that ERASE must not be conferred on every descendant —
+> is about reaching *other people's* content: a grant on a shared folder must not
+> let the grantee erase what colleagues put there. It was first implemented as
+> "never inherits at all", which is stricter than the concern requires and had a
+> consequence nobody wanted: a user could not erase their own file in their own
+> home, because the grant on the home folder never reached anything inside it.
+>
+> Tying inheritance to ownership gives a user full control of their own sandbox
+> while keeping the blast radius exactly where this section wants it — the grant
+> follows what you own, not what you can reach. A role-held ERASE never
+> propagates (a role cannot own a resource), and an unknown owner strips it,
+> because absent information must not confer an irreversible permission.
+>
+> It stays gated: this only propagates an ERASE that somebody deliberately
+> granted on the parent, which today is home provisioning and nothing else.
 
 Erasure is irreversible, compliance-driven and the most destructive operation on
 a file. It must be gated by its own permission, held by very few people:

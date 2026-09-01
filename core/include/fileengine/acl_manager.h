@@ -319,10 +319,16 @@ public:
     // preserved on the child so inheritance cascades. Fail-loud — any rule
     // copy failure aborts and returns the underlying error. performed_by
     // is recorded on the inherited rows + in the audit log.
+    //
+    // `child_owner` is who the new resource belongs to. It decides one thing
+    // only: whether an inherited ERASE survives the copy — see §5.4.9 and the
+    // implementation. Empty means "nobody owns this", and ERASE is stripped for
+    // every principal, which is the safe reading.
     Result<void> inherit_acls(const std::string& parent_uid,
                              const std::string& child_uid,
                              const std::string& tenant = "",
-                             const std::string& performed_by = "");
+                             const std::string& performed_by = "",
+                             const std::string& child_owner = "");
 
     // True iff the parent has at least one rule with ACL_INHERIT set.
     // Used by callers to decide between inherit_acls and apply_default_acls.

@@ -2254,7 +2254,11 @@ void FileSystem::apply_acls_for_new_resource(const std::string& parent_uid,
     // Inherit parent rules marked ACL_INHERIT on top. Empty parent_uid (the
     // filesystem root) skips inheritance.
     if (!parent_uid.empty() && acl_manager_->parent_has_inheritable_acls(parent_uid, tenant)) {
-        auto inherit_result = acl_manager_->inherit_acls(parent_uid, new_uid, tenant, user);
+        // `user` twice: they performed the creation AND they own the result —
+        // apply_default_acls above gives the creator full control of it. Passed
+        // explicitly rather than left implicit, because the second one decides
+        // whether an inherited ERASE survives.
+        auto inherit_result = acl_manager_->inherit_acls(parent_uid, new_uid, tenant, user, user);
         if (!inherit_result.success) {
             SERVER_LOG_WARN("FileSystem::apply_acls_for_new_resource",
                             "Inheritance failed for " + new_uid + " from parent " + parent_uid

@@ -229,9 +229,29 @@ Numerous ad-hoc `test_*.cpp` files at the project root are standalone integratio
 
 ## Critical Rules
 
+- **Data is retained by default; destruction happens only through two named,
+  permissioned, recorded operations.** Nothing else in the platform removes
+  committed data. The two are the version cull (`CULL_VERSIONS` — compacts
+  history, preserves current state) and erasure (`ERASE` — "true delete",
+  destroys everything including derived data across services, keeps only the
+  record that the file existed). Erasure is a deliberate exception to the
+  retention stance, for the contractual and legal obligations of jurisdictions
+  that require a right to erasure; it is not a convenience delete. `RemoveFile`
+  is a SOFT delete that `UndeleteFile` reverses and destroys nothing. Both
+  destroy-data permissions are withheld by default, are not conferred by the
+  tenant-admin bypass, and write an accountability record in the same
+  transaction as the destruction. See PROPOSAL_accountability_record.md §5.4
+
 - **Never edit the .env file** — it contains database and S3 connection credentials
 - The `.env` must be symlinked into the build directory so binaries can find it
-- S3 objects are immutable by design — deletion is not supported in the object store
+- S3 objects are **write-once, not undeletable**. The core never rewrites an
+  existing version's object — a new version is a new key — so treat objects as
+  immutable in normal operation. But `S3Storage::delete_file` exists and two
+  named operations do delete: the version cull (`PurgeOldVersions`) and erasure
+  (`EraseFile`). This line previously said deletion was not supported at all,
+  which was wrong, and wrong in a way that mattered: an erasure feature cannot be
+  designed against a constraint that is not real, nor shipped against one that is
+  (PROPOSAL_accountability_record.md §5.4.4)
 - All file operations use UUIDs, not paths, for distributed handling
 - ACL tables live in tenant-specific schemas (not PUBLIC) to prevent data leakage
 - Do not create per-tenant connection pools. (Note the intended "all tenants share one pool" invariant is not actually implemented — see `ConnectionPoolManager` above.)

@@ -392,6 +392,7 @@ static const int PERM_RETRIEVE_BACK_VERSION = static_cast<int>(Permission::RETRI
 static const int PERM_RESTORE_TO_VERSION = static_cast<int>(Permission::RESTORE_TO_VERSION);
 static const int PERM_EXECUTE = static_cast<int>(Permission::EXECUTE);
 static const int PERM_CULL_VERSIONS = static_cast<int>(Permission::CULL_VERSIONS);
+static const int PERM_ERASE = static_cast<int>(Permission::ERASE);
 static const int PERM_ALL = PERM_MANAGE_ACL | PERM_READ | PERM_WRITE | PERM_DELETE | PERM_LIST_DELETED |
                             PERM_UNDELETE | PERM_VIEW_VERSIONS | PERM_RETRIEVE_BACK_VERSION |
                             PERM_RESTORE_TO_VERSION | PERM_EXECUTE | PERM_CULL_VERSIONS;
@@ -1066,6 +1067,89 @@ void test_revoke_nonexistent_permission() {
 // =============================================================================
 // 7. ACL INHERITANCE
 // =============================================================================
+
+// ERASE inheritance is scoped to ownership (§5.4.9 + the home-sandbox rule).
+//
+// Two halves, both load-bearing: a user has full control of what they own inside
+// their own home, INCLUDING erasure — and a grant on a shared folder must never
+// let the grantee erase what somebody else put there. Getting either wrong is a
+// security bug rather than a missing feature.
+
+void test_erase_inherits_to_the_owner_of_the_new_resource() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    const std::string home = "dir-alice-home";
+    const std::string file = "file-alice-made";
+
+    // What home provisioning puts on a home folder: full control, inheritable.
+    acl.grant_permission(home, "alice", PrincipalType::USER,
+                         PERM_READ | PERM_WRITE | PERM_ERASE | PERM_ACL_INHERIT, "", kTestCtx);
+
+    // Alice creates a file in her own home, so alice owns it.
+    auto result = acl.inherit_acls(home, file, "", "alice", "alice");
+    TEST_ASSERT(result.success, "inheritance should succeed");
+
+    auto perms = acl.get_effective_permissions(file, "alice", {});
+    TEST_ASSERT(has_perm(perms.value, PERM_ERASE),
+                "alice can erase her own file in her own home");
+}
+
+void test_erase_does_not_inherit_to_someone_who_does_not_own_it() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    const std::string shared = "dir-shared";
+    const std::string file = "file-bob-made";
+
+    acl.grant_permission(shared, "alice", PrincipalType::USER,
+                         PERM_READ | PERM_WRITE | PERM_ERASE | PERM_ACL_INHERIT, "", kTestCtx);
+
+    // Bob creates a file there. Bob owns it.
+    auto result = acl.inherit_acls(shared, file, "", "bob", "bob");
+    TEST_ASSERT(result.success, "inheritance should succeed");
+
+    auto perms = acl.get_effective_permissions(file, "alice", {});
+    TEST_ASSERT(has_perm(perms.value, PERM_READ), "alice still inherits the ordinary rights");
+    TEST_ASSERT(!has_perm(perms.value, PERM_ERASE),
+                "alice must NOT be able to erase Bob's file");
+}
+
+void test_erase_does_not_inherit_through_a_role_grant() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    const std::string dir = "dir-team";
+    const std::string file = "file-in-team-dir";
+
+    // A ROLE cannot own a resource, so a role-held ERASE has no owner to match
+    // and must never propagate — otherwise granting a team ERASE on a folder
+    // would confer it on every descendant, for every member.
+    acl.grant_permission(dir, "editors", PrincipalType::ROLE,
+                         PERM_READ | PERM_ERASE | PERM_ACL_INHERIT, "", kTestCtx);
+
+    auto result = acl.inherit_acls(dir, file, "", "alice", "alice");
+    TEST_ASSERT(result.success, "inheritance should succeed");
+
+    auto perms = acl.get_effective_permissions(file, "someone", {"editors"});
+    TEST_ASSERT(has_perm(perms.value, PERM_READ), "the role still inherits READ");
+    TEST_ASSERT(!has_perm(perms.value, PERM_ERASE), "a role-held ERASE must not propagate");
+}
+
+void test_erase_is_stripped_when_the_owner_is_unknown() {
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    const std::string dir = "dir-x";
+    const std::string file = "file-x";
+
+    acl.grant_permission(dir, "alice", PrincipalType::USER,
+                         PERM_READ | PERM_ERASE | PERM_ACL_INHERIT, "", kTestCtx);
+
+    // No owner supplied — the safe reading is "nobody owns this".
+    auto result = acl.inherit_acls(dir, file, "", "alice");
+    TEST_ASSERT(result.success, "inheritance should succeed");
+
+    auto perms = acl.get_effective_permissions(file, "alice", {});
+    TEST_ASSERT(!has_perm(perms.value, PERM_ERASE),
+                "absent information must not grant an irreversible permission");
+}
 
 void test_inherit_acls_copies_inheritable_rules_only() {
     auto db = std::make_shared<MockDatabase>();
@@ -2279,6 +2363,14 @@ int main() {
 
     std::cout << "\n--- 7. ACL Inheritance ---\n";
     run_test("inherit copies only ACL_INHERIT-marked rules", test_inherit_acls_copies_inheritable_rules_only);
+    run_test("ERASE inherits to the owner of the new resource",
+             test_erase_inherits_to_the_owner_of_the_new_resource);
+    run_test("ERASE does not inherit to a non-owner",
+             test_erase_does_not_inherit_to_someone_who_does_not_own_it);
+    run_test("ERASE does not inherit through a role grant",
+             test_erase_does_not_inherit_through_a_role_grant);
+    run_test("ERASE is stripped when the owner is unknown",
+             test_erase_is_stripped_when_the_owner_is_unknown);
     run_test("inherit skips rules without ACL_INHERIT", test_inherit_acls_skips_non_inheritable_rules);
     run_test("inheritance is one-time copy", test_inherit_acls_is_one_time_copy);
     run_test("inherit from empty parent", test_inherit_from_empty_parent);
