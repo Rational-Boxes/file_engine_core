@@ -917,6 +917,12 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_has("FILEENGINE_AUDIT_WAL_PATH")) config.audit_wal_path = env_config.audit_wal_path;
     if (env_has("FILEENGINE_AUDIT_ACCESS_MODE")) config.audit_access_mode = env_config.audit_access_mode;
     if (env_has("FILEENGINE_AUDIT_HIDDEN_CHILDREN")) config.audit_hidden_children = env_config.audit_hidden_children;
+    // Without this line the value is read by load_from_env() and then dropped:
+    // the merge below is field-by-field, so a key added to the loader and not to
+    // the merge is silently lost. That is how erasure ran with no participants
+    // on a stack whose environment named three — the core logged "unset" while
+    // /proc/<pid>/environ plainly showed the variable.
+    if (env_has("FILEENGINE_ERASURE_PARTICIPANTS")) config.erasure_participants = env_config.erasure_participants;
 
     // 5. Load from command-line arguments (highest priority)
     Config cmd_config = load_from_cmd_args(argc, argv);
