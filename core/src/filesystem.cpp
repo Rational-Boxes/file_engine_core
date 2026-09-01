@@ -1736,63 +1736,103 @@ Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_
         return Result<EraseOutcome>::err("Database not available for tenant: " + tenant);
     }
 
-    // ERASE, never WRITE and never DELETE. Enforced here as well as at the gRPC
-    // boundary so no in-process caller can reach it by another route. Note that
-    // validate_user_permissions applies only the system_admin bypass: a tenant
-    // admin does NOT get this for free, and must hold an explicit grant
-    // (§5.4.9), which is what makes holding it a deliberate, recorded act.
-    auto perm_result = validate_user_permissions(file_uid, user, roles,
-                                                 static_cast<int>(fileengine::Permission::ERASE), tenant);
-    if (!perm_result.success || !perm_result.value) {
-        return Result<EraseOutcome>::err(
-            "User does not have permission to erase this file (requires ERASE)");
+    // ── Plan the whole subtree before destroying anything ───────────────────
+    //
+    // Erasing a FOLDER means erasing what is in it, all the way down. Two kinds
+    // of child, and they are NOT the same thing — conflating them is what made
+    // the first version of this wrong:
+    //
+    //   a RENDITION is a hidden child of a FILE — a preview, a thumbnail,
+    //   extracted text. It is derived from content that is being destroyed
+    //   anyway, so it rides on its parent's attestation and needs no
+    //   participants of its own;
+    //
+    //   a MEMBER is a child of a CONTAINER — a real document, with its own
+    //   content and its own derived copies in csai, discussion and difference.
+    //   It needs its own participants and its own erasure record, or those
+    //   services are never asked and their copies survive.
+    //
+    // Shipped once with folder members treated as renditions: a document inside
+    // an erased folder had its core content destroyed while its text and
+    // embedding stayed in the search index, with nothing outstanding to show it.
+    struct Node {
+        std::string uid;
+        bool needs_participants = false;   // false only for renditions
+    };
+    std::vector<Node> plan;
+
+    // Depth-first, children before parents, so a failure part-way leaves
+    // children whose parent still exists rather than orphans. Bounded: a
+    // pathological or cyclic tree must not run the server out of memory.
+    constexpr std::size_t kMaxSubtree = 100000;
+    {
+        std::vector<std::pair<std::string, bool>> stack;   // uid, parent_is_container
+        stack.emplace_back(file_uid, true);                // the root is treated as a real node
+        std::vector<Node> discovered;
+        while (!stack.empty()) {
+            auto [uid, parent_is_container] = stack.back();
+            stack.pop_back();
+            if (discovered.size() >= kMaxSubtree) {
+                return Result<EraseOutcome>::err(
+                    "Refusing to erase: the subtree exceeds " + std::to_string(kMaxSubtree) +
+                    " entries. Erase it in parts, so the operation stays reviewable.");
+            }
+            auto info = context->db->get_file_by_uid_include_deleted(uid, tenant);
+            if (!info.success || !info.value.has_value()) continue;
+            const bool is_container = info.value.value().type == FileType::DIRECTORY;
+            // A child of a container is a real file; a child of a file is a
+            // rendition and rides on its parent.
+            discovered.push_back(Node{uid, parent_is_container});
+
+            auto children = context->db->list_files_in_directory_with_deleted(uid, tenant);
+            if (children.success) {
+                for (const auto& c : children.value) {
+                    if (c.uid == uid) continue;             // defensive: self-parent
+                    stack.emplace_back(c.uid, is_container);
+                }
+            }
+        }
+        // Reverse to depth-first-post-order: deepest first, root last.
+        plan.assign(discovered.rbegin(), discovered.rend());
     }
 
-    EraseOutcome outcome;
-
-    // Renditions are hidden children under the file's uid — rendered pages,
-    // thumbnails, previews, markup — and every one is derived from the content
-    // being erased (§5.4.2). Leaving them would leave a readable copy of the
-    // document in image form, which is not a subtle failure.
+    // ── Authorize EVERY node before destroying any of them ──────────────────
     //
-    // Collected before the parent is erased, and erased first, so a failure
-    // partway leaves children whose parent still exists rather than orphans.
-    std::vector<std::string> child_uids;
-    {
-        auto children = context->db->list_files_in_directory_with_deleted(file_uid, tenant);
-        if (children.success) {
-            for (const auto& c : children.value) child_uids.push_back(c.uid);
+    // Checked up front rather than as we go: a folder erasure that destroyed
+    // half a subtree and then hit a file the caller may not erase would leave
+    // the tenant in a state nobody asked for and nothing can undo.
+    for (const auto& n : plan) {
+        auto perm = validate_user_permissions(n.uid, user, roles,
+                                              static_cast<int>(fileengine::Permission::ERASE), tenant);
+        if (!perm.success || !perm.value) {
+            return Result<EraseOutcome>::err(
+                "User does not have permission to erase this file (requires ERASE) — "
+                "denied on " + n.uid + ", so nothing was erased");
         }
     }
+
+    AccountabilityContext ctx;
+    ctx.actor        = user;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
 
     // Both copies, each by its OWN key. The object store is keyed
     // <tenant>/<uid>/<version> while local storage is sharded
     // <tenant>/xx/yy/zz/<uid>/<version>, so passing the local path to the bucket
-    // deletes nothing and reports no error — the content would survive in the
-    // durable copy after the platform had certified it destroyed.
+    // deletes nothing and reports no error.
     //
-    // Best-effort in the same sense culling is: the rows are already gone, so a
-    // failure here leaves orphaned bytes (which the object-store sync
-    // reconciles) rather than metadata pointing at content that is not there.
-    // Returns an error describing what could NOT be destroyed, or empty on success.
-    //
-    // The local half stays best-effort, as culling's does: the rows are already
-    // gone, so a failure leaves orphaned bytes the object-store sync reconciles.
-    // The DURABLE half is fatal. An erasure that destroyed the database rows and
-    // left the content in the bucket has erased nothing while reporting that it
-    // has — the false compliance claim §5.4.4 calls the worst thing to be wrong
-    // about here. It shipped exactly once, because S3Storage::delete_file was a
-    // hard-coded refusal and this swallowed the error.
+    // The local half is best-effort as culling's is: the rows are already gone,
+    // so a failure leaves orphaned bytes the object-store sync reconciles. The
+    // DURABLE half is fatal — an erasure that left content in the bucket has
+    // erased nothing while reporting that it has.
     auto destroy_bytes = [&](const std::string& uid, const ErasureInit& init) -> std::string {
         for (const auto& path : init.storage_paths) {
             if (cache_manager_) cache_manager_->remove_file(path);
             if (context->storage) context->storage->delete_file(path, tenant);
         }
-        if (!context->object_store) {
-            // No object store configured: local storage is the only copy, and it
-            // is gone. Nothing outstanding.
-            return "";
-        }
+        if (!context->object_store) return "";
         std::string failures;
         for (const auto& vts : init.version_timestamps) {
             const std::string key = context->object_store->get_storage_path(uid, vts, tenant);
@@ -1805,61 +1845,57 @@ Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_
         return failures;
     };
 
-    AccountabilityContext ctx;
-    ctx.actor        = user;
-    ctx.actor_roles  = roles;
-    ctx.source_iface = CallerContext::current().service_id.empty()
-                           ? std::string("grpc")
-                           : CallerContext::current().service_id;
+    EraseOutcome outcome;
+    for (const auto& n : plan) {
+        const std::vector<std::string> participants =
+            n.needs_participants ? erasure_participants_ : std::vector<std::string>{};
 
-    // Children carry no participants of their own: they are part of the parent's
-    // erasure, and asking every service to acknowledge each rendition separately
-    // would multiply the attestation without adding to it.
-    for (const auto& child : child_uids) {
-        auto child_result = context->db->begin_erasure(child, reason, retain_name, {}, tenant, ctx);
-        if (!child_result.success) {
-            return Result<EraseOutcome>::err(
-                "Failed to erase a derived child (" + child + "): " + child_result.error);
+        auto erased = context->db->begin_erasure(n.uid, reason, retain_name,
+                                                 participants, tenant, ctx);
+        if (!erased.success) {
+            // An already-erased DESCENDANT is skipped: a subtree can legitimately
+            // contain something erased on its own earlier, and refusing the whole
+            // folder for that would be perverse.
+            //
+            // The ROOT is not skipped. Re-erasing the thing the caller actually
+            // named must still be refused, or a second run destroys nothing,
+            // reports success, and attests to a destruction that did not happen
+            // on that occasion.
+            const bool already = erased.error.find("already been erased") != std::string::npos;
+            if (already && n.uid != file_uid) continue;
+            return Result<EraseOutcome>::err(erased.error);
         }
-        const std::string child_failed = destroy_bytes(child, child_result.value);
-        if (!child_failed.empty()) {
+        const std::string failed = destroy_bytes(n.uid, erased.value);
+        if (!failed.empty()) {
+            SERVER_LOG_ERROR("FileSystem::erase_file",
+                             "Content survives in the object store after erasure of " + n.uid +
+                             ": " + failed);
             return Result<EraseOutcome>::err(
-                "Erasure incomplete: a derived child's content survives in the object store ("
-                + child_failed + ")");
+                "Erasure incomplete: content survives in the object store (" + failed + ")");
         }
-        ++outcome.renditions_destroyed;
+
+        outcome.erasure_ids.push_back(erased.value.erasure_id);
+        outcome.versions_destroyed        += erased.value.versions_destroyed;
+        outcome.metadata_values_destroyed += erased.value.metadata_values_destroyed;
+        if (n.needs_participants) {
+            if (n.uid == file_uid) {
+                outcome.erasure_id = erased.value.erasure_id;
+                outcome.complete   = erased.value.complete;
+            }
+        } else {
+            ++outcome.renditions_destroyed;
+        }
+
+        // Push, for latency. Not the guarantee: the bus is fail-open and
+        // drop-oldest, so a dropped event would leave a service holding data the
+        // platform has certified destroyed. ListPendingErasures is the guarantee.
+        emit_fs_event(tenant, FileEventType::FileErased, n.uid, user);
     }
 
-    auto erased = context->db->begin_erasure(file_uid, reason, retain_name,
-                                             erasure_participants_, tenant, ctx);
-    if (!erased.success) {
-        return Result<EraseOutcome>::err(erased.error);
+    if (outcome.erasure_id.empty() && !outcome.erasure_ids.empty()) {
+        outcome.erasure_id = outcome.erasure_ids.back();
     }
-    const std::string failed = destroy_bytes(file_uid, erased.value);
-    if (!failed.empty()) {
-        // Loud, and not swallowed. The metadata is already destroyed, so this is
-        // not recoverable by retrying the whole operation — but saying so is the
-        // only honest outcome, and it is an operational alarm rather than a
-        // silent pass.
-        SERVER_LOG_ERROR("FileSystem::erase_file",
-                         "Content survives in the object store after erasure of " + file_uid +
-                         ": " + failed);
-        return Result<EraseOutcome>::err(
-            "Erasure incomplete: content survives in the object store (" + failed + ")");
-    }
-
-    outcome.erasure_id                = erased.value.erasure_id;
-    outcome.versions_destroyed        = erased.value.versions_destroyed;
-    outcome.metadata_values_destroyed = erased.value.metadata_values_destroyed;
-    outcome.complete                  = erased.value.complete;
-    outcome.awaiting                  = erasure_participants_;
-
-    // Push, for latency — a service purges within milliseconds. It is not the
-    // guarantee: the bus is fail-open and drop-oldest, so a dropped event would
-    // leave a service holding data the platform has certified destroyed, and do
-    // it silently. ListPendingErasures is the guarantee path.
-    emit_fs_event(tenant, FileEventType::FileErased, file_uid, user);
-
+    outcome.awaiting = erasure_participants_;
     return Result<EraseOutcome>::ok(outcome);
 }
 

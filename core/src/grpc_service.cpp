@@ -2255,9 +2255,11 @@ grpc::Status GRPCFileService::EraseFile(grpc::ServerContext* context,
     response->set_state(result.value.complete ? fileengine_rpc::ERASURE_COMPLETE
                                               : fileengine_rpc::ERASURE_INITIATED);
     for (const auto& p : result.value.awaiting) response->add_awaiting(p);
+    for (const auto& id : result.value.erasure_ids) response->add_erasure_ids(id);
 
     SERVER_LOG_INFO("GRPCService", "EraseFile " + file_uid + " -> erasure " + result.value.erasure_id +
-                    " (versions=" + std::to_string(result.value.versions_destroyed) +
+                    " (erasures=" + std::to_string(result.value.erasure_ids.size()) +
+                    ", versions=" + std::to_string(result.value.versions_destroyed) +
                     ", renditions=" + std::to_string(result.value.renditions_destroyed) +
                     ", awaiting=" + std::to_string(result.value.awaiting.size()) + ")");
     emit_mutate_audit(tenant, "erase", AuditOutcome::Ok, user, roles, file_uid, AuditTargetType::File,

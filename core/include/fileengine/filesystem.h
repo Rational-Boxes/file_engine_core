@@ -195,7 +195,13 @@ public:
     // must acknowledge before the obligation is met (§5.4.3). Callers must not
     // report this as a completed erasure — ask GetErasureStatus.
     struct EraseOutcome {
+        // The root's erasure. A folder erasure produces one record PER FILE, so
+        // this alone does not attest to the subtree — see erasure_ids.
         std::string erasure_id;
+        // Every erasure this operation started, deepest first. A folder's
+        // members each get their own record and their own participants, because
+        // each has its own derived copies in the services that must purge them.
+        std::vector<std::string> erasure_ids;
         int versions_destroyed = 0;
         int metadata_values_destroyed = 0;
         int renditions_destroyed = 0;
