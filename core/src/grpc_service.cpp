@@ -1893,8 +1893,29 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::CULL_VERSIONS:
             required_permissions_int = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
             break;
+        case fileengine_rpc::Permission::ERASE:
+            required_permissions_int = static_cast<int>(fileengine::Permission::ERASE);
+            break;
         default:
-            required_permissions_int = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
+            // An unrecognised permission is answered NO, and loudly.
+            //
+            // This used to fall through to READ, which is how a missing ERASE
+            // case shipped: a caller asking "may I erase?" was silently asked
+            // "may I read?" and told yes. The SPA decides whether to OFFER
+            // erasure from this answer, so every administrator saw the button
+            // and every one of them got a 403 on pressing it.
+            //
+            // Downgrading an unknown question to the weakest permission is the
+            // wrong direction for a security query in any case: a permission the
+            // core does not recognise cannot be meaningfully checked, so it is
+            // refused rather than approximated.
+            SERVER_LOG_SECURITY("GRPCService",
+                                "CheckPermission asked about an unrecognised permission (" +
+                                std::to_string(static_cast<int>(required_permission)) +
+                                ") for " + user + " on " + resource_uid + " — answering no");
+            response->set_success(true);
+            response->set_has_permission(false);
+            return grpc::Status::OK;
             break;
     }
 

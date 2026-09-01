@@ -851,7 +851,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
     std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, "
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
-                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE AND c.erased = FALSE) END AS rendition_count, "
                             "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
                             "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
@@ -859,7 +859,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
                             "FROM \"" + schema_name + "\".files f "
-                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.deleted = FALSE "
+                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.deleted = FALSE AND f.erased = FALSE "
                             "ORDER BY f.name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
@@ -955,7 +955,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
     std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
-                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE AND c.erased = FALSE) END AS rendition_count, "
                             "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
                             "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
@@ -963,7 +963,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
                             "FROM \"" + schema_name + "\".files f "
-                            "WHERE f.parent_uid = $1 AND f.uid <> $1 "
+                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.erased = FALSE "
                             "ORDER BY f.name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
