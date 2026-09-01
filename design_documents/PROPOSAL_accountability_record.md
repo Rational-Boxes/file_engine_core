@@ -1156,6 +1156,31 @@ tenant-scoped record would destroy itself.
 
 #### 5.4.9 Gating erasure — a bespoke permission, and why a new bit is not enough
 
+> **Deployment step — erasure does not work until these are granted.** The
+> `ERASE` permission gates the USER; the service-auth capability gates the DOOR,
+> and both must be satisfied. Out of the box no service holds either capability,
+> because both are high-risk and deliberately do not ride along with a routine
+> credential issue — so a fresh deployment answers every erasure with
+> `service lacks the 'destroy' capability`, which reads like a bug and is not one.
+>
+> ```
+> fileengine_cli service grant http_bridge destroy --i-understand-this-is-high-risk
+> fileengine_cli service grant http_bridge erasure --i-understand-this-is-high-risk
+> fileengine_cli service grant csai        erasure --i-understand-this-is-high-risk
+> fileengine_cli service grant discussion  erasure --i-understand-this-is-high-risk
+> fileengine_cli service grant difference  erasure --i-understand-this-is-high-risk
+> ```
+>
+> The bridge needs `destroy` to call `EraseFile` and `erasure` to read the
+> attestation record for the UI. Consumers need `erasure` ONLY — reading what they
+> owe and reporting back, without thereby being able to erase anything. Grant no
+> consumer `destroy`.
+>
+> Takes effect within the service-map cache TTL (30s default); no restart needed.
+> Grant only the services listed in `FILEENGINE_ERASURE_PARTICIPANTS`, and keep
+> the two lists in step: a service in the roster that cannot acknowledge leaves
+> every erasure permanently incomplete.
+
 > **As implemented: ERASE inherits to the OWNER of a new resource, and to nobody
 > else.** The rule below — that ERASE must not be conferred on every descendant —
 > is about reaching *other people's* content: a grant on a shared folder must not
