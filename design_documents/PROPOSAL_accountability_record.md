@@ -896,9 +896,15 @@ Two findings from the code, one of which contradicts the documentation:
   supported in the object store"*, which is either stale or describes a policy
   stance rather than a capability. Worth correcting either way, because an
   erasure feature cannot be designed against a constraint that is not real — nor
-  shipped against one that is. **Corrected as implemented**: that line now reads
-  write-once rather than undeletable, and names the two operations that do
-  delete.
+  shipped against one that is. **Corrected as implemented, twice.** This section
+  asserted `S3Storage::delete_file` exists and works. It existed; it did not
+  work — the body was a hard-coded refusal (*"Deleting files from S3 is not
+  allowed - S3 objects are immutable for history preservation"*), so erasure
+  destroyed rows and local bytes and left every object in the bucket while
+  reporting success. Found by verifying an erased file against the bucket rather
+  than against the API. `delete_file` is now a real DeleteObject (idempotent on
+  NoSuchKey), and erasure treats a failure there as **fatal**, not best-effort:
+  an erasure that cannot reach the durable copy has not erased anything.
 - **Encryption is deployment-wide, not per-file.** `Storage` takes a
   `bool encrypt_data` flag; the key is not per object. So **crypto-shredding —
   destroying a per-file key to render its ciphertext unrecoverable — is not

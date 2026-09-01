@@ -658,9 +658,39 @@ Result<void> S3Storage::delete_file(const std::string& storage_path, const std::
         return Result<void>::err("S3 client not initialized");
     }
 
-    // According to specifications, items should never be removed from S3
-    // This is to maintain an immutable file system with full history
-    return Result<void>::err("Deleting files from S3 is not allowed - S3 objects are immutable for history preservation");
+    // Deletion IS supported, and has to be.
+    //
+    // This used to be a hard-coded refusal, on the reasoning that S3 objects are
+    // immutable for history preservation. That is right as a POLICY for the
+    // normal write path — the core never rewrites a version's object, and the
+    // version cull deliberately leaves bucket copies alone — but it cannot be a
+    // CAPABILITY limit, because erasure has to reach the durable copy. With this
+    // refusing, an erasure destroyed the database rows and the local bytes and
+    // left the content sitting in the bucket, while the platform reported the
+    // file erased. That is the false compliance claim §5.4.4 warns is the worst
+    // thing to be wrong about here.
+    //
+    // Callers that must not delete simply do not call this. Erasure does, and
+    // treats a failure as fatal rather than best-effort.
+    Aws::S3::Model::DeleteObjectRequest request;
+    request.SetBucket(Aws::String(bucket_));
+    request.SetKey(Aws::String(storage_path));
+
+    auto outcome = s3_client_->DeleteObject(request);
+    if (outcome.IsSuccess()) {
+        return Result<void>::ok();
+    }
+    // S3 DeleteObject is idempotent: deleting a key that is not there succeeds.
+    // A NoSuchKey response therefore means somebody else already removed it,
+    // which is the outcome we wanted — not a failure to report.
+    const auto& err = outcome.GetError();
+    if (err.GetExceptionName().find("NoSuchKey") != std::string::npos ||
+        err.GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND) {
+        return Result<void>::ok();
+    }
+    return Result<void>::err("Failed to delete object from S3: " +
+                             std::string(err.GetExceptionName().c_str()) + " - " +
+                             std::string(err.GetMessage().c_str()));
 #else
     // For non-AWS SDK builds, return an error indicating the feature is not available
     return Result<void>::err("AWS SDK not available - S3 storage requires USE_AWS_SDK to be defined");

@@ -1774,17 +1774,35 @@ Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_
     // Best-effort in the same sense culling is: the rows are already gone, so a
     // failure here leaves orphaned bytes (which the object-store sync
     // reconciles) rather than metadata pointing at content that is not there.
-    auto destroy_bytes = [&](const std::string& uid, const ErasureInit& init) {
+    // Returns an error describing what could NOT be destroyed, or empty on success.
+    //
+    // The local half stays best-effort, as culling's does: the rows are already
+    // gone, so a failure leaves orphaned bytes the object-store sync reconciles.
+    // The DURABLE half is fatal. An erasure that destroyed the database rows and
+    // left the content in the bucket has erased nothing while reporting that it
+    // has — the false compliance claim §5.4.4 calls the worst thing to be wrong
+    // about here. It shipped exactly once, because S3Storage::delete_file was a
+    // hard-coded refusal and this swallowed the error.
+    auto destroy_bytes = [&](const std::string& uid, const ErasureInit& init) -> std::string {
         for (const auto& path : init.storage_paths) {
             if (cache_manager_) cache_manager_->remove_file(path);
             if (context->storage) context->storage->delete_file(path, tenant);
         }
-        if (context->object_store) {
-            for (const auto& vts : init.version_timestamps) {
-                const std::string key = context->object_store->get_storage_path(uid, vts, tenant);
-                context->object_store->delete_file(key, tenant);
+        if (!context->object_store) {
+            // No object store configured: local storage is the only copy, and it
+            // is gone. Nothing outstanding.
+            return "";
+        }
+        std::string failures;
+        for (const auto& vts : init.version_timestamps) {
+            const std::string key = context->object_store->get_storage_path(uid, vts, tenant);
+            auto r = context->object_store->delete_file(key, tenant);
+            if (!r.success) {
+                if (!failures.empty()) failures += "; ";
+                failures += key + ": " + r.error;
             }
         }
+        return failures;
     };
 
     AccountabilityContext ctx;
@@ -1803,7 +1821,12 @@ Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_
             return Result<EraseOutcome>::err(
                 "Failed to erase a derived child (" + child + "): " + child_result.error);
         }
-        destroy_bytes(child, child_result.value);
+        const std::string child_failed = destroy_bytes(child, child_result.value);
+        if (!child_failed.empty()) {
+            return Result<EraseOutcome>::err(
+                "Erasure incomplete: a derived child's content survives in the object store ("
+                + child_failed + ")");
+        }
         ++outcome.renditions_destroyed;
     }
 
@@ -1812,7 +1835,18 @@ Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_
     if (!erased.success) {
         return Result<EraseOutcome>::err(erased.error);
     }
-    destroy_bytes(file_uid, erased.value);
+    const std::string failed = destroy_bytes(file_uid, erased.value);
+    if (!failed.empty()) {
+        // Loud, and not swallowed. The metadata is already destroyed, so this is
+        // not recoverable by retrying the whole operation — but saying so is the
+        // only honest outcome, and it is an operational alarm rather than a
+        // silent pass.
+        SERVER_LOG_ERROR("FileSystem::erase_file",
+                         "Content survives in the object store after erasure of " + file_uid +
+                         ": " + failed);
+        return Result<EraseOutcome>::err(
+            "Erasure incomplete: content survives in the object store (" + failed + ")");
+    }
 
     outcome.erasure_id                = erased.value.erasure_id;
     outcome.versions_destroyed        = erased.value.versions_destroyed;
