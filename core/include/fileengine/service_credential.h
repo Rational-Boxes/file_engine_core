@@ -119,7 +119,14 @@ enum class Capability {
     Acl,             // GrantPermission, RevokePermission, GetResourceAcls
     Roles,           // role create/delete/assign/remove and the role queries, ListClaims
     Admin,           // GetStorageUsage, TriggerSync
-    Destroy,         // PurgeOldVersions, EraseFile — irreversible destruction
+    Destroy,         // PurgeOldVersions — compacts history, preserves current state
+    // True delete, kept apart from Destroy on purpose. They are different
+    // powers: a version cull is storage housekeeping that preserves the current
+    // file, erasure destroys everything including derived data across services.
+    // Bundling them would mean the door a user erases through also regains the
+    // purge endpoint that §5.4.9 deliberately withheld from it — a behaviour
+    // change smuggled in as a side effect of enabling erasure.
+    Erase,           // EraseFile
     Accountability,  // ListAccountabilityRecords
     // The erasure ATTESTATION surface, deliberately separate from Destroy.
     //
@@ -129,6 +136,7 @@ enum class Capability {
     // than the job needs. Splitting them keeps "must purge my derived copy"
     // apart from "may destroy the original".
     Erasure,         // ListPendingErasures, AcknowledgeErasure, GetErasureStatus
+                     // NB: attestation only. A holder cannot erase anything.
 };
 
 const char* to_string(Capability c);

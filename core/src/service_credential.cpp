@@ -136,6 +136,7 @@ const char* to_string(Capability c) {
         case Capability::Admin:          return "admin";
         case Capability::Destroy:        return "destroy";
         case Capability::Accountability: return "accountability";
+        case Capability::Erase:          return "erase";
         case Capability::Erasure:        return "erasure";
     }
     return "unknown";
@@ -152,7 +153,7 @@ const std::vector<Capability>& all_capabilities() {
     static const std::vector<Capability> kAll = {
         Capability::Read, Capability::Write, Capability::Delete, Capability::Restore,
         Capability::Acl, Capability::Roles, Capability::Admin, Capability::Destroy,
-        Capability::Accountability, Capability::Erasure,
+        Capability::Accountability, Capability::Erase, Capability::Erasure,
     };
     return kAll;
 }
@@ -167,7 +168,7 @@ bool is_high_risk(Capability c) {
     // failure than destroying data — it is the one this feature exists to make
     // impossible to make by accident.
     return c == Capability::Destroy || c == Capability::Accountability ||
-           c == Capability::Erasure;
+           c == Capability::Erase || c == Capability::Erasure;
 }
 
 // ── The RPC → capability map ────────────────────────────────────────────────
@@ -242,7 +243,10 @@ const std::map<std::string, Capability>& method_map() {
 
         // destroy — the irreversible kind.
         {"PurgeOldVersions",          Capability::Destroy},
-        {"EraseFile",                 Capability::Destroy},
+
+        // erase — true delete. Its own capability so that granting it does not
+        // also hand back the version-cull endpoint §5.4.9 withheld.
+        {"EraseFile",                 Capability::Erase},
 
         // erasure — the attestation surface. Separate from destroy on purpose:
         // a consumer must read what it owes and report back without thereby

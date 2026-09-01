@@ -139,6 +139,9 @@ static void test_capability_names_are_stable() {
     // reinterprets every stored grant.
     const char* expected[] = {"read", "write", "delete", "restore", "acl",
                               "roles", "admin", "destroy", "accountability",
+                              // True delete, apart from `destroy`: granting it
+                              // must not also restore the version-cull endpoint.
+                              "erase",
                               // The erasure attestation surface, kept apart from
                               // `destroy` so a consumer can read what it owes and
                               // report back without being able to erase anything.
@@ -267,12 +270,15 @@ static void test_erasure_attestation_is_not_destroy() {
 
     // The destructive act itself stays with the irreversible operations.
     CHECK(capability_for_method("/fileengine_rpc.FileService/EraseFile", c) &&
-          c == Capability::Destroy, "erasing a file is `destroy`");
+          c == Capability::Erase, "erasing a file is `erase`, not `destroy`");
+    CHECK(capability_for_method("/fileengine_rpc.FileService/PurgeOldVersions", c) &&
+          c == Capability::Destroy, "culling versions stays `destroy`");
 
     // Both are high risk, for different reasons: `destroy` removes committed
     // data, `erasure` can close a contractual obligation that was never met.
     // Neither may ride along with an ordinary credential issue.
     CHECK(is_high_risk(Capability::Destroy), "destroy is high risk");
+    CHECK(is_high_risk(Capability::Erase), "erase is high risk");
     CHECK(is_high_risk(Capability::Erasure),
           "erasure is high risk — a false acknowledgement is a false compliance claim");
     CHECK(!is_high_risk(Capability::Read), "read is not high risk");

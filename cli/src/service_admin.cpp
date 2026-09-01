@@ -271,6 +271,10 @@ int service_command(int argc, char** argv) {
                         why = "  accountability reads the security log, which across "
                               "tenants reconstructs who did what to whom.\n";
                         break;
+                    case fileengine::Capability::Erase:
+                        why = "  erase performs true delete — it destroys a file's content, "
+                              "every version, and everything derived from it, irreversibly.\n";
+                        break;
                     case fileengine::Capability::Erasure:
                         why = "  erasure lets this service acknowledge that it destroyed "
                               "its copy of erased content. A false acknowledgement closes "
