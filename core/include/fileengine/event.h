@@ -32,6 +32,19 @@ enum class FileEventType {
     FileRenamed,
     FileDeleted,
     FileRestored,
+    // Erasure (§5.4.5). DELIBERATELY distinct from FileDeleted: a consumer
+    // treats file.deleted as a SOFT delete — recoverable, since undelete
+    // exists — so it may reasonably keep an index entry marked deleted rather
+    // than destroying the vectors. Reusing that type for erasure would leave the
+    // extracted text and embeddings exactly where they were, which is the
+    // failure the whole feature exists to prevent. Different semantics, so a
+    // different type.
+    //
+    // The event TRIGGERS; it does not guarantee. fileengine:events is fail-open
+    // and drop-oldest by design, which is fine for a notification and
+    // unacceptable for a contractual obligation — so consumers also poll
+    // ListPendingErasures, and that pull is what the attestation counts.
+    FileErased,
     AclChanged,         // permission grant/revoke on a resource
     RoleAssigned,       // a user was added to a role
     RoleMemberRemoved,  // a user was removed from a role

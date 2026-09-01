@@ -229,9 +229,35 @@ Numerous ad-hoc `test_*.cpp` files at the project root are standalone integratio
 
 ## Critical Rules
 
+- **Data is retained by default; destruction happens only through two named,
+  permissioned, recorded operations.** Nothing else in the platform removes
+  committed data. The two are the version cull (`CULL_VERSIONS` — compacts
+  history, preserves current state) and erasure (`ERASE` — "true delete",
+  destroys everything including derived data across services, keeps only the
+  record that the file existed). Erasure is a deliberate exception to the
+  retention stance, for the contractual and legal obligations of jurisdictions
+  that require a right to erasure; it is not a convenience delete. `RemoveFile`
+  is a SOFT delete that `UndeleteFile` reverses and destroys nothing. Both
+  destroy-data permissions are withheld by default, are not conferred by the
+  tenant-admin bypass, and write an accountability record in the same
+  transaction as the destruction. See PROPOSAL_accountability_record.md §5.4
+
 - **Never edit the .env file** — it contains database and S3 connection credentials
 - The `.env` must be symlinked into the build directory so binaries can find it
-- S3 objects are immutable by design — deletion is not supported in the object store
+- S3 objects are **write-once, not undeletable**. The core never rewrites an
+  existing version's object — a new version is a new key — so treat objects as
+  immutable in normal operation. Only **erasure** (`EraseFile`) deletes from the
+  bucket; the version cull (`PurgeOldVersions`) deliberately leaves object-store
+  copies alone and removes local bytes only.
+  **History, twice corrected.** This line first said deletion was not supported
+  at all. §5.4.4 called that stale and asserted `S3Storage::delete_file` worked,
+  so the line was changed to say deletion was supported — but nobody had read the
+  method, which was a hard-coded `return err("Deleting files from S3 is not
+  allowed")`. Erasure called it best-effort and swallowed the refusal, so files
+  were reported erased with their content still in the bucket. The method is now
+  a real DeleteObject, and erasure treats a failure there as fatal. The lesson is
+  the one that cost the most here: a claim in a design document is not a
+  verification of the code it describes
 - All file operations use UUIDs, not paths, for distributed handling
 - ACL tables live in tenant-specific schemas (not PUBLIC) to prevent data leakage
 - Do not create per-tenant connection pools. (Note the intended "all tenants share one pool" invariant is not actually implemented — see `ConnectionPoolManager` above.)

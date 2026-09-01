@@ -218,6 +218,21 @@ public:
                                  const fileengine_rpc::PurgeOldVersionsRequest* request,
                                  fileengine_rpc::PurgeOldVersionsResponse* response) override;
 
+    // Erasure (§5.4). EraseFile is the destructive act; the other three are the
+    // attestation surface that makes it demonstrable.
+    grpc::Status EraseFile(grpc::ServerContext* context,
+                           const fileengine_rpc::EraseFileRequest* request,
+                           fileengine_rpc::EraseFileResponse* response) override;
+    grpc::Status ListPendingErasures(grpc::ServerContext* context,
+                                     const fileengine_rpc::ListPendingErasuresRequest* request,
+                                     fileengine_rpc::ListPendingErasuresResponse* response) override;
+    grpc::Status AcknowledgeErasure(grpc::ServerContext* context,
+                                    const fileengine_rpc::AcknowledgeErasureRequest* request,
+                                    fileengine_rpc::AcknowledgeErasureResponse* response) override;
+    grpc::Status GetErasureStatus(grpc::ServerContext* context,
+                                  const fileengine_rpc::GetErasureStatusRequest* request,
+                                  fileengine_rpc::GetErasureStatusResponse* response) override;
+
     grpc::Status ListAccountabilityRecords(grpc::ServerContext* context,
                                           const fileengine_rpc::ListAccountabilityRecordsRequest* request,
                                           fileengine_rpc::ListAccountabilityRecordsResponse* response) override;

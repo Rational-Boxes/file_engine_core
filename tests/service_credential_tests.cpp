@@ -138,10 +138,18 @@ static void test_capability_names_are_stable() {
     // Stored in the database and read by the CLI. Renaming one silently
     // reinterprets every stored grant.
     const char* expected[] = {"read", "write", "delete", "restore", "acl",
-                              "roles", "admin", "destroy", "accountability"};
+                              "roles", "admin", "destroy", "accountability",
+                              // The erasure attestation surface, kept apart from
+                              // `destroy` so a consumer can read what it owes and
+                              // report back without being able to erase anything.
+                              "erasure"};
+    constexpr size_t kExpected = sizeof(expected) / sizeof(expected[0]);
     const auto& all = all_capabilities();
-    CHECK(all.size() == 9, "nine capabilities, not five hundred cells");
-    for (size_t i = 0; i < all.size(); ++i) {
+    CHECK(all.size() == kExpected, "ten capabilities, not five hundred cells");
+    // Bounded by BOTH, not by all.size(): when the list grew this loop read past
+    // the end of `expected` and compared against whatever followed it in memory,
+    // so the failure it printed was garbage rather than the name that changed.
+    for (size_t i = 0; i < all.size() && i < kExpected; ++i) {
         CHECK(std::string(to_string(all[i])) == expected[i],
               std::string("capability name is stable: ") + expected[i]);
     }
@@ -241,6 +249,35 @@ static void test_loopback_detection() {
     CHECK(!peer_is_loopback("ipv4:127.0.0.1.evil.com:80"), "not a lookalike hostname");
 }
 
+// ── Erasure capability split (§5.4.3) ───────────────────────────────────────
+
+static void test_erasure_attestation_is_not_destroy() {
+    std::cout << "test_erasure_attestation_is_not_destroy\n";
+    // csai, discussion and difference all have to read the erasures they owe and
+    // report back. If that rode on `destroy`, every one of them would also be
+    // able to erase arbitrary files — a far larger grant than the job needs, and
+    // handed to the services most exposed to untrusted document content.
+    Capability c;
+    CHECK(capability_for_method("/fileengine_rpc.FileService/ListPendingErasures", c) &&
+          c == Capability::Erasure, "reading the queue is `erasure`, not `destroy`");
+    CHECK(capability_for_method("/fileengine_rpc.FileService/AcknowledgeErasure", c) &&
+          c == Capability::Erasure, "acknowledging is `erasure`, not `destroy`");
+    CHECK(capability_for_method("/fileengine_rpc.FileService/GetErasureStatus", c) &&
+          c == Capability::Erasure, "reading status is `erasure`, not `destroy`");
+
+    // The destructive act itself stays with the irreversible operations.
+    CHECK(capability_for_method("/fileengine_rpc.FileService/EraseFile", c) &&
+          c == Capability::Destroy, "erasing a file is `destroy`");
+
+    // Both are high risk, for different reasons: `destroy` removes committed
+    // data, `erasure` can close a contractual obligation that was never met.
+    // Neither may ride along with an ordinary credential issue.
+    CHECK(is_high_risk(Capability::Destroy), "destroy is high risk");
+    CHECK(is_high_risk(Capability::Erasure),
+          "erasure is high risk — a false acknowledgement is a false compliance claim");
+    CHECK(!is_high_risk(Capability::Read), "read is not high risk");
+}
+
 // ── The coverage test (§9.4, §9.8) ──────────────────────────────────────────
 
 static void test_every_rpc_in_the_descriptor_is_classified() {
@@ -297,6 +334,7 @@ int main() {
     test_an_unclassified_method_is_denied_to_everyone();
     test_identity_capability_checks();
     test_loopback_detection();
+    test_erasure_attestation_is_not_destroy();
     test_every_rpc_in_the_descriptor_is_classified();
 
     std::cout << "\n=== " << (g_checks - g_failures) << "/" << g_checks

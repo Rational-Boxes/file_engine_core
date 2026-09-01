@@ -851,7 +851,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
     std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, "
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
-                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE AND c.erased = FALSE) END AS rendition_count, "
                             "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
                             "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
@@ -859,7 +859,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory(const std::strin
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
                             "FROM \"" + schema_name + "\".files f "
-                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.deleted = FALSE "
+                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.deleted = FALSE AND f.erased = FALSE "
                             "ORDER BY f.name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
@@ -955,7 +955,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
     std::string query_sql = "SELECT f.uid, f.name, f.size, f.owner, f.permission_map, f.is_container, f.deleted, "
                             "CASE WHEN f.is_container THEN 0 ELSE "
                             "(SELECT COUNT(*) FROM \"" + schema_name + "\".files c "
-                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE) END AS rendition_count, "
+                            "WHERE c.parent_uid = f.uid AND c.deleted = FALSE AND c.erased = FALSE) END AS rendition_count, "
                             "FLOOR(EXTRACT(EPOCH FROM f.created_at))::bigint AS created_epoch, "
                             "FLOOR(EXTRACT(EPOCH FROM f.updated_at))::bigint AS updated_epoch, "
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp ASC LIMIT 1) AS first_vts, "
@@ -963,7 +963,7 @@ Result<std::vector<FileInfo>> Database::list_files_in_directory_with_deleted(con
                             "(SELECT v.version_timestamp FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_vts, "
                             "(SELECT v.revised_by FROM \"" + schema_name + "\".versions v WHERE v.file_uid = f.uid ORDER BY v.version_timestamp DESC LIMIT 1) AS last_by "
                             "FROM \"" + schema_name + "\".files f "
-                            "WHERE f.parent_uid = $1 AND f.uid <> $1 "
+                            "WHERE f.parent_uid = $1 AND f.uid <> $1 AND f.erased = FALSE "
                             "ORDER BY f.name;";
     const char* param_values[1] = {parent_uid.c_str()};
 
@@ -3294,6 +3294,498 @@ Result<int> Database::purge_versions(const std::string& file_uid,
     return Result<int>::ok(removed);
 }
 
+// ── Erasure (§5.4) ─────────────────────────────────────────────────────────
+
+Result<ErasureInit> Database::begin_erasure(const std::string& file_uid,
+                                            const std::string& reason,
+                                            bool retain_name,
+                                            const std::vector<std::string>& participants,
+                                            const std::string& tenant,
+                                            const AccountabilityContext& ctx) {
+    if (!ctx.valid()) {
+        return Result<ErasureInit>::err("Refusing erasure with no actor");
+    }
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<ErasureInit>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN erasure transaction: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<ErasureInit>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<ErasureInit>::err(msg);
+    };
+
+    ErasureInit out;
+
+    // Refuse to erase twice. Not merely wasteful: the second run would find no
+    // versions, destroy nothing, and still report success — an erasure record
+    // attesting to a destruction that did not happen on that occasion.
+    {
+        const std::string sql = "SELECT erased FROM " + schema + ".files WHERE uid = $1;";
+        const char* params[1] = { file_uid.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to read file for erasure: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        if (PQntuples(res) == 0) {
+            PQclear(res);
+            return rollback_and_fail("No such file: " + file_uid);
+        }
+        const bool already = std::string(PQgetvalue(res, 0, 0)) == "t";
+        PQclear(res);
+        if (already) {
+            return rollback_and_fail("File has already been erased: " + file_uid);
+        }
+    }
+
+    // The storage paths, read BEFORE the rows are destroyed — afterwards there
+    // is nothing left to say where the bytes are.
+    {
+        const std::string sql =
+            "SELECT storage_path, version_timestamp FROM " + schema + ".versions WHERE file_uid = $1;";
+        const char* params[1] = { file_uid.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to list version storage: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        for (int i = 0; i < PQntuples(res); ++i) {
+            out.storage_paths.emplace_back(PQgetvalue(res, i, 0));
+            out.version_timestamps.emplace_back(PQgetvalue(res, i, 1));
+        }
+        PQclear(res);
+    }
+
+    // The whole metadata VALUE HISTORY, not just current values. Metadata
+    // routinely carries personal data — a party name in a custom property, a
+    // reference number, a free-text note — and clearing only the live value
+    // leaves every superseded one readable one query away (§5.4.1).
+    {
+        const std::string sql = "DELETE FROM " + schema + ".metadata WHERE file_uid = $1;";
+        const char* params[1] = { file_uid.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = "Failed to destroy metadata history: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        out.metadata_values_destroyed = std::atoi(PQcmdTuples(res));
+        PQclear(res);
+    }
+
+    // Every version, including the current one. This is what separates erasure
+    // from culling: culling compacts history while preserving current state,
+    // which is the opposite of what an erasure obligation asks for.
+    {
+        const std::string sql = "DELETE FROM " + schema + ".versions WHERE file_uid = $1;";
+        const char* params[1] = { file_uid.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = "Failed to destroy versions: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        out.versions_destroyed = std::atoi(PQcmdTuples(res));
+        PQclear(res);
+    }
+
+    // The skeletal existence record. The row survives so the FACT survives; the
+    // name does not, unless a retention justification covers keeping it — a
+    // filename like "Acme_Contract_J_Smith.pdf" is itself party data, and the
+    // safe default for an erasure feature is to erase (§5.4.1).
+    {
+        const std::string sql =
+            "UPDATE " + schema + ".files SET erased = TRUE, erased_at = clock_timestamp(), "
+            "erased_by = $2, size = 0"
+            + (retain_name ? std::string("") : std::string(", name = ''")) +
+            " WHERE uid = $1;";
+        const char* params[2] = { file_uid.c_str(), ctx.actor.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = "Failed to write the existence record: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        PQclear(res);
+    }
+
+    // With no participants there is nobody to wait for, so the obligation is met
+    // the moment the core's own content is gone. A deployment running no
+    // derived-data services is the only case; anything else must wait.
+    out.complete = participants.empty();
+    out.erasure_id = Utils::generate_uuid();
+
+    {
+        const std::string roster = text_array_literal(participants);
+        const std::string state = out.complete ? "complete" : "initiated";
+        const std::string sql =
+            "INSERT INTO " + schema + ".erasure "
+            "(erasure_id, file_uid, actor, reason, state, name_retained, participants, completed_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7::text[], " +
+            (out.complete ? std::string("clock_timestamp()") : std::string("NULL")) + ");";
+        const char* params[7] = {
+            out.erasure_id.c_str(), file_uid.c_str(), ctx.actor.c_str(), reason.c_str(),
+            state.c_str(), retain_name ? "t" : "f", roster.c_str()
+        };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 7, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = "Failed to record the erasure: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        PQclear(res);
+    }
+
+    // In the SAME transaction as the destruction, for the reason culling does
+    // it: an erasure destroys evidence by design, so a record written
+    // separately — or not at all — would destroy the evidence OF the erasure.
+    //
+    // The detail deliberately carries counts and the roster, never the name or
+    // any metadata value: the chain must not capture content in the first place,
+    // or erasure would have to erase the chain too (§5.4.7).
+    std::int64_t hint_seq = 0;
+    {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Destruction;
+        rec.action      = accountability_action::kErase;
+        rec.target_uid  = file_uid;
+        rec.target_type = "file";
+        rec.detail.set("erasure_id", out.erasure_id);
+        rec.detail.set("versions_destroyed", out.versions_destroyed);
+        rec.detail.set("metadata_values_destroyed", out.metadata_values_destroyed);
+        rec.detail.set("name_retained", retain_name);
+        rec.detail.set("participants", static_cast<int>(participants.size()));
+        if (!reason.empty()) rec.detail.set("reason", reason);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Erasure refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT erasure: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+    return Result<ErasureInit>::ok(out);
+}
+
+Result<std::vector<PendingErasureRow>> Database::list_pending_erasures(
+        const std::string& participant, int limit, const std::string& tenant) {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<PendingErasureRow>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+    const int lim = (limit > 0 && limit <= 1000) ? limit : 100;
+
+    // Outstanding for THIS participant: on the frozen roster, and with no ack
+    // row of its own. Oldest first — an erasure that has waited longest is the
+    // one closest to being an operational problem.
+    const std::string sql =
+        "SELECT e.erasure_id, e.file_uid, EXTRACT(EPOCH FROM e.initiated_at)::bigint "
+        "FROM " + schema + ".erasure e "
+        "WHERE e.state = 'initiated' AND $1 = ANY(e.participants) "
+        "  AND NOT EXISTS (SELECT 1 FROM " + schema + ".erasure_ack a "
+        "                  WHERE a.erasure_id = e.erasure_id AND a.participant = $1) "
+        "ORDER BY e.initiated_at ASC LIMIT " + std::to_string(lim) + ";";
+    const char* params[1] = { participant.c_str() };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "Failed to list pending erasures: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<PendingErasureRow>>::err(error);
+    }
+    std::vector<PendingErasureRow> rows;
+    for (int i = 0; i < PQntuples(res); ++i) {
+        PendingErasureRow r;
+        r.erasure_id   = PQgetvalue(res, i, 0);
+        r.file_uid     = PQgetvalue(res, i, 1);
+        r.initiated_at = std::atoll(PQgetvalue(res, i, 2));
+        rows.push_back(std::move(r));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<PendingErasureRow>>::ok(rows);
+}
+
+Result<ErasureStatusRow> Database::acknowledge_erasure(const std::string& erasure_id,
+                                                       const std::string& participant,
+                                                       bool complied,
+                                                       const std::string& detail,
+                                                       const std::string& tenant,
+                                                       const AccountabilityContext& ctx) {
+    if (!ctx.valid()) {
+        return Result<ErasureStatusRow>::err("Refusing erasure acknowledgement with no actor");
+    }
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<ErasureStatusRow>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN acknowledgement: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<ErasureStatusRow>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<ErasureStatusRow>::err(msg);
+    };
+
+    // Lock the erasure row so two participants acknowledging at once cannot both
+    // read "one outstanding" and both decide they were the last.
+    {
+        const std::string sql =
+            "SELECT 1 FROM " + schema + ".erasure WHERE erasure_id = $1 FOR UPDATE;";
+        const char* params[1] = { erasure_id.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            std::string error = PQntuples(res) == 0
+                ? std::string("No such erasure: ") + erasure_id
+                : "Failed to lock erasure: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        PQclear(res);
+    }
+
+    // Idempotent: a consumer that acknowledged and then lost the reply must be
+    // able to say it again without it counting twice or being rejected.
+    {
+        const std::string sql =
+            "INSERT INTO " + schema + ".erasure_ack (erasure_id, participant, complied, detail) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (erasure_id, participant) DO UPDATE SET "
+            "  complied = EXCLUDED.complied, detail = EXCLUDED.detail, acked_at = clock_timestamp();";
+        const char* params[4] = {
+            erasure_id.c_str(), participant.c_str(), complied ? "t" : "f", detail.c_str()
+        };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 4, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = "Failed to record acknowledgement: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        PQclear(res);
+    }
+
+    std::int64_t hint_seq = 0;
+    // Close the erasure when every participant has answered. A single refusal
+    // makes it FAILED and it stays failed: partial completion must stay visibly
+    // incomplete rather than silently passing, because it represents an unmet
+    // contractual obligation (§5.4.3).
+    bool closed = false;
+    {
+        const std::string sql =
+            "UPDATE " + schema + ".erasure e SET "
+            "  state = CASE WHEN EXISTS (SELECT 1 FROM " + schema + ".erasure_ack a "
+            "                            WHERE a.erasure_id = e.erasure_id AND NOT a.complied) "
+            "               THEN 'failed' ELSE 'complete' END, "
+            "  completed_at = clock_timestamp() "
+            "WHERE e.erasure_id = $1 AND e.state = 'initiated' "
+            "  AND NOT EXISTS (SELECT unnest(e.participants) EXCEPT "
+            "                  SELECT a.participant FROM " + schema + ".erasure_ack a "
+            "                  WHERE a.erasure_id = e.erasure_id);";
+        const char* params[1] = { erasure_id.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = "Failed to close erasure: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            return rollback_and_fail(error);
+        }
+        // One row updated means THIS acknowledgement was the last outstanding
+        // one and the erasure just closed. Read from the UPDATE rather than
+        // re-querying: the row is locked in this transaction, so the count is
+        // exact and cannot race another participant closing it first.
+        closed = std::atoi(PQcmdTuples(res)) == 1;
+        PQclear(res);
+    }
+
+    // The completion record. Separate from the acknowledgement on purpose: the
+    // last participant's ack and "the obligation has been met" are different
+    // facts, and an auditor asking "was this erasure ever actually completed"
+    // should find one entry that says so rather than having to infer it from the
+    // absence of outstanding participants.
+    if (closed) {
+        std::string outcome = "complete";
+        {
+            const std::string sql =
+                "SELECT state FROM " + schema + ".erasure WHERE erasure_id = $1;";
+            const char* params[1] = { erasure_id.c_str() };
+            PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+            if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
+                outcome = PQgetvalue(res, 0, 0);
+            }
+            PQclear(res);
+        }
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Destruction;
+        rec.action      = accountability_action::kEraseComplete;
+        rec.target_type = "erasure";
+        rec.detail.set("erasure_id", erasure_id);
+        // "failed" when any participant reported it could not comply — recorded
+        // as an outcome rather than left to look like success.
+        rec.detail.set("outcome", outcome);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Erasure completion refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Destruction;
+        rec.action      = accountability_action::kEraseAck;
+        rec.target_type = "erasure";
+        rec.detail.set("erasure_id", erasure_id);
+        rec.detail.set("participant", participant);
+        rec.detail.set("complied", complied);
+        if (!detail.empty()) rec.detail.set("detail", detail);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Acknowledgement refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT acknowledgement: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+
+    return get_erasure(erasure_id, tenant);
+}
+
+Result<ErasureStatusRow> Database::get_erasure(const std::string& erasure_id,
+                                               const std::string& tenant) {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<ErasureStatusRow>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    ErasureStatusRow row;
+    {
+        const std::string sql =
+            "SELECT erasure_id, file_uid, actor, reason, state, name_retained, "
+            "       EXTRACT(EPOCH FROM initiated_at)::bigint, "
+            "       COALESCE(EXTRACT(EPOCH FROM completed_at)::bigint, 0), "
+            "       array_to_string(participants, ',') "
+            "FROM " + schema + ".erasure WHERE erasure_id = $1;";
+        const char* params[1] = { erasure_id.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to read erasure: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<ErasureStatusRow>::err(error);
+        }
+        if (PQntuples(res) == 0) {
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<ErasureStatusRow>::err("No such erasure: " + erasure_id);
+        }
+        row.erasure_id    = PQgetvalue(res, 0, 0);
+        row.file_uid      = PQgetvalue(res, 0, 1);
+        row.actor         = PQgetvalue(res, 0, 2);
+        row.reason        = PQgetvalue(res, 0, 3);
+        row.state         = PQgetvalue(res, 0, 4);
+        row.name_retained = std::string(PQgetvalue(res, 0, 5)) == "t";
+        row.initiated_at  = std::atoll(PQgetvalue(res, 0, 6));
+        row.completed_at  = std::atoll(PQgetvalue(res, 0, 7));
+        const std::string roster = PQgetvalue(res, 0, 8);
+        PQclear(res);
+        // Split the roster; `awaiting` is narrowed to the un-acked below.
+        std::string cur;
+        for (char c : roster) {
+            if (c == ',') { if (!cur.empty()) row.awaiting.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) row.awaiting.push_back(cur);
+    }
+
+    {
+        const std::string sql =
+            "SELECT participant, EXTRACT(EPOCH FROM acked_at)::bigint, complied, detail "
+            "FROM " + schema + ".erasure_ack WHERE erasure_id = $1 ORDER BY acked_at ASC;";
+        const char* params[1] = { erasure_id.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = "Failed to read acknowledgements: " + std::string(PQerrorMessage(pg_conn));
+            PQclear(res);
+            connection_pool_->release(conn);
+            return Result<ErasureStatusRow>::err(error);
+        }
+        for (int i = 0; i < PQntuples(res); ++i) {
+            ErasureAckRow a;
+            a.participant = PQgetvalue(res, i, 0);
+            a.acked_at    = std::atoll(PQgetvalue(res, i, 1));
+            a.complied    = std::string(PQgetvalue(res, i, 2)) == "t";
+            a.detail      = PQgetvalue(res, i, 3);
+            row.acks.push_back(std::move(a));
+        }
+        PQclear(res);
+    }
+    connection_pool_->release(conn);
+
+    // `awaiting` is the roster minus whoever has answered — the list an operator
+    // needs when an erasure is stuck, which is the question this surface exists
+    // to answer.
+    std::vector<std::string> still;
+    for (const auto& p : row.awaiting) {
+        bool acked = false;
+        for (const auto& a : row.acks) if (a.participant == p) { acked = true; break; }
+        if (!acked) still.push_back(p);
+    }
+    row.awaiting = std::move(still);
+    return Result<ErasureStatusRow>::ok(row);
+}
+
 // The pull surface (§4.3.1). Reads forward from the consumer's watermark in ts
 // order — which, under the chain lock, is also seq order.
 //
@@ -3494,6 +3986,22 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
         "ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
         "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;";
 
+    // The skeletal existence record erasure leaves behind (§5.4.1): the payload
+    // is destroyed, the fact is retained. The row itself is what remains — uid,
+    // parent, created_at — plus these two, so "a file existed here and was
+    // erased, by whom, when" is answerable without retaining anything of what it
+    // contained.
+    //
+    // `erased` is deliberately separate from `deleted`. Soft delete is
+    // recoverable and UndeleteFile reverses it; erasure is not and must never be
+    // reversible, so the two cannot share a column without undelete becoming a
+    // way to resurrect an erased file.
+    std::string migrate_files_erasure =
+        "ALTER TABLE \"" + escaped_schema + "\".files "
+        "ADD COLUMN IF NOT EXISTS erased BOOLEAN NOT NULL DEFAULT FALSE, "
+        "ADD COLUMN IF NOT EXISTS erased_at TIMESTAMPTZ, "
+        "ADD COLUMN IF NOT EXISTS erased_by VARCHAR(255);";
+
     std::string create_idx_uid = "CREATE INDEX IF NOT EXISTS idx_files_uid_" + escaped_schema +
         " ON \"" + escaped_schema + "\".files(uid);";
     std::string create_idx_parent_uid = "CREATE INDEX IF NOT EXISTS idx_files_parent_uid_" + escaped_schema +
@@ -3547,6 +4055,13 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     // Idempotent backfill migration for pre-existing tenants (non-critical).
     res = PQexec(pg_conn, migrate_files_timestamps.c_str());
     PQclear(res);  // columns may already exist; status is irrelevant
+
+    // The erasure existence-record columns, same shape and same place: right
+    // after the files table exists, because they are columns ON it. Status
+    // ignored for the same reason — ADD COLUMN IF NOT EXISTS is a no-op on a
+    // tenant that already has them.
+    res = PQexec(pg_conn, migrate_files_erasure.c_str());
+    PQclear(res);
 
     res = PQexec(pg_conn, create_idx_uid.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
@@ -3863,6 +4378,73 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
         connection_pool_->release(conn);
         return Result<void>::err("Failed to create tenant accountability_chain_head table: " + error);
     }
+    PQclear(res);
+
+    // --- Erasure (§5.4) ----------------------------------------------------
+    //
+    // Erasure is a tracked JOB, not a call that returns done (§5.4.3). The
+    // contractual value of the feature is being able to demonstrate compliance,
+    // so fire-and-forget propagation is insufficient: the core destroys its own
+    // content and records the erasure as initiated, each participating service
+    // acknowledges, and only then is it complete. An erasure stuck incomplete is
+    // an operational alarm, because it represents an unmet obligation rather
+    // than a transient error.
+    //
+    // These rows are NEVER culled. They are the evidence, they are small, and a
+    // service restored from a backup re-reads them from zero to re-purge what it
+    // should no longer hold (§5.4.6) — no retention window to get wrong.
+    std::string create_erasure_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".erasure ("
+        "    erasure_id    VARCHAR(64)  PRIMARY KEY,"
+        "    file_uid      VARCHAR(64)  NOT NULL,"       // the uid survives; the payload does not
+        "    actor         VARCHAR(255) NOT NULL,"
+        "    reason        TEXT         NOT NULL DEFAULT '',"
+        "    state         VARCHAR(16)  NOT NULL DEFAULT 'initiated',"  // initiated|complete|failed
+        "    name_retained BOOLEAN      NOT NULL DEFAULT FALSE,"        // false => the name was redacted
+        "    participants  TEXT[]       NOT NULL DEFAULT '{}',"         // roster fixed AT INITIATION
+        "    initiated_at  TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp(),"
+        "    completed_at  TIMESTAMPTZ"
+        ");";
+    res = PQexec(pg_conn, create_erasure_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant erasure table: " + error);
+    }
+    PQclear(res);
+
+    // The roster is frozen on the erasure row rather than read from config at
+    // acknowledgement time. Config changes — a service is added, another
+    // retired — and an erasure whose required participants shifted underneath it
+    // could complete without the service that actually held the data ever having
+    // been asked. What was outstanding when the erasure began is what has to
+    // answer for it.
+    std::string create_erasure_ack_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".erasure_ack ("
+        "    erasure_id  VARCHAR(64)  NOT NULL,"
+        "    participant VARCHAR(64)  NOT NULL,"
+        "    complied    BOOLEAN      NOT NULL,"   // false is recorded, never silence
+        "    detail      TEXT         NOT NULL DEFAULT '',"
+        "    acked_at    TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp(),"
+        "    PRIMARY KEY (erasure_id, participant)"
+        ");";
+    res = PQexec(pg_conn, create_erasure_ack_table.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<void>::err("Failed to create tenant erasure_ack table: " + error);
+    }
+    PQclear(res);
+
+    // The pull path's query is "erasures this participant has not acknowledged",
+    // which is an anti-join on state — worth an index because every consumer runs
+    // it on a timer, forever.
+    std::string create_idx_erasure_state =
+        "CREATE INDEX IF NOT EXISTS idx_erasure_state_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".erasure(state);";
+    res = PQexec(pg_conn, create_idx_erasure_state.c_str());
     PQclear(res);
 
     // Seed the head row here so the write path's bootstrap is normally a no-op.

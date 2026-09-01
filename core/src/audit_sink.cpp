@@ -120,7 +120,18 @@ bool RedisAuditSink::publish(AuditEntry entry) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!wal_append(line)) {
-            SERVER_LOG_ERROR("AuditSink", "audit WAL append failed — entry NOT durable");
+            // Name the path and the consequence. Without the path this said
+            // only that an append failed, and the default is RELATIVE
+            // ("audit.wal"), so it lands in the process's working directory —
+            // which for a container is "/", owned by root, with the core
+            // running unprivileged. The result is every audit entry rejected
+            // fail-closed while the sink reports itself enabled, and nothing
+            // on the line to suggest looking at a path or a permission.
+            SERVER_LOG_ERROR("AuditSink",
+                             "audit WAL append failed for '" + opts_.wal_path +
+                             "' — entry NOT durable and the operation will be "
+                             "refused. Check the path exists and is writable by "
+                             "this process (set FILEENGINE_AUDIT_WAL_PATH).");
             return false;  // fail-closed caller must reject the guarded op
         }
         pending_.push_back(std::move(line));

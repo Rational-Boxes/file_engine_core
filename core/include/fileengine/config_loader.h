@@ -57,6 +57,20 @@ struct Config {
     // startup rather than silently leaving the door open. The escape hatch
     // exists for the migration and warns on EVERY start.
     bool service_auth_required = true;
+
+    // Which services must acknowledge an erasure before it is COMPLETE (§5.4.3).
+    // Comma-separated, e.g. "csai,discussion,difference".
+    //
+    // Empty by default, and that default is the safe one for the wrong reason
+    // worth naming: with no participants an erasure completes as soon as the
+    // core's own content is gone, which is CORRECT only for a deployment that
+    // runs no derived-data services. Any deployment that runs csai and does not
+    // list it here will certify erasures complete while the extracted text and
+    // embeddings are still there. Deployment configuration must set this to the
+    // services it actually runs — the à-la-carte shape of the platform means the
+    // core cannot infer it, and inferring it wrongly in either direction is
+    // worse than requiring the statement.
+    std::string erasure_participants;
     // THE one secret. Peppers the stored hashes and deliberately never enters
     // the database, so a dump yields no usable token. Losing it is total
     // lockout — every stored hash becomes unverifiable — which makes it the

@@ -254,11 +254,33 @@ int service_command(int argc, char** argv) {
                 if (arg_at(argc, argv, i) == "--i-understand-this-is-high-risk") confirmed = true;
             }
             if (!confirmed) {
+                // One arm per capability, resolved by name rather than by an
+                // "everything else" fallback. This was a two-branch ternary
+                // assuming exactly two high-risk capabilities; when `erasure`
+                // became the third it fell into the accountability arm and told
+                // the operator that granting it would expose the security log.
+                // A confirmation prompt that describes the wrong power is worse
+                // than no prompt — it is the one moment someone is reading.
+                const char* why = "  this capability is high risk.\n";
+                switch (capability) {
+                    case fileengine::Capability::Destroy:
+                        why = "  destroy irreversibly removes committed data — "
+                              "version culls and erasure.\n";
+                        break;
+                    case fileengine::Capability::Accountability:
+                        why = "  accountability reads the security log, which across "
+                              "tenants reconstructs who did what to whom.\n";
+                        break;
+                    case fileengine::Capability::Erasure:
+                        why = "  erasure lets this service acknowledge that it destroyed "
+                              "its copy of erased content. A false acknowledgement closes "
+                              "a legal obligation that was never met.\n";
+                        break;
+                    default:
+                        break;   // the generic line above
+                }
                 std::cerr << "'" << cap_name << "' is a high-risk capability.\n"
-                          << (capability == fileengine::Capability::Destroy
-                                  ? "  destroy irreversibly removes committed data.\n"
-                                  : "  accountability reads the security log, which across "
-                                    "tenants reconstructs who did what to whom.\n")
+                          << why
                           << "Re-run with --i-understand-this-is-high-risk to grant it.\n";
                 return 2;
             }

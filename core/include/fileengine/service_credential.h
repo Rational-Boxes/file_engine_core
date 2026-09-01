@@ -119,8 +119,16 @@ enum class Capability {
     Acl,             // GrantPermission, RevokePermission, GetResourceAcls
     Roles,           // role create/delete/assign/remove and the role queries, ListClaims
     Admin,           // GetStorageUsage, TriggerSync
-    Destroy,         // PurgeOldVersions, and erasure when it lands
+    Destroy,         // PurgeOldVersions, EraseFile — irreversible destruction
     Accountability,  // ListAccountabilityRecords
+    // The erasure ATTESTATION surface, deliberately separate from Destroy.
+    //
+    // A consumer (csai, discussion, difference) has to read the erasures it owes
+    // and report back — but giving it Destroy so it can read its own work queue
+    // would also let it erase arbitrary files, which is a wildly larger grant
+    // than the job needs. Splitting them keeps "must purge my derived copy"
+    // apart from "may destroy the original".
+    Erasure,         // ListPendingErasures, AcknowledgeErasure, GetErasureStatus
 };
 
 const char* to_string(Capability c);

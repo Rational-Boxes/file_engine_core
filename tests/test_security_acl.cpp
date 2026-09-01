@@ -445,6 +445,77 @@ void test_admin_roles_bypass_within_tenant() {
     CHECK(!can(acl, "F", "bob", {"users"}, P_READ), "plain user denied without a grant");
 }
 
+// erasure_admin — the role that exists so a legal erasure obligation is
+// dischargeable at all.
+//
+// Requiring a per-file ACL grant is right for an ordinary administrator: it keeps
+// an irreversible power from riding along with an LDAP group. But as the ONLY
+// path it is unworkable, because the person answering a right-to-erasure request
+// has to act on any object in the tenant — including files they neither own nor
+// can self-grant on. §5.4 is explicit that being technically unable to erase is
+// itself the violation.
+void test_erasure_admin_may_erase_anything_in_its_tenant() {
+    std::cout << "test_erasure_admin_may_erase_anything_in_its_tenant\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);   // somebody else's file, no grants for us
+    AclManager acl(db);
+    acl.set_default_read(false);
+
+    CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_ERASE),
+          "erasure_admin may erase without owning the file or holding a grant");
+    CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_MANAGE), "erasure_admin still administers");
+    CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_DELETE), "erasure_admin still deletes");
+}
+
+void test_erasure_admin_is_not_a_licence_to_cull() {
+    std::cout << "test_erasure_admin_is_not_a_licence_to_cull\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+    acl.set_default_read(false);
+
+    // Withheld even though erasure is strictly more destructive. The bits are
+    // separate so each is granted for its own reason: this role answers erasure
+    // requests, not storage housekeeping. Bundling a permission nobody asked for
+    // is how tenant_admin came to hold CULL_VERSIONS silently in the first place.
+    CHECK(!can(acl, "F", "dpo", {"erasure_admin"}, P_CULL),
+          "erasure_admin must NOT reach CULL_VERSIONS by bypass");
+
+    acl.grant_permission("F", "dpo", PrincipalType::USER, P_CULL, "", kTestCtx);
+    CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_CULL),
+          "an explicit CULL grant still satisfies an erasure_admin");
+}
+
+void test_being_an_administrator_does_not_confer_erasure_admin() {
+    std::cout << "test_being_an_administrator_does_not_confer_erasure_admin\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+    acl.set_default_read(false);
+
+    // The point of a separate role: an administrator GRANTS it by managing that
+    // group's membership, and does not hold it by being an administrator.
+    CHECK(!can(acl, "F", "carol", {"tenant_admin"}, P_ERASE),
+          "tenant_admin alone still cannot erase");
+    CHECK(can(acl, "F", "carol", {"tenant_admin", "erasure_admin"}, P_ERASE),
+          "holding both roles — the normal case — gets the wider set");
+}
+
+void test_erasure_admin_effective_set_matches_the_check() {
+    std::cout << "test_erasure_admin_effective_set_matches_the_check\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+    acl.set_default_read(false);
+
+    // This drives the UI. Under-reporting hides an affordance the user has;
+    // over-reporting offers one the check then refuses.
+    int eff = acl.get_effective_permissions("F", "dpo", {"erasure_admin"}, "acme").value;
+    CHECK((eff & P_ERASE), "the effective set reports ERASE");
+    CHECK(!(eff & P_CULL), "the effective set excludes CULL_VERSIONS");
+    CHECK((eff & P_MANAGE) && (eff & P_DELETE), "and still carries the ordinary admin bits");
+}
+
 // The boundary is STRUCTURAL: each tenant has its own AclManager + data store, so
 // the same tenant_admin role, evaluated by a different tenant's manager, only ever
 // sees that tenant's data. Two isolated mocks stand in for two tenant schemas.
@@ -509,6 +580,10 @@ int main() {
     test_hierarchical_precedence();
     test_tenant_admin_is_scoped_not_global();
     test_admin_roles_bypass_within_tenant();
+    test_erasure_admin_may_erase_anything_in_its_tenant();
+    test_erasure_admin_is_not_a_licence_to_cull();
+    test_being_an_administrator_does_not_confer_erasure_admin();
+    test_erasure_admin_effective_set_matches_the_check();
     test_tenant_admin_boundary_is_per_manager();
     test_group_type_matches_nobody();
     std::cout << "\nAll " << g_checks << " checks passed.\n";

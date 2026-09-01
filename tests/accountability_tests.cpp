@@ -203,6 +203,56 @@ static void test_validate_rejects_out_of_scope_actions() {
     CHECK(result.error.find("not in scope") != std::string::npos, "the refusal says why");
 }
 
+// Every action constant the code can emit must have a schema.
+//
+// This is the general form of a bug that shipped: `erase.initiated` was declared
+// in accountability_action, emitted by the erasure path, and had no schema — so
+// validate_record refused it, and because the record and the destruction commit
+// together, the refusal aborted the whole erasure. The failure surfaced as
+// "Erasure refused: accountability action is not in scope", at the far end of a
+// feature, from a file nobody had touched.
+//
+// Asserting each new action individually would only ever catch the one somebody
+// remembered to add. This asserts the property: declaring an action and
+// forgetting its schema is a compile-and-ship-able mistake, and this is what
+// makes it a test failure instead.
+static void test_every_declared_action_has_a_schema() {
+    std::cout << "test_every_declared_action_has_a_schema\n";
+    namespace A = accountability_action;
+    const char* kDeclared[] = {
+        A::kAclGrant, A::kAclRevoke, A::kRoleCreate, A::kRoleDelete,
+        A::kRoleAssign, A::kRoleRemove, A::kCullVersions,
+        A::kErase, A::kEraseAck, A::kEraseComplete,
+        A::kTenantCreate, A::kTenantDelete,
+        A::kServiceTokenIssued, A::kServiceTokenRotated, A::kServiceTokenPruned,
+        A::kServiceTokenRevoked, A::kServiceBootstrapEnrolled,
+        A::kServiceBootstrapReopened, A::kServiceCapGranted, A::kServiceCapRevoked,
+    };
+    for (const char* action : kDeclared) {
+        AccountabilityRecord rec = sample_grant();
+        rec.action = action;
+        rec.detail = AccountabilityDetail{};   // fields are per-action; scope is what is under test
+        auto result = validate_record(rec);
+        const bool in_scope = result.success ||
+                              result.error.find("not in scope") == std::string::npos;
+        CHECK(in_scope, std::string("action has a schema: ") + action);
+    }
+}
+
+// The erasure records must never carry content. Erasing a file would otherwise
+// mean erasing the record of its erasure (§5.4.7).
+static void test_erasure_records_carry_no_content() {
+    std::cout << "test_erasure_records_carry_no_content\n";
+    AccountabilityRecord rec = sample_grant();
+    rec.category = AccountabilityCategory::Destruction;
+    rec.action   = accountability_action::kErase;
+    rec.detail   = AccountabilityDetail{};
+    rec.detail.set("erasure_id", std::string("e1"));
+    rec.detail.set("name", std::string("Acme_Contract_J_Smith.pdf"));
+    CHECK(!validate_record(rec).success,
+          "a filename is not an enumerated field on an erasure record");
+}
+
 static void test_validate_rejects_category_action_mismatch() {
     std::cout << "test_validate_rejects_category_action_mismatch\n";
     auto rec = sample_grant();
@@ -401,6 +451,8 @@ int main() {
     test_detail_from_json_round_trips_exactly();
     test_validate_requires_an_actor();
     test_validate_rejects_out_of_scope_actions();
+    test_every_declared_action_has_a_schema();
+    test_erasure_records_carry_no_content();
     test_validate_rejects_category_action_mismatch();
     test_validate_rejects_unenumerated_detail_fields();
     test_canonical_record_is_pinned();

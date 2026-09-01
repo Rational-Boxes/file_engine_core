@@ -139,14 +139,28 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
     if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()) {
         return Result<bool>::ok(true);
     }
+    // erasure_admin is a tenant_admin who may additionally ERASE — the person
+    // who has to be able to discharge a right-to-erasure request against any
+    // object in the tenant, including files they do not own. Checked BEFORE the
+    // tenant_admin arm because it is a superset of it: a member of both (the
+    // normal case, since they administer the tenant too) must get the wider set.
+    const bool is_erasure_admin_caller =
+        std::find(effective_roles.begin(), effective_roles.end(), kErasureAdminRole) != effective_roles.end();
+    if (is_erasure_admin_caller &&
+        (required_permissions & ~kErasureAdminPermissions) == 0) {
+        return Result<bool>::ok(true);
+    }
+
     const bool is_tenant_admin_caller =
         std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
     if (is_tenant_admin_caller &&
         (required_permissions & kDestroyDataPermissions) == 0) {
         return Result<bool>::ok(true);
     }
-    // A tenant_admin asking for a destroy-data bit falls through to the normal
-    // ACL evaluation below, where an explicit grant can satisfy it.
+    // An admin asking for a destroy-data bit their role does not cover falls
+    // through to the normal ACL evaluation below, where an explicit grant can
+    // still satisfy it — CULL_VERSIONS for an erasure_admin, either bit for a
+    // plain tenant_admin.
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
@@ -238,17 +252,23 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
     if (std::find(effective_roles.begin(), effective_roles.end(), kSystemAdminRole) != effective_roles.end()) {
         return Result<int>::ok(kAllPermissions);
     }
-    if (std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end()) {
-        // Union the bypass with anything explicitly granted, so a tenant_admin
-        // who HAS been granted CULL_VERSIONS or ERASE sees it here. Reporting
-        // the bare bypass set would tell the caller they lack a bit that
-        // check_permission would in fact allow.
+    const bool erasure_admin =
+        std::find(effective_roles.begin(), effective_roles.end(), kErasureAdminRole) != effective_roles.end();
+    const bool tenant_admin =
+        std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
+    if (erasure_admin || tenant_admin) {
+        // Union the bypass with anything explicitly granted, so an admin who HAS
+        // been granted a destroy-data bit sees it here. Reporting the bare bypass
+        // set would tell the caller they lack a bit that check_permission would
+        // in fact allow — and this answer drives the UI, so an under-report hides
+        // an affordance the user actually has.
         int granted = 0;
         auto acls_result = get_acls_for_resource(resource_uid, tenant);
         if (acls_result.success) {
             granted = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
         }
-        return Result<int>::ok(kTenantAdminPermissions | (granted & kDestroyDataPermissions));
+        const int bypass = erasure_admin ? kErasureAdminPermissions : kTenantAdminPermissions;
+        return Result<int>::ok(bypass | (granted & kDestroyDataPermissions));
     }
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
@@ -342,7 +362,8 @@ Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
 Result<void> AclManager::inherit_acls(const std::string& parent_uid,
                                      const std::string& child_uid,
                                      const std::string& tenant,
-                                     const std::string& performed_by) {
+                                     const std::string& performed_by,
+                                     const std::string& child_owner) {
     auto parent_acls_result = get_acls_for_resource(parent_uid, tenant);
     if (!parent_acls_result.success) {
         return Result<void>::err(parent_acls_result.error);
@@ -366,11 +387,30 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
         if ((rule.permissions & inherit_bit) == 0) {
             continue;
         }
-        // ERASE never inherits (§5.4.9). Granting the strongest destroy-data
-        // permission on a folder must not confer it on every descendant — blast
-        // radius is the entire reason it is a separate bit. It has to be granted
-        // on the resource it applies to, explicitly.
-        const int inheritable = rule.permissions & ~static_cast<int>(Permission::ERASE);
+        // ERASE inherits to the OWNER of the new resource, and to nobody else.
+        //
+        // §5.4.9's rule is that granting ERASE on a folder must not confer it on
+        // every descendant — blast radius is the entire reason it is a separate
+        // bit. That concern is about reaching OTHER PEOPLE'S content: a grant on
+        // a shared folder must not let the grantee erase what colleagues put
+        // there. It is not about your own.
+        //
+        // A user's home is a sandbox, and full control there means full control:
+        // without this, a user could not erase their own file in their own home,
+        // because the grant provisioning puts on the home folder would never
+        // reach anything inside it. Tying inheritance to ownership gives that,
+        // while keeping the blast radius exactly where §5.4.9 wants it — the
+        // grant follows what you own, not what you can reach.
+        //
+        // Still gated: this only propagates an ERASE that someone deliberately
+        // granted on the parent, which today is home provisioning and nothing
+        // else. A folder with no ERASE on it confers none.
+        const bool owner_rule = !child_owner.empty() &&
+                                rule.type == PrincipalType::USER &&
+                                rule.principal == child_owner;
+        const int inheritable = owner_rule
+                                    ? rule.permissions
+                                    : rule.permissions & ~static_cast<int>(Permission::ERASE);
         if (inheritable == 0 || inheritable == inherit_bit) {
             continue;   // nothing left to copy once ERASE is stripped
         }

@@ -1893,8 +1893,29 @@ grpc::Status GRPCFileService::CheckPermission(grpc::ServerContext* context,
         case fileengine_rpc::Permission::CULL_VERSIONS:
             required_permissions_int = static_cast<int>(fileengine::Permission::CULL_VERSIONS);
             break;
+        case fileengine_rpc::Permission::ERASE:
+            required_permissions_int = static_cast<int>(fileengine::Permission::ERASE);
+            break;
         default:
-            required_permissions_int = static_cast<int>(fileengine::Permission::READ);  // Default to read permission
+            // An unrecognised permission is answered NO, and loudly.
+            //
+            // This used to fall through to READ, which is how a missing ERASE
+            // case shipped: a caller asking "may I erase?" was silently asked
+            // "may I read?" and told yes. The SPA decides whether to OFFER
+            // erasure from this answer, so every administrator saw the button
+            // and every one of them got a 403 on pressing it.
+            //
+            // Downgrading an unknown question to the weakest permission is the
+            // wrong direction for a security query in any case: a permission the
+            // core does not recognise cannot be meaningfully checked, so it is
+            // refused rather than approximated.
+            SERVER_LOG_SECURITY("GRPCService",
+                                "CheckPermission asked about an unrecognised permission (" +
+                                std::to_string(static_cast<int>(required_permission)) +
+                                ") for " + user + " on " + resource_uid + " — answering no");
+            response->set_success(true);
+            response->set_has_permission(false);
+            return grpc::Status::OK;
             break;
     }
 
@@ -2183,6 +2204,176 @@ grpc::Status GRPCFileService::PurgeOldVersions(grpc::ServerContext* context,
     emit_mutate_audit(tenant, "cull_versions", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
                       user, roles, file_uid, AuditTargetType::File,
                       nlohmann::json({{"keep_count", keep_count}}).dump());
+    return grpc::Status::OK;
+}
+
+// ── Erasure (§5.4) ─────────────────────────────────────────────────────────
+
+grpc::Status GRPCFileService::EraseFile(grpc::ServerContext* context,
+                                        const fileengine_rpc::EraseFileRequest* request,
+                                        fileengine_rpc::EraseFileResponse* response) {
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+    (void)context;
+
+    const std::string file_uid = canonical_uid(request->uid());
+    auto auth_context = request->auth();
+    const std::string tenant = get_tenant_from_auth_context(auth_context);
+    const std::string user   = get_user_from_auth_context(auth_context);
+    const auto roles         = get_roles_from_auth_context(auth_context);
+
+    // ERASE, and only ERASE. Unlike every other permission this one is NOT
+    // conferred by the tenant_admin bypass (§5.4.9): tenant_admin maps from a
+    // tenant's `administrators` LDAP group, an ordinary operational population,
+    // and a blanket bypass would mean every tenant administrator silently held
+    // the strongest destroy-data permission on the platform. It has to be
+    // granted, which is what makes holding it a deliberate, recorded act.
+    if (!validate_user_permissions(file_uid, auth_context, static_cast<int>(Permission::ERASE))) {
+        response->set_success(false);
+        response->set_error("User does not have permission to erase this file (requires ERASE)");
+        SERVER_LOG_ERROR("GRPCService", "EraseFile denied: " + user + " lacks ERASE for " + file_uid);
+        emit_mutate_audit(tenant, "erase", AuditOutcome::Denied, user, roles, file_uid,
+                          AuditTargetType::File, "{}");
+        return grpc::Status::OK;
+    }
+
+    auto result = filesystem_->erase_file(file_uid, request->reason(), request->retain_name(),
+                                          user, roles, tenant);
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        SERVER_LOG_ERROR("GRPCService", "EraseFile failed for " + file_uid + ": " + result.error);
+        emit_mutate_audit(tenant, "erase", AuditOutcome::Error, user, roles, file_uid,
+                          AuditTargetType::File, "{}");
+        return grpc::Status::OK;
+    }
+
+    response->set_erasure_id(result.value.erasure_id);
+    // INITIATED unless there was nobody to wait for. Reporting COMPLETE here
+    // when participants are outstanding would be the false compliance claim the
+    // whole design exists to avoid — the core's copy is gone, but the extracted
+    // text and embeddings are not, yet.
+    response->set_state(result.value.complete ? fileengine_rpc::ERASURE_COMPLETE
+                                              : fileengine_rpc::ERASURE_INITIATED);
+    for (const auto& p : result.value.awaiting) response->add_awaiting(p);
+    for (const auto& id : result.value.erasure_ids) response->add_erasure_ids(id);
+
+    SERVER_LOG_INFO("GRPCService", "EraseFile " + file_uid + " -> erasure " + result.value.erasure_id +
+                    " (erasures=" + std::to_string(result.value.erasure_ids.size()) +
+                    ", versions=" + std::to_string(result.value.versions_destroyed) +
+                    ", renditions=" + std::to_string(result.value.renditions_destroyed) +
+                    ", awaiting=" + std::to_string(result.value.awaiting.size()) + ")");
+    emit_mutate_audit(tenant, "erase", AuditOutcome::Ok, user, roles, file_uid, AuditTargetType::File,
+                      nlohmann::json({{"erasure_id", result.value.erasure_id},
+                                      {"versions_destroyed", result.value.versions_destroyed},
+                                      {"renditions_destroyed", result.value.renditions_destroyed},
+                                      {"name_retained", request->retain_name()}}).dump());
+    return grpc::Status::OK;
+}
+
+grpc::Status GRPCFileService::ListPendingErasures(
+        grpc::ServerContext* context,
+        const fileengine_rpc::ListPendingErasuresRequest* request,
+        fileengine_rpc::ListPendingErasuresResponse* response) {
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+    (void)context;
+
+    auto auth_context = request->auth();
+    const std::string tenant = get_tenant_from_auth_context(auth_context);
+    const std::string participant = request->participant();
+    if (participant.empty()) {
+        response->set_success(false);
+        response->set_error("participant is required");
+        return grpc::Status::OK;
+    }
+
+    // all_tenants sweeps every tenant; the per-row tenant is what the consumer
+    // must acknowledge with.
+    auto result = filesystem_->list_pending_erasures(
+        participant, request->limit(), request->all_tenants() ? std::string() : tenant);
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        return grpc::Status::OK;
+    }
+    for (const auto& row : result.value) {
+        auto* e = response->add_erasures();
+        e->set_erasure_id(row.erasure_id);
+        e->set_uid(row.file_uid);
+        e->set_tenant(row.tenant.empty() ? tenant : row.tenant);
+        e->set_initiated_at(row.initiated_at);
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status GRPCFileService::AcknowledgeErasure(
+        grpc::ServerContext* context,
+        const fileengine_rpc::AcknowledgeErasureRequest* request,
+        fileengine_rpc::AcknowledgeErasureResponse* response) {
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+    (void)context;
+
+    auto auth_context = request->auth();
+    const std::string tenant = get_tenant_from_auth_context(auth_context);
+    const std::string user   = get_user_from_auth_context(auth_context);
+    const auto roles         = get_roles_from_auth_context(auth_context);
+    if (request->participant().empty()) {
+        response->set_success(false);
+        response->set_error("participant is required");
+        return grpc::Status::OK;
+    }
+
+    auto result = filesystem_->acknowledge_erasure(request->erasure_id(), request->participant(),
+                                                   request->complied(), request->detail(),
+                                                   user, roles, tenant);
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        return grpc::Status::OK;
+    }
+    const auto& st = result.value;
+    response->set_state(st.state == "complete" ? fileengine_rpc::ERASURE_COMPLETE
+                        : st.state == "failed" ? fileengine_rpc::ERASURE_FAILED
+                                               : fileengine_rpc::ERASURE_INITIATED);
+    SERVER_LOG_INFO("GRPCService", "AcknowledgeErasure " + request->erasure_id() + " by " +
+                    request->participant() + " complied=" + (request->complied() ? "yes" : "no") +
+                    " -> " + st.state);
+    return grpc::Status::OK;
+}
+
+grpc::Status GRPCFileService::GetErasureStatus(
+        grpc::ServerContext* context,
+        const fileengine_rpc::GetErasureStatusRequest* request,
+        fileengine_rpc::GetErasureStatusResponse* response) {
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+    (void)context;
+
+    auto auth_context = request->auth();
+    const std::string tenant = get_tenant_from_auth_context(auth_context);
+
+    auto result = filesystem_->get_erasure_status(request->erasure_id(), tenant);
+    response->set_success(result.success);
+    if (!result.success) {
+        response->set_error(result.error);
+        return grpc::Status::OK;
+    }
+    const auto& st = result.value;
+    response->set_uid(st.file_uid);
+    response->set_tenant(tenant);
+    response->set_state(st.state == "complete" ? fileengine_rpc::ERASURE_COMPLETE
+                        : st.state == "failed" ? fileengine_rpc::ERASURE_FAILED
+                                               : fileengine_rpc::ERASURE_INITIATED);
+    response->set_initiated_at(st.initiated_at);
+    response->set_completed_at(st.completed_at);
+    response->set_actor(st.actor);
+    response->set_reason(st.reason);
+    for (const auto& a : st.acks) {
+        auto* ack = response->add_acks();
+        ack->set_participant(a.participant);
+        ack->set_acked_at(a.acked_at);
+        ack->set_complied(a.complied);
+        ack->set_detail(a.detail);
+    }
+    for (const auto& p : st.awaiting) response->add_awaiting(p);
     return grpc::Status::OK;
 }
 

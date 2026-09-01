@@ -751,12 +751,22 @@ So the platform needs a second destructive operation, with a different shape:
 | Driven by | storage/retention housekeeping | contractual or legal obligation |
 | Permission | `CULL_VERSIONS` | a distinct, stronger grant (below) |
 
-> **Amendment required.** `PROPOSAL_metadata_change_events.md` §1.1 states that
-> *culling is the only permissible destructive operation*. That must become
-> **culling and erasure are the only two**, with erasure defined here. The rule's
-> intent is unchanged — destruction happens only through named, permissioned,
-> recorded operations — but it is no longer a single one. The metadata proposal
-> is on a separate branch; this amendment should land when the two merge.
+> **Amendment required — still outstanding.** `PROPOSAL_metadata_change_events.md`
+> §1.1 states that *culling is the only permissible destructive operation*. That
+> must become **culling and erasure are the only two**, with erasure defined here.
+> The rule's intent is unchanged — destruction happens only through named,
+> permissioned, recorded operations — but it is no longer a single one.
+>
+> It could not be applied when erasure landed: that proposal exists only on the
+> unmerged `design/metadata-change-events` and `design/metadata-events-on-system-log`
+> branches, which have diverged from each other and from `main`. Amending one of
+> them would put the correction on a branch that may not be the one that merges.
+> **This amendment must be made as part of merging whichever branch wins**, and is
+> recorded here so it is not lost in the meantime.
+>
+> The same rule is now stated on `main` where it is actually enforceable —
+> `CLAUDE.md`'s Critical Rules — so the platform-wide retention stance is written
+> down in a place that does not depend on an unmerged design branch.
 
 #### 5.4.1 What erasure destroys, and what survives
 
@@ -886,7 +896,15 @@ Two findings from the code, one of which contradicts the documentation:
   supported in the object store"*, which is either stale or describes a policy
   stance rather than a capability. Worth correcting either way, because an
   erasure feature cannot be designed against a constraint that is not real — nor
-  shipped against one that is.
+  shipped against one that is. **Corrected as implemented, twice.** This section
+  asserted `S3Storage::delete_file` exists and works. It existed; it did not
+  work — the body was a hard-coded refusal (*"Deleting files from S3 is not
+  allowed - S3 objects are immutable for history preservation"*), so erasure
+  destroyed rows and local bytes and left every object in the bucket while
+  reporting success. Found by verifying an erased file against the bucket rather
+  than against the API. `delete_file` is now a real DeleteObject (idempotent on
+  NoSuchKey), and erasure treats a failure there as **fatal**, not best-effort:
+  an erasure that cannot reach the durable copy has not erased anything.
 - **Encryption is deployment-wide, not per-file.** `Storage` takes a
   `bool encrypt_data` flag; the key is not per object. So **crypto-shredding —
   destroying a per-file key to render its ciphertext unrecoverable — is not
@@ -1143,6 +1161,73 @@ to administrators, and recorded in the **global** table (§7.3), since a
 tenant-scoped record would destroy itself.
 
 #### 5.4.9 Gating erasure — a bespoke permission, and why a new bit is not enough
+
+> **The `erasure_admin` role — added because the per-file grant is not a
+> sufficient path on its own.**
+>
+> Requiring an explicit ACL grant is the right gate for an ordinary
+> administrator: it stops an irreversible power riding along with an LDAP group,
+> which is what this section is about. But as the ONLY path it does not work.
+> The person answering a right-to-erasure request has to act on any object in the
+> tenant — files they do not own, cannot self-grant on, and may not be able to
+> see. Leaving them to hand-grant themselves ERASE per file makes the obligation
+> impractical, and §5.4 opens by saying that being technically unable to erase is
+> itself the violation.
+>
+> So there is a third role: `erasure_admin` = `tenant_admin` + `ERASE`. It is
+> tenant-scoped by the same structural mechanism (one AclManager per tenant
+> schema), and it does **not** include `CULL_VERSIONS` — the two destroy-data
+> bits stay separate so each is granted for its own reason. This role answers
+> erasure requests; it is not a storage-housekeeping licence.
+>
+> The bridges map a per-tenant `erasure_admins` group to it, deliberately NOT
+> implied by `administrators`. That is the gate: **an administrator GRANTS it by
+> editing that group's membership, and does not hold it by being an
+> administrator.** Moving somebody into it is a visible act in the directory, the
+> population stays small, and a mis-placed or attacker-created `administrators`
+> group still cannot destroy the tenant's contents.
+
+> **Deployment step — erasure does not work until these are granted.** The
+> `ERASE` permission gates the USER; the service-auth capability gates the DOOR,
+> and both must be satisfied. Out of the box no service holds either capability,
+> because both are high-risk and deliberately do not ride along with a routine
+> credential issue — so a fresh deployment answers every erasure with
+> `service lacks the 'destroy' capability`, which reads like a bug and is not one.
+>
+> ```
+> fileengine_cli service grant http_bridge destroy --i-understand-this-is-high-risk
+> fileengine_cli service grant http_bridge erasure --i-understand-this-is-high-risk
+> fileengine_cli service grant csai        erasure --i-understand-this-is-high-risk
+> fileengine_cli service grant discussion  erasure --i-understand-this-is-high-risk
+> fileengine_cli service grant difference  erasure --i-understand-this-is-high-risk
+> ```
+>
+> The bridge needs `destroy` to call `EraseFile` and `erasure` to read the
+> attestation record for the UI. Consumers need `erasure` ONLY — reading what they
+> owe and reporting back, without thereby being able to erase anything. Grant no
+> consumer `destroy`.
+>
+> Takes effect within the service-map cache TTL (30s default); no restart needed.
+> Grant only the services listed in `FILEENGINE_ERASURE_PARTICIPANTS`, and keep
+> the two lists in step: a service in the roster that cannot acknowledge leaves
+> every erasure permanently incomplete.
+
+> **As implemented: ERASE inherits to the OWNER of a new resource, and to nobody
+> else.** The rule below — that ERASE must not be conferred on every descendant —
+> is about reaching *other people's* content: a grant on a shared folder must not
+> let the grantee erase what colleagues put there. It was first implemented as
+> "never inherits at all", which is stricter than the concern requires and had a
+> consequence nobody wanted: a user could not erase their own file in their own
+> home, because the grant on the home folder never reached anything inside it.
+>
+> Tying inheritance to ownership gives a user full control of their own sandbox
+> while keeping the blast radius exactly where this section wants it — the grant
+> follows what you own, not what you can reach. A role-held ERASE never
+> propagates (a role cannot own a resource), and an unknown owner strips it,
+> because absent information must not confer an irreversible permission.
+>
+> It stays gated: this only propagates an ERASE that somebody deliberately
+> granted on the parent, which today is home provisioning and nothing else.
 
 Erasure is irreversible, compliance-driven and the most destructive operation on
 a file. It must be gated by its own permission, held by very few people:

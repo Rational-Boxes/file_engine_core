@@ -182,6 +182,69 @@ public:
                                             const std::vector<std::string>& roles = {},
                                             const std::string& tenant = "");
 
+    // Erasure — "true delete" (PROPOSAL_accountability_record.md §5.4).
+    //
+    // The second and stronger destroy-data operation. Culling compacts history
+    // while preserving current state; erasure destroys all content, every
+    // version, and everything derived from it, keeping only the record that the
+    // file existed. Requires ERASE, which is never conferred by the
+    // tenant_admin bypass and never inherited.
+    //
+    // Returns the erasure id. The erasure is INITIATED, not finished: the core's
+    // own content is gone, but derived data lives in other services and each
+    // must acknowledge before the obligation is met (§5.4.3). Callers must not
+    // report this as a completed erasure — ask GetErasureStatus.
+    struct EraseOutcome {
+        // The root's erasure. A folder erasure produces one record PER FILE, so
+        // this alone does not attest to the subtree — see erasure_ids.
+        std::string erasure_id;
+        // Every erasure this operation started, deepest first. A folder's
+        // members each get their own record and their own participants, because
+        // each has its own derived copies in the services that must purge them.
+        std::vector<std::string> erasure_ids;
+        int versions_destroyed = 0;
+        int metadata_values_destroyed = 0;
+        int renditions_destroyed = 0;
+        bool complete = false;          // true only where there are no participants
+        std::vector<std::string> awaiting;
+    };
+    virtual Result<EraseOutcome> erase_file(const std::string& file_uid,
+                                            const std::string& reason,
+                                            bool retain_name,
+                                            const std::string& user,
+                                            const std::vector<std::string>& roles = {},
+                                            const std::string& tenant = "");
+
+    // The attestation surface (§5.4.3/§5.4.5). These are SERVICE-facing, not
+    // user-facing: a consumer polls for what it has not acknowledged and reports
+    // back. Authorization is the service-auth capability gate at the gRPC
+    // boundary — there is no per-file ACL to apply, because the file's ACLs were
+    // destroyed along with everything else about it.
+    // `tenant` empty means EVERY tenant — see the proto's all_tenants. Each row
+    // carries the tenant it belongs to, because the acknowledgement has to go
+    // back to the same schema the erasure lives in.
+    virtual Result<std::vector<PendingErasureRow>> list_pending_erasures(
+            const std::string& participant, int limit, const std::string& tenant = "");
+    virtual Result<ErasureStatusRow> acknowledge_erasure(const std::string& erasure_id,
+                                                         const std::string& participant,
+                                                         bool complied,
+                                                         const std::string& detail,
+                                                         const std::string& actor,
+                                                         const std::vector<std::string>& roles = {},
+                                                         const std::string& tenant = "");
+    virtual Result<ErasureStatusRow> get_erasure_status(const std::string& erasure_id,
+                                                        const std::string& tenant = "");
+
+    // Which services must acknowledge an erasure before it is complete. Set from
+    // deployment configuration, because the platform is deliberately à-la-carte:
+    // requiring an ack from a service the deployment does not run would leave
+    // every erasure permanently incomplete, which is indistinguishable from a
+    // real unmet obligation and would make the alarm useless.
+    void set_erasure_participants(const std::vector<std::string>& participants) {
+        erasure_participants_ = participants;
+    }
+    const std::vector<std::string>& erasure_participants() const { return erasure_participants_; }
+
     // Given a file's version timestamps ordered newest-first (exactly as
     // Database::list_versions returns them — ORDER BY version_timestamp DESC),
     // return the current/newest version, or "" when there are none. Centralizes
@@ -292,6 +355,7 @@ public:
     }
 
 private:
+    std::vector<std::string> erasure_participants_;
     std::shared_ptr<TenantManager> tenant_manager_;
     std::shared_ptr<AclManager> acl_manager_;
     std::unique_ptr<CacheManager> cache_manager_;

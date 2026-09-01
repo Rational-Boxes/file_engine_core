@@ -136,6 +136,7 @@ const char* to_string(Capability c) {
         case Capability::Admin:          return "admin";
         case Capability::Destroy:        return "destroy";
         case Capability::Accountability: return "accountability";
+        case Capability::Erasure:        return "erasure";
     }
     return "unknown";
 }
@@ -151,7 +152,7 @@ const std::vector<Capability>& all_capabilities() {
     static const std::vector<Capability> kAll = {
         Capability::Read, Capability::Write, Capability::Delete, Capability::Restore,
         Capability::Acl, Capability::Roles, Capability::Admin, Capability::Destroy,
-        Capability::Accountability,
+        Capability::Accountability, Capability::Erasure,
     };
     return kAll;
 }
@@ -160,7 +161,13 @@ bool is_high_risk(Capability c) {
     // `destroy` irreversibly removes committed data; `accountability` reads the
     // security log, which across tenants reconstructs who did what to whom
     // platform-wide. Neither may ride along with a credential issue.
-    return c == Capability::Destroy || c == Capability::Accountability;
+    // `erasure` joins them: acknowledging an erasure you did not perform closes
+    // a contractual obligation that was never met, and does it in the very
+    // record an auditor is shown. A false compliance claim is not a lesser
+    // failure than destroying data — it is the one this feature exists to make
+    // impossible to make by accident.
+    return c == Capability::Destroy || c == Capability::Accountability ||
+           c == Capability::Erasure;
 }
 
 // ── The RPC → capability map ────────────────────────────────────────────────
@@ -233,8 +240,16 @@ const std::map<std::string, Capability>& method_map() {
         {"GetStorageUsage",           Capability::Admin},
         {"TriggerSync",               Capability::Admin},
 
-        // destroy — the irreversible kind, and erasure when it lands.
+        // destroy — the irreversible kind.
         {"PurgeOldVersions",          Capability::Destroy},
+        {"EraseFile",                 Capability::Destroy},
+
+        // erasure — the attestation surface. Separate from destroy on purpose:
+        // a consumer must read what it owes and report back without thereby
+        // being able to erase anything itself.
+        {"ListPendingErasures",       Capability::Erasure},
+        {"AcknowledgeErasure",        Capability::Erasure},
+        {"GetErasureStatus",          Capability::Erasure},
 
         // accountability — reading the guaranteed security record.
         {"ListAccountabilityRecords", Capability::Accountability},
