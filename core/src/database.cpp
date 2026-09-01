@@ -3605,10 +3605,12 @@ Result<ErasureStatusRow> Database::acknowledge_erasure(const std::string& erasur
         PQclear(res);
     }
 
+    std::int64_t hint_seq = 0;
     // Close the erasure when every participant has answered. A single refusal
     // makes it FAILED and it stays failed: partial completion must stay visibly
     // incomplete rather than silently passing, because it represents an unmet
     // contractual obligation (§5.4.3).
+    bool closed = false;
     {
         const std::string sql =
             "UPDATE " + schema + ".erasure e SET "
@@ -3627,10 +3629,47 @@ Result<ErasureStatusRow> Database::acknowledge_erasure(const std::string& erasur
             PQclear(res);
             return rollback_and_fail(error);
         }
+        // One row updated means THIS acknowledgement was the last outstanding
+        // one and the erasure just closed. Read from the UPDATE rather than
+        // re-querying: the row is locked in this transaction, so the count is
+        // exact and cannot race another participant closing it first.
+        closed = std::atoi(PQcmdTuples(res)) == 1;
         PQclear(res);
     }
 
-    std::int64_t hint_seq = 0;
+    // The completion record. Separate from the acknowledgement on purpose: the
+    // last participant's ack and "the obligation has been met" are different
+    // facts, and an auditor asking "was this erasure ever actually completed"
+    // should find one entry that says so rather than having to infer it from the
+    // absence of outstanding participants.
+    if (closed) {
+        std::string outcome = "complete";
+        {
+            const std::string sql =
+                "SELECT state FROM " + schema + ".erasure WHERE erasure_id = $1;";
+            const char* params[1] = { erasure_id.c_str() };
+            PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+            if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
+                outcome = PQgetvalue(res, 0, 0);
+            }
+            PQclear(res);
+        }
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Destruction;
+        rec.action      = accountability_action::kEraseComplete;
+        rec.target_type = "erasure";
+        rec.detail.set("erasure_id", erasure_id);
+        // "failed" when any participant reported it could not comply — recorded
+        // as an outcome rather than left to look like success.
+        rec.detail.set("outcome", outcome);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Erasure completion refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
     {
         AccountabilityRecord rec;
         rec.ctx         = ctx;

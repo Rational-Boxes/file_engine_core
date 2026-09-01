@@ -128,6 +128,23 @@ const std::vector<ActionSchema>& action_schemas() {
          {"role"}},
         {accountability_action::kCullVersions, AccountabilityCategory::Destruction,
          {"keep_count", "versions_removed", "cut_ts"}},
+        // Erasure (§5.4), three actions because the record has to tell a story
+        // with a beginning and an end: what was destroyed and by whom, who
+        // confirmed destroying their derived copy, and the moment the obligation
+        // was actually met. An erasure that never reaches erase.complete is an
+        // unmet contractual obligation, and the chain is where that is visible.
+        //
+        // No field here carries content — not the filename, not a metadata
+        // value. Counts and identifiers only. The chain must never capture
+        // content in the first place, or erasing a file would mean erasing the
+        // record of its erasure (§5.4.7).
+        {accountability_action::kErase, AccountabilityCategory::Destruction,
+         {"erasure_id", "versions_destroyed", "metadata_values_destroyed",
+          "name_retained", "participants", "reason"}},
+        {accountability_action::kEraseAck, AccountabilityCategory::Destruction,
+         {"erasure_id", "participant", "complied", "detail"}},
+        {accountability_action::kEraseComplete, AccountabilityCategory::Destruction,
+         {"erasure_id", "outcome", "participants"}},
         {accountability_action::kTenantCreate, AccountabilityCategory::Lifecycle,
          {"schema"}},
         {accountability_action::kTenantDelete, AccountabilityCategory::Destruction,
