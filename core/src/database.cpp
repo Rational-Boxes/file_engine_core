@@ -4017,6 +4017,13 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     res = PQexec(pg_conn, migrate_files_timestamps.c_str());
     PQclear(res);  // columns may already exist; status is irrelevant
 
+    // The erasure existence-record columns, same shape and same place: right
+    // after the files table exists, because they are columns ON it. Status
+    // ignored for the same reason — ADD COLUMN IF NOT EXISTS is a no-op on a
+    // tenant that already has them.
+    res = PQexec(pg_conn, migrate_files_erasure.c_str());
+    PQclear(res);
+
     res = PQexec(pg_conn, create_idx_uid.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
 
@@ -4027,18 +4034,6 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         std::string error = PQerrorMessage(pg_conn);
         PQclear(res);
-
-    // Same shape as the migration above: ADD COLUMN IF NOT EXISTS, so tenants
-    // provisioned before erasure existed gain the columns with every existing
-    // row defaulted to not-erased.
-    res = PQexec(pg_conn, migrate_files_erasure.c_str());
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        std::string error = PQerrorMessage(pg_conn);
-        PQclear(res);
-        connection_pool_->release(conn);
-        return Result<void>::err("Failed to add erasure columns to files: " + error);
-    }
-    PQclear(res);
         connection_pool_->release(conn);
         return Result<void>::err("Failed to create tenant versions table: " + error);
     }
