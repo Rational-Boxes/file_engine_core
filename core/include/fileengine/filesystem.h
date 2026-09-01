@@ -214,6 +214,9 @@ public:
     // back. Authorization is the service-auth capability gate at the gRPC
     // boundary — there is no per-file ACL to apply, because the file's ACLs were
     // destroyed along with everything else about it.
+    // `tenant` empty means EVERY tenant — see the proto's all_tenants. Each row
+    // carries the tenant it belongs to, because the acknowledgement has to go
+    // back to the same schema the erasure lives in.
     virtual Result<std::vector<PendingErasureRow>> list_pending_erasures(
             const std::string& participant, int limit, const std::string& tenant = "");
     virtual Result<ErasureStatusRow> acknowledge_erasure(const std::string& erasure_id,

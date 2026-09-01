@@ -1865,11 +1865,45 @@ Result<FileSystem::EraseOutcome> FileSystem::erase_file(const std::string& file_
 
 Result<std::vector<PendingErasureRow>> FileSystem::list_pending_erasures(
         const std::string& participant, int limit, const std::string& tenant) {
-    auto context = get_tenant_context(tenant);
-    if (!context || !context->db) {
-        return Result<std::vector<PendingErasureRow>>::err("Database not available for tenant: " + tenant);
+    // One tenant: the ordinary case.
+    if (!tenant.empty()) {
+        auto context = get_tenant_context(tenant);
+        if (!context || !context->db) {
+            return Result<std::vector<PendingErasureRow>>::err("Database not available for tenant: " + tenant);
+        }
+        auto r = context->db->list_pending_erasures(participant, limit, tenant);
+        if (r.success) for (auto& row : r.value) row.tenant = tenant;
+        return r;
     }
-    return context->db->list_pending_erasures(participant, limit, tenant);
+
+    // Every tenant. The core is the authority on which tenants exist; a consumer
+    // sweeping only the tenants it has seen traffic for would leave an erasure
+    // in a quiet tenant outstanding for ever, with nothing saying so.
+    auto ctx = get_tenant_context("");
+    if (!ctx || !ctx->db) {
+        return Result<std::vector<PendingErasureRow>>::err("Database not available");
+    }
+    auto tenants = ctx->db->list_tenants();
+    if (!tenants.success) {
+        return Result<std::vector<PendingErasureRow>>::err("Failed to list tenants: " + tenants.error);
+    }
+
+    std::vector<PendingErasureRow> all;
+    for (const auto& t : tenants.value) {
+        auto tctx = get_tenant_context(t);
+        if (!tctx || !tctx->db) continue;   // a tenant we cannot reach is not a reason to fail the rest
+        auto r = tctx->db->list_pending_erasures(participant, limit, t);
+        if (!r.success) {
+            SERVER_LOG_WARN("FileSystem::list_pending_erasures",
+                            "Could not read pending erasures for tenant " + t + ": " + r.error);
+            continue;
+        }
+        for (auto& row : r.value) {
+            row.tenant = t;
+            all.push_back(std::move(row));
+        }
+    }
+    return Result<std::vector<PendingErasureRow>>::ok(all);
 }
 
 Result<ErasureStatusRow> FileSystem::acknowledge_erasure(const std::string& erasure_id,

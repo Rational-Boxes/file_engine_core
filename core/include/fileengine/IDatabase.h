@@ -53,6 +53,9 @@ struct PendingErasureRow {
     std::string erasure_id;
     std::string file_uid;
     std::int64_t initiated_at = 0;   // epoch seconds
+    // Which tenant this erasure lives in. Set when sweeping across tenants; the
+    // acknowledgement must be sent with it, or it lands in the wrong schema.
+    std::string tenant;
 };
 
 struct ErasureAckRow {

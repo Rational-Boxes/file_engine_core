@@ -2284,7 +2284,10 @@ grpc::Status GRPCFileService::ListPendingErasures(
         return grpc::Status::OK;
     }
 
-    auto result = filesystem_->list_pending_erasures(participant, request->limit(), tenant);
+    // all_tenants sweeps every tenant; the per-row tenant is what the consumer
+    // must acknowledge with.
+    auto result = filesystem_->list_pending_erasures(
+        participant, request->limit(), request->all_tenants() ? std::string() : tenant);
     response->set_success(result.success);
     if (!result.success) {
         response->set_error(result.error);
@@ -2294,7 +2297,7 @@ grpc::Status GRPCFileService::ListPendingErasures(
         auto* e = response->add_erasures();
         e->set_erasure_id(row.erasure_id);
         e->set_uid(row.file_uid);
-        e->set_tenant(tenant);
+        e->set_tenant(row.tenant.empty() ? tenant : row.tenant);
         e->set_initiated_at(row.initiated_at);
     }
     return grpc::Status::OK;
