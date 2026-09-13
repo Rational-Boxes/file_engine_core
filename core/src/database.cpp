@@ -5744,8 +5744,23 @@ Result<int> Database::add_acl_subtree(const std::string& root_uid, const std::st
         root_uid.c_str(), principal.c_str(), type_str.c_str(),
         action_label.c_str(), perms_str.c_str(), performed_by.c_str()
     };
+    // SAVEPOINT, because "best-effort" is not a thing you can do by ignoring a
+    // result. In Postgres a failed statement aborts the entire transaction, so
+    // an unchecked convenience INSERT takes the ACL change down with it — which
+    // is precisely what a too-long action label did, reported as "current
+    // transaction is aborted" from an unrelated statement three lines later.
+    PGresult* sp = PQexec(pg_conn, "SAVEPOINT acl_audit_row;");
+    if (sp) PQclear(sp);
     PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
-    if (audit_res) PQclear(audit_res);   // best-effort, as in add_acl
+    if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) {
+        PQclear(audit_res);
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK TO SAVEPOINT acl_audit_row;");
+        if (rb) PQclear(rb);
+    } else {
+        PQclear(audit_res);
+        PGresult* rel = PQexec(pg_conn, "RELEASE SAVEPOINT acl_audit_row;");
+        if (rel) PQclear(rel);
+    }
 
     std::int64_t hint_seq = 0;
     if (ctx.mode == AccountabilityMode::Record) {
@@ -5873,8 +5888,23 @@ Result<int> Database::remove_acl_subtree(const std::string& root_uid, const std:
         root_uid.c_str(), principal.c_str(), type_str.c_str(),
         action_label.c_str(), perms_str.c_str(), performed_by.c_str()
     };
+    // SAVEPOINT, because "best-effort" is not a thing you can do by ignoring a
+    // result. In Postgres a failed statement aborts the entire transaction, so
+    // an unchecked convenience INSERT takes the ACL change down with it — which
+    // is precisely what a too-long action label did, reported as "current
+    // transaction is aborted" from an unrelated statement three lines later.
+    PGresult* sp = PQexec(pg_conn, "SAVEPOINT acl_audit_row;");
+    if (sp) PQclear(sp);
     PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
-    if (audit_res) PQclear(audit_res);
+    if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) {
+        PQclear(audit_res);
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK TO SAVEPOINT acl_audit_row;");
+        if (rb) PQclear(rb);
+    } else {
+        PQclear(audit_res);
+        PGresult* rel = PQexec(pg_conn, "RELEASE SAVEPOINT acl_audit_row;");
+        if (rel) PQclear(rel);
+    }
 
     std::int64_t hint_seq = 0;
     if (ctx.mode == AccountabilityMode::Record) {
