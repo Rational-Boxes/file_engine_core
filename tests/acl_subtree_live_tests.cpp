@@ -249,7 +249,13 @@ void test_recent_files_newest_first(Database& db) {
         CHECK(r.value[0].uid == uids[2], "a1 is first (its newest version wins)");
         CHECK(r.value[0].version == "20260103_000000.000", "and it is the NEWEST version");
         CHECK(r.value[0].modified_by == "carol", "attributed to the latest reviser");
+        // version_count is what lets a caller say "created" or "updated"
+        // without a second round trip — it is the one thing the event
+        // projection carried that a plain newest-version query would lose.
+        CHECK(r.value[0].version_count == 2, "a1 has two versions, got " +
+              std::to_string(r.value[0].version_count));
         CHECK(r.value[1].uid == uids[3], "a2 second");
+        CHECK(r.value[1].version_count == 1, "a2 has one — a newly created file");
     }
 }
 

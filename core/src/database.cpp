@@ -5543,10 +5543,14 @@ Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& ten
     // Containers are excluded: a folder has no version of its own, and its
     // recursive mtime is a separate and far more expensive question.
     std::string sql =
-        "SELECT uid, name, owner, version_timestamp, revised_by, size_bytes, parent_uid FROM ("
+        "SELECT uid, name, owner, version_timestamp, revised_by, size_bytes, parent_uid, vcount FROM ("
         "  SELECT DISTINCT ON (v.file_uid) f.uid AS uid, f.name AS name, f.owner AS owner,"
         "         v.version_timestamp AS version_timestamp, v.revised_by AS revised_by,"
-        "         COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid"
+        "         COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid,"
+        // How many versions this file has, so a caller can say "created" or
+        // "updated" without a second round trip. Indexed on file_uid, and
+        // evaluated only for rows the scan already touched.
+        "         (SELECT count(*) FROM " + schema + ".versions v2 WHERE v2.file_uid = f.uid) AS vcount"
         "    FROM " + schema + ".versions v"
         "    JOIN " + schema + ".files f ON f.uid = v.file_uid"
         "   WHERE f.deleted = FALSE AND f.is_container = FALSE";
@@ -5604,6 +5608,7 @@ Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& ten
         info.modified_by = PQgetisnull(res, i, 4) ? info.owner : PQgetvalue(res, i, 4);
         info.size        = PQgetisnull(res, i, 5) ? 0 : std::atoll(PQgetvalue(res, i, 5));
         info.parent_uid  = PQgetisnull(res, i, 6) ? "" : PQgetvalue(res, i, 6);
+        info.version_count = PQgetisnull(res, i, 7) ? 0 : static_cast<int32_t>(std::atoi(PQgetvalue(res, i, 7)));
         info.type        = FileType::REGULAR_FILE;
         info.created_by  = info.owner;
         // Both timestamps derive from the version name, as everywhere else —

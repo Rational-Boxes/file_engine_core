@@ -210,10 +210,30 @@ message ListRecentFilesRequest {
     int64 since_epoch = 4;
 }
 
+// Deliberately not DirectoryEntry. A listing entry answers "what is in this
+// folder"; this answers "what changed", so it carries the version that changed
+// and how many there have been — which is what lets a caller say "created" or
+// "updated" without a second lookup, and what the event projection it replaces
+// used to carry.
+message RecentFileEntry {
+    string uid = 1;
+    string name = 2;
+    // No path. `files` stores parent_uid, not a path, so producing one means an
+    // ancestor walk PER ROW — the precise cost this RPC exists to remove. A
+    // caller that needs paths can resolve the handful it actually displays.
+    reserved 3;
+    string version = 4;           // the version_timestamp that made it recent
+    int32 version_count = 5;      // 1 = this file is new; >1 = it was updated
+    int64 size = 6;
+    int64 modified_at = 7;        // UNIX epoch seconds, derived from `version`
+    string modified_by = 8;       // who wrote that version
+    string owner = 9;
+}
+
 message ListRecentFilesResponse {
     bool success = 1;
     string error = 2;
-    repeated DirectoryEntry entries = 3;
+    repeated RecentFileEntry entries = 3;
     // Rows the query examined before ACL filtering. The gap between this and
     // entries.size() is how much of the tenant's recent activity the caller
     // cannot see — useful for tuning, and the reason the scan is bounded.

@@ -481,16 +481,13 @@ grpc::Status GRPCFileService::ListRecentFiles(grpc::ServerContext* context,
         auto* e = response->add_entries();
         e->set_uid(info.uid);
         e->set_name(info.name);
-        e->set_type(fileengine_rpc::FileType::REGULAR_FILE);
+        e->set_version(info.version);
+        e->set_version_count(info.version_count);
         e->set_size(info.size);
-        e->set_created_at(std::chrono::duration_cast<std::chrono::seconds>(
-                              info.created_at.time_since_epoch()).count());
         e->set_modified_at(std::chrono::duration_cast<std::chrono::seconds>(
                                info.modified_at.time_since_epoch()).count());
-        e->set_owner(info.owner);
-        e->set_created_by(info.created_by);
         e->set_modified_by(info.modified_by);
-        e->set_deleted(false);
+        e->set_owner(info.owner);
         ++returned;
     }
 
