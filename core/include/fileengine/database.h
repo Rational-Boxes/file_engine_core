@@ -134,6 +134,18 @@ public:
                          const std::string& tenant,
                          const AccountabilityContext& ctx,
                          int effect = 0) override;
+
+    // Subtree forms — see IDatabase for why these exist.
+    Result<int> add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                int type, int permissions,
+                                const std::string& tenant,
+                                const AccountabilityContext& ctx,
+                                int effect = 0) override;
+    Result<int> remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                   int type, int permissions,
+                                   const std::string& tenant,
+                                   const AccountabilityContext& ctx,
+                                   int effect = 0) override;
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
                             const std::string& tenant,

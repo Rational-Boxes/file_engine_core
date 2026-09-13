@@ -5343,6 +5343,290 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     return Result<void>::ok();
 }
 
+// ── Subtree ACL application ─────────────────────────────────────────────────
+//
+// One statement, one transaction, one accountability record.
+//
+// The alternative was a caller walking the tree: http_bridge enumerated it with
+// recursive listDirectory calls and then issued a grant per node — and because
+// GrantPermissionRequest carried a single Permission enum rather than a mask, a
+// per PERMISSION BIT as well. Full control on a 50,000-node tree is on the order
+// of half a million round trips inside one HTTP request, which timed out having
+// applied part of the tree and left no record of where it stopped.
+//
+// A database can express "a row for every descendant" directly. Nothing outside
+// it can, and every client-side batching or resumption scheme is an attempt to
+// approximate this from the wrong side of the wire.
+namespace {
+
+// The subtree rooted at $1, INCLUDING the root itself.
+//
+// UNION rather than UNION ALL, for the reason the folder-mtime walk documents:
+// it dedups, so the recursion terminates even if a corrupt parent_uid points
+// back into the subtree. UNION ALL would spin forever while holding an ACCESS
+// SHARE lock on files.
+//
+// Deleted nodes are excluded: applying an ACL to something in the trash grants
+// access to a resource the caller cannot see and would resurrect a stale row if
+// it were ever undeleted.
+std::string subtree_cte(const std::string& schema) {
+    return
+        "WITH RECURSIVE subtree(uid) AS ("
+        "  SELECT $1::text"
+        "  UNION"
+        "  SELECT f.uid FROM " + schema + ".files f"
+        "    JOIN subtree s ON f.parent_uid = s.uid"
+        "   WHERE f.deleted = FALSE"
+        ") ";
+}
+
+int rows_affected(PGresult* res) {
+    const char* t = PQcmdTuples(res);
+    return (t && *t) ? std::atoi(t) : 0;
+}
+
+}  // namespace
+
+Result<int> Database::add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                      int type, int permissions,
+                                      const std::string& tenant,
+                                      const AccountabilityContext& ctx,
+                                      int effect) {
+    // §5.1, same as add_acl: refuse before touching anything.
+    if (!ctx.valid()) {
+        return Result<int>::err("Refusing recursive ACL grant with no actor");
+    }
+    const std::string& performed_by = ctx.actor;
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<int>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN add_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<int>::err(msg);
+    };
+
+    const std::string type_str   = std::to_string(type);
+    const std::string perms_str  = std::to_string(permissions);
+    const std::string effect_str = std::to_string(effect);
+
+    // INSERT … SELECT over the subtree, with add_acl's conflict behaviour so a
+    // node that already has a rule for this principal gets the bits OR-ed in
+    // rather than replaced. Idempotent: re-running after a failure converges.
+    const std::string insert_sql =
+        subtree_cte(schema) +
+        "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions, granted_by, effect) "
+        "SELECT s.uid, $2, $3::int, $4::int, NULLIF($5, ''), $6::int FROM subtree s "
+        "ON CONFLICT ON CONSTRAINT acls_principal_effect "
+        "DO UPDATE SET permissions = " + schema + ".acls.permissions | ($4::int), "
+        "              granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
+
+    const char* params[6] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        perms_str.c_str(), performed_by.c_str(), effect_str.c_str()
+    };
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 6, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to apply recursive ACL: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        return rollback_and_fail(error);
+    }
+    const int affected = rows_affected(res);
+    PQclear(res);
+
+    // ONE acl_audit row for the operation, against the ROOT. Per-node rows would
+    // be the same fan-out this function exists to remove, and they would say
+    // nothing the ACL table does not already hold.
+    const std::string action_label = (effect == 1) ? "grant_deny_subtree" : "grant_subtree";
+    const std::string audit_sql =
+        "INSERT INTO " + schema + ".acl_audit "
+        "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
+        "VALUES ($1, $2, $3, $4, 0, $5, NULLIF($6, ''));";
+    const char* audit_params[6] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        action_label.c_str(), perms_str.c_str(), performed_by.c_str()
+    };
+    PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
+    if (audit_res) PQclear(audit_res);   // best-effort, as in add_acl
+
+    std::int64_t hint_seq = 0;
+    if (ctx.mode == AccountabilityMode::Record) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Authorization;
+        rec.action      = accountability_action::kAclGrantSubtree;
+        rec.target_uid  = root_uid;
+        rec.target_type = "acl";
+        rec.principal   = principal;
+        rec.detail.set("principal_type", type);
+        rec.detail.set("effect", std::string(effect == 1 ? "deny" : "allow"));
+        rec.detail.set("mask", permissions);
+        rec.detail.set("recursive", std::string("true"));
+        // The count is the point: it is what tells a reader how far the change
+        // reached, which per-node records would otherwise have to be counted to
+        // discover.
+        rec.detail.set("nodes_affected", affected);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Recursive permission change refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT add_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+    return Result<int>::ok(affected);
+}
+
+Result<int> Database::remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                         int type, int permissions,
+                                         const std::string& tenant,
+                                         const AccountabilityContext& ctx,
+                                         int effect) {
+    if (!ctx.valid()) {
+        return Result<int>::err("Refusing recursive ACL revoke with no actor");
+    }
+    const std::string& performed_by = ctx.actor;
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<int>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN remove_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<int>::err(msg);
+    };
+
+    const std::string type_str   = std::to_string(type);
+    const std::string perms_str  = std::to_string(permissions);
+    const std::string effect_str = std::to_string(effect);
+
+    // Clear the bits across the subtree…
+    const std::string update_sql =
+        subtree_cte(schema) +
+        "UPDATE " + schema + ".acls a "
+        "   SET permissions = a.permissions & ~($4::int), updated_at = CURRENT_TIMESTAMP "
+        "  FROM subtree s "
+        " WHERE a.resource_uid = s.uid AND a.principal = $2 "
+        "   AND a.principal_type = $3::int AND a.effect = $5::int;";
+    const char* up_params[5] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        perms_str.c_str(), effect_str.c_str()
+    };
+    PGresult* up = PQexecParams(pg_conn, update_sql.c_str(), 5, nullptr, up_params, nullptr, nullptr, 0);
+    if (PQresultStatus(up) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to apply recursive ACL revoke: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(up);
+        return rollback_and_fail(error);
+    }
+    const int affected = rows_affected(up);
+    PQclear(up);
+
+    // …then delete anything left with an empty mask. remove_acl does the same
+    // for one node, and the reason matters more here: this system is
+    // read-by-default, so an ALLOW row with no bits and no row at all must be
+    // indistinguishable. Leaving empty rows behind would turn a revoke into
+    // evidence that reads like a grant.
+    const std::string delete_sql =
+        subtree_cte(schema) +
+        "DELETE FROM " + schema + ".acls a "
+        " USING subtree s "
+        " WHERE a.resource_uid = s.uid AND a.principal = $2 "
+        "   AND a.principal_type = $3::int AND a.effect = $4::int AND a.permissions = 0;";
+    const char* del_params[4] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(), effect_str.c_str()
+    };
+    PGresult* del = PQexecParams(pg_conn, delete_sql.c_str(), 4, nullptr, del_params, nullptr, nullptr, 0);
+    if (PQresultStatus(del) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to prune emptied ACL rows: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(del);
+        return rollback_and_fail(error);
+    }
+    PQclear(del);
+
+    const std::string action_label = (effect == 1) ? "revoke_deny_subtree" : "revoke_subtree";
+    const std::string audit_sql =
+        "INSERT INTO " + schema + ".acl_audit "
+        "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
+        "VALUES ($1, $2, $3, $4, $5, 0, NULLIF($6, ''));";
+    const char* audit_params[6] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        action_label.c_str(), perms_str.c_str(), performed_by.c_str()
+    };
+    PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
+    if (audit_res) PQclear(audit_res);
+
+    std::int64_t hint_seq = 0;
+    if (ctx.mode == AccountabilityMode::Record) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Authorization;
+        rec.action      = accountability_action::kAclRevokeSubtree;
+        rec.target_uid  = root_uid;
+        rec.target_type = "acl";
+        rec.principal   = principal;
+        rec.detail.set("principal_type", type);
+        rec.detail.set("effect", std::string(effect == 1 ? "deny" : "allow"));
+        rec.detail.set("mask", permissions);
+        rec.detail.set("recursive", std::string("true"));
+        rec.detail.set("nodes_affected", affected);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Recursive permission change refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT remove_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+    return Result<int>::ok(affected);
+}
+
 Result<void> Database::remove_acl(const std::string& resource_uid, const std::string& principal,
                                   int type, int permissions,
                                   const std::string& tenant,

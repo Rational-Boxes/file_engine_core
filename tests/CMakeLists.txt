@@ -437,6 +437,14 @@ target_include_directories(accountability_live_tests PRIVATE
 target_link_libraries(accountability_live_tests
     fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
 add_test(NAME accountability_live_tests COMMAND accountability_live_tests)
+
+add_executable(acl_subtree_live_tests acl_subtree_live_tests.cpp)
+target_include_directories(acl_subtree_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)
+target_link_libraries(acl_subtree_live_tests
+    fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
+add_test(NAME acl_subtree_live_tests COMMAND acl_subtree_live_tests)
+set_tests_properties(acl_subtree_live_tests PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(accountability_live_tests PROPERTIES
     LABELS "lifecycle" TIMEOUT 300 SKIP_RETURN_CODE 77)
 

@@ -1592,6 +1592,12 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
             break;
     }
 
+    // A mask supersedes the single-bit field. Callers that set eleven bits now
+    // make one call instead of eleven; `permission` stays for existing clients.
+    if (request->permission_mask() != 0) {
+        converted_permissions = request->permission_mask();
+    }
+
     AclEffect rule_effect = (request->effect() == fileengine_rpc::AclEffect::DENY)
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
@@ -1614,7 +1620,16 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     //
     // The entry itself stays. It feeds cross-service correlation and the rules
     // engine, which the core-local record cannot do.
-    emit_permission_audit(tenant, "acl_grant", AuditOutcome::Ok, user, roles,
+    // ONE event, whether this touches one node or fifty thousand.
+    //
+    // A recursive apply that emitted an event per node would be the same fan-out
+    // the recursive form exists to remove, and it would land on the audit chain,
+    // which serializes appends per tenant — the event stream would become slower
+    // than the walk it replaced. The event names the ROOT and says the scope was
+    // a subtree; the per-node expansion is derivable from the ACL table, while
+    // what an auditor needs is who widened access, to what, and how far.
+    const char* audit_action = request->recursive() ? "acl_grant_subtree" : "acl_grant";
+    emit_permission_audit(tenant, audit_action, AuditOutcome::Ok, user, roles,
                           resource_uid, principal, static_cast<int>(principal_type),
                           effect_str, converted_permissions);
 
@@ -1622,20 +1637,38 @@ grpc::Status GRPCFileService::GrantPermission(grpc::ServerContext* context,
     // own transaction (PROPOSAL_accountability_record.md §5.1), so a failure to
     // record fails the grant. That is the point: unlike the write-ahead above —
     // which is durable-but-separate — this cannot leave a committed permission
-    // change with no record of it.
-    auto result = acl_manager_->grant_permission(resource_uid, principal,
-                                                 principal_type,
-                                                 converted_permissions, tenant,
-                                                 accountability_ctx(auth_context),
-                                                 rule_effect);
+    // change with no record of it. The subtree form writes exactly one record,
+    // naming the root and the number of nodes reached.
+    Result<void> result = Result<void>::ok();
+    int nodes_affected = 0;
+    if (request->recursive()) {
+        auto sub = acl_manager_->grant_permission_subtree(resource_uid, principal,
+                                                          principal_type,
+                                                          converted_permissions, tenant,
+                                                          accountability_ctx(auth_context),
+                                                          rule_effect);
+        if (sub.success) {
+            nodes_affected = sub.value;
+        } else {
+            result = Result<void>::err(sub.error);
+        }
+    } else {
+        result = acl_manager_->grant_permission(resource_uid, principal,
+                                                principal_type,
+                                                converted_permissions, tenant,
+                                                accountability_ctx(auth_context),
+                                                rule_effect);
+        if (result.success) nodes_affected = 1;
+    }
 
     response->set_success(result.success);
+    response->set_nodes_affected(nodes_affected);
     if (!result.success) {
         response->set_error(result.error);
         SERVER_LOG_ERROR("GRPCService", "GrantPermission failed for resource_uid: " + resource_uid + " with error: " + result.error);
         // The write-ahead entry recorded an intended grant that then errored;
         // record the failure truthfully (best-effort).
-        emit_permission_audit(tenant, "acl_grant", AuditOutcome::Error, user, roles,
+        emit_permission_audit(tenant, audit_action, AuditOutcome::Error, user, roles,
                               resource_uid, principal, static_cast<int>(principal_type),
                               effect_str, converted_permissions);
     } else {
@@ -1790,6 +1823,10 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
             break;
     }
 
+    if (request->permission_mask() != 0) {
+        converted_permissions = request->permission_mask();
+    }
+
     AclEffect rule_effect = (request->effect() == fileengine_rpc::AclEffect::DENY)
                                 ? AclEffect::DENY : AclEffect::ALLOW;
 
@@ -1812,21 +1849,40 @@ grpc::Status GRPCFileService::RevokePermission(grpc::ServerContext* context,
     //
     // The entry itself stays. It feeds cross-service correlation and the rules
     // engine, which the core-local record cannot do.
-    emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Ok, user, roles,
+    // ONE event for the operation — see the note in GrantPermission.
+    const char* audit_action = request->recursive() ? "acl_revoke_subtree" : "acl_revoke";
+    emit_permission_audit(tenant, audit_action, AuditOutcome::Ok, user, roles,
                           resource_uid, principal, static_cast<int>(principal_type),
                           effect_str, converted_permissions);
 
-    auto result = acl_manager_->revoke_permission(resource_uid, principal,
-                                                  principal_type,
-                                                  converted_permissions, tenant,
-                                                  accountability_ctx(auth_context),
-                                                  rule_effect);
+    Result<void> result = Result<void>::ok();
+    int nodes_affected = 0;
+    if (request->recursive()) {
+        auto sub = acl_manager_->revoke_permission_subtree(resource_uid, principal,
+                                                           principal_type,
+                                                           converted_permissions, tenant,
+                                                           accountability_ctx(auth_context),
+                                                           rule_effect);
+        if (sub.success) {
+            nodes_affected = sub.value;
+        } else {
+            result = Result<void>::err(sub.error);
+        }
+    } else {
+        result = acl_manager_->revoke_permission(resource_uid, principal,
+                                                 principal_type,
+                                                 converted_permissions, tenant,
+                                                 accountability_ctx(auth_context),
+                                                 rule_effect);
+        if (result.success) nodes_affected = 1;
+    }
 
     response->set_success(result.success);
+    response->set_nodes_affected(nodes_affected);
     if (!result.success) {
         response->set_error(result.error);
         SERVER_LOG_ERROR("GRPCService", "RevokePermission failed for resource_uid: " + resource_uid + " with error: " + result.error);
-        emit_permission_audit(tenant, "acl_revoke", AuditOutcome::Error, user, roles,
+        emit_permission_audit(tenant, audit_action, AuditOutcome::Error, user, roles,
                               resource_uid, principal, static_cast<int>(principal_type),
                               effect_str, converted_permissions);
     } else {

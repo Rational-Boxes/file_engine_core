@@ -81,6 +81,19 @@ void AclManager::invalidate_cache_entry(const std::string& resource_uid,
     tls_acl_cache->erase(tenant + "::" + resource_uid);
 }
 
+// Drop every cached ACL read for a tenant. Used by the subtree operations,
+// where the set of changed resources is exactly what the caller did not have to
+// enumerate — so there is no list of keys to erase, and erasing the root alone
+// would be worse than useless: it looks like invalidation while leaving every
+// descendant stale.
+void AclManager::invalidate_all_cached(const std::string& tenant) const {
+    if (!tls_acl_cache.has_value()) return;
+    const std::string prefix = tenant + "::";
+    for (auto it = tls_acl_cache->begin(); it != tls_acl_cache->end(); ) {
+        it = (it->first.rfind(prefix, 0) == 0) ? tls_acl_cache->erase(it) : std::next(it);
+    }
+}
+
 Result<void> AclManager::grant_permission(const std::string& resource_uid,
                                           const std::string& principal,
                                           PrincipalType type,
@@ -108,6 +121,37 @@ Result<void> AclManager::revoke_permission(const std::string& resource_uid,
     auto result = db_->remove_acl(resource_uid, principal, static_cast<int>(type), permissions,
                                   tenant, ctx, static_cast<int>(effect));
     invalidate_cache_entry(resource_uid, tenant);
+    return result;
+}
+
+Result<int> AclManager::grant_permission_subtree(const std::string& root_uid,
+                                                const std::string& principal,
+                                                PrincipalType type,
+                                                int permissions,
+                                                const std::string& tenant,
+                                                const AccountabilityContext& ctx,
+                                                AclEffect effect) {
+    auto result = db_->add_acl_subtree(root_uid, principal, static_cast<int>(type), permissions,
+                                       tenant, ctx, static_cast<int>(effect));
+    // The whole request-scoped cache, not one entry: this changed an unknown
+    // number of resources, and erasing only the root would leave a descendant's
+    // pre-change ACLs cached for the rest of the scope — a permission check
+    // answering from a state that no longer exists. The cache is thread-local
+    // and request-scoped, so this costs one request's worth of re-reads.
+    invalidate_all_cached(tenant);
+    return result;
+}
+
+Result<int> AclManager::revoke_permission_subtree(const std::string& root_uid,
+                                                 const std::string& principal,
+                                                 PrincipalType type,
+                                                 int permissions,
+                                                 const std::string& tenant,
+                                                 const AccountabilityContext& ctx,
+                                                 AclEffect effect) {
+    auto result = db_->remove_acl_subtree(root_uid, principal, static_cast<int>(type), permissions,
+                                          tenant, ctx, static_cast<int>(effect));
+    invalidate_all_cached(tenant);
     return result;
 }
 

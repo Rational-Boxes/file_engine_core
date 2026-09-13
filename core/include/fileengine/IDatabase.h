@@ -228,6 +228,24 @@ public:
                                  const std::string& tenant,
                                  const AccountabilityContext& ctx,
                                  int effect = 0) = 0;
+
+    // Apply `permissions` to `root_uid` AND every descendant, in one statement
+    // and one transaction. Returns the number of rows written.
+    //
+    // This exists because the alternative is a client walking the tree: the
+    // bridge's recursive apply issued one listDirectory per folder and one
+    // grant per node per permission bit, which for a 50k-node tree is on the
+    // order of half a million round trips inside one HTTP request — it timed
+    // out having half-applied the tree. The database can express "a row for
+    // every descendant" as a single set operation; nothing outside it can.
+    //
+    // Records ONE accountability record naming the root and the count, not one
+    // per node.
+    virtual Result<int> add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                        int type, int permissions,
+                                        const std::string& tenant,
+                                        const AccountabilityContext& ctx,
+                                        int effect = 0) = 0;
     // Clear the bits in `permissions` from the matching ACL row. If the
     // resulting permission bitmask is zero the row is deleted. Pass -1 (all
     // bits set) to fully revoke the principal's row in one call. effect
@@ -237,6 +255,17 @@ public:
                                     const std::string& tenant,
                                     const AccountabilityContext& ctx,
                                     int effect = 0) = 0;
+
+    // Clear `permissions` from `root_uid` and every descendant, in one
+    // statement. Rows left with an empty mask are deleted, matching remove_acl:
+    // in a read-by-default system an ALLOW row with no bits and no row at all
+    // must not be distinguishable, or a revoke leaves evidence that reads as a
+    // grant. Returns the number of rows updated or deleted.
+    virtual Result<int> remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                           int type, int permissions,
+                                           const std::string& tenant,
+                                           const AccountabilityContext& ctx,
+                                           int effect = 0) = 0;
     virtual Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                                  const std::string& tenant = "") = 0;
     virtual Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,
