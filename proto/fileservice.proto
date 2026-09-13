@@ -11,6 +11,8 @@ service FileService {
     rpc RemoveDirectory(RemoveDirectoryRequest) returns (RemoveDirectoryResponse);
     rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
     rpc ListDirectoryWithDeleted(ListDirectoryWithDeletedRequest) returns (ListDirectoryWithDeletedResponse);
+    // "What changed most recently, that I may see?" — answered in the core.
+    rpc ListRecentFiles(ListRecentFilesRequest) returns (ListRecentFilesResponse);
 
     // File operations
     rpc Touch(TouchRequest) returns (TouchResponse);
@@ -185,6 +187,41 @@ message ListDirectoryResponse {
     bool success = 1;
     string error = 2;
     repeated DirectoryEntry entries = 3;
+}
+
+// Most-recently-versioned files the caller may read, newest first.
+//
+// This exists because the alternative is a caller assembling the answer from
+// outside: the dashboard read a projection of file events, over-fetched four
+// times its page size, then made TWO permission calls per row — up to 800 round
+// trips for one page, each building and closing a core client. The question
+// "what are the newest files I can see" is a query, and the core is where the
+// files, their versions and their ACLs already are.
+//
+// One security event per call, naming how many rows were examined and returned —
+// not one per row. An event stream that fires per file touched answers this
+// question by accident and at enormous cost; this answers it on purpose.
+message ListRecentFilesRequest {
+    int32 limit = 1;                    // rows to RETURN (server clamps; default 50)
+    AuthenticationContext auth = 2;
+    // Optional: restrict to a subtree. Empty = the whole tenant.
+    string under_uid = 3;
+    // Optional: only versions newer than this (UNIX epoch seconds). 0 = no bound.
+    int64 since_epoch = 4;
+}
+
+message ListRecentFilesResponse {
+    bool success = 1;
+    string error = 2;
+    repeated DirectoryEntry entries = 3;
+    // Rows the query examined before ACL filtering. The gap between this and
+    // entries.size() is how much of the tenant's recent activity the caller
+    // cannot see — useful for tuning, and the reason the scan is bounded.
+    int32 examined = 4;
+    // True when the scan bound was reached before `limit` rows were collected,
+    // so a caller knows the page is short because of the bound rather than
+    // because the tenant has nothing older.
+    bool scan_truncated = 5;
 }
 
 message ListDirectoryWithDeletedRequest {

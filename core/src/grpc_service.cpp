@@ -429,6 +429,96 @@ grpc::Status GRPCFileService::ListDirectory(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+grpc::Status GRPCFileService::ListRecentFiles(grpc::ServerContext* context,
+                                              const fileengine_rpc::ListRecentFilesRequest* request,
+                                              fileengine_rpc::ListRecentFilesResponse* response) {
+    if (auto denied = service_auth_guard(); !denied.ok()) return denied;
+    (void)context;
+
+    auto auth_context = request->auth();
+    const std::string tenant = get_tenant_from_auth_context(auth_context);
+    const std::string user   = get_user_from_auth_context(auth_context);
+    const std::vector<std::string> roles = get_roles_from_auth_context(auth_context);
+
+    // Clamped, not trusted. `limit` decides how much work this does, and an
+    // unbounded one from a caller that can read everything is a tenant-wide
+    // scan on request.
+    int limit = request->limit() > 0 ? request->limit() : 50;
+    if (limit > 200) limit = 200;
+
+    // Over-fetch, because rows the caller cannot read are dropped after the
+    // query and the page should still fill. Bounded, so a caller who can read
+    // nothing cannot make this walk the tenant: it returns a short page and
+    // says so via scan_truncated rather than scanning until it finds something.
+    const int scan_limit = limit * 4;
+
+    const std::string under_uid = canonical_uid(request->under_uid());
+
+    // One ACL cache scope for the whole page. The old path made each check a
+    // separate RPC from another service, with a core client built and closed per
+    // call; here they are in-process and share a request-scoped cache, so a tree
+    // whose ancestors repeat — which is what a directory of recent edits looks
+    // like — resolves them once.
+    AclManager::CacheScope acl_scope(*acl_manager_);
+
+    auto candidates = filesystem_->list_recent(tenant, under_uid,
+                                               request->since_epoch(), scan_limit);
+    if (!candidates.success) {
+        response->set_success(false);
+        response->set_error(candidates.error);
+        SERVER_LOG_ERROR("GRPCService", "ListRecentFiles failed: " + candidates.error);
+        emit_access_audit(tenant, "recent.list", AuditOutcome::Error, user, roles,
+                          under_uid, AuditTargetType::Dir);
+        return grpc::Status::OK;
+    }
+
+    int returned = 0;
+    for (const auto& info : candidates.value) {
+        if (returned >= limit) break;
+        if (!validate_user_permissions(info.uid, auth_context, static_cast<int>(Permission::READ))) {
+            continue;
+        }
+        auto* e = response->add_entries();
+        e->set_uid(info.uid);
+        e->set_name(info.name);
+        e->set_type(fileengine_rpc::FileType::REGULAR_FILE);
+        e->set_size(info.size);
+        e->set_created_at(std::chrono::duration_cast<std::chrono::seconds>(
+                              info.created_at.time_since_epoch()).count());
+        e->set_modified_at(std::chrono::duration_cast<std::chrono::seconds>(
+                               info.modified_at.time_since_epoch()).count());
+        e->set_owner(info.owner);
+        e->set_created_by(info.created_by);
+        e->set_modified_by(info.modified_by);
+        e->set_deleted(false);
+        ++returned;
+    }
+
+    const int examined = static_cast<int>(candidates.value.size());
+    response->set_success(true);
+    response->set_examined(examined);
+    // Short because the scan bound was hit, not because the tenant ran out.
+    response->set_scan_truncated(returned < limit && examined >= scan_limit);
+
+    // ONE event for the query.
+    //
+    // The point of this RPC is that answering "what changed recently" should not
+    // require a stream of per-file events to have been recorded first, nor a
+    // per-row check emitting its own. The event says who asked, how wide the
+    // question was, how much was examined and how much came back — the gap
+    // between the last two being how much of the tenant's recent activity this
+    // caller cannot see.
+    emit_access_audit(tenant, "recent.list", AuditOutcome::Ok, user, roles,
+                      under_uid, AuditTargetType::Dir,
+                      "{\"limit\":" + std::to_string(limit) +
+                      ",\"examined\":" + std::to_string(examined) +
+                      ",\"returned\":" + std::to_string(returned) + "}");
+
+    SERVER_LOG_DEBUG("GRPCService", "ListRecentFiles returned " + std::to_string(returned) +
+                                    " of " + std::to_string(examined) + " examined");
+    return grpc::Status::OK;
+}
+
 grpc::Status GRPCFileService::ListDirectoryWithDeleted(grpc::ServerContext* context,
                                                        const fileengine_rpc::ListDirectoryWithDeletedRequest* request,
                                                        fileengine_rpc::ListDirectoryWithDeletedResponse* response) {

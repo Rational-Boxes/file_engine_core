@@ -61,6 +61,14 @@ public:
                                                                      const std::vector<std::string>& roles = {},
                                                                      const std::string& tenant = "");
 
+    // Candidate rows for "what changed most recently", newest first, UNFILTERED
+    // by ACL — the caller filters with the evaluator it already holds. See
+    // IDatabase::list_recent_files for why the filter is not pushed into SQL.
+    virtual Result<std::vector<FileInfo>> list_recent(const std::string& tenant,
+                                                      const std::string& under_uid,
+                                                      std::int64_t since_epoch,
+                                                      int scan_limit);
+
     // File operations
     virtual Result<std::string> touch(const std::string& parent_uid, const std::string& name,
                                       const std::string& user,

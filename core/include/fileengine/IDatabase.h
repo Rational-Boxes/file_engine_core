@@ -96,6 +96,29 @@ public:
                                             const std::string& path, const std::string& parent_uid,
                                             FileType type, const std::string& owner,
                                             int permissions, const std::string& tenant = "") = 0;
+    // Candidate rows for "what changed most recently", newest version first.
+    //
+    // Returns UNFILTERED candidates: ACL evaluation stays in AclManager rather
+    // than being reimplemented in SQL. Two implementations of "may they read
+    // it" is how they drift, and the expensive part of the old dashboard path
+    // was never the checks — it was making each one a network round trip from
+    // another service, with a client built and closed per call.
+    //
+    // `scan_limit` bounds the work: the caller asks for more candidates than it
+    // needs, filters, and stops. A caller who can read nothing cannot make this
+    // walk the whole tenant.
+    //
+    // Rows are deduplicated to one per file (its newest version). Soft-deleted
+    // files and containers are excluded — a folder has no version of its own.
+    virtual Result<std::vector<FileInfo>> list_recent_files(const std::string& tenant,
+                                                            const std::string& under_uid,
+                                                            std::int64_t since_epoch,
+                                                            int scan_limit) {
+        (void)tenant; (void)under_uid; (void)since_epoch; (void)scan_limit;
+        return Result<std::vector<FileInfo>>::err(
+            "list_recent_files is not available from this database implementation");
+    }
+
     virtual Result<void> update_file_modified(const std::string& uid, const std::string& tenant = "") = 0;
     virtual Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
     // Update the stored byte size of a file's current content. Non-pure so

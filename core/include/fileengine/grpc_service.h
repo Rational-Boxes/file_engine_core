@@ -65,6 +65,10 @@ public:
                                          const fileengine_rpc::ListDirectoryWithDeletedRequest* request,
                                          fileengine_rpc::ListDirectoryWithDeletedResponse* response) override;
 
+    grpc::Status ListRecentFiles(grpc::ServerContext* context,
+                                 const fileengine_rpc::ListRecentFilesRequest* request,
+                                 fileengine_rpc::ListRecentFilesResponse* response) override;
+
     // File operations
     grpc::Status Touch(grpc::ServerContext* context,
                       const fileengine_rpc::TouchRequest* request,

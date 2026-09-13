@@ -5343,6 +5343,111 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     return Result<void>::ok();
 }
 
+// ── Recent activity ─────────────────────────────────────────────────────────
+//
+// One query for "what changed most recently". The dashboard used to assemble
+// this from a projection of file events plus two permission RPCs per row — up
+// to 800 round trips for one page. The files, their versions and their ACLs all
+// live here; the question is a query.
+Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& tenant,
+                                                          const std::string& under_uid,
+                                                          std::int64_t since_epoch,
+                                                          int scan_limit) {
+    if (scan_limit <= 0) scan_limit = 200;
+
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<FileInfo>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    // DISTINCT ON gives one row per file — its newest version — and the outer
+    // ordering then ranks files against each other. Doing it the other way
+    // round (order, then dedupe in the caller) would let one busy file fill the
+    // scan window with its own versions and crowd everything else out.
+    //
+    // Containers are excluded: a folder has no version of its own, and its
+    // recursive mtime is a separate and far more expensive question.
+    std::string sql =
+        "SELECT uid, name, owner, version_timestamp, revised_by, size_bytes, parent_uid FROM ("
+        "  SELECT DISTINCT ON (v.file_uid) f.uid AS uid, f.name AS name, f.owner AS owner,"
+        "         v.version_timestamp AS version_timestamp, v.revised_by AS revised_by,"
+        "         COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid"
+        "    FROM " + schema + ".versions v"
+        "    JOIN " + schema + ".files f ON f.uid = v.file_uid"
+        "   WHERE f.deleted = FALSE AND f.is_container = FALSE";
+
+    int param_index = 1;
+    std::vector<std::string> params;
+    if (since_epoch > 0) {
+        // version_timestamp is a fixed-width, zero-padded, UTC string
+        // (20260830_204237.123), so a lexical comparison is a chronological one
+        // — the same property the backup sync gate relies on. No parsing, and no
+        // dependence on a format string matching the writer's.
+        sql += " AND v.version_timestamp >= $" + std::to_string(param_index++);
+        std::time_t t = static_cast<std::time_t>(since_epoch);
+        std::tm tm_utc{};
+        gmtime_r(&t, &tm_utc);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_utc);
+        params.emplace_back(buf);
+    }
+    if (!under_uid.empty()) {
+        sql += " AND f.uid IN (WITH RECURSIVE sub(uid) AS ("
+               "   SELECT $" + std::to_string(param_index) + "::text"
+               "   UNION SELECT c.uid FROM " + schema + ".files c JOIN sub ON c.parent_uid = sub.uid"
+               "    WHERE c.deleted = FALSE) SELECT uid FROM sub)";
+        params.emplace_back(under_uid);
+        ++param_index;
+    }
+    sql += "   ORDER BY v.file_uid, v.version_timestamp DESC"
+           ") newest"
+           " ORDER BY version_timestamp DESC LIMIT " + std::to_string(scan_limit) + ";";
+
+    std::vector<const char*> param_ptrs;
+    param_ptrs.reserve(params.size());
+    for (const auto& p : params) param_ptrs.push_back(p.c_str());
+
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), static_cast<int>(param_ptrs.size()),
+                                 nullptr, param_ptrs.empty() ? nullptr : param_ptrs.data(),
+                                 nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "list_recent_files failed: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err(error);
+    }
+
+    std::vector<FileInfo> out;
+    const int rows = PQntuples(res);
+    out.reserve(static_cast<size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        FileInfo info;
+        info.uid         = PQgetvalue(res, i, 0);
+        info.name        = PQgetvalue(res, i, 1);
+        info.owner       = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+        info.version     = PQgetisnull(res, i, 3) ? "" : PQgetvalue(res, i, 3);
+        info.modified_by = PQgetisnull(res, i, 4) ? info.owner : PQgetvalue(res, i, 4);
+        info.size        = PQgetisnull(res, i, 5) ? 0 : std::atoll(PQgetvalue(res, i, 5));
+        info.parent_uid  = PQgetisnull(res, i, 6) ? "" : PQgetvalue(res, i, 6);
+        info.type        = FileType::REGULAR_FILE;
+        info.created_by  = info.owner;
+        // Both timestamps derive from the version name, as everywhere else —
+        // see the ctime/mtime derivation rule. now() here would make a listing
+        // report a modification that never happened.
+        std::int64_t epoch = 0;
+        if (parse_vts_epoch(info.version.c_str(), epoch)) {
+            info.modified_at = std::chrono::system_clock::from_time_t(static_cast<std::time_t>(epoch));
+            info.created_at  = info.modified_at;
+        }
+        out.push_back(std::move(info));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<FileInfo>>::ok(std::move(out));
+}
+
 // ── Subtree ACL application ─────────────────────────────────────────────────
 //
 // One statement, one transaction, one accountability record.

@@ -228,10 +228,97 @@ void test_deleted_nodes_are_skipped(Database& db) {
           "while the live branch is unaffected");
 }
 
+void test_recent_files_newest_first(Database& db) {
+    std::cout << "- recent files come back newest first, one row per file\n";
+    const std::string tenant = new_tenant(db, "recent");
+    auto uids = build_tree(db, tenant);
+
+    // Three versions on a1, one on a2 — a1 must appear ONCE, at its newest.
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1 v1");
+    CHECK(db.insert_version(uids[3], "20260102_000000.000", 0, "/dev/null", "bob", tenant).success, "a2 v1");
+    CHECK(db.insert_version(uids[2], "20260103_000000.000", 0, "/dev/null", "carol", tenant).success, "a1 v2");
+
+    auto r = db.list_recent_files(tenant, "", 0, 50);
+    CHECK(r.success, "query succeeds" + std::string(r.success ? "" : ": " + r.error));
+    if (!r.success) return;
+
+    CHECK(r.value.size() == 2, "two files, not three versions — got " +
+                               std::to_string(r.value.size()));
+    if (r.value.size() >= 2) {
+        CHECK(r.value[0].uid == uids[2], "a1 is first (its newest version wins)");
+        CHECK(r.value[0].version == "20260103_000000.000", "and it is the NEWEST version");
+        CHECK(r.value[0].modified_by == "carol", "attributed to the latest reviser");
+        CHECK(r.value[1].uid == uids[3], "a2 second");
+    }
+}
+
+void test_recent_files_excludes_deleted_and_folders(Database& db) {
+    std::cout << "- deleted files and folders are not 'recent activity'\n";
+    const std::string tenant = new_tenant(db, "recentdel");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1 v1");
+    CHECK(db.insert_version(uids[5], "20260102_000000.000", 0, "/dev/null", "bob", tenant).success, "b1 v1");
+    CHECK(db.delete_file(uids[5], tenant).success, "soft-delete b1");
+
+    auto r = db.list_recent_files(tenant, "", 0, 50);
+    CHECK(r.success, "query succeeds");
+    if (!r.success) return;
+    for (const auto& f : r.value) {
+        CHECK(f.uid != uids[5], "the deleted file is absent");
+        CHECK(f.uid != uids[1] && f.uid != uids[4] && f.uid != uids[0],
+              "no folders — a folder has no version of its own");
+    }
+    CHECK(r.value.size() == 1, "only the one live versioned file, got " +
+                               std::to_string(r.value.size()));
+}
+
+void test_recent_files_scoped_to_a_subtree(Database& db) {
+    std::cout << "- under_uid restricts to a subtree\n";
+    const std::string tenant = new_tenant(db, "recentsub");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1 v1");
+    CHECK(db.insert_version(uids[5], "20260102_000000.000", 0, "/dev/null", "bob", tenant).success, "b1 v1");
+
+    auto r = db.list_recent_files(tenant, uids[1] /* folder a */, 0, 50);
+    CHECK(r.success, "query succeeds");
+    if (!r.success) return;
+    CHECK(r.value.size() == 1, "only a's subtree, got " + std::to_string(r.value.size()));
+    if (!r.value.empty()) CHECK(r.value[0].uid == uids[2], "and it is a1");
+}
+
+void test_recent_files_since_bound(Database& db) {
+    std::cout << "- since_epoch drops anything older\n";
+    const std::string tenant = new_tenant(db, "recentsince");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "old");
+    CHECK(db.insert_version(uids[3], "20260601_000000.000", 0, "/dev/null", "bob", tenant).success, "new");
+
+    // 2026-03-01T00:00:00Z
+    auto r = db.list_recent_files(tenant, "", 1772323200LL, 50);
+    CHECK(r.success, "query succeeds");
+    if (!r.success) return;
+    CHECK(r.value.size() == 1, "only the newer one, got " + std::to_string(r.value.size()));
+    if (!r.value.empty()) CHECK(r.value[0].uid == uids[3], "and it is a2");
+}
+
+void test_recent_files_scan_limit_is_honoured(Database& db) {
+    std::cout << "- the scan bound caps the work\n";
+    const std::string tenant = new_tenant(db, "recentcap");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1");
+    CHECK(db.insert_version(uids[3], "20260102_000000.000", 0, "/dev/null", "bob", tenant).success, "a2");
+    CHECK(db.insert_version(uids[5], "20260103_000000.000", 0, "/dev/null", "carol", tenant).success, "b1");
+
+    auto r = db.list_recent_files(tenant, "", 0, 2);
+    CHECK(r.success, "query succeeds");
+    CHECK(r.success && r.value.size() == 2, "exactly the scan limit, got " +
+          std::to_string(r.success ? r.value.size() : 0));
+}
+
 }  // namespace
 
 int main() {
-    std::cout << "=== acl_subtree_live_tests ===\n";
+    std::cout << "=== acl_subtree + recent_files live tests ===\n";
 
     const std::string host = env_or("FILEENGINE_PG_HOST", env_or("FE_TEST_PG_HOST", "localhost"));
     const int port = std::stoi(env_or("FILEENGINE_PG_PORT", env_or("FE_TEST_PG_PORT", "5434")));
@@ -256,6 +343,12 @@ int main() {
     test_one_record_regardless_of_size(db);
     test_refuses_without_an_actor(db);
     test_deleted_nodes_are_skipped(db);
+
+    test_recent_files_newest_first(db);
+    test_recent_files_excludes_deleted_and_folders(db);
+    test_recent_files_scoped_to_a_subtree(db);
+    test_recent_files_since_bound(db);
+    test_recent_files_scan_limit_is_honoured(db);
 
     for (const auto& t : created_tenants()) {
         db.cleanup_tenant_data(t, ctx_for("test-teardown"));
