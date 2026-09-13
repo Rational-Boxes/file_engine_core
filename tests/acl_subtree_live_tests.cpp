@@ -29,6 +29,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <chrono>
 #include <unistd.h>
 #include <vector>
 
@@ -315,6 +316,107 @@ void test_recent_files_scan_limit_is_honoured(Database& db) {
           std::to_string(r.success ? r.value.size() : 0));
 }
 
+// ── folder mtime ────────────────────────────────────────────────────────────
+//
+// A folder's mtime is the newest version anywhere beneath it. It used to be
+// recomputed by descending the whole subtree on EVERY read — 94% of a four-core
+// host during a bulk import. It is now memoised on the folder row, pushed up on
+// write, and forgotten where the newest can move backwards.
+//
+// The risk a memo introduces is that it lies. These tests compare it against a
+// fresh walk rather than against an expected constant, because the property that
+// matters is agreement, not any particular value.
+
+std::int64_t folder_mtime(Database& db, const std::string& uid, const std::string& tenant) {
+    auto f = db.get_file_by_uid(uid, tenant);
+    if (!f.success || !f.value.has_value()) return -1;
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               f.value->modified_at.time_since_epoch()).count();
+}
+
+void test_folder_mtime_follows_the_newest_version(Database& db) {
+    std::cout << "- a new version moves every ancestor's mtime\n";
+    const std::string tenant = new_tenant(db, "mtime");
+    auto uids = build_tree(db, tenant);
+
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1 v1");
+    const std::int64_t after_first_a = folder_mtime(db, uids[1], tenant);
+    const std::int64_t after_first_root = folder_mtime(db, uids[0], tenant);
+    CHECK(after_first_a > 0, "folder a has an mtime");
+    CHECK(after_first_root == after_first_a, "and it reached the root too");
+
+    CHECK(db.insert_version(uids[3], "20260601_000000.000", 0, "/dev/null", "bob", tenant).success, "a2 v1");
+    CHECK(folder_mtime(db, uids[1], tenant) > after_first_a,
+          "a newer version moved the folder forward");
+    CHECK(folder_mtime(db, uids[0], tenant) > after_first_root,
+          "and moved the root forward");
+}
+
+void test_an_older_version_does_not_move_it_backwards(Database& db) {
+    std::cout << "- an out-of-order arrival cannot move it backwards\n";
+    const std::string tenant = new_tenant(db, "mtimeback");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260601_000000.000", 0, "/dev/null", "alice", tenant).success, "new");
+    const std::int64_t newest = folder_mtime(db, uids[1], tenant);
+    CHECK(db.insert_version(uids[3], "20260101_000000.000", 0, "/dev/null", "bob", tenant).success, "older");
+    CHECK(folder_mtime(db, uids[1], tenant) == newest,
+          "the folder still reports the NEWEST version, not the last written");
+}
+
+void test_the_memo_agrees_with_a_fresh_walk(Database& db) {
+    std::cout << "- the memo agrees with recomputing from scratch\n";
+    const std::string tenant = new_tenant(db, "mtimeagree");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1");
+    CHECK(db.insert_version(uids[5], "20260301_000000.000", 0, "/dev/null", "bob",   tenant).success, "b1");
+
+    const std::int64_t memoised = folder_mtime(db, uids[0], tenant);
+
+    // Forget it the way a delete would, then read again: the value must be
+    // rebuilt identically. A memo that survives this is one that cannot drift
+    // silently.
+    CHECK(db.forget_subtree_mtime(uids[0], tenant).success, "forget the memo");
+    const std::int64_t recomputed = folder_mtime(db, uids[0], tenant);
+    CHECK(memoised == recomputed,
+          "memoised " + std::to_string(memoised) + " vs recomputed " +
+          std::to_string(recomputed));
+}
+
+void test_deleting_the_newest_moves_the_folder_back(Database& db) {
+    std::cout << "- deleting the newest file moves the folder's mtime back\n";
+    const std::string tenant = new_tenant(db, "mtimedel");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1 old");
+    CHECK(db.insert_version(uids[3], "20260601_000000.000", 0, "/dev/null", "bob",   tenant).success, "a2 new");
+    const std::int64_t with_newest = folder_mtime(db, uids[1], tenant);
+
+    CHECK(db.delete_file(uids[3], tenant).success, "delete the newest");
+    const std::int64_t after = folder_mtime(db, uids[1], tenant);
+    CHECK(after < with_newest,
+          "the folder no longer reports content it does not contain (" +
+          std::to_string(after) + " vs " + std::to_string(with_newest) + ")");
+}
+
+void test_moving_a_file_updates_both_folders(Database& db) {
+    std::cout << "- a move updates the folder it left and the one it joined\n";
+    const std::string tenant = new_tenant(db, "mtimemove");
+    auto uids = build_tree(db, tenant);
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success, "a1");
+    CHECK(db.insert_version(uids[3], "20260601_000000.000", 0, "/dev/null", "bob",   tenant).success, "a2 (newest)");
+    CHECK(db.insert_version(uids[5], "20260201_000000.000", 0, "/dev/null", "carol", tenant).success, "b1");
+
+    const std::int64_t a_before = folder_mtime(db, uids[1], tenant);
+    const std::int64_t b_before = folder_mtime(db, uids[4], tenant);
+
+    // Move the newest file out of a and into b.
+    CHECK(db.update_file_parent(uids[3], uids[4], tenant).success, "move a2 -> b");
+
+    const std::int64_t a_after = folder_mtime(db, uids[1], tenant);
+    const std::int64_t b_after = folder_mtime(db, uids[4], tenant);
+    CHECK(a_after < a_before, "the source folder went back — it lost its newest");
+    CHECK(b_after > b_before, "the destination folder moved forward");
+}
+
 }  // namespace
 
 int main() {
@@ -349,6 +451,12 @@ int main() {
     test_recent_files_scoped_to_a_subtree(db);
     test_recent_files_since_bound(db);
     test_recent_files_scan_limit_is_honoured(db);
+
+    test_folder_mtime_follows_the_newest_version(db);
+    test_an_older_version_does_not_move_it_backwards(db);
+    test_the_memo_agrees_with_a_fresh_walk(db);
+    test_deleting_the_newest_moves_the_folder_back(db);
+    test_moving_a_file_updates_both_folders(db);
 
     for (const auto& t : created_tenants()) {
         db.cleanup_tenant_data(t, ctx_for("test-teardown"));

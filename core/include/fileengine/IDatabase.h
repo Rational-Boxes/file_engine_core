@@ -119,6 +119,18 @@ public:
             "list_recent_files is not available from this database implementation");
     }
 
+    // Forget the memoised folder mtime for `uid` and its ancestors, so the next
+    // read recomputes it by walking the subtree.
+    //
+    // The write paths maintain this themselves; this is the escape hatch — for
+    // tests that need to prove the memo agrees with a fresh walk, and for an
+    // operator who has reason to believe it drifted. Cheap: O(depth) UPDATE.
+    virtual Result<void> forget_subtree_mtime(const std::string& uid,
+                                              const std::string& tenant = "") {
+        (void)uid; (void)tenant;
+        return Result<void>::ok();
+    }
+
     virtual Result<void> update_file_modified(const std::string& uid, const std::string& tenant = "") = 0;
     virtual Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
     // Update the stored byte size of a file's current content. Non-pure so

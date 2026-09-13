@@ -76,6 +76,7 @@ public:
                                                     const std::string& under_uid,
                                                     std::int64_t since_epoch,
                                                     int scan_limit) override;
+    Result<void> forget_subtree_mtime(const std::string& uid, const std::string& tenant = "") override;
     Result<void> update_file_modified(const std::string& uid, const std::string& tenant) override;
     Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) override;
     Result<void> update_file_size(const std::string& uid, int64_t size, const std::string& tenant = "") override;
