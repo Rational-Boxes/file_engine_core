@@ -188,6 +188,10 @@ const std::map<std::string, Capability>& method_map() {
         {"Stat",                      Capability::Read},
         {"Exists",                    Capability::Read},
         {"ListDirectory",             Capability::Read},
+        // Read: it observes recent activity and changes nothing. Note it is
+        // scoped by the caller's own ACLs like any other read, so classifying it
+        // Read grants no visibility a ListDirectory walk would not.
+        {"ListRecentFiles",           Capability::Read},
         {"GetFile",                   Capability::Read},
         {"StreamFileDownload",        Capability::Read},
         {"GetVersion",                Capability::Read},

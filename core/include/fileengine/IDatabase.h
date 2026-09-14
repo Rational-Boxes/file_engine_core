@@ -96,6 +96,41 @@ public:
                                             const std::string& path, const std::string& parent_uid,
                                             FileType type, const std::string& owner,
                                             int permissions, const std::string& tenant = "") = 0;
+    // Candidate rows for "what changed most recently", newest version first.
+    //
+    // Returns UNFILTERED candidates: ACL evaluation stays in AclManager rather
+    // than being reimplemented in SQL. Two implementations of "may they read
+    // it" is how they drift, and the expensive part of the old dashboard path
+    // was never the checks — it was making each one a network round trip from
+    // another service, with a client built and closed per call.
+    //
+    // `scan_limit` bounds the work: the caller asks for more candidates than it
+    // needs, filters, and stops. A caller who can read nothing cannot make this
+    // walk the whole tenant.
+    //
+    // Rows are deduplicated to one per file (its newest version). Soft-deleted
+    // files and containers are excluded — a folder has no version of its own.
+    virtual Result<std::vector<FileInfo>> list_recent_files(const std::string& tenant,
+                                                            const std::string& under_uid,
+                                                            std::int64_t since_epoch,
+                                                            int scan_limit) {
+        (void)tenant; (void)under_uid; (void)since_epoch; (void)scan_limit;
+        return Result<std::vector<FileInfo>>::err(
+            "list_recent_files is not available from this database implementation");
+    }
+
+    // Forget the memoised folder mtime for `uid` and its ancestors, so the next
+    // read recomputes it by walking the subtree.
+    //
+    // The write paths maintain this themselves; this is the escape hatch — for
+    // tests that need to prove the memo agrees with a fresh walk, and for an
+    // operator who has reason to believe it drifted. Cheap: O(depth) UPDATE.
+    virtual Result<void> forget_subtree_mtime(const std::string& uid,
+                                              const std::string& tenant = "") {
+        (void)uid; (void)tenant;
+        return Result<void>::ok();
+    }
+
     virtual Result<void> update_file_modified(const std::string& uid, const std::string& tenant = "") = 0;
     virtual Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant = "") = 0;
     // Update the stored byte size of a file's current content. Non-pure so
@@ -228,6 +263,24 @@ public:
                                  const std::string& tenant,
                                  const AccountabilityContext& ctx,
                                  int effect = 0) = 0;
+
+    // Apply `permissions` to `root_uid` AND every descendant, in one statement
+    // and one transaction. Returns the number of rows written.
+    //
+    // This exists because the alternative is a client walking the tree: the
+    // bridge's recursive apply issued one listDirectory per folder and one
+    // grant per node per permission bit, which for a 50k-node tree is on the
+    // order of half a million round trips inside one HTTP request — it timed
+    // out having half-applied the tree. The database can express "a row for
+    // every descendant" as a single set operation; nothing outside it can.
+    //
+    // Records ONE accountability record naming the root and the count, not one
+    // per node.
+    virtual Result<int> add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                        int type, int permissions,
+                                        const std::string& tenant,
+                                        const AccountabilityContext& ctx,
+                                        int effect = 0) = 0;
     // Clear the bits in `permissions` from the matching ACL row. If the
     // resulting permission bitmask is zero the row is deleted. Pass -1 (all
     // bits set) to fully revoke the principal's row in one call. effect
@@ -237,6 +290,17 @@ public:
                                     const std::string& tenant,
                                     const AccountabilityContext& ctx,
                                     int effect = 0) = 0;
+
+    // Clear `permissions` from `root_uid` and every descendant, in one
+    // statement. Rows left with an empty mask are deleted, matching remove_acl:
+    // in a read-by-default system an ALLOW row with no bits and no row at all
+    // must not be distinguishable, or a revoke leaves evidence that reads as a
+    // grant. Returns the number of rows updated or deleted.
+    virtual Result<int> remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                           int type, int permissions,
+                                           const std::string& tenant,
+                                           const AccountabilityContext& ctx,
+                                           int effect = 0) = 0;
     virtual Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                                  const std::string& tenant = "") = 0;
     virtual Result<std::vector<AclEntry>> get_user_acls(const std::string& resource_uid,

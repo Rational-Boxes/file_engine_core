@@ -138,6 +138,17 @@ private:
 namespace accountability_action {
 inline constexpr const char* kAclGrant     = "acl.grant";
 inline constexpr const char* kAclRevoke    = "acl.revoke";
+// Subtree forms. A recursive application is ONE authorization decision — "this
+// principal gets this mask on this folder and everything under it" — and it is
+// recorded as one record naming the root and the number of nodes reached, not
+// as one record per node. Per-node expansion is derivable from the ACL table;
+// what the record exists to capture is who widened access, to what, and how far.
+//
+// A distinct action rather than a flag on kAclGrant so a reader of the chain
+// cannot mistake the scope: "acl.grant" is a node, "acl.grant.subtree" is a
+// tree, and the two should never be counted as the same kind of event.
+inline constexpr const char* kAclGrantSubtree  = "acl.grant.subtree";
+inline constexpr const char* kAclRevokeSubtree = "acl.revoke.subtree";
 inline constexpr const char* kRoleCreate   = "role.create";
 inline constexpr const char* kRoleDelete   = "role.delete";
 inline constexpr const char* kRoleAssign   = "role.assign";

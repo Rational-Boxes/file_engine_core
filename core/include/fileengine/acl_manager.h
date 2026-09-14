@@ -314,6 +314,35 @@ public:
                                    const std::string& tenant,
                                    const AccountabilityContext& ctx,
                                    AclEffect effect = AclEffect::ALLOW);
+
+    // Apply a grant/revoke to `root_uid` AND every descendant, as ONE database
+    // operation. Returns the number of ACL rows written.
+    //
+    // The per-node alternative is not merely slower, it does not finish: a
+    // caller walking a 50,000-node tree issues that many grants (times the
+    // number of permission bits, before masks were accepted) inside one
+    // request, and a timeout leaves the tree half-applied with no record of
+    // where it stopped. This is a set operation and belongs in the set engine.
+    //
+    // ONE accountability record is written, naming the root and the number of
+    // nodes reached — not one per node. Per-node expansion is derivable from
+    // the ACL table; what the record captures is who widened access, to what,
+    // and how far.
+    Result<int> grant_permission_subtree(const std::string& root_uid,
+                                         const std::string& principal,
+                                         PrincipalType type,
+                                         int permissions,
+                                         const std::string& tenant,
+                                         const AccountabilityContext& ctx,
+                                         AclEffect effect = AclEffect::ALLOW);
+
+    Result<int> revoke_permission_subtree(const std::string& root_uid,
+                                          const std::string& principal,
+                                          PrincipalType type,
+                                          int permissions,
+                                          const std::string& tenant,
+                                          const AccountabilityContext& ctx,
+                                          AclEffect effect = AclEffect::ALLOW);
     
     // Check if a user has specific permissions on a resource. `claims` are the
     // principal's auth claims (key->value); they let CLAIM-type (ABAC) rules
@@ -420,6 +449,7 @@ private:
                          const std::vector<ACLRule>& acls) const;
     void invalidate_cache_entry(const std::string& resource_uid,
                                 const std::string& tenant) const;
+    void invalidate_all_cached(const std::string& tenant) const;
 };
 
 } // namespace fileengine

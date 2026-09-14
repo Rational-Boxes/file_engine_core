@@ -11,6 +11,8 @@ service FileService {
     rpc RemoveDirectory(RemoveDirectoryRequest) returns (RemoveDirectoryResponse);
     rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
     rpc ListDirectoryWithDeleted(ListDirectoryWithDeletedRequest) returns (ListDirectoryWithDeletedResponse);
+    // "What changed most recently, that I may see?" — answered in the core.
+    rpc ListRecentFiles(ListRecentFilesRequest) returns (ListRecentFilesResponse);
 
     // File operations
     rpc Touch(TouchRequest) returns (TouchResponse);
@@ -127,6 +129,30 @@ enum FileType {
     SYMLINK = 2;
 }
 
+// The same permissions as BIT VALUES, for permission_mask.
+//
+// `Permission` above is an ordinal (READ = 0), which is what a single-permission
+// field needs and is useless for OR-ing: READ|WRITE would be 1. The core stores
+// a bitmask, so a mask field has to speak in bits, and two fields in one message
+// numbering the same concept differently is a trap — a caller who assumes
+// permission_mask takes Permission values gets silent nonsense rather than an
+// error. These are those bits, named, so nobody has to hardcode 0x400.
+enum PermissionBit {
+    PB_NONE                  = 0;
+    PB_RESTORE_TO_VERSION    = 0x008;
+    PB_RETRIEVE_BACK_VERSION = 0x010;
+    PB_VIEW_VERSIONS         = 0x020;
+    PB_UNDELETE              = 0x040;
+    PB_LIST_DELETED          = 0x080;
+    PB_DELETE                = 0x100;
+    PB_WRITE                 = 0x200;
+    PB_READ                  = 0x400;
+    PB_MANAGE_ACL            = 0x800;
+    PB_ACL_INHERIT           = 0x1000;
+    PB_CULL_VERSIONS         = 0x2000;
+    PB_ERASE                 = 0x4000;
+}
+
 enum Permission {
     READ = 0;              // Read permission
     WRITE = 1;             // Write permission
@@ -185,6 +211,61 @@ message ListDirectoryResponse {
     bool success = 1;
     string error = 2;
     repeated DirectoryEntry entries = 3;
+}
+
+// Most-recently-versioned files the caller may read, newest first.
+//
+// This exists because the alternative is a caller assembling the answer from
+// outside: the dashboard read a projection of file events, over-fetched four
+// times its page size, then made TWO permission calls per row — up to 800 round
+// trips for one page, each building and closing a core client. The question
+// "what are the newest files I can see" is a query, and the core is where the
+// files, their versions and their ACLs already are.
+//
+// One security event per call, naming how many rows were examined and returned —
+// not one per row. An event stream that fires per file touched answers this
+// question by accident and at enormous cost; this answers it on purpose.
+message ListRecentFilesRequest {
+    int32 limit = 1;                    // rows to RETURN (server clamps; default 50)
+    AuthenticationContext auth = 2;
+    // Optional: restrict to a subtree. Empty = the whole tenant.
+    string under_uid = 3;
+    // Optional: only versions newer than this (UNIX epoch seconds). 0 = no bound.
+    int64 since_epoch = 4;
+}
+
+// Deliberately not DirectoryEntry. A listing entry answers "what is in this
+// folder"; this answers "what changed", so it carries the version that changed
+// and how many there have been — which is what lets a caller say "created" or
+// "updated" without a second lookup, and what the event projection it replaces
+// used to carry.
+message RecentFileEntry {
+    string uid = 1;
+    string name = 2;
+    // No path. `files` stores parent_uid, not a path, so producing one means an
+    // ancestor walk PER ROW — the precise cost this RPC exists to remove. A
+    // caller that needs paths can resolve the handful it actually displays.
+    reserved 3;
+    string version = 4;           // the version_timestamp that made it recent
+    int32 version_count = 5;      // 1 = this file is new; >1 = it was updated
+    int64 size = 6;
+    int64 modified_at = 7;        // UNIX epoch seconds, derived from `version`
+    string modified_by = 8;       // who wrote that version
+    string owner = 9;
+}
+
+message ListRecentFilesResponse {
+    bool success = 1;
+    string error = 2;
+    repeated RecentFileEntry entries = 3;
+    // Rows the query examined before ACL filtering. The gap between this and
+    // entries.size() is how much of the tenant's recent activity the caller
+    // cannot see — useful for tuning, and the reason the scan is bounded.
+    int32 examined = 4;
+    // True when the scan bound was reached before `limit` rows were collected,
+    // so a caller knows the page is short because of the bound rather than
+    // because the tenant has nothing older.
+    bool scan_truncated = 5;
 }
 
 message ListDirectoryWithDeletedRequest {
@@ -461,9 +542,34 @@ enum AclEffect {
 message GrantPermissionRequest {
     string resource_uid = 1;            // Resource UUID to grant permission on
     string principal = 2;               // user id | "role:<name>" | "claim:<k=v>" | "everyone"
-    Permission permission = 3;          // Permission to grant
+    Permission permission = 3;          // Permission to grant (single bit; see permission_mask)
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // ALLOW (default) or DENY
+
+    // OR of PermissionBit values, applied in one call. Supersedes `permission`
+    // when non-zero. NOTE these are bits, not the `Permission` ordinals above —
+    // see PermissionBit for why the two differ.
+    //
+    // The core's own grant_permission has always taken a bitmask — the creator
+    // grant sets eleven bits at once — but that shape was not reachable here, so
+    // every caller looped. Tenant provisioning issued eleven RPCs for a single
+    // folder; a recursive apply multiplied that by the size of the tree.
+    int32 permission_mask = 6;
+
+    // Apply to resource_uid AND every descendant, as one database operation.
+    //
+    // Without this a caller must enumerate the tree and grant per node, which
+    // for a large tree does not complete: it exceeds the request timeout having
+    // applied part of the tree, with no record of where it stopped.
+    //
+    // MANAGE_ACL is required on the ROOT and is not re-checked per descendant —
+    // checking per node would reintroduce inside the core the fan-out this
+    // field exists to remove, and a caller who may manage a folder's ACL can
+    // already reach everything inside it.
+    //
+    // ONE accountability record is written, naming the root and the number of
+    // nodes reached, rather than one per node.
+    bool recursive = 7;
 }
 
 // List all ACL entries on a resource (for an ACL editor). Requires MANAGE_ACL on
@@ -489,19 +595,27 @@ message GetResourceAclsResponse {
 message GrantPermissionResponse {
     bool success = 1;
     string error = 2;
+    int32 nodes_affected = 3;           // rows written; 1 for a non-recursive grant
 }
 
 message RevokePermissionRequest {
     string resource_uid = 1;            // Resource UUID to revoke permission from
     string principal = 2;               // user id | "role:<name>" | "claim:<k=v>" | "everyone"
-    Permission permission = 3;          // Permission to revoke
+    Permission permission = 3;          // Permission to revoke (single bit; see permission_mask)
     AuthenticationContext auth = 4;     // Authentication information
     AclEffect effect = 5;               // Which row to revoke from: ALLOW (default) or DENY
+
+    int32 permission_mask = 6;          // OR of PermissionBit values; supersedes `permission`
+    // Apply to resource_uid and every descendant. A row left with an empty mask
+    // is deleted, not kept at zero: this system is read-by-default, so an ALLOW
+    // row with no bits and no row at all must be indistinguishable.
+    bool recursive = 7;
 }
 
 message RevokePermissionResponse {
     bool success = 1;
     string error = 2;
+    int32 nodes_affected = 3;           // rows updated or deleted; 1 for a non-recursive revoke
 }
 
 message CheckPermissionRequest {

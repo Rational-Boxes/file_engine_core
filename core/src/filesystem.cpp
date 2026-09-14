@@ -249,6 +249,17 @@ Result<std::vector<DirectoryEntry>> FileSystem::listdir(const std::string& dir_u
     return Result<std::vector<DirectoryEntry>>::ok(entries);
 }
 
+Result<std::vector<FileInfo>> FileSystem::list_recent(const std::string& tenant,
+                                                      const std::string& under_uid,
+                                                      std::int64_t since_epoch,
+                                                      int scan_limit) {
+    TenantContext* context = get_tenant_context(tenant);
+    if (!context || !context->db) {
+        return Result<std::vector<FileInfo>>::err("No database for tenant " + tenant);
+    }
+    return context->db->list_recent_files(tenant, under_uid, since_epoch, scan_limit);
+}
+
 Result<std::vector<DirectoryEntry>> FileSystem::listdir_with_deleted(const std::string& dir_uid,
                                                                      const std::string& user,
                                                                      const std::vector<std::string>& roles,

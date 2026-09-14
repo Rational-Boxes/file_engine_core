@@ -233,6 +233,27 @@ public:
             resource_acls.end());
         return Result<void>::ok();
     }
+
+    // Subtree forms. The mock stores a flat ACL list with no tree, so these
+    // apply to the named resource only and report one row — enough for the
+    // unit tests that exercise the manager's plumbing; the set behaviour itself
+    // is covered against a real database in test_acl_subtree_live.
+    Result<int> add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                int type, int permissions,
+                                const std::string& tenant,
+                                const AccountabilityContext& ctx,
+                                int effect = 0) override {
+        auto r = add_acl(root_uid, principal, type, permissions, tenant, ctx, effect);
+        return r.success ? Result<int>::ok(1) : Result<int>::err(r.error);
+    }
+    Result<int> remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                   int type, int permissions,
+                                   const std::string& tenant,
+                                   const AccountabilityContext& ctx,
+                                   int effect = 0) override {
+        auto r = remove_acl(root_uid, principal, type, permissions, tenant, ctx, effect);
+        return r.success ? Result<int>::ok(1) : Result<int>::err(r.error);
+    }
     
     Result<std::vector<AclEntry>> get_acls_for_resource(const std::string& resource_uid,
                                                         const std::string& tenant = "") override {

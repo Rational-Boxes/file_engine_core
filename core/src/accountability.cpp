@@ -118,6 +118,15 @@ const std::vector<ActionSchema>& action_schemas() {
          {"principal_type", "effect", "mask", "mask_before", "mask_after"}},
         {accountability_action::kAclRevoke, AccountabilityCategory::Authorization,
          {"principal_type", "effect", "mask", "mask_before", "mask_after", "row_removed"}},
+        // Subtree forms. Deliberately a different field set from the per-node
+        // actions: there is no single mask_before/mask_after for a tree, and
+        // pretending otherwise would record a number that is true of no
+        // particular node. What a reader needs instead is how far the change
+        // reached, which is nodes_affected.
+        {accountability_action::kAclGrantSubtree, AccountabilityCategory::Authorization,
+         {"principal_type", "effect", "mask", "recursive", "nodes_affected"}},
+        {accountability_action::kAclRevokeSubtree, AccountabilityCategory::Authorization,
+         {"principal_type", "effect", "mask", "recursive", "nodes_affected"}},
         {accountability_action::kRoleCreate, AccountabilityCategory::Identity,
          {"role"}},
         {accountability_action::kRoleDelete, AccountabilityCategory::Identity,

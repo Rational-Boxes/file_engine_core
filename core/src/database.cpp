@@ -32,6 +32,17 @@
 
 namespace fileengine {
 
+// Folder-mtime memo maintenance. Declared here because the write paths that
+// invalidate it (delete, undelete, move, version removal) sit above the
+// definitions, and the memo is the reason a folder's mtime is no longer an
+// O(subtree) walk on every read.
+static void bump_ancestor_subtree_mtime(PGconn* conn, const std::string& schema,
+                                        const std::string& file_uid,
+                                        const std::string& vts,
+                                        const std::string& revised_by);
+static void invalidate_ancestor_subtree_mtime(PGconn* conn, const std::string& schema,
+                                              const std::string& file_uid);
+
 // Include the Database class implementation methods in full
 Database::Database(const std::string& host, int port, const std::string& dbname,
                    const std::string& user, const std::string& password, int pool_size)
@@ -491,6 +502,9 @@ Result<bool> Database::delete_file(const std::string& uid, const std::string& te
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         int rows_affected = std::stoi(PQcmdTuples(res));
         PQclear(res);
+        // Forget the ancestors' memoised mtime: deleting content can move a folder's newest version backwards, which GREATEST cannot express.
+        // The next read recomputes once.
+        invalidate_ancestor_subtree_mtime(pg_conn, schema_name, uid);
         connection_pool_->release(conn);
         return Result<bool>::ok(rows_affected > 0);
     } else {
@@ -520,6 +534,9 @@ Result<bool> Database::undelete_file(const std::string& uid, const std::string& 
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         int rows_affected = std::stoi(PQcmdTuples(res));
         PQclear(res);
+        // Forget the ancestors' memoised mtime: an undelete can move it forwards past what the memo holds.
+        // The next read recomputes once.
+        invalidate_ancestor_subtree_mtime(pg_conn, schema_name, uid);
         connection_pool_->release(conn);
         return Result<bool>::ok(rows_affected > 0);
     } else {
@@ -789,6 +806,103 @@ static std::pair<std::string, std::string> subtree_newest_version(
     return out;
 }
 
+// The memoised form: read the answer, and only walk when it is not known.
+//
+// The walk above is O(subtree) and was being paid on EVERY read of a folder,
+// including once per child folder when listing a directory. Measured during a
+// bulk import: 3.77 of 4 vCPU, in one query, growing with the corpus.
+//
+// NULL means "not known". That is what an existing tenant has before its first
+// write, so this degrades exactly to the old behaviour rather than to a wrong
+// answer — there is no backfill and nothing to get wrong at deploy time.
+//
+// The store-back is best-effort: a failure to memoise costs the next reader
+// another walk, which is what it would have paid anyway.
+static std::pair<std::string, std::string> subtree_newest_version_memo(
+        PGconn* conn, const std::string& schema, const std::string& dir_uid) {
+    const std::string read_sql =
+        "SELECT subtree_newest_vts, subtree_newest_by FROM \"" + schema + "\".files "
+        " WHERE uid = $1 AND subtree_newest_vts IS NOT NULL;";
+    const char* rparams[1] = { dir_uid.c_str() };
+    PGresult* rres = PQexecParams(conn, read_sql.c_str(), 1, nullptr, rparams, nullptr, nullptr, 0);
+    if (PQresultStatus(rres) == PGRES_TUPLES_OK && PQntuples(rres) > 0) {
+        std::pair<std::string, std::string> hit;
+        if (!PQgetisnull(rres, 0, 0)) hit.first  = PQgetvalue(rres, 0, 0);
+        if (!PQgetisnull(rres, 0, 1)) hit.second = PQgetvalue(rres, 0, 1);
+        PQclear(rres);
+        return hit;
+    }
+    PQclear(rres);
+
+    auto computed = subtree_newest_version(conn, schema, dir_uid);
+
+    // An empty result is still an answer — a folder with no versioned content
+    // beneath it. Storing "" rather than leaving NULL is what stops an empty
+    // folder being re-walked on every single read, which is the cheapest walk
+    // but also the most frequent.
+    const std::string write_sql =
+        "UPDATE \"" + schema + "\".files SET subtree_newest_vts = $2, subtree_newest_by = $3 "
+        " WHERE uid = $1;";
+    const char* wparams[3] = { dir_uid.c_str(), computed.first.c_str(), computed.second.c_str() };
+    PGresult* wres = PQexecParams(conn, write_sql.c_str(), 3, nullptr, wparams, nullptr, nullptr, 0);
+    if (wres) PQclear(wres);
+    return computed;
+}
+
+// Push a new version's timestamp up the ancestor chain, keeping the maximum.
+//
+// O(depth) on write against O(subtree) on read, and reads outnumber writes by a
+// wide margin on this workload — a WebDAV client issues PROPFINDs around almost
+// every PUT. GREATEST means an out-of-order arrival cannot move a folder's mtime
+// backwards, and the NULLIF guard leaves a folder whose value is not yet known
+// alone: it stays NULL and is computed on first read rather than being seeded
+// with a value that ignores everything already beneath it.
+static void bump_ancestor_subtree_mtime(PGconn* conn, const std::string& schema,
+                                        const std::string& file_uid,
+                                        const std::string& vts,
+                                        const std::string& revised_by) {
+    if (vts.empty()) return;
+    const std::string sql =
+        "WITH RECURSIVE anc(uid, parent_uid) AS ("
+        "  SELECT f.uid, f.parent_uid FROM \"" + schema + "\".files f WHERE f.uid = $1"
+        "  UNION"
+        "  SELECT p.uid, p.parent_uid FROM \"" + schema + "\".files p"
+        "    JOIN anc ON p.uid = anc.parent_uid"
+        ") "
+        "UPDATE \"" + schema + "\".files f "
+        "   SET subtree_newest_vts = $2, subtree_newest_by = $3 "
+        "  FROM anc "
+        " WHERE f.uid = anc.uid AND f.is_container = TRUE "
+        "   AND f.subtree_newest_vts IS NOT NULL "
+        "   AND f.subtree_newest_vts < $2;";
+    const char* params[3] = { file_uid.c_str(), vts.c_str(), revised_by.c_str() };
+    PGresult* res = PQexecParams(conn, sql.c_str(), 3, nullptr, params, nullptr, nullptr, 0);
+    if (res) PQclear(res);
+}
+
+// Forget the memo for a node's ancestors.
+//
+// Used where the newest version can move BACKWARDS — a delete, an undelete, a
+// move, a cull — which GREATEST cannot express. The next read recomputes once;
+// the alternative is a folder reporting the mtime of content that is no longer
+// there, which is worse than slow.
+static void invalidate_ancestor_subtree_mtime(PGconn* conn, const std::string& schema,
+                                              const std::string& file_uid) {
+    const std::string sql =
+        "WITH RECURSIVE anc(uid, parent_uid) AS ("
+        "  SELECT f.uid, f.parent_uid FROM \"" + schema + "\".files f WHERE f.uid = $1"
+        "  UNION"
+        "  SELECT p.uid, p.parent_uid FROM \"" + schema + "\".files p"
+        "    JOIN anc ON p.uid = anc.parent_uid"
+        ") "
+        "UPDATE \"" + schema + "\".files f "
+        "   SET subtree_newest_vts = NULL, subtree_newest_by = NULL "
+        "  FROM anc WHERE f.uid = anc.uid AND f.is_container = TRUE;";
+    const char* params[1] = { file_uid.c_str() };
+    PGresult* res = PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    if (res) PQclear(res);
+}
+
 // A directory's mtime is the newest file anywhere in its subtree (recursively),
 // per the "folder mtime = newest contained file" rule. No-op for non-directories
 // or a file-less subtree (an empty folder keeps its own updated_at from
@@ -796,7 +910,7 @@ static std::pair<std::string, std::string> subtree_newest_version(
 // file that set its mtime report the identical second on every surface.
 static void apply_folder_recursive_mtime(FileInfo& info, PGconn* conn, const std::string& schema) {
     if (info.type != FileType::DIRECTORY) return;
-    auto nv = subtree_newest_version(conn, schema, info.uid);   // (version_timestamp, revised_by)
+    auto nv = subtree_newest_version_memo(conn, schema, info.uid);  // (version_timestamp, revised_by)
     int64_t e;
     if (parse_vts_epoch(nv.first.c_str(), e)) {
         // A folder's mtime AND its "modified by" both come from the newest file in
@@ -1532,6 +1646,21 @@ Result<void> Database::update_file_parent(const std::string& uid, const std::str
     std::string update_sql = "UPDATE \"" + schema_name + "\".files SET parent_uid = $2 WHERE uid = $1;";
     const char* param_values[2] = {uid.c_str(), new_parent_uid.c_str()};
 
+    // The OLD parent, read before the move: afterwards it is no longer reachable
+    // from this node, and it is the chain whose newest version may have just
+    // walked out of the subtree. Forgetting only the new chain would leave the
+    // source folder reporting the mtime of content it no longer contains.
+    std::string old_parent_uid;
+    {
+        const std::string sel = "SELECT parent_uid FROM \"" + schema_name + "\".files WHERE uid = $1;";
+        const char* sp[1] = { uid.c_str() };
+        PGresult* sr = PQexecParams(pg_conn, sel.c_str(), 1, nullptr, sp, nullptr, nullptr, 0);
+        if (PQresultStatus(sr) == PGRES_TUPLES_OK && PQntuples(sr) > 0 && !PQgetisnull(sr, 0, 0)) {
+            old_parent_uid = PQgetvalue(sr, 0, 0);
+        }
+        PQclear(sr);
+    }
+
     PGresult* res = PQexecParams(pg_conn, update_sql.c_str(), 2, nullptr, param_values, nullptr, nullptr, 0);
 
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
@@ -1542,6 +1671,13 @@ Result<void> Database::update_file_parent(const std::string& uid, const std::str
             return Result<void>::err("File with UID not found: " + uid);
         }
         PQclear(res);
+        // Both chains: the destination gains whatever moved in, the source loses
+        // it, and a move is the one operation that can change two folders'
+        // mtimes in opposite directions at once.
+        invalidate_ancestor_subtree_mtime(pg_conn, schema_name, uid);
+        if (!old_parent_uid.empty()) {
+            invalidate_ancestor_subtree_mtime(pg_conn, schema_name, old_parent_uid);
+        }
         connection_pool_->release(conn);
         return Result<void>::ok();
     } else {
@@ -1641,6 +1777,12 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
         if (PQntuples(res) > 0) {
             int64_t id = std::stoll(PQgetvalue(res, 0, 0));
             PQclear(res);
+            // A folder's mtime is the newest version beneath it, so a new
+            // version moves every ancestor's. O(depth) here buys O(1) on the
+            // read path, and reads dominate: a WebDAV client issues PROPFINDs
+            // around almost every PUT.
+            bump_ancestor_subtree_mtime(pg_conn, get_schema_prefix(tenant), file_uid,
+                                        version_timestamp, revised_by);
             connection_pool_->release(conn);
             return Result<int64_t>::ok(id);
         } else {
@@ -1767,6 +1909,10 @@ Result<bool> Database::delete_version(const std::string& file_uid, const std::st
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         int rows_affected = std::stoi(PQcmdTuples(res));
         PQclear(res);
+        // Removing a version can move a folder's newest backwards — a cull that
+        // takes the most recent one is exactly that case — so forget rather than
+        // try to express it as a maximum.
+        invalidate_ancestor_subtree_mtime(pg_conn, schema_name, file_uid);
         connection_pool_->release(conn);
         return Result<bool>::ok(rows_affected > 0);
     } else {
@@ -4002,6 +4148,20 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
         "ADD COLUMN IF NOT EXISTS erased_at TIMESTAMPTZ, "
         "ADD COLUMN IF NOT EXISTS erased_by VARCHAR(255);";
 
+    // A folder's mtime is the newest version anywhere beneath it. Computing that
+    // per read means descending the whole subtree per read — measured at 94% of
+    // a four-core host during a bulk import, and it grows with the corpus, so no
+    // amount of hardware fixes it.
+    //
+    // These two columns hold the answer. NULL means "not known, compute it" —
+    // which is exactly today's behaviour, so an existing tenant needs no
+    // backfill and degrades to the old path until its folders are next written
+    // to or read.
+    std::string migrate_files_subtree_mtime =
+        "ALTER TABLE \"" + escaped_schema + "\".files "
+        "ADD COLUMN IF NOT EXISTS subtree_newest_vts VARCHAR(32), "
+        "ADD COLUMN IF NOT EXISTS subtree_newest_by VARCHAR(255);";
+
     std::string create_idx_uid = "CREATE INDEX IF NOT EXISTS idx_files_uid_" + escaped_schema +
         " ON \"" + escaped_schema + "\".files(uid);";
     std::string create_idx_parent_uid = "CREATE INDEX IF NOT EXISTS idx_files_parent_uid_" + escaped_schema +
@@ -4061,6 +4221,9 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     // ignored for the same reason — ADD COLUMN IF NOT EXISTS is a no-op on a
     // tenant that already has them.
     res = PQexec(pg_conn, migrate_files_erasure.c_str());
+    PQclear(res);
+
+    res = PQexec(pg_conn, migrate_files_subtree_mtime.c_str());
     PQclear(res);
 
     res = PQexec(pg_conn, create_idx_uid.c_str());
@@ -5341,6 +5504,440 @@ Result<void> Database::add_acl(const std::string& resource_uid, const std::strin
     connection_pool_->release(conn);
     fire_accountability_hint(tenant, hint_seq);
     return Result<void>::ok();
+}
+
+Result<void> Database::forget_subtree_mtime(const std::string& uid, const std::string& tenant) {
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    invalidate_ancestor_subtree_mtime(conn->get_connection(), get_schema_prefix(tenant), uid);
+    connection_pool_->release(conn);
+    return Result<void>::ok();
+}
+
+// ── Recent activity ─────────────────────────────────────────────────────────
+//
+// One query for "what changed most recently". The dashboard used to assemble
+// this from a projection of file events plus two permission RPCs per row — up
+// to 800 round trips for one page. The files, their versions and their ACLs all
+// live here; the question is a query.
+Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& tenant,
+                                                          const std::string& under_uid,
+                                                          std::int64_t since_epoch,
+                                                          int scan_limit) {
+    if (scan_limit <= 0) scan_limit = 200;
+
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::vector<FileInfo>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    // DISTINCT ON gives one row per file — its newest version — and the outer
+    // ordering then ranks files against each other. Doing it the other way
+    // round (order, then dedupe in the caller) would let one busy file fill the
+    // scan window with its own versions and crowd everything else out.
+    //
+    // Containers are excluded: a folder has no version of its own, and its
+    // recursive mtime is a separate and far more expensive question.
+    std::string sql =
+        "SELECT uid, name, owner, version_timestamp, revised_by, size_bytes, parent_uid, vcount FROM ("
+        "  SELECT DISTINCT ON (v.file_uid) f.uid AS uid, f.name AS name, f.owner AS owner,"
+        "         v.version_timestamp AS version_timestamp, v.revised_by AS revised_by,"
+        "         COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid,"
+        // How many versions this file has, so a caller can say "created" or
+        // "updated" without a second round trip. Indexed on file_uid, and
+        // evaluated only for rows the scan already touched.
+        "         (SELECT count(*) FROM " + schema + ".versions v2 WHERE v2.file_uid = f.uid) AS vcount"
+        "    FROM " + schema + ".versions v"
+        "    JOIN " + schema + ".files f ON f.uid = v.file_uid"
+        "   WHERE f.deleted = FALSE AND f.is_container = FALSE";
+
+    int param_index = 1;
+    std::vector<std::string> params;
+    if (since_epoch > 0) {
+        // version_timestamp is a fixed-width, zero-padded, UTC string
+        // (20260830_204237.123), so a lexical comparison is a chronological one
+        // — the same property the backup sync gate relies on. No parsing, and no
+        // dependence on a format string matching the writer's.
+        sql += " AND v.version_timestamp >= $" + std::to_string(param_index++);
+        std::time_t t = static_cast<std::time_t>(since_epoch);
+        std::tm tm_utc{};
+        gmtime_r(&t, &tm_utc);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_utc);
+        params.emplace_back(buf);
+    }
+    if (!under_uid.empty()) {
+        sql += " AND f.uid IN (WITH RECURSIVE sub(uid) AS ("
+               "   SELECT $" + std::to_string(param_index) + "::text"
+               "   UNION SELECT c.uid FROM " + schema + ".files c JOIN sub ON c.parent_uid = sub.uid"
+               "    WHERE c.deleted = FALSE) SELECT uid FROM sub)";
+        params.emplace_back(under_uid);
+        ++param_index;
+    }
+    sql += "   ORDER BY v.file_uid, v.version_timestamp DESC"
+           ") newest"
+           " ORDER BY version_timestamp DESC LIMIT " + std::to_string(scan_limit) + ";";
+
+    std::vector<const char*> param_ptrs;
+    param_ptrs.reserve(params.size());
+    for (const auto& p : params) param_ptrs.push_back(p.c_str());
+
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), static_cast<int>(param_ptrs.size()),
+                                 nullptr, param_ptrs.empty() ? nullptr : param_ptrs.data(),
+                                 nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = "list_recent_files failed: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::vector<FileInfo>>::err(error);
+    }
+
+    std::vector<FileInfo> out;
+    const int rows = PQntuples(res);
+    out.reserve(static_cast<size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        FileInfo info;
+        info.uid         = PQgetvalue(res, i, 0);
+        info.name        = PQgetvalue(res, i, 1);
+        info.owner       = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+        info.version     = PQgetisnull(res, i, 3) ? "" : PQgetvalue(res, i, 3);
+        info.modified_by = PQgetisnull(res, i, 4) ? info.owner : PQgetvalue(res, i, 4);
+        info.size        = PQgetisnull(res, i, 5) ? 0 : std::atoll(PQgetvalue(res, i, 5));
+        info.parent_uid  = PQgetisnull(res, i, 6) ? "" : PQgetvalue(res, i, 6);
+        info.version_count = PQgetisnull(res, i, 7) ? 0 : static_cast<int32_t>(std::atoi(PQgetvalue(res, i, 7)));
+        info.type        = FileType::REGULAR_FILE;
+        info.created_by  = info.owner;
+        // Both timestamps derive from the version name, as everywhere else —
+        // see the ctime/mtime derivation rule. now() here would make a listing
+        // report a modification that never happened.
+        std::int64_t epoch = 0;
+        if (parse_vts_epoch(info.version.c_str(), epoch)) {
+            info.modified_at = std::chrono::system_clock::from_time_t(static_cast<std::time_t>(epoch));
+            info.created_at  = info.modified_at;
+        }
+        out.push_back(std::move(info));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::vector<FileInfo>>::ok(std::move(out));
+}
+
+// ── Subtree ACL application ─────────────────────────────────────────────────
+//
+// One statement, one transaction, one accountability record.
+//
+// The alternative was a caller walking the tree: http_bridge enumerated it with
+// recursive listDirectory calls and then issued a grant per node — and because
+// GrantPermissionRequest carried a single Permission enum rather than a mask, a
+// per PERMISSION BIT as well. Full control on a 50,000-node tree is on the order
+// of half a million round trips inside one HTTP request, which timed out having
+// applied part of the tree and left no record of where it stopped.
+//
+// A database can express "a row for every descendant" directly. Nothing outside
+// it can, and every client-side batching or resumption scheme is an attempt to
+// approximate this from the wrong side of the wire.
+namespace {
+
+// The subtree rooted at $1, INCLUDING the root itself.
+//
+// UNION rather than UNION ALL, for the reason the folder-mtime walk documents:
+// it dedups, so the recursion terminates even if a corrupt parent_uid points
+// back into the subtree. UNION ALL would spin forever while holding an ACCESS
+// SHARE lock on files.
+//
+// Deleted nodes are excluded: applying an ACL to something in the trash grants
+// access to a resource the caller cannot see and would resurrect a stale row if
+// it were ever undeleted.
+std::string subtree_cte(const std::string& schema) {
+    return
+        "WITH RECURSIVE subtree(uid) AS ("
+        "  SELECT $1::text"
+        "  UNION"
+        "  SELECT f.uid FROM " + schema + ".files f"
+        "    JOIN subtree s ON f.parent_uid = s.uid"
+        "   WHERE f.deleted = FALSE"
+        ") ";
+}
+
+int rows_affected(PGresult* res) {
+    const char* t = PQcmdTuples(res);
+    return (t && *t) ? std::atoi(t) : 0;
+}
+
+}  // namespace
+
+Result<int> Database::add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                      int type, int permissions,
+                                      const std::string& tenant,
+                                      const AccountabilityContext& ctx,
+                                      int effect) {
+    // §5.1, same as add_acl: refuse before touching anything.
+    if (!ctx.valid()) {
+        return Result<int>::err("Refusing recursive ACL grant with no actor");
+    }
+    const std::string& performed_by = ctx.actor;
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<int>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN add_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<int>::err(msg);
+    };
+
+    const std::string type_str   = std::to_string(type);
+    const std::string perms_str  = std::to_string(permissions);
+    const std::string effect_str = std::to_string(effect);
+
+    // INSERT … SELECT over the subtree, with add_acl's conflict behaviour so a
+    // node that already has a rule for this principal gets the bits OR-ed in
+    // rather than replaced. Idempotent: re-running after a failure converges.
+    const std::string insert_sql =
+        subtree_cte(schema) +
+        "INSERT INTO " + schema + ".acls (resource_uid, principal, principal_type, permissions, granted_by, effect) "
+        "SELECT s.uid, $2, $3::int, $4::int, NULLIF($5, ''), $6::int FROM subtree s "
+        "ON CONFLICT ON CONSTRAINT acls_principal_effect "
+        "DO UPDATE SET permissions = " + schema + ".acls.permissions | ($4::int), "
+        "              granted_by = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP;";
+
+    const char* params[6] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        perms_str.c_str(), performed_by.c_str(), effect_str.c_str()
+    };
+    PGresult* res = PQexecParams(pg_conn, insert_sql.c_str(), 6, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to apply recursive ACL: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(res);
+        return rollback_and_fail(error);
+    }
+    const int affected = rows_affected(res);
+    PQclear(res);
+
+    // ONE acl_audit row for the operation, against the ROOT. Per-node rows would
+    // be the same fan-out this function exists to remove, and they would say
+    // nothing the ACL table does not already hold.
+    const std::string action_label = (effect == 1) ? "grant_deny_subtree" : "grant_subtree";
+    const std::string audit_sql =
+        "INSERT INTO " + schema + ".acl_audit "
+        "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
+        "VALUES ($1, $2, $3, $4, 0, $5, NULLIF($6, ''));";
+    const char* audit_params[6] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        action_label.c_str(), perms_str.c_str(), performed_by.c_str()
+    };
+    // SAVEPOINT, because "best-effort" is not a thing you can do by ignoring a
+    // result. In Postgres a failed statement aborts the entire transaction, so
+    // an unchecked convenience INSERT takes the ACL change down with it — which
+    // is precisely what a too-long action label did, reported as "current
+    // transaction is aborted" from an unrelated statement three lines later.
+    PGresult* sp = PQexec(pg_conn, "SAVEPOINT acl_audit_row;");
+    if (sp) PQclear(sp);
+    PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
+    if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) {
+        PQclear(audit_res);
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK TO SAVEPOINT acl_audit_row;");
+        if (rb) PQclear(rb);
+    } else {
+        PQclear(audit_res);
+        PGresult* rel = PQexec(pg_conn, "RELEASE SAVEPOINT acl_audit_row;");
+        if (rel) PQclear(rel);
+    }
+
+    std::int64_t hint_seq = 0;
+    if (ctx.mode == AccountabilityMode::Record) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Authorization;
+        rec.action      = accountability_action::kAclGrantSubtree;
+        rec.target_uid  = root_uid;
+        rec.target_type = "acl";
+        rec.principal   = principal;
+        rec.detail.set("principal_type", type);
+        rec.detail.set("effect", std::string(effect == 1 ? "deny" : "allow"));
+        rec.detail.set("mask", permissions);
+        rec.detail.set("recursive", std::string("true"));
+        // The count is the point: it is what tells a reader how far the change
+        // reached, which per-node records would otherwise have to be counted to
+        // discover.
+        rec.detail.set("nodes_affected", affected);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Recursive permission change refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT add_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+    return Result<int>::ok(affected);
+}
+
+Result<int> Database::remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                         int type, int permissions,
+                                         const std::string& tenant,
+                                         const AccountabilityContext& ctx,
+                                         int effect) {
+    if (!ctx.valid()) {
+        return Result<int>::err("Refusing recursive ACL revoke with no actor");
+    }
+    const std::string& performed_by = ctx.actor;
+
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<int>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    const std::string schema = get_schema_prefix(tenant);
+
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to BEGIN remove_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<int>::err(error);
+    }
+    PQclear(begin_res);
+
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<int>::err(msg);
+    };
+
+    const std::string type_str   = std::to_string(type);
+    const std::string perms_str  = std::to_string(permissions);
+    const std::string effect_str = std::to_string(effect);
+
+    // Clear the bits across the subtree…
+    const std::string update_sql =
+        subtree_cte(schema) +
+        "UPDATE " + schema + ".acls a "
+        "   SET permissions = a.permissions & ~($4::int), updated_at = CURRENT_TIMESTAMP "
+        "  FROM subtree s "
+        " WHERE a.resource_uid = s.uid AND a.principal = $2 "
+        "   AND a.principal_type = $3::int AND a.effect = $5::int;";
+    const char* up_params[5] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        perms_str.c_str(), effect_str.c_str()
+    };
+    PGresult* up = PQexecParams(pg_conn, update_sql.c_str(), 5, nullptr, up_params, nullptr, nullptr, 0);
+    if (PQresultStatus(up) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to apply recursive ACL revoke: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(up);
+        return rollback_and_fail(error);
+    }
+    const int affected = rows_affected(up);
+    PQclear(up);
+
+    // …then delete anything left with an empty mask. remove_acl does the same
+    // for one node, and the reason matters more here: this system is
+    // read-by-default, so an ALLOW row with no bits and no row at all must be
+    // indistinguishable. Leaving empty rows behind would turn a revoke into
+    // evidence that reads like a grant.
+    const std::string delete_sql =
+        subtree_cte(schema) +
+        "DELETE FROM " + schema + ".acls a "
+        " USING subtree s "
+        " WHERE a.resource_uid = s.uid AND a.principal = $2 "
+        "   AND a.principal_type = $3::int AND a.effect = $4::int AND a.permissions = 0;";
+    const char* del_params[4] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(), effect_str.c_str()
+    };
+    PGresult* del = PQexecParams(pg_conn, delete_sql.c_str(), 4, nullptr, del_params, nullptr, nullptr, 0);
+    if (PQresultStatus(del) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to prune emptied ACL rows: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(del);
+        return rollback_and_fail(error);
+    }
+    PQclear(del);
+
+    const std::string action_label = (effect == 1) ? "revoke_deny_subtree" : "revoke_subtree";
+    const std::string audit_sql =
+        "INSERT INTO " + schema + ".acl_audit "
+        "(resource_uid, principal, principal_type, action, permissions_before, permissions_after, performed_by) "
+        "VALUES ($1, $2, $3, $4, $5, 0, NULLIF($6, ''));";
+    const char* audit_params[6] = {
+        root_uid.c_str(), principal.c_str(), type_str.c_str(),
+        action_label.c_str(), perms_str.c_str(), performed_by.c_str()
+    };
+    // SAVEPOINT, because "best-effort" is not a thing you can do by ignoring a
+    // result. In Postgres a failed statement aborts the entire transaction, so
+    // an unchecked convenience INSERT takes the ACL change down with it — which
+    // is precisely what a too-long action label did, reported as "current
+    // transaction is aborted" from an unrelated statement three lines later.
+    PGresult* sp = PQexec(pg_conn, "SAVEPOINT acl_audit_row;");
+    if (sp) PQclear(sp);
+    PGresult* audit_res = PQexecParams(pg_conn, audit_sql.c_str(), 6, nullptr, audit_params, nullptr, nullptr, 0);
+    if (PQresultStatus(audit_res) != PGRES_COMMAND_OK) {
+        PQclear(audit_res);
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK TO SAVEPOINT acl_audit_row;");
+        if (rb) PQclear(rb);
+    } else {
+        PQclear(audit_res);
+        PGresult* rel = PQexec(pg_conn, "RELEASE SAVEPOINT acl_audit_row;");
+        if (rel) PQclear(rel);
+    }
+
+    std::int64_t hint_seq = 0;
+    if (ctx.mode == AccountabilityMode::Record) {
+        AccountabilityRecord rec;
+        rec.ctx         = ctx;
+        rec.category    = AccountabilityCategory::Authorization;
+        rec.action      = accountability_action::kAclRevokeSubtree;
+        rec.target_uid  = root_uid;
+        rec.target_type = "acl";
+        rec.principal   = principal;
+        rec.detail.set("principal_type", type);
+        rec.detail.set("effect", std::string(effect == 1 ? "deny" : "allow"));
+        rec.detail.set("mask", permissions);
+        rec.detail.set("recursive", std::string("true"));
+        rec.detail.set("nodes_affected", affected);
+        auto recorded = append_accountability(pg_conn, tenant, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Recursive permission change refused: " + recorded.error);
+        }
+        hint_seq = recorded.value.seq;
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        std::string error = "Failed to COMMIT remove_acl_subtree: " + std::string(PQerrorMessage(pg_conn));
+        PQclear(commit_res);
+        return rollback_and_fail(error);
+    }
+    PQclear(commit_res);
+
+    connection_pool_->release(conn);
+    fire_accountability_hint(tenant, hint_seq);
+    return Result<int>::ok(affected);
 }
 
 Result<void> Database::remove_acl(const std::string& resource_uid, const std::string& principal,

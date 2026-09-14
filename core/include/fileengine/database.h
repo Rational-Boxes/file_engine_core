@@ -72,6 +72,11 @@ public:
                                                int permissions,
                                                const std::vector<AclGrant>& acl_grants,
                                                const std::string& tenant = "") override;
+    Result<std::vector<FileInfo>> list_recent_files(const std::string& tenant,
+                                                    const std::string& under_uid,
+                                                    std::int64_t since_epoch,
+                                                    int scan_limit) override;
+    Result<void> forget_subtree_mtime(const std::string& uid, const std::string& tenant = "") override;
     Result<void> update_file_modified(const std::string& uid, const std::string& tenant) override;
     Result<void> update_file_current_version(const std::string& uid, const std::string& version_timestamp, const std::string& tenant) override;
     Result<void> update_file_size(const std::string& uid, int64_t size, const std::string& tenant = "") override;
@@ -134,6 +139,18 @@ public:
                          const std::string& tenant,
                          const AccountabilityContext& ctx,
                          int effect = 0) override;
+
+    // Subtree forms — see IDatabase for why these exist.
+    Result<int> add_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                int type, int permissions,
+                                const std::string& tenant,
+                                const AccountabilityContext& ctx,
+                                int effect = 0) override;
+    Result<int> remove_acl_subtree(const std::string& root_uid, const std::string& principal,
+                                   int type, int permissions,
+                                   const std::string& tenant,
+                                   const AccountabilityContext& ctx,
+                                   int effect = 0) override;
     Result<void> remove_acl(const std::string& resource_uid, const std::string& principal,
                             int type, int permissions,
                             const std::string& tenant,
