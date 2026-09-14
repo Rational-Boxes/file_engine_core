@@ -4187,6 +4187,13 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     std::string create_idx_versions = "CREATE INDEX IF NOT EXISTS idx_versions_file_uid_" + escaped_schema +
         " ON \"" + escaped_schema + "\".versions(file_uid);";
 
+    // Newest-first across the whole tenant. list_recent_files walks versions in
+    // timestamp order and stops at its scan bound; without this index that walk
+    // is a full sort of every version in the tenant, which is what made the
+    // dashboard's one query take seconds instead of milliseconds.
+    std::string create_idx_versions_vts = "CREATE INDEX IF NOT EXISTS idx_versions_vts_" + escaped_schema +
+        " ON \"" + escaped_schema + "\".versions(version_timestamp DESC);";
+
     std::string create_metadata_table = "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".metadata ("
         "id BIGSERIAL PRIMARY KEY, "
         "file_uid VARCHAR(64) NOT NULL, "
@@ -4247,6 +4254,14 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
 
     res = PQexec(pg_conn, create_idx_versions.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
+
+    res = PQexec(pg_conn, create_idx_versions_vts.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        SERVER_LOG_ERROR("Database::create_tenant_schema",
+                         "Failed to create versions(version_timestamp) index: " +
+                         std::string(PQerrorMessage(pg_conn)));
+    }
+    PQclear(res);
 
     res = PQexec(pg_conn, create_metadata_table.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
@@ -5542,18 +5557,25 @@ Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& ten
     //
     // Containers are excluded: a folder has no version of its own, and its
     // recursive mtime is a separate and far more expensive question.
-    std::string sql =
-        "SELECT uid, name, owner, version_timestamp, revised_by, size_bytes, parent_uid, vcount FROM ("
-        "  SELECT DISTINCT ON (v.file_uid) f.uid AS uid, f.name AS name, f.owner AS owner,"
-        "         v.version_timestamp AS version_timestamp, v.revised_by AS revised_by,"
-        "         COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid,"
-        // How many versions this file has, so a caller can say "created" or
-        // "updated" without a second round trip. Indexed on file_uid, and
-        // evaluated only for rows the scan already touched.
-        "         (SELECT count(*) FROM " + schema + ".versions v2 WHERE v2.file_uid = f.uid) AS vcount"
-        "    FROM " + schema + ".versions v"
-        "    JOIN " + schema + ".files f ON f.uid = v.file_uid"
-        "   WHERE f.deleted = FALSE AND f.is_container = FALSE";
+    // Bound the scan, then dedupe — not the other way round.
+    //
+    // This used to run DISTINCT ON over EVERY version of every file in the
+    // tenant, evaluate a correlated count(*) for each deduped row, and only
+    // then apply the LIMIT. Cost was O(all versions) no matter how small the
+    // page, which measured ~35ms against a 200-file fixture and ~5s against
+    // the real thing. Walking versions newest-first and stopping at a bound
+    // makes the work proportional to the page, and idx_versions_vts is what
+    // turns that walk into an index scan instead of a full sort.
+    //
+    // The bound is deliberately well above the page: several versions can
+    // belong to one file, and files the caller cannot read are dropped after
+    // this. `scan_truncated` (the bound being hit) is how a caller tells a
+    // short page from the end of the history.
+    const int scan_bound = std::max(scan_limit * 20, 1000);
+
+    std::string inner =
+        "SELECT v.file_uid, v.version_timestamp, v.revised_by"
+        "   FROM " + schema + ".versions v";
 
     int param_index = 1;
     std::vector<std::string> params;
@@ -5562,7 +5584,7 @@ Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& ten
         // (20260830_204237.123), so a lexical comparison is a chronological one
         // — the same property the backup sync gate relies on. No parsing, and no
         // dependence on a format string matching the writer's.
-        sql += " AND v.version_timestamp >= $" + std::to_string(param_index++);
+        inner += " WHERE v.version_timestamp >= $" + std::to_string(param_index++);
         std::time_t t = static_cast<std::time_t>(since_epoch);
         std::tm tm_utc{};
         gmtime_r(&t, &tm_utc);
@@ -5570,17 +5592,43 @@ Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& ten
         std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_utc);
         params.emplace_back(buf);
     }
+    inner += " ORDER BY v.version_timestamp DESC LIMIT " + std::to_string(scan_bound);
+
+    // DISTINCT ON gives one row per file — its newest version — and the outer
+    // ordering then ranks files against each other. Doing it the other way
+    // round (order, then dedupe in the caller) would let one busy file fill the
+    // scan window with its own versions and crowd everything else out.
+    //
+    // Containers are excluded: a folder has no version of its own, and its
+    // recursive mtime is a separate and far more expensive question.
+    std::string dedup =
+        "SELECT DISTINCT ON (t.file_uid) f.uid AS uid, f.name AS name, f.owner AS owner,"
+        "       t.version_timestamp AS version_timestamp, t.revised_by AS revised_by,"
+        "       COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid"
+        "  FROM (" + inner + ") t"
+        "  JOIN " + schema + ".files f ON f.uid = t.file_uid"
+        " WHERE f.deleted = FALSE AND f.is_container = FALSE";
+
     if (!under_uid.empty()) {
-        sql += " AND f.uid IN (WITH RECURSIVE sub(uid) AS ("
-               "   SELECT $" + std::to_string(param_index) + "::text"
-               "   UNION SELECT c.uid FROM " + schema + ".files c JOIN sub ON c.parent_uid = sub.uid"
-               "    WHERE c.deleted = FALSE) SELECT uid FROM sub)";
+        dedup += " AND f.uid IN (WITH RECURSIVE sub(uid) AS ("
+                 "   SELECT $" + std::to_string(param_index) + "::text"
+                 "   UNION SELECT c.uid FROM " + schema + ".files c JOIN sub ON c.parent_uid = sub.uid"
+                 "    WHERE c.deleted = FALSE) SELECT uid FROM sub)";
         params.emplace_back(under_uid);
         ++param_index;
     }
-    sql += "   ORDER BY v.file_uid, v.version_timestamp DESC"
-           ") newest"
-           " ORDER BY version_timestamp DESC LIMIT " + std::to_string(scan_limit) + ";";
+    dedup += " ORDER BY t.file_uid, t.version_timestamp DESC";
+
+    // How many versions this file has, so a caller can say "created" or
+    // "updated" without a second round trip. Evaluated on the PAGE only —
+    // inside the dedupe it ran for every file the scan touched.
+    std::string sql =
+        "SELECT p.uid, p.name, p.owner, p.version_timestamp, p.revised_by,"
+        "       p.size_bytes, p.parent_uid,"
+        "       (SELECT count(*) FROM " + schema + ".versions v2 WHERE v2.file_uid = p.uid) AS vcount"
+        "  FROM (SELECT * FROM (" + dedup + ") newest"
+        "         ORDER BY version_timestamp DESC LIMIT " + std::to_string(scan_limit) + ") p"
+        " ORDER BY p.version_timestamp DESC;";
 
     std::vector<const char*> param_ptrs;
     param_ptrs.reserve(params.size());
