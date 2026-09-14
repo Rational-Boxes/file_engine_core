@@ -473,8 +473,10 @@ grpc::Status GRPCFileService::ListRecentFiles(grpc::ServerContext* context,
     }
 
     int returned = 0;
+    int examined = 0;
     for (const auto& info : candidates.value) {
         if (returned >= limit) break;
+        ++examined;
         if (!validate_user_permissions(info.uid, auth_context, static_cast<int>(Permission::READ))) {
             continue;
         }
@@ -491,7 +493,10 @@ grpc::Status GRPCFileService::ListRecentFiles(grpc::ServerContext* context,
         ++returned;
     }
 
-    const int examined = static_cast<int>(candidates.value.size());
+    // How many rows this actually INSPECTED — not how many the query returned.
+    // Reporting the candidate count made a page that filled immediately look
+    // like it had sifted the whole over-fetch, and `examined - returned` is
+    // meant to say how much recent activity the caller cannot see.
     response->set_success(true);
     response->set_examined(examined);
     // Short because the scan bound was hit, not because the tenant ran out.

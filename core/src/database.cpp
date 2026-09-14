@@ -5607,7 +5607,15 @@ Result<std::vector<FileInfo>> Database::list_recent_files(const std::string& ten
         "       COALESCE(f.size, 0) AS size_bytes, f.parent_uid AS parent_uid"
         "  FROM (" + inner + ") t"
         "  JOIN " + schema + ".files f ON f.uid = t.file_uid"
-        " WHERE f.deleted = FALSE AND f.is_container = FALSE";
+        " WHERE f.deleted = FALSE AND f.is_container = FALSE"
+        // Renditions are not activity. A rendition is a hidden CHILD OF A FILE
+        // (previews, diff manifests, extracted text) — the same rule the event
+        // envelope uses for is_rendition, and every consumer already ignores
+        // them to avoid feeding on its own output. Without this the feed is
+        // mostly "<timestamp>-preview.png", because one user edit produces
+        // several machine writes that are all newer than the edit itself.
+        "   AND NOT EXISTS (SELECT 1 FROM " + schema + ".files p"
+        "                    WHERE p.uid = f.parent_uid AND p.is_container = FALSE)";
 
     if (!under_uid.empty()) {
         dedup += " AND f.uid IN (WITH RECURSIVE sub(uid) AS ("
