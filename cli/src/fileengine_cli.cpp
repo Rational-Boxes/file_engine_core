@@ -952,12 +952,20 @@ public:
     }
 
     // ACL operations
-    bool grant_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default", fileengine_rpc::AclEffect effect = fileengine_rpc::AclEffect::ALLOW) {
+    // `mask` (an OR of PermissionBit values) supersedes `permission` when
+    // non-zero, and `recursive` applies the grant to the whole subtree in ONE
+    // call. Both exist on the RPC but were unreachable from here, which meant
+    // the one tool an operator actually has could not do what the core can:
+    // re-permissioning a tree meant a client-side walk, and provisioning a role
+    // meant one call per bit.
+    bool grant_permission(const std::string& resource_uid, const std::string& principal, Permission permission, const std::string& user, const std::string& tenant = "default", fileengine_rpc::AclEffect effect = fileengine_rpc::AclEffect::ALLOW, int mask = 0, bool recursive = false) {
         GrantPermissionRequest request;
         request.set_resource_uid(resource_uid);
         request.set_principal(principal);
         request.set_permission(permission);
         request.set_effect(effect);
+        if (mask != 0) request.set_permission_mask(mask);
+        request.set_recursive(recursive);
         *request.mutable_auth() = create_auth_context(user, roles_, tenant);
 
         GrantPermissionResponse response;
@@ -968,8 +976,18 @@ public:
 
         const char* effect_str = (effect == fileengine_rpc::AclEffect::DENY) ? "DENY" : "ALLOW";
         if (status.ok() && response.success()) {
-            std::cout << "✓ Granted " << effect_str << " " << perm_name(permission)
-                      << " to '" << principal << "' on resource '" << resource_uid << "'" << std::endl;
+            std::cout << "✓ Granted " << effect_str << " ";
+            if (mask != 0) {
+                std::cout << "mask 0x" << std::hex << mask << std::dec;
+            } else {
+                std::cout << perm_name(permission);
+            }
+            std::cout << " to '" << principal << "' on resource '"
+                      << (resource_uid.empty() ? "<root>" : resource_uid) << "'";
+            if (recursive) {
+                std::cout << " and " << response.nodes_affected() << " descendant(s)";
+            }
+            std::cout << std::endl;
             return true;
         } else {
             std::cout << "✗ Failed to grant permission: " << response.error() << std::endl;
@@ -1256,6 +1274,8 @@ int main(int argc, char** argv) {
     // Phase 6: ACL effect for grant/revoke. Default to ALLOW; users opt into
     // DENY rules with --effect deny (or -e deny).
     fileengine_rpc::AclEffect effect = fileengine_rpc::AclEffect::ALLOW;
+    int acl_mask = 0;
+    bool acl_recursive = false;
 
     // First, let's handle global options before the command, including config file
     int arg_offset = 1;
@@ -1293,6 +1313,24 @@ int main(int argc, char** argv) {
                     claims.push_back(claim);
                 }
             }
+        } else if (opt == "--mask") {
+            // An OR of PermissionBit values, e.g. 0x1730. Supersedes the
+            // permission letter, so a role can be provisioned in one call
+            // instead of one call per bit.
+            if (arg_offset + 1 < argc) {
+                std::string val = argv[++arg_offset];
+                try {
+                    acl_mask = static_cast<int>(std::stoul(val, nullptr, 0));
+                } catch (const std::exception&) {
+                    std::cout << "Invalid --mask value: " << val
+                              << " (use a number, e.g. 0x1730)" << std::endl;
+                    return 1;
+                }
+            }
+        } else if (opt == "--recursive") {
+            // Apply to the resource AND its descendants, in one call and one
+            // audit event, rather than walking the tree from out here.
+            acl_recursive = true;
         } else if (opt == "--server") {
             if (arg_offset + 1 < argc) {
                 server_address = argv[++arg_offset];
@@ -1591,12 +1629,15 @@ int main(int argc, char** argv) {
         client.delete_metadata(argv[arg_offset + 1], argv[arg_offset + 2], user, tenant);
     }
     else if (command == "grant" && argc - arg_offset == 4) {  // command + 3 args
-        fileengine_rpc::Permission perm;
-        if (!fileengine::parse_perm_letter(argv[arg_offset + 3], perm)) {
+        fileengine_rpc::Permission perm = fileengine_rpc::Permission::READ;
+        // With --mask the letter is ignored by the server, so accept a
+        // placeholder rather than making the caller name a bit twice.
+        if (acl_mask == 0 && !fileengine::parse_perm_letter(argv[arg_offset + 3], perm)) {
             std::cout << "✗ Invalid permission letter. Use one of: r w x d l u v b s m i" << std::endl;
             return 1;
         }
-        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant, effect);
+        client.grant_permission(argv[arg_offset + 1], argv[arg_offset + 2], perm, user, tenant, effect,
+                                acl_mask, acl_recursive);
     }
     else if (command == "revoke" && argc - arg_offset == 4) {  // command + 3 args
         fileengine_rpc::Permission perm;
