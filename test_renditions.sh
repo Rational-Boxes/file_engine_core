@@ -6,8 +6,10 @@
 # carried by move, deep-copied by copy, and cascaded on delete.
 #
 # Usage: ./test_renditions.sh   (core must be listening; defaults to :50051)
+# FE_CLI defaults to build/, NOT build_2/: build_2 is a stale pre-audit tree that
+# is still present in many checkouts, and driving it silently tests old code.
 set -u
-BIN="${FE_CLI:-./build_2/cli/fileengine_cli}"
+BIN="${FE_CLI:-./build/cli/fileengine_cli}"
 SRV="${FE_SERVER:-localhost:50051}"
 TENANT="${FE_TENANT:-default}"
 CLI="$BIN -u rendtester -t $TENANT -r system_admin --server $SRV"
@@ -15,9 +17,20 @@ CLI="$BIN -u rendtester -t $TENANT -r system_admin --server $SRV"
 pass=0; fail=0
 ck() { if [ "$2" = "$3" ]; then echo "  PASS  $1"; pass=$((pass+1)); else echo "  FAIL  $1 (want '$2' got '$3')"; fail=$((fail+1)); fi; }
 uid_of() { grep -oiE 'UID: [0-9a-f-]{36}' | head -1 | awk '{print $2}'; }
-has_uid() { $CLI ls "$1" 2>/dev/null | grep -q "$2" && echo yes || echo no; }
+# REFUSE an empty needle or haystack. `grep -q ""` matches every line, so when
+# setup failed and a uid came back empty, "is the rendition hidden in the parent
+# directory?" answered YES for a directory that was never created — a real-looking
+# assertion failure pointing at the wrong thing entirely. That is how a core
+# refusing every call (no service token) read as four broken rendition features.
+has_uid() {
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || { echo "no-uid"; return; }
+    $CLI ls "$1" 2>/dev/null | grep -q "$2" && echo yes || echo no
+}
 # Count only entry lines ("[FILE]"/"[DIR]"), not the "Contents of ... (UID:)" header.
-child_count() { $CLI ls "$1" 2>/dev/null | grep -cE '\[(FILE|DIR)\]'; }
+child_count() {
+    [ -n "${1:-}" ] || { echo "no-uid"; return; }
+    $CLI ls "$1" 2>/dev/null | grep -cE '\[(FILE|DIR)\]'
+}
 
 ts=$(date +%s)
 printf 'parent content\n' > /tmp/rend_parent.$$
@@ -32,6 +45,27 @@ rend=$($CLI touch "$file" "${ts}-pdf.pdf" | uid_of)   # rendition: child of the 
 $CLI put "$rend" /tmp/rend_child.$$ >/dev/null 2>&1
 
 ck "setup produced uids" "ok" "$([ -n "$dir" ] && [ -n "$file" ] && [ -n "$rend" ] && echo ok || echo missing)"
+
+# Stop here when the fixture does not exist. Every assertion below is about the
+# relationship between those three uids, so running them without the uids reports
+# failures that have nothing to do with renditions.
+if [ -z "$dir" ] || [ -z "$file" ] || [ -z "$rend" ]; then
+    echo "  ABORT  the fixture was not created — the checks below would be meaningless."
+    setup_err=$($CLI mkdir "" "rendprobe_$ts" 2>&1)
+    printf '         %s\n' "$setup_err" | tail -1
+    case "$setup_err" in
+      *"no service token presented"*|*UNAUTHENTICATED*)
+        echo "         The core requires service auth. Issue an operator credential:"
+        echo "           FILEENGINE_SERVICE_TOKEN_PEPPER=<the core's pepper> \\"
+        echo "             $BIN service-token issue cli:\$USER"
+        echo "         then re-run with FILEENGINE_CLI_TOKEN=<the printed secret>." ;;
+      *"Connection refused"*|*UNAVAILABLE*)
+        echo "         No core is listening on $SRV." ;;
+    esac
+    rm -f /tmp/rend_parent.$$ /tmp/rend_child.$$
+    echo "== results: $pass passed, $fail failed (aborted during setup) =="
+    exit 1
+fi
 
 # Hiding: the rendition is a child of the file, so it must NOT appear in the dir.
 ck "file visible in parent dir"        yes "$(has_uid "$dir" "$file")"

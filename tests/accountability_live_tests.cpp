@@ -545,6 +545,26 @@ static void test_detail_survives_the_read_path_byte_for_byte(Database& db) {
 
 // ── tenant lifecycle on the global chain (§7.3) ────────────────────────────
 
+// Global-chain records naming ONE tenant.
+//
+// The global chain is shared by every tenant in the database, so "how many rows
+// does it have" is not a question this test can own: another suite provisioning
+// a tenant of its own appends to the same chain, and under `ctest -j` that is
+// exactly what happens. Counting rows FOR THIS TENANT asks what the test
+// actually means — the assertions below read the same, and stop depending on
+// nothing else in the process having created a tenant meanwhile.
+static std::vector<StoredAccountabilityRecord> global_records_for(Database& db,
+                                                         const std::string& tenant) {
+    bool has_more = false;
+    auto all = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
+    std::vector<StoredAccountabilityRecord> mine;
+    if (!all.success) return mine;
+    for (const auto& row : all.value) {
+        if (row.record.global_tenant == tenant) mine.push_back(row);
+    }
+    return mine;
+}
+
 static void test_tenant_lifecycle_is_recorded_globally(Database& db) {
     std::cout << "test_tenant_lifecycle_is_recorded_globally\n";
     const std::string tenant = unique_tenant("lifecycle");
@@ -553,15 +573,16 @@ static void test_tenant_lifecycle_is_recorded_globally(Database& db) {
     bool has_more = false;
     auto before = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
     CHECK(before.success, "the global chain is readable");
-    const size_t baseline = before.value.size();
+    CHECK(global_records_for(db, tenant).empty(), "and holds nothing for this tenant yet");
 
     CHECK(db.create_tenant_schema(tenant, ctx_for("root", {"system_admin"})).success,
           "tenant created");
 
-    auto after_create = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
-    CHECK(after_create.success && after_create.value.size() == baseline + 1,
-          "creating a tenant adds exactly one global record");
-    const auto& created = after_create.value.back();
+    auto mine = global_records_for(db, tenant);
+    CHECK(mine.size() == 1, "creating a tenant adds exactly one global record, got " +
+                            std::to_string(mine.size()));
+    if (mine.empty()) return;
+    const auto& created = mine.back();
     CHECK(created.record.action == "tenant.create", "recorded as tenant.create");
     CHECK(created.record.global_tenant == tenant, "naming the tenant");
     CHECK(created.record.ctx.actor == "root", "and the operator");
@@ -569,8 +590,7 @@ static void test_tenant_lifecycle_is_recorded_globally(Database& db) {
     // Called again for an existing tenant — this happens on nearly every context
     // lookup — and must NOT append a duplicate creation record.
     CHECK(db.create_tenant_schema(tenant, ctx_for("root")).success, "idempotent re-provision");
-    auto after_repeat = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
-    CHECK(after_repeat.success && after_repeat.value.size() == baseline + 1,
+    CHECK(global_records_for(db, tenant).size() == 1,
           "re-provisioning an existing tenant records nothing");
 
     // Put something in the tenant's own chain, then destroy the tenant.
@@ -580,10 +600,11 @@ static void test_tenant_lifecycle_is_recorded_globally(Database& db) {
     CHECK(db.cleanup_tenant_data(tenant, ctx_for("root", {"system_admin"})).success,
           "tenant destroyed");
 
-    auto after_delete = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
-    CHECK(after_delete.success && after_delete.value.size() == baseline + 2,
-          "the deletion is recorded globally");
-    const auto& deleted = after_delete.value.back();
+    auto after_delete = global_records_for(db, tenant);
+    CHECK(after_delete.size() == 2, "the deletion is recorded globally, got " +
+                                    std::to_string(after_delete.size()) + " record(s)");
+    if (after_delete.size() < 2) return;
+    const auto& deleted = after_delete.back();
     CHECK(deleted.record.action == "tenant.delete", "recorded as tenant.delete");
     CHECK(deleted.record.category == AccountabilityCategory::Destruction,
           "as a destruction");
@@ -595,10 +616,14 @@ static void test_tenant_lifecycle_is_recorded_globally(Database& db) {
     CHECK(read_rows(db, tenant).empty(),
           "the tenant's own accountability history is destroyed with the tenant");
 
-    // The global chain still verifies end to end across the deletion.
+    // The global chain still verifies end to end across the deletion. Read the
+    // WHOLE chain here, not this tenant's rows: hash linkage is a property of the
+    // chain, and checking a filtered subset of it would verify nothing.
+    auto whole = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
+    CHECK(whole.success, "the global chain is readable after the deletion");
     std::vector<std::uint8_t> prev;
-    bool chain_ok = true;
-    for (const auto& r : after_delete.value) {
+    bool chain_ok = whole.success;
+    for (const auto& r : whole.value) {
         if (r.prev_hash != prev) chain_ok = false;
         if (chain_hash(prev, canonical_record(r.seq, r.ts_micros, r.record)) != r.hash) {
             chain_ok = false;

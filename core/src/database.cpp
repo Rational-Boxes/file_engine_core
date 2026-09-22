@@ -865,6 +865,22 @@ static void bump_ancestor_subtree_mtime(PGconn* conn, const std::string& schema,
     const std::string sql =
         "WITH RECURSIVE anc(uid, parent_uid) AS ("
         "  SELECT f.uid, f.parent_uid FROM \"" + schema + "\".files f WHERE f.uid = $1"
+        // A RENDITION IS NOT A MODIFICATION. It is a hidden child OF A FILE
+        // (preview, extracted text, diff manifest), written by a worker minutes
+        // or hours after the user's upload, so pushing its timestamp up would
+        // make a folder report machine work — "modified by svc-csai", at a time
+        // no user did anything — and the read path deliberately does not: the
+        // walk in subtree_newest_version only descends CONTAINERS, so a recompute
+        // never sees renditions. Without this the memo and the recompute
+        // disagreed, and the memo is what every listing shows.
+        //
+        // Anchoring on the guard rather than filtering later means a rendition
+        // write produces an empty `anc` and the UPDATE touches nothing — one
+        // statement, no extra round trip on the hot write path. Same rule as the
+        // recent-files feed and the is_rendition flag on the event envelope:
+        // parent is a file, not a folder.
+        "     AND NOT EXISTS (SELECT 1 FROM \"" + schema + "\".files p"
+        "                      WHERE p.uid = f.parent_uid AND p.is_container = FALSE)"
         "  UNION"
         "  SELECT p.uid, p.parent_uid FROM \"" + schema + "\".files p"
         "    JOIN anc ON p.uid = anc.parent_uid"
@@ -891,6 +907,13 @@ static void invalidate_ancestor_subtree_mtime(PGconn* conn, const std::string& s
     const std::string sql =
         "WITH RECURSIVE anc(uid, parent_uid) AS ("
         "  SELECT f.uid, f.parent_uid FROM \"" + schema + "\".files f WHERE f.uid = $1"
+        // Renditions are excluded here for the same reason as in the bump: they
+        // are invisible to the recompute, so throwing the memo away when one is
+        // culled or superseded can only buy an identical answer. Not skipping
+        // them costs a full subtree walk every time a worker replaces a preview,
+        // which is precisely the work the memo exists to avoid.
+        "     AND NOT EXISTS (SELECT 1 FROM \"" + schema + "\".files p"
+        "                      WHERE p.uid = f.parent_uid AND p.is_container = FALSE)"
         "  UNION"
         "  SELECT p.uid, p.parent_uid FROM \"" + schema + "\".files p"
         "    JOIN anc ON p.uid = anc.parent_uid"
@@ -4232,6 +4255,46 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
 
     res = PQexec(pg_conn, migrate_files_subtree_mtime.c_str());
     PQclear(res);
+
+    // A one-shot sweep for memos already poisoned before the rendition guard in
+    // bump_ancestor_subtree_mtime existed. Those values are wrong and nothing
+    // else will correct them: a memo is only rewritten by a newer version or
+    // dropped by a delete/move/cull, so a quiet folder keeps reporting a worker's
+    // preview write — the wrong user AND the wrong time — indefinitely. NULL is
+    // simply "not known", so clearing it costs one recompute per folder on next
+    // read and cannot itself be wrong.
+    //
+    // Recorded rather than unconditional: doing it on every start would throw
+    // away the whole tenant's memos at every deploy and hand back the O(subtree)
+    // per-read walk this table exists to avoid.
+    std::string create_repairs_table =
+        "CREATE TABLE IF NOT EXISTS \"" + escaped_schema + "\".schema_repairs ("
+        "name TEXT PRIMARY KEY, "
+        "applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ");";
+    res = PQexec(pg_conn, create_repairs_table.c_str());
+    PQclear(res);
+
+    // ON CONFLICT DO NOTHING ... RETURNING hands a row back only to the caller
+    // that actually inserted it, so of several cores starting at once exactly one
+    // runs the sweep. Idempotent DDL is not the same thing as a concurrency-safe
+    // migration.
+    std::string claim_subtree_repair =
+        "INSERT INTO \"" + escaped_schema + "\".schema_repairs (name) "
+        "VALUES ('subtree_mtime_rendition_bleed') "
+        "ON CONFLICT (name) DO NOTHING RETURNING name;";
+    res = PQexec(pg_conn, claim_subtree_repair.c_str());
+    const bool claimed_subtree_repair =
+        (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1);
+    PQclear(res);
+    if (claimed_subtree_repair) {
+        std::string clear_subtree_memos =
+            "UPDATE \"" + escaped_schema + "\".files "
+            "   SET subtree_newest_vts = NULL, subtree_newest_by = NULL "
+            " WHERE is_container = TRUE AND subtree_newest_vts IS NOT NULL;";
+        res = PQexec(pg_conn, clear_subtree_memos.c_str());
+        PQclear(res);
+    }
 
     res = PQexec(pg_conn, create_idx_uid.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical
