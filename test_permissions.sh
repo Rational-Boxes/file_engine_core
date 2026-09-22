@@ -1,120 +1,129 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Permission enforcement over the gRPC surface, driven through the CLI against a
+# running core.
+#
+# WHAT THIS ASSERTS ON, AND WHY IT MATTERS: the CLI exits 0 whether an operation
+# SUCCEEDED or was REFUSED — a refused mkdir, a denied read and a clean write all
+# return 0. The previous version of this script tested `$?`, so it passed
+# unconditionally and reported nothing; it also "expected" an unauthorized user to
+# be refused a read, which is the opposite of how this system works. Every check
+# below reads the ✓/✗ marker the CLI prints, which is the only place the outcome
+# actually appears.
+#
+# The model it encodes (see the ACL design docs):
+#   * READ is allowed BY DEFAULT. A user with no ACL row can read and list.
+#   * A DENY row is what withholds a read, and it beats an ALLOW.
+#   * WRITE is not default — it takes a grant.
+#   * A grant to `role:<name>` reaches any caller presenting that role.
+#
+# Usage: ./test_permissions.sh          (core must be listening; defaults to :50051)
+#   FE_CLI=./build/cli/fileengine_cli   the CLI to drive (NOT build_2 — that is stale)
+#   FE_SERVER=localhost:50051           the core to drive it against
+#   FE_TENANT=default                   the tenant to work in
+#   FILEENGINE_CLI_TOKEN=…              operator credential, when the core requires
+#                                       service auth (it does by default):
+#                                         FILEENGINE_SERVICE_TOKEN_PEPPER=<core's> \
+#                                         $FE_CLI service-token issue cli:<you>
+set -u
 
-# Test script for FileEngine permissions system
+BIN="${FE_CLI:-./build/cli/fileengine_cli}"
+SRV="${FE_SERVER:-localhost:50051}"
+TENANT="${FE_TENANT:-default}"
 
-echo "Starting FileEngine permissions system test..."
+pass=0; fail=0
+ck() { if [ "$2" = "$3" ]; then echo "  PASS  $1"; pass=$((pass+1));
+       else echo "  FAIL  $1 (want '$2' got '$3')"; fail=$((fail+1)); fi; }
 
-# Create a test file to upload
-echo "Creating test file..."
-echo "This is a test file for permissions testing" > /tmp/test_file.txt
-
-# First, let's create a directory as root user (root should have full access)
-echo "Step 1: Creating a directory as root user"
-cd /home/telendry/code/file_projects/file_engine_core/build
-
-# Create a directory as root user
-TEST_DIR_UID=$(./cli/fileengine_cli -u root touch "" test_permissions_dir | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
-
-if [ -z "$TEST_DIR_UID" ]; then
-    # If touch doesn't work for directory, try mkdir
-    TEST_DIR_UID=$(./cli/fileengine_cli -u root mkdir "" test_permissions_dir | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
-    if [ -z "$TEST_DIR_UID" ]; then
-        echo "Failed to create test directory as root user"
-        exit 1
+# Run the CLI as `user` with optional roles. `as <user> <roles|-> <args...>`
+as() {
+    local user="$1" roles="$2"; shift 2
+    if [ "$roles" = "-" ]; then
+        "$BIN" -u "$user" -t "$TENANT" --server "$SRV" "$@" 2>&1
+    else
+        "$BIN" -u "$user" -t "$TENANT" -r "$roles" --server "$SRV" "$@" 2>&1
     fi
-fi
+}
 
-echo "Created test directory with UID: $TEST_DIR_UID"
+# "allowed"/"refused" from the marker on the last non-empty output line, so an
+# assertion says which of the two happened rather than merely that the process
+# exited.
+verdict() { grep -E '^[✓✗]' | tail -1 | grep -q '^✓' && echo allowed || echo refused; }
+uid_of()  { grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
 
-# Create a test file in that directory
-TEST_FILE_UID=$(./cli/fileengine_cli -u root touch $TEST_DIR_UID test_file.txt | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
+echo "== permission enforcement (tenant=$TENANT, server=$SRV) =="
 
-if [ -z "$TEST_FILE_UID" ]; then
-    echo "Failed to create test file as root user"
+# ---- setup -----------------------------------------------------------------
+# Root-level creation is admin-only, so the fixture is built as system_admin.
+# This is also the step that fails first when the core wants a service token, so
+# it reports that specifically: every later assertion would otherwise fail with
+# an unrelated-looking message.
+ts=$(date +%s)
+setup_out=$(as root system_admin mkdir "" "perm_test_$ts")
+DIR=$(printf '%s' "$setup_out" | uid_of)
+if [ -z "$DIR" ]; then
+    echo "  ABORT  could not create the fixture directory:"
+    printf '         %s\n' "$setup_out" | tail -2
+    case "$setup_out" in
+      *"no service token presented"*|*UNAUTHENTICATED*)
+        echo "         The core requires service auth. Issue an operator credential:"
+        echo "           FILEENGINE_SERVICE_TOKEN_PEPPER=<the core's pepper> \\"
+        echo "             $BIN service-token issue cli:\$USER"
+        echo "         then re-run with FILEENGINE_CLI_TOKEN=<the printed secret>." ;;
+    esac
     exit 1
 fi
 
-echo "Created test file with UID: $TEST_FILE_UID"
+printf 'content under test\n' > "/tmp/perm_body.$$"
+FILE=$(as root system_admin upload "$DIR" body.txt "/tmp/perm_body.$$" | uid_of)
+ck "fixture: a directory and a file exist" "yes" "$([ -n "$FILE" ] && echo yes || echo no)"
+[ -n "$FILE" ] || { echo "  ABORT  no file to test against"; exit 1; }
 
-# Upload content to the test file as root
-echo "Uploading content to test file as root user..."
-./cli/fileengine_cli -u root upload $TEST_DIR_UID test_file.txt /tmp/test_file.txt
+# ---- read is allowed by default --------------------------------------------
+echo "-- READ is allowed by default (no ACL row) --"
+ck "a stranger has READ" "allowed" "$(as stranger - check "$FILE" stranger r | verdict)"
+ck "and can list the directory" "allowed" \
+   "$(as stranger - ls "$DIR" | grep -q 'Contents of directory' && echo allowed || echo refused)"
 
-# Now let's grant specific permissions to another user
-echo "Step 2: Granting permissions to test_user"
+# ---- write takes a grant ---------------------------------------------------
+echo "-- WRITE is not default --"
+ck "a stranger has no WRITE" "refused" "$(as stranger - check "$FILE" stranger w | verdict)"
+ck "granting WRITE to alice" "allowed" "$(as root system_admin grant "$FILE" alice w | verdict)"
+ck "alice now has WRITE" "allowed" "$(as alice - check "$FILE" alice w | verdict)"
+ck "and can write the bytes" "allowed" \
+   "$(as alice - put "$FILE" "/tmp/perm_body.$$" | verdict)"
 
-# Grant read permission to test_user on the test file
-./cli/fileengine_cli -u root grant $TEST_FILE_UID test_user r
+# ---- deny withholds a read, and beats allow --------------------------------
+echo "-- a DENY row is what withholds a read --"
+ck "granting alice an explicit ALLOW READ" "allowed" \
+   "$(as root system_admin grant "$FILE" alice r | verdict)"
+ck "adding a DENY READ for alice" "allowed" \
+   "$(as root system_admin -e deny grant "$FILE" alice r | verdict)"
+ck "DENY beats the ALLOW she also holds" "refused" "$(as alice - check "$FILE" alice r | verdict)"
+ck "and the read itself is refused" "refused" \
+   "$(as alice - get "$FILE" "/tmp/perm_dl.$$" | verdict)"
+ck "removing the DENY restores the read" "allowed" \
+   "$(as root system_admin -e deny revoke "$FILE" alice r >/dev/null; as alice - check "$FILE" alice r | verdict)"
 
-# Grant write permission to test_user on the test file
-./cli/fileengine_cli -u root grant $TEST_FILE_UID test_user w
+# ---- a grant to a role reaches whoever presents it -------------------------
+echo "-- role grants --"
+ck "granting WRITE to role:editor" "allowed" \
+   "$(as root system_admin grant "$FILE" "role:editor" w | verdict)"
+ck "a caller presenting 'editor' has WRITE" "allowed" \
+   "$(as edna editor check "$FILE" edna w | verdict)"
+ck "the same caller WITHOUT the role does not" "refused" \
+   "$(as edna - check "$FILE" edna w | verdict)"
 
-# Grant read permission to test_user on the directory
-./cli/fileengine_cli -u root grant $TEST_DIR_UID test_user r
+# ---- revocation ------------------------------------------------------------
+echo "-- revocation --"
+ck "revoking alice's WRITE" "allowed" "$(as root system_admin revoke "$FILE" alice w | verdict)"
+ck "alice has no WRITE" "refused" "$(as alice - check "$FILE" alice w | verdict)"
+ck "while her READ is untouched" "allowed" "$(as alice - check "$FILE" alice r | verdict)"
 
-echo "Granted read and write permissions to test_user on test file and directory"
+# ---- cleanup ---------------------------------------------------------------
+as root system_admin rm "$FILE" >/dev/null
+as root system_admin rm "$DIR"  >/dev/null
+rm -f "/tmp/perm_body.$$" "/tmp/perm_dl.$$"
 
-# Now let's test access with test_user
-echo "Step 3: Testing access with test_user"
-
-# Check if test_user can list the directory
-echo "Checking if test_user can list directory..."
-./cli/fileengine_cli -u test_user ls $TEST_DIR_UID
-
-# Check if test_user can read the file
-echo "Checking if test_user can read file..."
-./cli/fileengine_cli -u test_user get $TEST_FILE_UID /tmp/downloaded_test_file.txt
-
-# Check if test_user can check their permissions
-echo "Checking if test_user has read permission..."
-./cli/fileengine_cli -u test_user check $TEST_FILE_UID test_user r
-
-echo "Checking if test_user has write permission..."
-./cli/fileengine_cli -u test_user check $TEST_FILE_UID test_user w
-
-# Now let's test with a user that has no permissions
-echo "Step 4: Testing access with unauthorized_user"
-
-# Check if unauthorized_user can list the directory (should fail)
-echo "Checking if unauthorized_user can list directory (should fail)..."
-./cli/fileengine_cli -u unauthorized_user ls $TEST_DIR_UID
-
-# Check if unauthorized_user can read the file (should fail)
-echo "Checking if unauthorized_user can read file (should fail)..."
-./cli/fileengine_cli -u unauthorized_user get $TEST_FILE_UID /tmp/unauthorized_download.txt
-
-# Check if unauthorized_user has read permission (should fail)
-echo "Checking if unauthorized_user has read permission (should fail)..."
-./cli/fileengine_cli -u unauthorized_user check $TEST_FILE_UID unauthorized_user r
-
-# Now let's test with roles
-echo "Step 5: Testing with roles"
-
-# Grant permissions to a role
-./cli/fileengine_cli -u root grant $TEST_FILE_UID "role:editor" r
-./cli/fileengine_cli -u root grant $TEST_FILE_UID "role:editor" w
-
-# Test access with a user that has the editor role
-echo "Checking access for user with editor role..."
-./cli/fileengine_cli -u editor_user -r editor ls $TEST_DIR_UID
-./cli/fileengine_cli -u editor_user -r editor get $TEST_FILE_UID /tmp/editor_download.txt
-
-echo "Step 6: Testing permission revocation"
-
-# Revoke write permission from test_user
-./cli/fileengine_cli -u root revoke $TEST_FILE_UID test_user w
-
-# Check if test_user still has write permission (should fail now)
-echo "Checking if test_user still has write permission after revocation (should fail)..."
-./cli/fileengine_cli -u test_user check $TEST_FILE_UID test_user w
-
-# Check if test_user still has read permission (should still work)
-echo "Checking if test_user still has read permission after write revocation (should work)..."
-./cli/fileengine_cli -u test_user check $TEST_FILE_UID test_user r
-
-echo "Permissions test completed!"
-
-# Clean up test files
-echo "Cleaning up test files..."
-./cli/fileengine_cli -u root rm $TEST_FILE_UID
-./cli/fileengine_cli -u root rm $TEST_DIR_UID
+echo "== results: $pass passed, $fail failed =="
+[ "$fail" -eq 0 ]
