@@ -340,6 +340,12 @@ std::int64_t folder_mtime(Database& db, const std::string& uid, const std::strin
                f.value->modified_at.time_since_epoch()).count();
 }
 
+std::string folder_modified_by(Database& db, const std::string& uid, const std::string& tenant) {
+    auto f = db.get_file_by_uid(uid, tenant);
+    if (!f.success || !f.value.has_value()) return "<no row>";
+    return f.value->modified_by;
+}
+
 void test_folder_mtime_follows_the_newest_version(Database& db) {
     std::cout << "- a new version moves every ancestor's mtime\n";
     const std::string tenant = new_tenant(db, "mtime");
@@ -386,6 +392,53 @@ void test_the_memo_agrees_with_a_fresh_walk(Database& db) {
     CHECK(memoised == recomputed,
           "memoised " + std::to_string(memoised) + " vs recomputed " +
           std::to_string(recomputed));
+}
+
+void test_a_rendition_does_not_touch_its_folders(Database& db) {
+    std::cout << "- a rendition write leaves its folders' mtime and reviser alone\n";
+    const std::string tenant = new_tenant(db, "mtimerend");
+    auto uids = build_tree(db, tenant);
+
+    // What a user did.
+    CHECK(db.insert_version(uids[2], "20260101_000000.000", 0, "/dev/null", "alice", tenant).success,
+          "a1 v1, uploaded by alice");
+    const std::int64_t a_before    = folder_mtime(db, uids[1], tenant);
+    const std::int64_t root_before = folder_mtime(db, uids[0], tenant);
+    CHECK(folder_modified_by(db, uids[1], tenant) == "alice",
+          "the folder is attributed to the user who wrote its newest file, got " +
+          folder_modified_by(db, uids[1], tenant));
+
+    // What a worker did hours later: a hidden child OF THE FILE, with a much
+    // newer timestamp and a service identity. It must be invisible upwards —
+    // both because it is not a modification of anything the user owns, and
+    // because conversion lags the upload by an arbitrary amount, so letting it
+    // through reports a time at which nobody touched the folder.
+    const std::string rend = tenant + "-a1-preview";
+    CHECK(db.insert_file(rend, "20260101_000000.000-preview.png", "/a1-preview", uids[2],
+                         FileType::REGULAR_FILE, "svc-csai@example.com", 0, tenant).success,
+          "the rendition child inserts under the FILE");
+    CHECK(db.insert_version(rend, "20260901_000000.000", 0, "/dev/null",
+                            "svc-csai@example.com", tenant).success,
+          "the worker writes its bytes");
+
+    CHECK(folder_mtime(db, uids[1], tenant) == a_before,
+          "the folder still reports the user's upload (" +
+          std::to_string(folder_mtime(db, uids[1], tenant)) + " vs " +
+          std::to_string(a_before) + ")");
+    CHECK(folder_modified_by(db, uids[1], tenant) == "alice",
+          "and still names the user, not the worker — got " +
+          folder_modified_by(db, uids[1], tenant));
+    CHECK(folder_mtime(db, uids[0], tenant) == root_before,
+          "nor did it leak further up to the root");
+
+    // The memo and a fresh walk must AGREE about this: the walk never sees
+    // renditions, so a bump that did would have made the two disagree — with the
+    // memo, the wrong one, being what every listing reads.
+    CHECK(db.forget_subtree_mtime(uids[1], tenant).success, "forget the memo");
+    CHECK(folder_mtime(db, uids[1], tenant) == a_before,
+          "a recompute from scratch says the same");
+    CHECK(folder_modified_by(db, uids[1], tenant) == "alice",
+          "including who");
 }
 
 void test_deleting_the_newest_moves_the_folder_back(Database& db) {
@@ -461,6 +514,7 @@ int main() {
     test_folder_mtime_follows_the_newest_version(db);
     test_an_older_version_does_not_move_it_backwards(db);
     test_the_memo_agrees_with_a_fresh_walk(db);
+    test_a_rendition_does_not_touch_its_folders(db);
     test_deleting_the_newest_moves_the_folder_back(db);
     test_moving_a_file_updates_both_folders(db);
 
