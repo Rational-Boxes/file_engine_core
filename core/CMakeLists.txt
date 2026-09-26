@@ -162,6 +162,8 @@ add_library(fileengine_core SHARED
     src/query_builder.cpp      # Add query builder source file
     src/server_logger.cpp      # Add server logger source file
     src/crypto_utils.cpp       # Add crypto utilities source file
+    src/compression_policy.cpp # Should this payload be compressed at all? (storage_pipeline.md §3)
+    src/storage_format_v2.cpp  # Chunked, per-block authenticated storage format (§6)
     src/rest_server.cpp        # Monitoring HTTP listener (Phase A)
     src/thread_stats.cpp       # Per-thread kernel state, for stuck-thread detection
     src/rpc_tracker.cpp        # In-flight RPC register (driven by the interceptor)

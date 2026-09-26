@@ -159,6 +159,59 @@ target_include_directories(crypto_stream_tests PRIVATE
     ${GRPCPP_INCLUDE_DIRS}
 )
 
+
+# compression_policy_tests — storage_pipeline.md
+add_executable(compression_policy_tests compression_policy_tests.cpp)
+target_link_libraries(compression_policy_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+if(AWSSDK_FOUND)
+    target_link_libraries(compression_policy_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+
+target_include_directories(compression_policy_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
+# storage_format_v2_tests — storage_pipeline.md
+add_executable(storage_format_v2_tests storage_format_v2_tests.cpp)
+target_link_libraries(storage_format_v2_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+if(AWSSDK_FOUND)
+    target_link_libraries(storage_format_v2_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+
+target_include_directories(storage_format_v2_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
 # Read/write connection-routing failover unit test (header-only; no core link).
 add_executable(test_connection_router test_connection_router.cpp)
 target_include_directories(test_connection_router PRIVATE
@@ -359,7 +412,9 @@ foreach(t
     test_connection_router
     test_version_selection
     file_culler_tests
-    crypto_stream_tests)
+    crypto_stream_tests
+    compression_policy_tests
+    storage_format_v2_tests)
   add_test(NAME ${t} COMMAND ${t})
   set_tests_properties(${t} PROPERTIES LABELS "unit" TIMEOUT 120)
 endforeach()
