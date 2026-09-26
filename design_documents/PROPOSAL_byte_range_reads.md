@@ -7,6 +7,13 @@
 read-and-discard one); `webdav_bridge` (GET `Range`); `share_service` and
 `convert_search_ai` (consumers). No schema change and no ACL change.
 
+> **Superseded as the contract by [`storage_pipeline.md`](storage_pipeline.md).**
+> That document is the specification — the normative requirements, the stages and
+> the acceptance criteria. This one remains as the **rationale**: how the
+> conclusions were reached, what was measured, what was rejected and why. Read it
+> for the argument; implement from the specification. Where they disagree, the
+> specification wins.
+
 > **This is a deliberate reopening of "the core does not change."**
 > `share_service/design_documents/OUTSIDE_SHARE_LINKS.md` §4 and its §14 say that
 > a milestone wanting a core change is the signal to reopen §4 *deliberately

@@ -4,6 +4,13 @@
 **Scope:** `file_engine_core` only. No proto change, no ACL change, no API
 change. One additive schema migration, in the style the versions table already
 uses.
+> **Superseded as the contract by [`storage_pipeline.md`](storage_pipeline.md).**
+> That document is the specification — the normative requirements, the stages and
+> the acceptance criteria. This one remains as the **rationale**: how the
+> conclusions were reached, what was measured, what was rejected and why. Read it
+> for the argument; implement from the specification. Where they disagree, the
+> specification wins.
+
 **Companion:** `PROPOSAL_byte_range_reads.md` §7.1, which needs this and where
 the idea first appeared. This document stands alone: the optimisation is worth
 doing whether or not byte ranges are ever built.
