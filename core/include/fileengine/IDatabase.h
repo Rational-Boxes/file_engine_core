@@ -211,6 +211,13 @@ public:
             const VersionTransform& /*t*/, const std::string& /*tenant*/ = "") {
         return Result<void>::ok();
     }
+    // Plaintext size of one version. SR-12 needs it for total_size, which is
+    // what lets a door emit a valid Content-Range without a second Stat.
+    virtual Result<std::optional<int64_t>> get_version_size(
+            const std::string& /*file_uid*/, const std::string& /*version_timestamp*/,
+            const std::string& /*tenant*/ = "") {
+        return Result<std::optional<int64_t>>::ok(std::nullopt);
+    }
     // SR-3. One-time, idempotent: fills in only the rows that have no record,
     // from the flags in force right now. Returns how many rows were written.
     virtual Result<int64_t> backfill_version_transforms(

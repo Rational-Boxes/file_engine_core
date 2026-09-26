@@ -111,6 +111,9 @@ public:
     Result<void> set_version_transform(
         const std::string& file_uid, const std::string& version_timestamp,
         const VersionTransform& t, const std::string& tenant = "") override;
+    Result<std::optional<int64_t>> get_version_size(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const std::string& tenant = "") override;
     Result<int64_t> backfill_version_transforms(
         bool compressed, bool encrypted, const std::string& tenant = "") override;
     Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant) override;

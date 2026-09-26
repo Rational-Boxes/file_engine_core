@@ -993,21 +993,82 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
                                     const std::vector<std::string>& roles,
                                     const std::string& tenant,
                                     const std::string& version_timestamp) {
+    // SR-21: the whole file, byte for byte as before. get_range with no window
+    // is the same code path, so there is no second implementation to drift.
+    return get_range(file_uid, 0, 0, raw_on_chunk, user, roles, tenant,
+                     version_timestamp, nullptr);
+}
+
+Result<void> FileSystem::get_range(const std::string& file_uid,
+                                   int64_t req_offset, int64_t req_length,
+                                   const std::function<bool(const uint8_t*, size_t)>& raw_on_chunk,
+                                   const std::string& user,
+                                   const std::vector<std::string>& roles,
+                                   const std::string& tenant,
+                                   const std::string& version_timestamp,
+                                   RangeReport* report) {
+    if (req_offset < 0 || req_length < 0) {
+        return Result<void>::err("Range offset and length must not be negative");
+    }
+    const bool windowed = (req_offset > 0 || req_length > 0);
+
+    // The plaintext cursor. Bytes before the window are decrypted and inflated
+    // (they must be — neither transform is seekable) but never handed to the
+    // caller, and never cross the RPC boundary. That is the whole of tier 1:
+    // the discarded bytes stop being transmitted.
+    int64_t produced = 0;                 // plaintext bytes seen so far
+    int64_t delivered = 0;                // plaintext bytes handed to the caller
+    bool window_done = false;
+
     // Every emit path below goes through this, so the bound holds regardless of
     // how much plaintext a given source produces at once. Two sources produce a
     // lot: the cold path hands over the whole restored file, and decompression
     // inflates a 256 KiB read into however much plaintext it encodes — for
     // compressible content that can be the entire file from a single read.
     // Bounding at the sink covers both, and covers whatever is added later.
-    const auto on_chunk = [&raw_on_chunk](const uint8_t* p, size_t n) -> bool {
+    const auto on_chunk = [&](const uint8_t* p, size_t n) -> bool {
         if (n == 0) return true;
-        size_t offset = 0;
-        while (offset < n) {
-            const size_t take = std::min(kMaxStreamChunkBytes, n - offset);
-            if (!raw_on_chunk(p + offset, take)) return false;
-            offset += take;
+        if (window_done) return false;
+
+        size_t consumed_here = 0;
+        while (consumed_here < n) {
+            const int64_t chunk_start = produced + static_cast<int64_t>(consumed_here);
+            const size_t remaining = n - consumed_here;
+
+            // Skip anything before the window.
+            if (chunk_start + static_cast<int64_t>(remaining) <= req_offset) {
+                consumed_here = n;
+                break;
+            }
+            size_t skip = 0;
+            if (chunk_start < req_offset) {
+                skip = static_cast<size_t>(req_offset - chunk_start);
+            }
+            size_t avail = remaining - skip;
+            if (req_length > 0) {
+                const int64_t left = req_length - delivered;
+                if (left <= 0) { window_done = true; break; }
+                if (static_cast<int64_t>(avail) > left) avail = static_cast<size_t>(left);
+            }
+
+            size_t off = 0;
+            while (off < avail) {
+                const size_t take = std::min(kMaxStreamChunkBytes, avail - off);
+                if (!raw_on_chunk(p + consumed_here + skip + off, take)) {
+                    produced += static_cast<int64_t>(consumed_here);
+                    return false;
+                }
+                off += take;
+                delivered += static_cast<int64_t>(take);
+            }
+            consumed_here += skip + avail;
+            if (req_length > 0 && delivered >= req_length) { window_done = true; break; }
         }
-        return true;
+        produced += static_cast<int64_t>(n);
+        // Returning false stops the read loop. For a windowed read that is the
+        // early termination that makes a head range cheap; the caller's own
+        // false is handled above.
+        return !window_done;
     };
 
     auto context = get_tenant_context(tenant);
@@ -1163,7 +1224,17 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
             if (n <= 0) break;
             consume(reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(n));
         }
-        if (!aborted) {
+        // SR-15 / SR-16. finish() is what verifies the GCM tag, and it can only
+        // do so over the WHOLE object. A read that stopped early never saw the
+        // tail, so calling finish() on it is a guaranteed spurious failure —
+        // and the bytes it did emit were therefore not authenticated, which the
+        // report has to say out loud rather than leave to be assumed.
+        //
+        // A full read (offset 0, length 0, run to completion) still verifies,
+        // exactly as before. That line must not blur: adding ranges must not
+        // weaken the integrity guarantee of an ordinary download.
+        const bool ran_to_completion = !aborted && !window_done;
+        if (ran_to_completion) {
             if (do_encrypt) {
                 decryptor->finish(dbuf);     // verifies the GCM tag (throws on mismatch)
                 if (!dbuf.empty()) emit(dbuf.data(), dbuf.size());
@@ -1173,8 +1244,32 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
                 if (!ddbuf.empty()) on_chunk(ddbuf.data(), ddbuf.size());
             }
         }
+        // Unencrypted content has no tag to verify, so it is trivially "as
+        // authenticated as it ever was"; encrypted content is authenticated
+        // only when finish() ran.
+        if (report) report->authenticated = !do_encrypt || ran_to_completion;
     } catch (const std::exception& e) {
         return Result<void>::err(std::string("Failed to stream file from storage: ") + e.what());
+    }
+
+    if (report) {
+        report->ranged = windowed;
+        report->range_start = req_offset;
+        report->range_length = delivered;
+        // SR-12: the plaintext length of the WHOLE version, not of what this
+        // read happened to touch. A windowed read stops early, so `produced` is
+        // not it — the authority is the version row, which is also what lets a
+        // door emit a valid Content-Range without a second Stat.
+        report->total_size = 0;
+        if (context->db) {
+            auto sz = context->db->get_version_size(file_uid, current_version, tenant);
+            if (sz.success && sz.value.has_value()) report->total_size = *sz.value;
+        }
+        if (report->total_size == 0 && !windowed) report->total_size = produced;
+        // Tier 1 serves every format by windowing at the sink, which costs
+        // offset+length. SR-13 requires saying so rather than letting callers
+        // infer it from latency.
+        report->range_method = "scan";
     }
     return Result<void>::ok();
 }

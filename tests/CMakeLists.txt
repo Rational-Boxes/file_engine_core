@@ -239,6 +239,58 @@ target_include_directories(storage_pipeline_live_tests PRIVATE
 add_test(NAME storage_pipeline_live_tests COMMAND storage_pipeline_live_tests)
 set_tests_properties(storage_pipeline_live_tests PROPERTIES
     LABELS "live" TIMEOUT 300 SKIP_RETURN_CODE 77)
+# storage_range_live_tests — storage_pipeline.md S3a byte ranges, end to end
+add_executable(storage_range_live_tests storage_range_live_tests.cpp)
+target_link_libraries(storage_range_live_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(storage_range_live_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(storage_range_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME storage_range_live_tests COMMAND storage_range_live_tests)
+set_tests_properties(storage_range_live_tests PROPERTIES
+    LABELS "live" TIMEOUT 600 SKIP_RETURN_CODE 77)
+# compression_corpus_tests — storage_pipeline.md the compression decision over the real local corpus
+add_executable(compression_corpus_tests compression_corpus_tests.cpp)
+target_link_libraries(compression_corpus_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(compression_corpus_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(compression_corpus_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME compression_corpus_tests COMMAND compression_corpus_tests)
+set_tests_properties(compression_corpus_tests PROPERTIES
+    LABELS "corpus" TIMEOUT 300 SKIP_RETURN_CODE 77)
 
 # Read/write connection-routing failover unit test (header-only; no core link).
 add_executable(test_connection_router test_connection_router.cpp)

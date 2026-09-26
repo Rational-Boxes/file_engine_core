@@ -1932,6 +1932,34 @@ Result<void> Database::set_version_transform(
     return Result<void>::ok();
 }
 
+Result<std::optional<int64_t>> Database::get_version_size(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const std::string& tenant) {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::optional<int64_t>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema_name = get_schema_prefix(tenant);
+    std::string sql = "SELECT size FROM \"" + schema_name +
+                      "\".versions WHERE file_uid = $1 AND version_timestamp = $2 LIMIT 1;";
+    const char* params[2] = {file_uid.c_str(), version_timestamp.c_str()};
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::optional<int64_t>>::err("Failed to get version size: " + error);
+    }
+    std::optional<int64_t> out;
+    if (PQntuples(res) > 0 && !PQgetisnull(res, 0, 0)) {
+        out = std::stoll(PQgetvalue(res, 0, 0));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::optional<int64_t>>::ok(out);
+}
+
 Result<int64_t> Database::backfill_version_transforms(
         bool compressed, bool encrypted, const std::string& tenant) {
     auto conn = acquire(DbOp::Write);

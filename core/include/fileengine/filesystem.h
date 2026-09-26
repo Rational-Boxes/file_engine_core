@@ -115,6 +115,37 @@ public:
                                     const std::string& tenant = "",
                                     const std::string& version_timestamp = "");
 
+    // What a ranged read reported about itself (storage_pipeline.md SR-12/13).
+    struct RangeReport {
+        int64_t total_size = 0;       // plaintext length of the whole version
+        int64_t range_start = 0;
+        int64_t range_length = 0;
+        bool ranged = false;
+        // "seek" — cost proportional to length. "scan" — proportional to
+        // offset+length. The caller is entitled to know which it got.
+        std::string range_method = "scan";
+        // True when the bytes emitted were covered by a verified GCM tag. A
+        // range that stops early never reaches finish(), so its bytes are not
+        // authenticated (SR-15/SR-16/SR-17) — and the audit record has to say so.
+        bool authenticated = true;
+    };
+
+    // Ranged read over the PLAINTEXT, half-open [offset, offset+length).
+    // length 0 means "to the end"; offset 0 + length 0 is the whole file and
+    // behaves exactly as get_stream does (SR-10, SR-21).
+    //
+    // SR-11: a range is ALWAYS satisfiable. The server never refuses one
+    // because the stored format makes it expensive — it satisfies it and
+    // reports how, in `report`.
+    virtual Result<void> get_range(const std::string& file_uid,
+                                   int64_t offset, int64_t length,
+                                   const std::function<bool(const uint8_t*, size_t)>& on_chunk,
+                                   const std::string& user,
+                                   const std::vector<std::string>& roles = {},
+                                   const std::string& tenant = "",
+                                   const std::string& version_timestamp = "",
+                                   RangeReport* report = nullptr);
+
     // Metadata operations
     virtual Result<FileInfo> stat(const std::string& file_uid, const std::string& user,
                                   const std::vector<std::string>& roles = {},

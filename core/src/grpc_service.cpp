@@ -2235,15 +2235,35 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
     // asking to stream a past version got the current one — and anything
     // wanting an older version had to fall back to the unary GetVersion, which
     // is capped by the message limit.
-    auto result = filesystem_->get_stream(
-        file_uid,
+    // SR-10 - SR-13. offset 0 + length 0 is the whole file, so a client that
+    // never sets the fields gets exactly today's behaviour (SR-21).
+    const int64_t req_offset = request->offset();
+    const int64_t req_length = request->length();
+
+    // The range metadata rides on the FIRST frame only (SR-12). It cannot be
+    // known before the read starts — total_size comes from the version row and
+    // range_method from how the read was satisfied — so the first frame is
+    // emitted lazily, once there is something to report alongside it.
+    FileSystem::RangeReport report;
+    bool first_frame_sent = false;
+
+    auto result = filesystem_->get_range(
+        file_uid, req_offset, req_length,
         [&](const uint8_t* p, size_t n) -> bool {
             fileengine_rpc::GetFileResponse response;
             response.set_success(true);
             response.set_data(std::string(reinterpret_cast<const char*>(p), n));
+            if (!first_frame_sent) {
+                response.set_total_size(report.total_size);
+                response.set_range_start(report.range_start);
+                response.set_range_length(report.range_length);
+                response.set_ranged(report.ranged);
+                response.set_range_method(report.range_method);
+                first_frame_sent = true;
+            }
             return writer->Write(response);
         },
-        user, roles, tenant, request->version_timestamp());
+        user, roles, tenant, request->version_timestamp(), &report);
 
     if (result.success) {
         SERVER_LOG_INFO("GRPCService", "StreamFileDownload successful for uid: " + file_uid);
@@ -2258,7 +2278,15 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
         SERVER_LOG_ERROR("GRPCService", "StreamFileDownload failed for uid: " + file_uid + " with error: " + result.error);
     }
 
-    emit_access_audit(tenant, "download_stream", result.success ? AuditOutcome::Ok : AuditOutcome::Error,
+    // SR-20: a ranged read records WHAT WAS READ and whether those bytes were
+    // covered by a verified tag. Today the log cannot tell "read the whole
+    // document" from "read 4 KB of it", and for a departed-employee review that
+    // is precisely the distinction that matters.
+    //
+    // One event per RPC, never per frame: a scrubbing media player would
+    // otherwise flood a hash-chained log.
+    const std::string action = report.ranged ? "download_range" : "download_stream";
+    emit_access_audit(tenant, action, result.success ? AuditOutcome::Ok : AuditOutcome::Error,
                       user, roles, file_uid, AuditTargetType::File);
     return grpc::Status::OK;
 }
