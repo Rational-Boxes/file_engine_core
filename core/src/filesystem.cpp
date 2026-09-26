@@ -17,6 +17,7 @@
 #include "fileengine/utils.h"
 #include "fileengine/server_logger.h"
 #include "fileengine/crypto_utils.h"
+#include "fileengine/compression_policy.h"
 #include "fileengine/service_auth_interceptor.h"
 #include <algorithm>
 #include <optional>
@@ -24,6 +25,43 @@
 #include <filesystem>
 
 namespace fileengine {
+namespace {
+
+// storage_pipeline.md SR-2: what to UNDO on a read is what was DONE on the
+// write, read off the version row — never re-derived from the deployment's
+// current configuration.
+//
+// An absent record (a version written before SR-1, or a database that does not
+// implement the record) falls back to the configuration, which is exactly how
+// that row is already being read today. The fallback is therefore safe and is
+// also temporary: FileSystem backfills every such row once per tenant (SR-3).
+struct AppliedTransform {
+    bool compress = false;
+    bool encrypt = false;
+    int16_t storage_format = 1;
+    bool from_record = false;   // false = fell back to configuration
+};
+
+AppliedTransform resolve_applied_transform(
+        const std::shared_ptr<IDatabase>& db, IStorage* storage,
+        const std::string& file_uid, const std::string& version, const std::string& tenant) {
+    AppliedTransform t;
+    t.compress = storage && storage->is_compression_enabled();
+    t.encrypt = storage && storage->is_encryption_enabled();
+
+    if (!db || version.empty()) return t;
+    auto rec = db->get_version_transform(file_uid, version, tenant);
+    if (!rec.success || !rec.value.has_value()) return t;
+
+    const VersionTransform& v = *rec.value;
+    t.storage_format = v.storage_format;
+    if (v.compressed.has_value()) { t.compress = *v.compressed; t.from_record = true; }
+    if (v.encrypted.has_value())  { t.encrypt  = *v.encrypted;  t.from_record = true; }
+    return t;
+}
+
+} // namespace
+
 
 namespace {
 // Convert a system_clock time_point to whole UNIX epoch seconds, matching the
@@ -456,8 +494,16 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     // Process data for storage (compress and encrypt if enabled)
     std::vector<uint8_t> processed_data = data;
 
-    // Check if compression is enabled for this tenant/context
-    if (context->storage && context->storage->is_compression_enabled()) {
+    // SR-5 / SR-6 / SR-6a: decide from the BYTES whether compression is worth
+    // anything for this payload. Video, images, Office documents (ZIP
+    // containers) and the conversion pipeline's own renditions gain nothing,
+    // and the cost is paid again on every read.
+    CompressionPolicyConfig comp_cfg;
+    comp_cfg.enabled = context->storage && context->storage->is_compression_enabled();
+    const CompressionDecision comp_decision = decide_compression(data, comp_cfg);
+    const bool applied_compression = comp_decision.compress;
+
+    if (applied_compression) {
         try {
             processed_data = fileengine::CryptoUtils::compress_data(processed_data);
             SERVER_LOG_DEBUG("FileSystem::put", "Data compressed from " + std::to_string(data.size()) +
@@ -466,10 +512,14 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
             SERVER_LOG_ERROR("FileSystem::put", "Compression failed: " + std::string(e.what()));
             return Result<void>::err("Failed to compress data: " + std::string(e.what()));
         }
+    } else if (comp_cfg.enabled) {
+        SERVER_LOG_DEBUG("FileSystem::put", std::string("Compression skipped (") +
+                         comp_decision.reason_name() + ") for " + file_uid);
     }
 
     // Check if encryption is enabled for this tenant/context
-    if (context->storage && context->storage->is_encryption_enabled()) {
+    const bool applied_encryption = context->storage && context->storage->is_encryption_enabled();
+    if (applied_encryption) {
         try {
             // Get the encryption key from the config
             std::string encryption_key = context->config.encryption_key;
@@ -507,6 +557,23 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
                                                              storage_result.value, user, tenant);
     if (!insert_version_result.success) {
         return Result<void>::err("Failed to record version: " + insert_version_result.error);
+    }
+
+    // SR-1: record what was actually applied, in the same operation that
+    // records the version. A failure here is fatal rather than logged: a
+    // version whose transform is unrecorded reads back through the
+    // configuration fallback, and if the flags ever change that read is
+    // silently wrong. Refusing the write is the recoverable outcome.
+    {
+        VersionTransform vt;
+        vt.compressed = applied_compression;
+        vt.encrypted = applied_encryption;
+        vt.storage_format = 1;
+        vt.key_id = 0;
+        auto rec = context->db->set_version_transform(file_uid, version_timestamp, vt, tenant);
+        if (!rec.success) {
+            return Result<void>::err("Failed to record storage transform: " + rec.error);
+        }
     }
 
     // Keep files.size in sync with the current content so stat/listdir report
@@ -698,11 +765,18 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
         if (storage_result.success) {
             SERVER_LOG_DEBUG("FileSystem::get", "Successfully read " + std::to_string(storage_result.value.size()) + " bytes from local storage");
 
-            // Process data after reading (decrypt and decompress if needed)
+            // Process data after reading (decrypt and decompress if needed).
+            //
+            // SR-2: what to undo is what the WRITE did, read off the version
+            // row — not what the deployment is configured for now. Asking
+            // configuration here is the defect: flip compression off and this
+            // path hands the raw zlib stream back as the file's content, with
+            // no error.
             std::vector<uint8_t> processed_data = storage_result.value;
+            const AppliedTransform applied = resolve_applied_transform(
+                context->db, context->storage.get(), file_uid, current_version, tenant);
 
-            // Check if encryption is enabled for this tenant/context
-            if (context->storage && context->storage->is_encryption_enabled()) {
+            if (applied.encrypt) {
                 try {
                     // Get the encryption key from the config
                     std::string encryption_key = context->config.encryption_key;
@@ -718,8 +792,7 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
                 }
             }
 
-            // Check if compression is enabled for this tenant/context
-            if (context->storage && context->storage->is_compression_enabled()) {
+            if (applied.compress) {
                 try {
                     processed_data = fileengine::CryptoUtils::decompress_data(processed_data);
                     SERVER_LOG_DEBUG("FileSystem::get", "Data decompressed successfully");
@@ -770,12 +843,32 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     const std::string version_timestamp = Utils::get_timestamp_string();
     const std::string storage_path = context->storage->get_storage_path(file_uid, version_timestamp, tenant);
 
-    const bool do_compress = context->storage->is_compression_enabled();
+    const bool compression_allowed = context->storage->is_compression_enabled();
     const bool do_encrypt = context->storage->is_encryption_enabled();
     std::string encryption_key;
     if (do_encrypt) {
         encryption_key = context->config.encryption_key;
         if (encryption_key.empty()) return Result<void>::err("Encryption key not available");
+    }
+
+    // SR-7: a streaming write cannot see the whole payload, so the compression
+    // decision is made from the FIRST buffer and applied unchanged to the rest.
+    // That is also why the answer has to be recorded (SR-1) rather than
+    // recomputed on read — nothing later in the stream can revise it.
+    std::vector<uint8_t> first_chunk;
+    {
+        std::vector<uint8_t> probe;
+        while (next_chunk(probe)) {
+            if (!probe.empty()) { first_chunk = probe; break; }
+        }
+    }
+    CompressionPolicyConfig stream_cfg;
+    stream_cfg.enabled = compression_allowed;
+    const CompressionDecision stream_decision = decide_compression(first_chunk, stream_cfg);
+    const bool do_compress = stream_decision.compress;
+    if (compression_allowed && !do_compress) {
+        SERVER_LOG_DEBUG("FileSystem::put_stream", std::string("Compression skipped (") +
+                         stream_decision.reason_name() + ") for " + file_uid);
     }
 
     try {
@@ -808,6 +901,12 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
             else sink(p, n);
         };
 
+        // The first buffer was already pulled above to make the decision; feed
+        // it before resuming the stream so no bytes are lost or reordered.
+        if (!first_chunk.empty()) {
+            original_size += first_chunk.size();
+            feed(first_chunk.data(), first_chunk.size());
+        }
         while (next_chunk(chunk)) {
             if (chunk.empty()) continue;
             original_size += chunk.size();
@@ -850,6 +949,16 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     auto insert_version_result = context->db->insert_version(file_uid, version_timestamp,
                                                              static_cast<int64_t>(original_size), storage_path, user, tenant);
     if (!insert_version_result.success) return Result<void>::err("Failed to record version: " + insert_version_result.error);
+    {
+        // SR-1, as in put(): fatal rather than logged.
+        VersionTransform vt;
+        vt.compressed = do_compress;
+        vt.encrypted = do_encrypt;
+        vt.storage_format = 1;
+        vt.key_id = 0;
+        auto rec = context->db->set_version_transform(file_uid, version_timestamp, vt, tenant);
+        if (!rec.success) return Result<void>::err("Failed to record storage transform: " + rec.error);
+    }
     auto update_size_result = context->db->update_file_size(file_uid, static_cast<int64_t>(original_size), tenant);
     if (!update_size_result.success) {
         SERVER_LOG_ERROR("FileSystem::put_stream", "Failed to update file size for " + file_uid + ": " + update_size_result.error);
@@ -876,6 +985,7 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
 // A large message also monopolises the connection while it is written, which is
 // the congestion this bound exists to prevent.
 static constexpr size_t kMaxStreamChunkBytes = 1024 * 1024;
+
 
 Result<void> FileSystem::get_stream(const std::string& file_uid,
                                     const std::function<bool(const uint8_t*, size_t)>& raw_on_chunk,
@@ -1005,8 +1115,12 @@ Result<void> FileSystem::get_stream(const std::string& file_uid,
         return Result<void>::ok();
     }
 
-    const bool do_compress = context->storage->is_compression_enabled();
-    const bool do_encrypt = context->storage->is_encryption_enabled();
+    // SR-2: the transform to undo comes from the version record, not from the
+    // deployment's current flags.
+    const AppliedTransform applied = resolve_applied_transform(
+        context->db, context->storage.get(), file_uid, current_version, tenant);
+    const bool do_compress = applied.compress;
+    const bool do_encrypt = applied.encrypt;
     std::string encryption_key;
     if (do_encrypt) {
         encryption_key = context->config.encryption_key;
@@ -1511,11 +1625,13 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
     if (context->storage) {
         auto storage_result = context->storage->read_file(storage_path, tenant);
         if (storage_result.success) {
-            // Process data after reading (decrypt and decompress if needed)
+            // Process data after reading (decrypt and decompress if needed).
+            // SR-2: from the version record, not from current configuration.
             std::vector<uint8_t> processed_data = storage_result.value;
+            const AppliedTransform applied = resolve_applied_transform(
+                context->db, context->storage.get(), file_uid, version_timestamp, tenant);
 
-            // Check if encryption is enabled for this tenant/context
-            if (context->storage && context->storage->is_encryption_enabled()) {
+            if (applied.encrypt) {
                 try {
                     // Get the encryption key from the config
                     std::string encryption_key = context->config.encryption_key;
@@ -1531,8 +1647,7 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
                 }
             }
 
-            // Check if compression is enabled for this tenant/context
-            if (context->storage && context->storage->is_compression_enabled()) {
+            if (applied.compress) {
                 try {
                     processed_data = fileengine::CryptoUtils::decompress_data(processed_data);
                     SERVER_LOG_DEBUG("FileSystem::get_version", "Version data decompressed successfully");
@@ -2474,6 +2589,19 @@ Result<std::vector<uint8_t>> FileSystem::fetch_from_object_store_if_missing(cons
     return Result<std::vector<uint8_t>>::ok(object_store_result.value);
 }
 
+// One SR-3 backfill per tenant per process. The flags live here rather than in
+// TenantContext so nothing about the tenant model changes for a migration.
+std::once_flag* FileSystem::backfill_once_for(const std::string& tenant) {
+    static std::mutex m;
+    static std::map<std::string, std::unique_ptr<std::once_flag>> flags;
+    std::lock_guard<std::mutex> lock(m);
+    auto it = flags.find(tenant);
+    if (it == flags.end()) {
+        it = flags.emplace(tenant, std::make_unique<std::once_flag>()).first;
+    }
+    return it->second.get();
+}
+
 TenantContext* FileSystem::get_tenant_context(const std::string& tenant) {
     SERVER_LOG_DEBUG("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
               "Called for tenant: " + tenant);
@@ -2503,6 +2631,29 @@ TenantContext* FileSystem::get_tenant_context(const std::string& tenant) {
     } else {
         SERVER_LOG_DEBUG("FileSystem::get_tenant_context", ServerLogger::getInstance().detailed_log_prefix() +
                   "Tenant context found for: " + tenant);
+    }
+
+    // SR-3: record, for every version written before the transform columns
+    // existed, what the deployment's flags say was done to it — which is the
+    // assumption those rows are already being read under. Run once per tenant
+    // per process: the UPDATE only touches rows with no record, so it is
+    // idempotent, and the guard is here purely to keep it off the hot path.
+    //
+    // Deliberately best-effort. A failure leaves the configuration fallback in
+    // place, which is today's behaviour; refusing to serve the tenant over it
+    // would turn a latent inconsistency into an outage.
+    if (context && context->db && context->storage) {
+        std::call_once(*backfill_once_for(tenant), [&]() {
+            auto r = context->db->backfill_version_transforms(
+                context->storage->is_compression_enabled(),
+                context->storage->is_encryption_enabled(),
+                tenant);
+            if (!r.success) {
+                SERVER_LOG_WARN("FileSystem::get_tenant_context",
+                                "Could not backfill version transforms for tenant '" +
+                                tenant + "': " + r.error);
+            }
+        });
     }
 
     return context;

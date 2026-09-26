@@ -387,6 +387,8 @@ private:
     
     // Helper to get tenant context for operations
     TenantContext* get_tenant_context(const std::string& tenant);
+    // One-per-tenant guard for the SR-3 transform backfill (storage_pipeline.md).
+    static std::once_flag* backfill_once_for(const std::string& tenant);
     
     // Helper to validate permissions
     Result<bool> validate_user_permissions(const std::string& resource_uid,
