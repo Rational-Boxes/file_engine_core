@@ -2,8 +2,10 @@
 
 **Status:** Specification — implementation-ready, staged. Nothing implemented yet.
 **Scope:** `file_engine_core`. One additive schema migration, two additive proto
-fields, two additions each to `IStorage` and `IObjectStore`. No ACL change, no
-new permission, no new capability, no change to the tenancy model.
+fields, two additions each to `IStorage` and `IObjectStore`, and a new on-disk
+storage format (§6) that coexists with the existing one rather than replacing
+it. No ACL change, no new permission, no new capability, no change to the
+tenancy model, and nothing already stored is rewritten.
 **Consumers unblocked:** `http_bridge`, `webdav_bridge`, `share_service`,
 `convert_search_ai`, `python_interface`.
 
@@ -158,8 +160,13 @@ carry their usual force.
 - **SR-17** — Bytes returned by a ranged read that were not covered by a verified
   tag MUST be recorded as such in the audit event (SR-20), and serving them at
   all MUST be gated by `storage.allow_unauthenticated_ranges` (default
-  **false**). With it false, a ranged read of an encrypted version falls back to
-  a scan — correct, authenticated up to where it stops, merely slower.
+  **false**). With it false, a ranged read of an encrypted v1 version falls back
+  to a scan — correct, authenticated up to where it stops, merely slower.
+  **This requirement is transitional and applies to v1 versions only.** v2 (§6)
+  authenticates every block a range touches (SR-28), so once a deployment's
+  content is v2 the flag has nothing left to govern. It MUST NOT be presented to
+  operators as a permanent posture, and S5's completion is the point at which it
+  can be removed.
 
 ### Cost, accounting and abuse
 
@@ -198,20 +205,29 @@ Two additive columns on the per-tenant `versions` table, in the
 
 ```sql
 ALTER TABLE "<tenant>".versions
-  ADD COLUMN IF NOT EXISTS compressed BOOLEAN NOT NULL DEFAULT <current compression flag>;
+  ADD COLUMN IF NOT EXISTS compressed     BOOLEAN  NOT NULL DEFAULT <current compression flag>;
 ALTER TABLE "<tenant>".versions
-  ADD COLUMN IF NOT EXISTS encrypted  BOOLEAN NOT NULL DEFAULT <current encryption flag>;
+  ADD COLUMN IF NOT EXISTS encrypted      BOOLEAN  NOT NULL DEFAULT <current encryption flag>;
+ALTER TABLE "<tenant>".versions
+  ADD COLUMN IF NOT EXISTS storage_format SMALLINT NOT NULL DEFAULT 1;
 ```
+
+**`storage_format` is in the S0 migration because v2 is in scope** (§6). Deciding
+it now costs one column in a migration that is being written once; deciding it at
+S5 costs a second migration across every tenant. It is the field SR-32 selects
+the reader by, and a v2 version sets it to `2`. For v1 versions `compressed` and
+`encrypted` retain their meaning; for v2 versions the authoritative copy of both
+is the format header, and the columns are a redundant index kept in step by the
+writer.
 
 The defaults are **rendered from the deployment's live configuration at migration
 time**, not written as literals. That is SR-3: the backfill cannot know what was
 applied to a row written before the column existed, and the only safe assumption
 is the one every existing read is already making.
 
-A third column is **not** specified here but is the obvious next one and should
-be decided while this migration is being written rather than added by a second
-one later: `key_id`, which is the prerequisite for ever rotating the encryption
-key without rewriting every blob (§9-D2).
+`key_id` remains open (§10-D2), but v2's header carries one (§6.2), so the
+per-version column is now the lesser half of that question rather than the whole
+of it.
 
 ---
 
@@ -277,7 +293,166 @@ read should require naming the thing that does it, not passing a number.
 
 ---
 
-## 6. Stages
+## 6. Storage format v2 — authenticated random access
+
+**In scope** *(D1 settled 2026-09-26: build it, keep authentication and random
+access).* This is the end state. Stages S0–S4 are correct and useful on their own
+and remain the path to it, but v2 is what removes the trade rather than managing
+it — with v2, a ranged read is **fully authenticated**, and
+`allow_unauthenticated_ranges` (SR-17) becomes a transitional flag with a defined
+end rather than a permanent posture.
+
+### 6.1 The idea
+
+Instead of one deflate stream inside one GCM object, a version is stored as a
+sequence of **independent blocks** over fixed-size *plaintext* windows. Each
+block is compressed on its own, encrypted on its own, and carries its own
+authentication tag. Plaintext offset → block index is arithmetic; block index →
+stored offset is either arithmetic (uncompressed) or one index lookup.
+
+Random access and authentication stop being in tension because the unit of
+authentication becomes the unit of access.
+
+### 6.2 Layout
+
+```
+┌ header (fixed 32 bytes, cleartext, authenticated via AAD) ──────────────┐
+│ magic          "FEV2"                    4                             │
+│ format_version uint16 = 2                2                             │
+│ flags          uint16                    2   bit0 compressed-blocks     │
+│                                              bit1 encrypted             │
+│                                              bit2 uniform-stored-length │
+│ block_size     uint32                    4   PLAINTEXT bytes per block  │
+│ salt           bytes                     8   per-version nonce prefix   │
+│ key_id         uint32                    4   0 = deployment key         │
+│ reserved                                 8                             │
+└─────────────────────────────────────────────────────────────────────────┘
+[ block 0 ][ block 1 ] … [ block n-1 ]        each: ciphertext ‖ tag(16)
+┌ trailer ────────────────────────────────────────────────────────────────┐
+│ block_count    uint32                                                   │
+│ plaintext_size uint64                                                   │
+│ index          uint32 × block_count   stored length of each block       │
+│                                       (ABSENT when flags.bit2 is set)   │
+│ trailer_tag    bytes 16               AEAD over the header + this trailer│
+└─────────────────────────────────────────────────────────────────────────┘
+┌ footer (fixed 16 bytes, always last) ───────────────────────────────────┐
+│ trailer_offset uint64 │ magic "FEV2" 4 │ reserved 4                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Three things about this shape are deliberate:
+
+- **Plaintext offsets are implicit.** Block *i* covers
+  `[i·block_size, (i+1)·block_size)`, so the index stores only each block's
+  *stored* length — 4 bytes per block, ~4 KiB for a 1 GiB file at 1 MiB blocks.
+- **An uncompressed version needs no index at all.** With `uniform-stored-length`
+  set, every block is `block_size + 16` bytes stored, so stored offset is pure
+  arithmetic and the trailer is 28 bytes. **This is the media case** (S2 leaves
+  media uncompressed), which is the case that most needs O(1) seek — so the
+  hottest path is also the cheapest one.
+- **`block_count` and the index live in the trailer, not the header**, so writing
+  stays **single-pass and streaming**. A writer that had to patch a count into
+  the header could not stream to an object store. The footer is fixed-size and
+  last, so a reader finds the trailer with one read from the end.
+
+### 6.3 Normative requirements
+
+**Crypto**
+
+- **SR-23** — Each block MUST be encrypted with a nonce unique under its key. The
+  nonce is `salt(8) ‖ block_index(4)`, with `salt` freshly generated per **write**
+  (not per file, and not per version name). **Nonce reuse under one key is
+  catastrophic for GCM**, so a rewritten version MUST generate a new salt rather
+  than inherit one.
+- **SR-24** — Each block's AEAD MUST authenticate, as associated data: the
+  header bytes, the **block index**, and a **final-block flag**. Per-block tags
+  alone prove each block is genuine but prove nothing about *order*,
+  *completeness*, or *which file it came from* — an attacker could otherwise
+  reorder blocks, splice blocks between versions encrypted under the same key, or
+  truncate the file, and every individual tag would still verify.
+- **SR-25** — The AAD MUST additionally bind the version's identity (`file_uid`
+  and `version_timestamp`), so a block cannot be moved between versions.
+- **SR-26** — The trailer MUST be authenticated (`trailer_tag`) over the header
+  and the trailer. Otherwise an attacker rewrites the index and reorders or drops
+  blocks without touching a single block tag.
+- **SR-27** — Truncation MUST be detectable: a read that reaches the end without
+  encountering the block whose AAD carries the final-block flag MUST fail. The
+  footer's `trailer_offset` and magic MUST be validated before the trailer is
+  trusted.
+
+**Behaviour**
+
+- **SR-28** — A ranged read over a v2 version MUST verify the tag of **every
+  block it touches**, and MUST fail the request if any fails. There is no
+  unauthenticated read path for v2; SR-17's flag has no effect on it.
+- **SR-29** — A ranged read MUST read at most one block beyond each end of the
+  requested window (the partial blocks the window lands in). `range_method` for
+  a v2 version is always `"seek"`.
+- **SR-30** — `block_size` MUST be recorded per version, never assumed. A
+  deployment changing it MUST affect only subsequent writes.
+- **SR-31** — Per-block compression MUST use the same decision rule as SR-5/SR-6,
+  applied **per block**, so a file with a compressible header and an
+  incompressible body stores each part appropriately. A block that does not
+  shrink is stored uncompressed and flagged in its index entry.
+- **SR-32** — The reader MUST be selected by the version's recorded
+  `storage_format` (§4), not by sniffing the blob. v1 blobs are read by exactly
+  today's code path, which stays.
+- **SR-33** — Writing v2 MUST be a per-deployment setting that defaults to **on**
+  once S5 ships, and MUST NOT rewrite anything already stored (SR-22).
+
+### 6.4 Block size
+
+`storage.block_size`, default **1 MiB** — it matches `kMaxStreamChunkBytes`
+(`filesystem.cpp:878`), bounds read amplification to at most one block either
+side of the window, and costs 16 bytes of tag plus 4 of index per MiB
+(~0.002%). 256 KiB matches the current disk read size and costs 4× the overhead
+(still ~0.008%) for finer seeks. This is a measurement, not an argument — S1's
+method applies (§10-D3).
+
+### 6.5 What v2 costs
+
+Stated plainly, because it is not free:
+
+- **Compression ratio drops.** Each block is deflated independently, so there is
+  no shared dictionary across block boundaries. On 1 MiB blocks over text the
+  loss is small — low single-digit percent — but it is a real regression against
+  whole-stream compression and MUST be measured on the SR-9 corpus (a real IFC
+  model) before v2 becomes the default for compressible content.
+- **A coarse length side channel.** Per-block stored lengths reveal per-block
+  compressibility, where v1 revealed only the total. For file storage at rest
+  this is a marginal change from a leak that already exists, and it is noted
+  rather than mitigated.
+- **Two small reads before the first byte** — the footer, then the trailer.
+  Both are cacheable per version, and for the uniform-stored-length case the
+  trailer is 28 bytes.
+
+### 6.6 What v2 buys beyond the range case
+
+- **Corruption is localised.** Today one flipped bit fails the tag for the whole
+  version; with v2 the damage is one block. For a video that is the difference
+  between a lost file and a glitched second of it — and, more importantly, the
+  rest of the file is still *provably* intact rather than merely readable.
+- **Parallel read and write** become possible; blocks are independent.
+- **Key rotation gets a path.** `key_id` in the header means a version states
+  which key it was written under, which is the prerequisite for rotating without
+  rewriting every blob (§10-D2).
+- **Deduplication and delta sync** get a natural unit, if ever wanted.
+
+### 6.7 Migration
+
+There is none, and that is the point. The format is self-describing and the
+version row records which one was used (SR-32), so v1 and v2 versions **of the
+same file** coexist indefinitely. Old versions age out through the existing
+version lifecycle. An offline rewriter is offered for a deployment that wants
+the benefits applied retroactively; it is a tool, not a step.
+
+**No flag day, no downtime, no re-encrypt window.** That property is what makes
+v2 proposable at all, and it MUST NOT be traded away for implementation
+convenience.
+
+---
+
+## 7. Stages
 
 Each stage is independently shippable and independently valuable. The gate
 column is what must be true before the next stage is safe.
@@ -285,12 +460,12 @@ column is what must be true before the next stage is safe.
 | Stage | Content | Gate it opens |
 |---|---|---|
 | **S0** | **SR-1 – SR-4.** The two columns, the live-flag backfill, both read paths switched from configuration to the version record. | Everything. Also fixes defect **A** on its own. |
-| **S1** | **Measure** (§7). Corpus composition by stored bytes, real zlib ratios per format, CPU attributable to deflate/inflate. | Decides whether S2 is scheduled at all. |
+| **S1** | **Measure** (§8). Corpus composition by stored bytes, real zlib ratios per format, CPU attributable to deflate/inflate. | Decides whether S2 is scheduled at all. |
 | **S2** | **SR-5 – SR-9.** The trial deflate, wired into `put` and the streaming writer, with the §3 SR-9 regression corpus. | Media and other already-compressed content becomes uncompressed, and therefore seekable. |
 | **S3a** | **SR-10 – SR-16, SR-20, SR-21.** Proto fields, the windowed sink with early stop, `total_size` / `range_method`, 416/clamp, the `finish()` rule, audit range fields, `python_interface`. **Scan-only — no format change, no security change.** | Correct ranges for every deployment. Stops discarded bytes crossing gRPC. |
 | **S3b** | **SR-17.** True seek for uncompressed-encrypted versions; the seeking decryptor; `allow_unauthenticated_ranges` off by default; the audit integrity flag. | O(1) seek for media, on a deployment that accepts the trade. |
 | **S4** | **SR-18, SR-19.** Ranged object-store reads and the restore heuristic; the amplification bounds and their metrics. | Safe to expose ranges to an unauthenticated door. |
-| **S5** | **Storage format v2** — chunked, per-block compressed and independently authenticated, with an index. Deferred; specified in `PROPOSAL_byte_range_reads.md` §8. | Retires SR-17's trade entirely: random access and authentication stop being in tension. |
+| **S5** | **Storage format v2** — **SR-23 – SR-33** (§6). The block format, the AAD binding, the authenticated trailer, the streaming writer, the format-selected reader, and the offline rewriter. **In scope**, and the largest single piece; it warrants its own security review before merge, since it is new cryptographic framing. | Retires SR-17 entirely: ranged reads become fully authenticated, and corruption stops being whole-file. |
 
 **S0 is the prerequisite in the strict sense** — it is a defect fix, it is
 required before S2 can exist, and it should be scheduled on its own merits even
@@ -300,7 +475,14 @@ if every other stage is dropped.
 and S3a alone removes the largest practical cost (a gigabyte crossing a process
 boundary to be discarded).
 
-### 6.1 What each downstream consumer needs
+**S3b is now optional, and should probably be skipped.** It buys an
+unauthenticated O(1) seek for v1 encrypted content, and S5 buys an authenticated
+one for everything written afterwards. Building S3b is worthwhile only if the gap
+between S3a and S5 is long enough that media seeking needs an interim answer that
+the `share_service` cache does not already provide — and it does already provide
+one. Decide this when S5 is scheduled, not before.
+
+### 7.1 What each downstream consumer needs
 
 | Consumer | Needs | Notes |
 |---|---|---|
@@ -315,7 +497,7 @@ S0 is the exception, and it is blocked on nothing.
 
 ---
 
-## 7. Measurement (S1)
+## 8. Measurement (S1)
 
 The ratios and savings asserted in the companion proposals are general
 knowledge, not measurements of this corpus, and S2 MUST NOT be scheduled on
@@ -334,7 +516,7 @@ Required before S2:
 
 ---
 
-## 8. Acceptance criteria
+## 9. Acceptance criteria
 
 The tests that must exist, phrased as the failures they prevent.
 
@@ -377,20 +559,64 @@ The tests that must exist, phrased as the failures they prevent.
 
 - A tail range does **not** read the whole version — asserted by counting bytes
   read from storage, not by timing.
-- With `allow_unauthenticated_ranges` false, a ranged read of an encrypted
+- With `allow_unauthenticated_ranges` false, a ranged read of an encrypted v1
   version is served by scan and is reported as such.
 - The audit event carries the range and the integrity flag.
 
+**S5 — the format.** These are the tests that decide whether the format is
+sound, and most of them are adversarial rather than functional.
+
+- A v2 version round-trips byte-for-byte, across every combination of
+  compressed/uncompressed blocks, encrypted and not, at sizes of 0 bytes, 1
+  byte, exactly one block, one block plus one byte, and many blocks.
+- A ranged read reads **at most one block beyond each end** of the window
+  (SR-29) — asserted by counting bytes read from storage.
+- **Reordering two blocks is detected** (SR-24). Swap them on disk; the read
+  must fail, not return scrambled plaintext.
+- **Splicing a block from another version encrypted under the same key is
+  detected** (SR-25). This is the test that proves the AAD carries identity and
+  not just an index.
+- **Truncation is detected** (SR-27) — remove the last block, and separately
+  remove the trailer and footer; both must fail rather than returning a short
+  file.
+- **A rewritten index is detected** (SR-26). Edit the trailer to drop or
+  reorder an entry without touching any block tag; the trailer tag must fail.
+- **Nonces never repeat** (SR-23). Write the same payload twice and assert the
+  salts differ; assert no two blocks within a version share a nonce.
+- A corrupted block fails **that** range and does not fail ranges that do not
+  touch it (SR-28, and the localisation claim in §6.6 — if this does not hold,
+  the claim comes out of the document).
+- **v1 and v2 versions of the same file coexist** and both round-trip (SR-32),
+  selected by the recorded `storage_format` and not by sniffing.
+- The writer is **single-pass**: assert it never seeks backwards, which is what
+  keeps a direct-to-object-store upload possible (§6.2).
+- **Compression ratio on the SR-9 corpus** is measured against v1 whole-stream
+  compression, and the regression is within the band §6.5 predicts. If a real
+  IFC model loses materially more than a few percent, block size is wrong or v2
+  should not default on for compressible content.
+- The offline rewriter produces a v2 version whose plaintext is identical to the
+  v1 it replaced, and is interruptible without damaging either.
+
 ---
 
-## 9. Remaining decisions
+## 10. Remaining decisions
 
-**D1 — Is S5 (format v2) in scope?** It is the correct end state and the largest
-piece. If it is not going to be built, **SR-17's `allow_unauthenticated_ranges`
-stops being a transitional flag** and must be documented as a permanent
-deployment posture, with the integrity consequence stated in the operator
-documentation rather than in a proposal. This is the one decision that changes
-what the specification means rather than when it lands.
+**D1 — Format v2 is in scope** *(settled 2026-09-26: build it, keep
+authentication and random access)*. Specified in §6 as SR-23 – SR-33 and
+scheduled as S5. Three consequences already folded in: `storage_format` joins the
+S0 migration (§4), SR-17 is explicitly transitional and must not be presented to
+operators as a permanent posture, and S3b becomes optional and probably skippable
+(§7).
+
+**D6 — Block size** (§6.4): 1 MiB by default, but the ratio cost in §6.5 and the
+seek granularity both depend on it, and neither has been measured on this corpus.
+Folds into S1's measurement.
+
+**D7 — Does v2 default on for compressible content immediately?** SR-33 says v2
+writing defaults on once S5 ships. If §9's ratio test shows a material loss on
+the SR-9 corpus, the honest answer is v2-on for incompressible content (where
+there is no ratio to lose and all the seek benefit) and a decision to make for
+the rest. Cannot be settled before the measurement exists.
 
 **D2 — Does `key_id` join the S0 migration?** Out of this document's scope, but
 the column is cheap and the migration is being written once. Deciding it later
@@ -409,7 +635,7 @@ product question this document does not open.
 
 ---
 
-## 10. Non-goals
+## 11. Non-goals
 
 - **No change to the permission model.** `get_stream` validates READ before
   resolving anything (`filesystem.cpp:907`); a range narrows what is returned and
