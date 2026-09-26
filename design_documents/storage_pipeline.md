@@ -225,7 +225,7 @@ time**, not written as literals. That is SR-3: the backfill cannot know what was
 applied to a row written before the column existed, and the only safe assumption
 is the one every existing read is already making.
 
-`key_id` remains open (§10-D2), but v2's header carries one (§6.2), so the
+`key_id` remains open (§11-D2), but v2's header carries one (§6.2), so the
 per-version column is now the lesser half of that question rather than the whole
 of it.
 
@@ -319,13 +319,14 @@ authentication becomes the unit of access.
 ┌ header (fixed 32 bytes, cleartext, authenticated via AAD) ──────────────┐
 │ magic          "FEV2"                    4                             │
 │ format_version uint16 = 2                2                             │
-│ flags          uint16                    2   bit0 compressed-blocks     │
+│ required_caps  uint16                    2   bit0 compressed-blocks     │
 │                                              bit1 encrypted             │
 │                                              bit2 uniform-stored-length │
+│ advisory_caps  uint16                    2   hints; safe to ignore      │
 │ block_size     uint32                    4   PLAINTEXT bytes per block  │
 │ salt           bytes                     8   per-version nonce prefix   │
 │ key_id         uint32                    4   0 = deployment key         │
-│ reserved                                 8                             │
+│ reserved                                 6                             │
 └─────────────────────────────────────────────────────────────────────────┘
 [ block 0 ][ block 1 ] … [ block n-1 ]        each: ciphertext ‖ tag(16)
 ┌ trailer ────────────────────────────────────────────────────────────────┐
@@ -355,7 +356,73 @@ Three things about this shape are deliberate:
   the header could not stream to an object store. The footer is fixed-size and
   last, so a reader finds the trailer with one read from the end.
 
-### 6.3 Normative requirements
+### 6.3 The header is the authority, and that is the point
+
+The most valuable property of v2 is not the block structure — it is that **a v2
+blob describes itself**. Today a stored blob is an undifferentiated lump of
+bytes whose meaning lives entirely outside it: in the deployment's configuration
+(which §3's SR-1 shows is already the wrong place) and, after S0, in a database
+column. Interpreting it requires that external state to be present, correct, and
+in step.
+
+- **SR-34** — A v2 blob MUST be fully interpretable from **the blob and the key
+  alone**. A reader given the bytes and the correct key MUST be able to
+  determine the format, the block size, the nonce basis, whether blocks are
+  compressed, and the plaintext length, **with no database and no
+  configuration**.
+- **SR-35** — Where the header and the `versions` row disagree, **the header
+  wins**. The columns added in §4 are an index for querying and for selecting a
+  reader cheaply; they are not the source of truth. A reader MUST validate the
+  header it actually found rather than trusting the column that led it there.
+
+This is the robustness affordance, and it is worth more than the performance
+work around it:
+
+- **Disaster recovery stops depending on two systems agreeing.** The existing
+  restore rehearsal already verifies by hashing content rather than counting
+  rows; with v2 a recovered blob can be read with nothing but the key, so a
+  restore that brings back object storage without a matching database is a
+  recoverable situation rather than a forensic exercise.
+- **A restore into a differently-configured instance is safe.** Today it is an
+  unwritten requirement that the target's compression and encryption settings
+  match the source's, and nothing checks it. With SR-34 the target's settings are
+  irrelevant to reading what it was given.
+- **Bugs become detectable rather than silent.** A mismatch between header and
+  column is a loud, diagnosable inconsistency. The v1 equivalent — the defect in
+  §3 — produces plausible-looking wrong bytes and no error at all.
+
+**The asymmetry this creates for v1 is the strongest argument for the rewriter**
+(§6.9). A corpus that is entirely v2 is a corpus that can be read from cold
+storage with a key; a mixed corpus is only as recoverable as its database.
+
+### 6.4 Unknown capabilities must refuse, not guess
+
+`required_caps` and `advisory_caps` exist so that the next format change is
+survivable, which the current format has no way to be.
+
+- **SR-36** — A reader encountering a bit set in `required_caps` that it does not
+  implement MUST refuse the read with a distinguishable error naming the
+  unsupported capability. It MUST NOT attempt the read.
+- **SR-37** — A reader encountering an unknown bit in `advisory_caps` MUST
+  proceed normally. Advisory bits carry hints — a content-class marker, a
+  dedup-friendliness flag — that affect efficiency and never correctness.
+- **SR-38** — `format_version` and `magic` MUST be validated before any other
+  field is read, and a blob whose footer magic or `trailer_offset` is
+  inconsistent MUST be refused rather than parsed defensively.
+
+The split is the same reasoning PNG's critical-versus-ancillary chunks encode,
+and the failure it prevents is specific: **an old binary silently misreading a
+newer blob.** Without it, adding any future capability — a different cipher, a
+per-block dictionary, a new compressor — means either a flag day or a class of
+bug that returns wrong bytes without erroring. With it, an old reader says
+exactly what it cannot do.
+
+This matters most in the window this specification creates deliberately: §7's
+migration deploys a reader before it enables the writer, and mixed-version
+readers will exist in a replicated deployment. A reader that refuses cleanly is
+the difference between a rolling upgrade and an outage.
+
+### 6.5 Normative requirements
 
 **Crypto**
 
@@ -400,16 +467,16 @@ Three things about this shape are deliberate:
 - **SR-33** — Writing v2 MUST be a per-deployment setting that defaults to **on**
   once S5 ships, and MUST NOT rewrite anything already stored (SR-22).
 
-### 6.4 Block size
+### 6.6 Block size
 
 `storage.block_size`, default **1 MiB** — it matches `kMaxStreamChunkBytes`
 (`filesystem.cpp:878`), bounds read amplification to at most one block either
 side of the window, and costs 16 bytes of tag plus 4 of index per MiB
 (~0.002%). 256 KiB matches the current disk read size and costs 4× the overhead
 (still ~0.008%) for finer seeks. This is a measurement, not an argument — S1's
-method applies (§10-D3).
+method applies (§11-D3).
 
-### 6.5 What v2 costs
+### 6.7 What v2 costs
 
 Stated plainly, because it is not free:
 
@@ -426,7 +493,7 @@ Stated plainly, because it is not free:
   Both are cacheable per version, and for the uniform-stored-length case the
   trailer is 28 bytes.
 
-### 6.6 What v2 buys beyond the range case
+### 6.8 What v2 buys beyond the range case
 
 - **Corruption is localised.** Today one flipped bit fails the tag for the whole
   version; with v2 the damage is one block. For a video that is the difference
@@ -435,24 +502,168 @@ Stated plainly, because it is not free:
 - **Parallel read and write** become possible; blocks are independent.
 - **Key rotation gets a path.** `key_id` in the header means a version states
   which key it was written under, which is the prerequisite for rotating without
-  rewriting every blob (§10-D2).
+  rewriting every blob (§11-D2).
 - **Deduplication and delta sync** get a natural unit, if ever wanted.
 
-### 6.7 Migration
+### 6.9 Rewriting v1 content
 
-There is none, and that is the point. The format is self-describing and the
-version row records which one was used (SR-32), so v1 and v2 versions **of the
-same file** coexist indefinitely. Old versions age out through the existing
-version lifecycle. An offline rewriter is offered for a deployment that wants
-the benefits applied retroactively; it is a tool, not a step.
+**Nothing has to be rewritten.** The format is self-describing and the version
+row records which one was used (SR-32), so v1 and v2 versions **of the same
+file** coexist indefinitely and old versions age out through the existing
+version lifecycle. **No flag day, no downtime, no re-encrypt window** — that
+property is what makes v2 proposable at all and it MUST NOT be traded away for
+implementation convenience.
 
-**No flag day, no downtime, no re-encrypt window.** That property is what makes
-v2 proposable at all, and it MUST NOT be traded away for implementation
-convenience.
+An offline rewriter is nevertheless specified, and it has **two independent
+purposes** that are worth separating, because only one of them needs v2:
+
+| Mode | Available after | What it does | Why |
+|---|---|---|---|
+| **A — recompress** (v1 → v1) | **S0 + S2** | re-evaluates SR-5/SR-6 against the existing corpus and stores the payload uncompressed where compression was achieving nothing | **removes a useless inflate from every future read of that blob** — S2 applied retroactively |
+| **B — convert** (v1 → v2) | S5 | the above, per block, plus the v2 framing | self-describing recovery (§6.3) and authenticated random access (SR-28) |
+
+**Mode A is the one worth noticing.** S2 only improves content written after it
+ships; the deployed corpus keeps paying an inflate on every read, forever, for
+compression that saved nothing. If a rewrite pass is going to be run at all, that
+pass is where the existing corpus gets the same benefit — and Mode A needs
+neither v2 nor a security review, only S0's per-version record to write the
+answer into.
+
+**Candidate selection is a metadata query, not a corpus scan.** `versions.size`
+is the plaintext size and the stored object's size is a `stat`; their ratio says
+whether compression achieved anything **without reading, decrypting or
+decompressing a single blob**. A ratio above `storage.recompress_candidate_ratio`
+(default **0.95**) is a candidate; everything else is left alone. So the pass
+touches only the blobs that stand to gain, which on a media-heavy tenant is most
+of them and on a BIM-heavy tenant is almost none — and it can say which before it
+starts.
+
+**One pass or two.** Running Mode A now and Mode B after S5 rewrites the same
+blobs twice and pays the offsite replication cost twice (below). Since v2 is
+committed, the default is **one pass, Mode B, after S5**. Mode A earlier is worth
+it only if the read-performance win on the existing corpus is wanted before S5
+lands — which §9's measurement is what decides (§11-D8).
+
+Either mode is **a tool, not a step**, and running it has a cost that is easy to
+miss:
+
+- **Every rewritten blob is a new object to replicate offsite.** The deployment
+  mirrors content to a second provider; rewriting the corpus re-uploads the
+  corpus. Rewriting is therefore paced, resumable, and scheduled against
+  bandwidth — not run as a single pass. This is the cost that argues for doing it
+  once rather than twice, and for the candidate filter above rather than a blanket
+  sweep.
+- **A rewrite is a new stored object, not an edit.** It MUST preserve the
+  version's identity, timestamps and `revised_by` exactly; it MUST NOT create a
+  new version, disturb ordering, or alter what any consumer's idempotency keys
+  see. A rewrite that produced a new version name would silently re-trigger every
+  downstream conversion and re-index in the platform.
+- **It MUST be interruptible** at any point without damaging either
+  representation: write the v2 object beside the v1 one, verify it reads back to
+  an identical plaintext hash, then swap the pointer and delete the old — never
+  the reverse order.
 
 ---
 
-## 7. Stages
+## 7. Migrating the deployed system
+
+This lands on a live installation with real tenants, an offsite content mirror
+and no maintenance window on offer. The stages in §8 are the engineering
+sequence; this is the deployment sequence, and they are not the same thing.
+
+### 7.1 The one-way door
+
+**The moment the first v2 blob is written, the core cannot be rolled back.** An
+older binary has no v2 reader, and SR-36 means it will refuse rather than
+misread — which is the correct behaviour and still an outage for anything
+touching that content.
+
+Everything below is arranged around that single fact. The rule it produces:
+
+> **Ship the reader first, and let it bake. Enable the writer separately, later,
+> and per tenant.**
+
+`storage.write_format` (default `1`) is therefore a distinct setting from
+whatever code is deployed. Deploying S5 MUST NOT itself start writing v2.
+
+### 7.2 The sequence
+
+| Phase | Action | Rollback |
+|---|---|---|
+| **P0** | Answer §11-Q1: has `compression` or `encryption` ever been flipped on this deployment? If yes, there may already be versions affected by the §3 defect, and this becomes a repair before it is a migration. | n/a — a question, not a change |
+| **P1** | Deploy **S0**: the migration and the switch from configuration to the version record. No behaviour change; every version reads exactly as before. | ordinary redeploy; columns are additive and unused by the old binary |
+| **P2** | Soak. Verify via the restore rehearsal that a restored instance reads the corpus **without** matching configuration — the property S0 buys. | as P1 |
+| **P3** | Deploy **S2** (selective compression) after §9's measurement. New writes only; the corpus is now mixed by design, which P1 made safe. | ordinary redeploy; mixed corpus stays readable either way |
+| **P4** | Deploy **S3a** (ranges). Purely additive to the RPC. | ordinary redeploy |
+| **P5** | Deploy **S5 code** with `write_format = 1`. **The reader ships and bakes; nothing writes v2.** | ordinary redeploy — this is the last fully reversible step |
+| **P6** | Set `write_format = 2` on **one low-value tenant**. Verify by content hash, then let it run. | revert the setting; v2 blobs already written stay readable, because P5's reader is deployed everywhere |
+| **P7** | Broaden per tenant. | as P6 |
+| **P8** | Optionally run the rewriter (§6.9) — **Mode B by default**, so the existing corpus gets both the retroactive decompression and the v2 framing in one pass. Candidate-filtered, paced against offsite replication bandwidth, resumable. | v1 originals are deleted only after the v2 copy verifies its plaintext hash |
+
+P5 and P6 being separate deployments is the whole design of this table. Merging
+them is the mistake that turns a reversible rollout into a one-way door taken by
+accident.
+
+### 7.3 Replication and mixed readers
+
+`REPLICATION_FAILOVER.md` governs the topology. Two constraints follow:
+
+- **Every node must run the v2 reader before any node writes v2.** In a
+  replicated deployment P5 must complete across the whole topology, not on one
+  node. SR-36 makes a lagging node fail loudly rather than corrupt, which is the
+  right failure — and still a failure.
+- **A failover target is a reader.** A standby that has not taken P5 cannot serve
+  v2 content after promotion. P5 covers standbys.
+
+### 7.4 What verifies it
+
+The existing **restore rehearsal harness** is the instrument, and it already has
+the right shape: it verifies by hashing content rather than counting rows. Three
+checks, at P2, P6 and P8:
+
+1. A restored instance reads the corpus with **no configuration match** to the
+   source (SR-34/SR-35).
+2. Plaintext hashes are identical across the format change, per version, for a
+   sample spanning compressible and incompressible content.
+3. A v2 blob restored **without its database row** can still be decoded to the
+   correct plaintext given the key — the §6.3 property, tested rather than
+   asserted.
+
+Check 3 is the one that justifies the whole header, and it is the one that will
+be skipped if it is not written down here.
+
+### 7.5 Interactions worth checking before P6
+
+- **Offsite mirror.** v2 blobs are opaque bytes and replication is unaffected;
+  the mirror's *volume* is affected only by P8, and then only for the blobs the
+  candidate filter selects. Size the P8 window from that query before scheduling
+  it — it is answerable up front and cheaply (§6.9).
+- **Backups.** A backup taken mid-P7 contains both formats. That is fine by
+  construction — but the restore procedure must not assume one format, and the
+  rehearsal at P6 is what proves it.
+- **The culler and the version lifecycle.** Unchanged; v2 is a storage
+  representation, not a lifecycle concept.
+- **Read-only periods.** During a failover the core refuses writes; a rewriter
+  run must stop cleanly rather than accumulate failures.
+- **Storage accounting.** Reported sizes are stored bytes and will move slightly
+  in both directions (tag and index overhead up, useless compression removed).
+  Nothing depends on the old numbers, but a dashboard may show a step.
+
+### 7.6 Operator documentation owed
+
+Two things must be written before P1 ships, not after:
+
+1. **`compression` and `encryption` are set-once until S0.** Flipping either on
+   an existing deployment corrupts reads silently in one direction (§3). This
+   warning is owed today, independently of whether any of this is built.
+2. **`write_format` is a one-way setting**, what P5-before-P6 means, and why a
+   replicated deployment upgrades readers first.
+
+---
+
+---
+
+## 8. Stages
 
 Each stage is independently shippable and independently valuable. The gate
 column is what must be true before the next stage is safe.
@@ -460,8 +671,8 @@ column is what must be true before the next stage is safe.
 | Stage | Content | Gate it opens |
 |---|---|---|
 | **S0** | **SR-1 – SR-4.** The two columns, the live-flag backfill, both read paths switched from configuration to the version record. | Everything. Also fixes defect **A** on its own. |
-| **S1** | **Measure** (§8). Corpus composition by stored bytes, real zlib ratios per format, CPU attributable to deflate/inflate. | Decides whether S2 is scheduled at all. |
-| **S2** | **SR-5 – SR-9.** The trial deflate, wired into `put` and the streaming writer, with the §3 SR-9 regression corpus. | Media and other already-compressed content becomes uncompressed, and therefore seekable. |
+| **S1** | **Measure** (§9). Corpus composition by stored bytes, real zlib ratios per format, CPU attributable to deflate/inflate. | Decides whether S2 is scheduled at all. |
+| **S2** | **SR-5 – SR-9.** The trial deflate, wired into `put` and the streaming writer, with the §3 SR-9 regression corpus. Plus the **candidate query** (§6.9) — stored-size against `versions.size`, which quantifies what the *existing* corpus is paying for useless compression without reading a blob. | Media and other already-compressed content becomes uncompressed, and therefore seekable. The query decides §11-D8. |
 | **S3a** | **SR-10 – SR-16, SR-20, SR-21.** Proto fields, the windowed sink with early stop, `total_size` / `range_method`, 416/clamp, the `finish()` rule, audit range fields, `python_interface`. **Scan-only — no format change, no security change.** | Correct ranges for every deployment. Stops discarded bytes crossing gRPC. |
 | **S3b** | **SR-17.** True seek for uncompressed-encrypted versions; the seeking decryptor; `allow_unauthenticated_ranges` off by default; the audit integrity flag. | O(1) seek for media, on a deployment that accepts the trade. |
 | **S4** | **SR-18, SR-19.** Ranged object-store reads and the restore heuristic; the amplification bounds and their metrics. | Safe to expose ranges to an unauthenticated door. |
@@ -482,7 +693,7 @@ between S3a and S5 is long enough that media seeking needs an interim answer tha
 the `share_service` cache does not already provide — and it does already provide
 one. Decide this when S5 is scheduled, not before.
 
-### 7.1 What each downstream consumer needs
+### 8.1 What each downstream consumer needs
 
 | Consumer | Needs | Notes |
 |---|---|---|
@@ -497,7 +708,7 @@ S0 is the exception, and it is blocked on nothing.
 
 ---
 
-## 8. Measurement (S1)
+## 9. Measurement (S1)
 
 The ratios and savings asserted in the companion proposals are general
 knowledge, not measurements of this corpus, and S2 MUST NOT be scheduled on
@@ -516,7 +727,7 @@ Required before S2:
 
 ---
 
-## 9. Acceptance criteria
+## 10. Acceptance criteria
 
 The tests that must exist, phrased as the failures they prevent.
 
@@ -584,36 +795,55 @@ sound, and most of them are adversarial rather than functional.
 - **Nonces never repeat** (SR-23). Write the same payload twice and assert the
   salts differ; assert no two blocks within a version share a nonce.
 - A corrupted block fails **that** range and does not fail ranges that do not
-  touch it (SR-28, and the localisation claim in §6.6 — if this does not hold,
+  touch it (SR-28, and the localisation claim in §6.8 — if this does not hold,
   the claim comes out of the document).
 - **v1 and v2 versions of the same file coexist** and both round-trip (SR-32),
   selected by the recorded `storage_format` and not by sniffing.
 - The writer is **single-pass**: assert it never seeks backwards, which is what
   keeps a direct-to-object-store upload possible (§6.2).
 - **Compression ratio on the SR-9 corpus** is measured against v1 whole-stream
-  compression, and the regression is within the band §6.5 predicts. If a real
+  compression, and the regression is within the band §6.7 predicts. If a real
   IFC model loses materially more than a few percent, block size is wrong or v2
   should not default on for compressible content.
 - The offline rewriter produces a v2 version whose plaintext is identical to the
   v1 it replaced, and is interruptible without damaging either.
+- **The rewriter does not create a version.** After a rewrite the version name,
+  `revised_by`, timestamps and ordering are unchanged, and no consumer's
+  idempotency key sees a new value — asserted against the rendition namer, which
+  keys on the version name and would otherwise re-convert the entire corpus.
+- **Mode A round-trips**: a v1 blob whose compression saved nothing is stored
+  uncompressed and reads back to an identical plaintext hash, with
+  `versions.compressed` updated in the same transaction as the swap.
+- **The candidate query is honest**: on a fixture corpus containing both a real
+  IFC model and a real video, it selects the video and not the IFC — asserted
+  without decrypting anything.
 
 ---
 
-## 10. Remaining decisions
+## 11. Remaining decisions
 
 **D1 — Format v2 is in scope** *(settled 2026-09-26: build it, keep
 authentication and random access)*. Specified in §6 as SR-23 – SR-33 and
 scheduled as S5. Three consequences already folded in: `storage_format` joins the
 S0 migration (§4), SR-17 is explicitly transitional and must not be presented to
 operators as a permanent posture, and S3b becomes optional and probably skippable
-(§7).
+(§8).
 
-**D6 — Block size** (§6.4): 1 MiB by default, but the ratio cost in §6.5 and the
+**D6 — Block size** (§6.6): 1 MiB by default, but the ratio cost in §6.7 and the
 seek granularity both depend on it, and neither has been measured on this corpus.
 Folds into S1's measurement.
 
+**D8 — One rewrite pass or two?** §6.9's Mode A (retroactive decompression, v1 →
+v1) is available at S0+S2 and needs no security review; Mode B folds it into the
+v2 conversion at S5. Doing both means rewriting the same blobs twice and paying
+the offsite replication twice, so the default is one pass at P8. Running Mode A
+earlier is justified only if §9's measurement shows the existing corpus is
+paying enough for useless inflation to be worth the duplicated work — which is a
+number, not an opinion, and the candidate query in §6.9 produces it before
+anything is rewritten.
+
 **D7 — Does v2 default on for compressible content immediately?** SR-33 says v2
-writing defaults on once S5 ships. If §9's ratio test shows a material loss on
+writing defaults on once S5 ships. If §10's ratio test shows a material loss on
 the SR-9 corpus, the honest answer is v2-on for incompressible content (where
 there is no ratio to lose and all the seek benefit) and a decision to make for
 the rest. Cannot be settled before the measurement exists.
@@ -635,7 +865,7 @@ product question this document does not open.
 
 ---
 
-## 11. Non-goals
+## 12. Non-goals
 
 - **No change to the permission model.** `get_stream` validates READ before
   resolving anything (`filesystem.cpp:907`); a range narrows what is returned and
