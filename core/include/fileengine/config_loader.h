@@ -34,6 +34,22 @@ struct Config {
     bool encrypt_data = false;
     bool compress_data = false;
     std::string encryption_key;  // Added for encryption support
+
+    // Which on-disk storage format NEW writes use.
+    //   1 = the original layout: one zlib stream inside one GCM object
+    //   2 = the chunked, per-block authenticated format (storage_pipeline.md §6)
+    //
+    // Reading is decided per version, from the version's own record (SR-32), so
+    // a deployment always reads BOTH formats whatever this is set to. This
+    // governs writes alone.
+    //
+    // DEFAULT 1, DELIBERATELY. Deploying the v2 code must not start writing v2:
+    // §7.1 — the moment the first v2 blob exists the core cannot be rolled
+    // back, because an older binary has no v2 reader and SR-36 makes it refuse
+    // rather than misread. So the reader ships and bakes first (P5), and this
+    // setting is turned on separately and per tenant afterwards (P6). Merging
+    // those two steps is how a one-way door gets taken by accident.
+    int storage_write_format = 1;
     
     // S3/MinIO configuration
     std::string s3_endpoint = "http://localhost:9000";

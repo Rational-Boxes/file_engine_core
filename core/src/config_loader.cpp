@@ -184,6 +184,9 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
     it = env_vars.find("FILEENGINE_COMPRESS_DATA");
     if (it != env_vars.end()) config.compress_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
 
+    it = env_vars.find("FILEENGINE_STORAGE_WRITE_FORMAT");
+    if (it != env_vars.end()) config.storage_write_format = std::atoi(it->second.c_str());
+
     it = env_vars.find("AT_REST_KEY");
     if (it != env_vars.end()) config.encryption_key = it->second;
 
@@ -303,6 +306,9 @@ Config ConfigLoader::load_from_env() {
 
     env_value = get_env_var("FILEENGINE_COMPRESS_DATA", "");
     if (!env_value.empty()) config.compress_data = (env_value == "true" || env_value == "TRUE" || env_value == "1");
+
+    env_value = get_env_var("FILEENGINE_STORAGE_WRITE_FORMAT", "");
+    if (!env_value.empty()) config.storage_write_format = std::atoi(env_value.c_str());
 
     env_value = get_env_var("AT_REST_KEY", "");
     if (!env_value.empty()) config.encryption_key = env_value;
@@ -587,6 +593,9 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     it = default_file_vars.find("FILEENGINE_COMPRESS_DATA");
     if (it != default_file_vars.end()) config.compress_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
 
+    it = default_file_vars.find("FILEENGINE_STORAGE_WRITE_FORMAT");
+    if (it != default_file_vars.end()) config.storage_write_format = std::atoi(it->second.c_str());
+
     it = default_file_vars.find("AT_REST_KEY");
     if (it != default_file_vars.end()) config.encryption_key = it->second;
 
@@ -728,6 +737,9 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     it = cmdline_file_vars.find("FILEENGINE_COMPRESS_DATA");
     if (it != cmdline_file_vars.end()) config.compress_data = (it->second == "true" || it->second == "TRUE" || it->second == "1");
 
+    it = cmdline_file_vars.find("FILEENGINE_STORAGE_WRITE_FORMAT");
+    if (it != cmdline_file_vars.end()) config.storage_write_format = std::atoi(it->second.c_str());
+
     it = cmdline_file_vars.find("AT_REST_KEY");
     if (it != cmdline_file_vars.end()) config.encryption_key = it->second;
 
@@ -844,6 +856,7 @@ Config ConfigLoader::load_config(int argc, char* argv[]) {
     if (env_has("FILEENGINE_STORAGE_BASE")) config.storage_base_path = env_config.storage_base_path;
     if (env_has("FILEENGINE_ENCRYPT_DATA")) config.encrypt_data = env_config.encrypt_data;
     if (env_has("FILEENGINE_COMPRESS_DATA")) config.compress_data = env_config.compress_data;
+    if (env_has("FILEENGINE_STORAGE_WRITE_FORMAT")) config.storage_write_format = env_config.storage_write_format;
     if (env_has("AT_REST_KEY")) config.encryption_key = env_config.encryption_key;
     if (env_has("FILEENGINE_CACHE_THRESHOLD")) config.cache_threshold = env_config.cache_threshold;
     if (env_has("FILEENGINE_MAX_CACHE_SIZE_MB")) config.max_cache_size_mb = env_config.max_cache_size_mb;

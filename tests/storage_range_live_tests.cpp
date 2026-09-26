@@ -94,7 +94,8 @@ struct Fixture {
     std::string root;
 };
 
-static bool make_fixture(Fixture& f, bool encrypt, bool compress, const std::string& suffix) {
+static bool make_fixture(Fixture& f, bool encrypt, bool compress, const std::string& suffix,
+                         int write_format = 1) {
     TenantConfig cfg;
     cfg.db_host = env_or("FILEENGINE_PG_HOST", env_or("FE_TEST_PG_HOST", "localhost"));
     cfg.db_port = std::stoi(env_or("FILEENGINE_PG_PORT", env_or("FE_TEST_PG_PORT", "5434")));
@@ -111,6 +112,7 @@ static bool make_fixture(Fixture& f, bool encrypt, bool compress, const std::str
     cfg.s3_path_style = true;
     cfg.encrypt_data = encrypt;
     cfg.compress_data = compress;
+    cfg.storage_write_format = write_format;
     cfg.encryption_key =
         "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
@@ -166,11 +168,11 @@ static bool read_range(FileSystem& fs, const std::string& uid, const std::string
 }
 
 static void run_combination(bool encrypt, bool compress, const std::string& label,
-                            bool exhaustive) {
+                            bool exhaustive, int write_format = 1) {
     std::cout << "ranges end-to-end: " << label << "..." << std::endl;
 
     Fixture f;
-    if (!make_fixture(f, encrypt, compress, label)) {
+    if (!make_fixture(f, encrypt, compress, label, write_format)) {
         check(false, "fixture " + label);
         return;
     }
@@ -221,8 +223,13 @@ static void run_combination(bool encrypt, bool compress, const std::string& labe
                   " = " + std::to_string(rep.total_size));
         check(rep.range_length == static_cast<int64_t>(expect_len),
               label + std::string(": range_length on ") + w.name);
-        // SR-13: tier 1 satisfies every format by scanning, and says so.
-        check(rep.range_method == "scan", label + ": range_method is reported");
+        // SR-13. v1 satisfies every window by scanning; v2 seeks. Asserting
+        // the value rather than merely its presence is what would catch a v2
+        // read silently falling back to the v1 path.
+        const char* expect_method = (write_format == 2) ? "seek" : "scan";
+        check(rep.range_method == expect_method,
+              label + std::string(": range_method is ") + expect_method +
+                  " (got " + rep.range_method + ")");
     }
 
     // SR-14: overlong clamps rather than failing.
@@ -246,9 +253,14 @@ static void run_combination(bool encrypt, bool compress, const std::string& labe
         FileSystem::RangeReport part;
         check(read_range(*f.fs, uid, f.tenant, 0, 100, got, &part), label + ": head range");
         check(part.ranged, label + ": a window is reported as a range");
-        if (encrypt) {
+        if (write_format == 2) {
+            // SR-28: v2 verifies every block a range touches, so a ranged read
+            // is authenticated. This is the trade the format exists to remove.
+            check(part.authenticated,
+                  label + ": a v2 ranged read IS authenticated (SR-28)");
+        } else if (encrypt) {
             check(!part.authenticated,
-                  label + ": an early-terminated ranged read reports UNAUTHENTICATED");
+                  label + ": an early-terminated v1 ranged read reports UNAUTHENTICATED");
         } else {
             check(part.authenticated,
                   label + ": unencrypted content has no tag to miss");
@@ -303,6 +315,96 @@ static void run_combination(bool encrypt, bool compress, const std::string& labe
     destroy_fixture(f);
 }
 
+// §7.1 / SR-33: the switch is what decides the format, and the default must be
+// 1 so that deploying the code does not start writing v2.
+static void test_write_format_is_opt_in() {
+    std::cout << "SR-33: v2 is written only when configured..." << std::endl;
+
+    // Default config: a fresh TenantConfig must not write v2.
+    TenantConfig fresh;
+    check(fresh.storage_write_format == 1,
+          "TenantConfig defaults to format 1 — deploying the code writes no v2");
+
+    Fixture f;
+    if (!make_fixture(f, /*encrypt=*/true, /*compress=*/true, "fmtdefault", /*write_format=*/1)) {
+        check(false, "fixture");
+        return;
+    }
+    auto c = f.fs->touch("", "v1.bin", USER, ROLES, f.tenant);
+    check(c.success, "touch");
+    const auto payload = mixed_payload(5000);
+    check(f.fs->put(c.value, payload, USER, ROLES, f.tenant).success, "put");
+
+    // The version row must say 1, and the stored bytes must NOT be v2.
+    auto rec = f.db->get_version_transform(c.value, f.fs->stat(c.value, USER, ROLES, f.tenant).value.version,
+                                           f.tenant);
+    check(rec.success && rec.value.has_value() && rec.value->storage_format == 1,
+          "a default deployment records storage_format = 1");
+
+    destroy_fixture(f);
+}
+
+// A tenant that switches the setting mid-life ends up with both formats. That
+// is the steady state P6/P7 create, and §6.9 says it is permanent — so it has
+// to read correctly, per version, forever.
+static void test_mixed_corpus() {
+    std::cout << "§6.9: v1 and v2 versions of the same file both read..." << std::endl;
+
+    Fixture f;
+    if (!make_fixture(f, /*encrypt=*/true, /*compress=*/true, "mixed", /*write_format=*/1)) {
+        check(false, "fixture");
+        return;
+    }
+    auto c = f.fs->touch("", "mixed.bin", USER, ROLES, f.tenant);
+    check(c.success, "touch");
+    const std::string uid = c.value;
+
+    const auto v1_payload = mixed_payload(9000);
+    check(f.fs->put(uid, v1_payload, USER, ROLES, f.tenant).success, "put v1");
+    const std::string v1_version = f.fs->stat(uid, USER, ROLES, f.tenant).value.version;
+
+    // Flip the switch, as P6 does, and write another version of the SAME file.
+    TenantContext* ctx = f.tm->get_tenant_context(f.tenant);
+    check(ctx != nullptr, "tenant context");
+    if (ctx) ctx->config.storage_write_format = 2;
+
+    const auto v2_payload = mixed_payload(11000);
+    check(f.fs->put(uid, v2_payload, USER, ROLES, f.tenant).success, "put v2");
+    const std::string v2_version = f.fs->stat(uid, USER, ROLES, f.tenant).value.version;
+    check(v1_version != v2_version, "two distinct versions");
+
+    auto r1 = f.db->get_version_transform(uid, v1_version, f.tenant);
+    auto r2 = f.db->get_version_transform(uid, v2_version, f.tenant);
+    check(r1.value.has_value() && r1.value->storage_format == 1, "the first version is v1");
+    check(r2.value.has_value() && r2.value->storage_format == 2, "the second version is v2");
+
+    // The current version (v2) reads through every path.
+    std::vector<uint8_t> whole;
+    check(read_all(*f.fs, uid, f.tenant, whole), "get_stream on v2");
+    check(whole == v2_payload, "v2 content is correct through get_stream");
+
+    auto got = f.fs->get(uid, USER, ROLES, f.tenant);
+    check(got.success && got.value == v2_payload, "v2 content is correct through get");
+
+    // And the OLD v1 version still reads, selected by its own record (SR-32).
+    auto old = f.fs->get_version(uid, v1_version, USER, ROLES, f.tenant);
+    check(old.success, "the v1 version still reads: " + old.error);
+    check(old.success && old.value == v1_payload, "…and is byte-identical");
+
+    // Ranges over the v2 version seek and are authenticated.
+    FileSystem::RangeReport rep;
+    std::vector<uint8_t> window;
+    check(read_range(*f.fs, uid, f.tenant, 4321, 1000, window, &rep), "range on v2");
+    check(window == std::vector<uint8_t>(v2_payload.begin() + 4321,
+                                         v2_payload.begin() + 5321),
+          "v2 range content");
+    check(rep.range_method == "seek", "v2 ranges seek");
+    check(rep.authenticated, "v2 ranges are authenticated");
+    check(rep.total_size == static_cast<int64_t>(v2_payload.size()), "v2 total_size");
+
+    destroy_fixture(f);
+}
+
 int main() {
     std::cout << "=== storage_range_live_tests ===\n";
 
@@ -321,6 +423,14 @@ int main() {
     run_combination(true,  false, "encrypted", /*exhaustive=*/false);
     run_combination(false, true,  "compressed", /*exhaustive=*/false);
     run_combination(true,  true,  "compressed-encrypted", /*exhaustive=*/true);
+
+    // The same battery again, with the format switch on (§7.1 / SR-33).
+    run_combination(true,  true,  "v2-compressed-encrypted", /*exhaustive=*/true,  /*write_format=*/2);
+    run_combination(true,  false, "v2-encrypted",            /*exhaustive=*/false, /*write_format=*/2);
+    run_combination(false, true,  "v2-compressed",           /*exhaustive=*/false, /*write_format=*/2);
+
+    test_write_format_is_opt_in();
+    test_mixed_corpus();
 
     std::cout << "\n=== " << (g_checks - g_failures) << "/" << g_checks
               << " checks passed ===\n";

@@ -18,6 +18,7 @@
 #include "fileengine/server_logger.h"
 #include "fileengine/crypto_utils.h"
 #include "fileengine/compression_policy.h"
+#include "fileengine/storage_format_v2.h"
 #include "fileengine/service_auth_interceptor.h"
 #include <algorithm>
 #include <optional>
@@ -54,10 +55,33 @@ AppliedTransform resolve_applied_transform(
     if (!rec.success || !rec.value.has_value()) return t;
 
     const VersionTransform& v = *rec.value;
+    // SR-32: the reader is selected by the RECORDED format, never by sniffing
+    // the blob. v1 versions keep exactly today's code path, for as long as any
+    // exist — which, since there is no rewrite pass (§6.9), is indefinitely.
     t.storage_format = v.storage_format;
     if (v.compressed.has_value()) { t.compress = *v.compressed; t.from_record = true; }
     if (v.encrypted.has_value())  { t.encrypt  = *v.encrypted;  t.from_record = true; }
     return t;
+}
+
+// SR-32 / SR-34: decode a v2 blob held in memory. The blob carries its own
+// block size, salt, compression flags and plaintext length, so nothing is
+// passed in except the key and the identity the AAD binds.
+Result<std::vector<uint8_t>> decode_v2_buffer(const std::vector<uint8_t>& blob,
+                                              const std::string& key,
+                                              const std::string& file_uid,
+                                              const std::string& version) {
+    v2::VersionIdentity vid;
+    vid.file_uid = file_uid;
+    vid.version_timestamp = version;
+    std::vector<uint8_t> out;
+    auto e = v2::decode(blob, key, vid, out);
+    if (e) {
+        return Result<std::vector<uint8_t>>::err(
+            std::string("storage format v2: ") + v2::status_name(e.status) +
+            " (" + e.detail + ")");
+    }
+    return Result<std::vector<uint8_t>>::ok(std::move(out));
 }
 
 } // namespace
@@ -501,7 +525,15 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     CompressionPolicyConfig comp_cfg;
     comp_cfg.enabled = context->storage && context->storage->is_compression_enabled();
     const CompressionDecision comp_decision = decide_compression(data, comp_cfg);
-    const bool applied_compression = comp_decision.compress;
+
+    // §7.1 / SR-33: v2 is written only when the deployment asks for it. The
+    // reader is always present; this switch is what P6 turns on, separately
+    // from the deploy that shipped the code.
+    const bool write_v2 = (context->config.storage_write_format == 2);
+
+    // v2 compresses and encrypts per block, so the whole-payload transforms
+    // below are skipped entirely rather than run and discarded.
+    const bool applied_compression = !write_v2 && comp_decision.compress;
 
     if (applied_compression) {
         try {
@@ -518,7 +550,8 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     }
 
     // Check if encryption is enabled for this tenant/context
-    const bool applied_encryption = context->storage && context->storage->is_encryption_enabled();
+    const bool encryption_on = context->storage && context->storage->is_encryption_enabled();
+    const bool applied_encryption = !write_v2 && encryption_on;
     if (applied_encryption) {
         try {
             // Get the encryption key from the config
@@ -533,6 +566,26 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
             SERVER_LOG_ERROR("FileSystem::put", "Encryption failed: " + std::string(e.what()));
             return Result<void>::err("Failed to encrypt data: " + std::string(e.what()));
         }
+    }
+
+    if (write_v2) {
+        v2::Options o;
+        o.encrypt = encryption_on;
+        // v2 decides compression per BLOCK (SR-31), so the whole-payload
+        // decision above only says whether to try at all.
+        o.compress = comp_cfg.enabled;
+        o.block_size = v2::kDefaultBlockSize;
+        v2::VersionIdentity vid;
+        vid.file_uid = file_uid;
+        vid.version_timestamp = version_timestamp;
+
+        std::vector<uint8_t> encoded;
+        auto enc = v2::encode(data, context->config.encryption_key, vid, encoded, o);
+        if (enc) {
+            return Result<void>::err(std::string("Failed to encode storage format v2: ") +
+                                     v2::status_name(enc.status) + " (" + enc.detail + ")");
+        }
+        processed_data.swap(encoded);
     }
 
     // Store the processed file in storage
@@ -566,9 +619,11 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     // silently wrong. Refusing the write is the recoverable outcome.
     {
         VersionTransform vt;
-        vt.compressed = applied_compression;
-        vt.encrypted = applied_encryption;
-        vt.storage_format = 1;
+        // For v2 the header is authoritative (SR-35) and carries all of this;
+        // the columns are the index that selects a reader cheaply.
+        vt.compressed = write_v2 ? comp_cfg.enabled : applied_compression;
+        vt.encrypted = write_v2 ? encryption_on : applied_encryption;
+        vt.storage_format = write_v2 ? 2 : 1;
         vt.key_id = 0;
         auto rec = context->db->set_version_transform(file_uid, version_timestamp, vt, tenant);
         if (!rec.success) {
@@ -775,6 +830,14 @@ Result<std::vector<uint8_t>> FileSystem::get(const std::string& file_uid,
             std::vector<uint8_t> processed_data = storage_result.value;
             const AppliedTransform applied = resolve_applied_transform(
                 context->db, context->storage.get(), file_uid, current_version, tenant);
+
+            if (applied.storage_format == 2) {
+                auto dec = decode_v2_buffer(processed_data, context->config.encryption_key,
+                                            file_uid, current_version);
+                if (!dec.success) return Result<std::vector<uint8_t>>::err(dec.error);
+                if (cache_manager_) cache_manager_->add_file(local_storage_path, dec.value, tenant);
+                return Result<std::vector<uint8_t>>::ok(dec.value);
+            }
 
             if (applied.encrypt) {
                 try {
@@ -1180,6 +1243,73 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
     // deployment's current flags.
     const AppliedTransform applied = resolve_applied_transform(
         context->db, context->storage.get(), file_uid, current_version, tenant);
+
+    // ── v2: a real seek, and a fully authenticated one ─────────────────────
+    //
+    // This is what the format is for (§6.1, SR-28/SR-29). The reader maps the
+    // plaintext offset to a block index arithmetically, reads only the blocks
+    // the window lands in, and verifies the tag of every one of them. So unlike
+    // the v1 path below, the cost is proportional to LENGTH rather than to
+    // offset+length, and a ranged read is not an unauthenticated read.
+    if (applied.storage_format == 2) {
+        std::ifstream v2f(local_storage_path, std::ios::binary | std::ios::ate);
+        if (!v2f.is_open()) {
+            return Result<void>::err("Failed to open file for reading: " + local_storage_path);
+        }
+        const uint64_t stored_size = static_cast<uint64_t>(v2f.tellg());
+
+        v2::VersionIdentity vid;
+        vid.file_uid = file_uid;
+        vid.version_timestamp = current_version;
+
+        v2::Reader reader;
+        auto opened = reader.open(
+            [&v2f](uint64_t off, size_t len, uint8_t* dst) {
+                v2f.clear();
+                v2f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+                if (!v2f) return false;
+                v2f.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));
+                return static_cast<size_t>(v2f.gcount()) == len;
+            },
+            stored_size, context->config.encryption_key, vid);
+        if (opened) {
+            return Result<void>::err(std::string("storage format v2: ") +
+                                     v2::status_name(opened.status) + " (" + opened.detail + ")");
+        }
+
+        const uint64_t total = reader.plaintext_size();
+        int64_t emitted = 0;
+        auto e = reader.read_range(
+            static_cast<uint64_t>(req_offset),
+            static_cast<uint64_t>(req_length),
+            [&](const uint8_t* p, size_t n) {
+                // Same bound as the v1 sink: one plaintext run per gRPC message.
+                size_t off = 0;
+                while (off < n) {
+                    const size_t take = std::min(kMaxStreamChunkBytes, n - off);
+                    if (!raw_on_chunk(p + off, take)) return false;
+                    off += take;
+                    emitted += static_cast<int64_t>(take);
+                }
+                return true;
+            });
+        if (e && e.status != v2::Status::Internal) {
+            // Status::Internal here means the CALLER's sink refused, which is a
+            // normal early stop, not a failure of the read.
+            return Result<void>::err(std::string("storage format v2: ") +
+                                     v2::status_name(e.status) + " (" + e.detail + ")");
+        }
+        if (report) {
+            report->ranged = windowed;
+            report->range_start = req_offset;
+            report->range_length = emitted;
+            report->total_size = static_cast<int64_t>(total);
+            report->range_method = "seek";
+            report->authenticated = true;   // SR-28: every block touched verified
+        }
+        return Result<void>::ok();
+    }
+
     const bool do_compress = applied.compress;
     const bool do_encrypt = applied.encrypt;
     std::string encryption_key;
@@ -1725,6 +1855,14 @@ Result<std::vector<uint8_t>> FileSystem::get_version(const std::string& file_uid
             std::vector<uint8_t> processed_data = storage_result.value;
             const AppliedTransform applied = resolve_applied_transform(
                 context->db, context->storage.get(), file_uid, version_timestamp, tenant);
+
+            if (applied.storage_format == 2) {
+                auto dec = decode_v2_buffer(processed_data, context->config.encryption_key,
+                                            file_uid, version_timestamp);
+                if (!dec.success) return Result<std::vector<uint8_t>>::err(dec.error);
+                if (cache_manager_) cache_manager_->add_file(storage_path, dec.value, tenant);
+                return Result<std::vector<uint8_t>>::ok(dec.value);
+            }
 
             if (applied.encrypt) {
                 try {
