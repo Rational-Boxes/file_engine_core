@@ -324,7 +324,7 @@ static Layout layout_of(const std::vector<uint8_t>& blob) {
         return true;
     }, blob.size(), KEY, ident());
     if (e) return L;
-    uint64_t off = kHeaderSize;
+    uint64_t off = r.data_offset();
     for (uint32_t entry : r.trailer().index) {
         const uint32_t len = entry & kBlockLenMask;
         L.offset.push_back(off);
@@ -377,11 +377,15 @@ static void test_splicing_from_another_version_is_detected() {
         if (o + l > a.size()) return false; std::memcpy(d, a.data() + o, l); return true;
     }, a.size(), KEY, ident("file-A", "v1")), Status::Ok, "open A");
 
-    uint64_t off = kHeaderSize;
+    const uint64_t off = ra.data_offset();
     const uint32_t len0 = ra.trailer().index[0] & kBlockLenMask;
 
+    // Both blobs have identical identity-block LENGTHS here (same uid/version
+    // widths), so block 0 sits at the same stored offset in each and the splice
+    // is byte-clean — which is what makes this a fair test of the AAD rather
+    // than of the framing.
     std::vector<uint8_t> spliced = a;
-    std::memcpy(spliced.data() + off, b.data() + kHeaderSize, len0);
+    std::memcpy(spliced.data() + off, b.data() + off, len0);
 
     std::vector<uint8_t> out;
     CHECK_STATUS(decode(spliced, KEY, ident("file-A", "v1"), out), Status::BadBlock,
@@ -391,13 +395,21 @@ static void test_splicing_from_another_version_is_detected() {
     std::vector<uint8_t> c;
     CHECK_STATUS(encode(plain, KEY, ident("file-A", "v2"), c, opts(block)), Status::Ok, "encode A v2");
     std::vector<uint8_t> spliced2 = a;
-    std::memcpy(spliced2.data() + off, c.data() + kHeaderSize, len0);
+    std::memcpy(spliced2.data() + off, c.data() + off, len0);
     CHECK_STATUS(decode(spliced2, KEY, ident("file-A", "v1"), out), Status::BadBlock,
                  "a block from another VERSION of the same file is rejected");
 
     // And reading A as if it were B fails wholesale — identity is not advisory.
-    CHECK_STATUS(decode(a, KEY, ident("file-B", "v1"), out), Status::BadTrailer,
+    // Since the blob now RECORDS its identity, this is refused up front with a
+    // status that names the disagreement, rather than surfacing as a trailer tag
+    // failure three structures in. Both refuse; one is diagnosable.
+    auto mism = decode(a, KEY, ident("file-B", "v1"), out);
+    CHECK_STATUS(mism, Status::IdentityMismatch,
                  "the whole blob is bound to its version identity");
+    CHECK(mism.detail.find("file-A") != std::string::npos &&
+          mism.detail.find("file-B") != std::string::npos,
+          "…and the error names both what the blob is and what was asked for");
+    CHECK(out.empty(), "no bytes are returned on a mismatch");
 }
 
 static void test_truncation_is_detected() {
@@ -483,8 +495,16 @@ static void test_header_tampering_is_detected() {
     std::vector<uint8_t> blob;
     CHECK_STATUS(encode(plain, KEY, ident(), blob, opts(block)), Status::Ok, "encode");
 
+    // Now spans the identity block too, since that is part of the header and is
+    // bound into every AAD.
+    Reader hr;
+    (void)hr.open([&blob](uint64_t o, size_t l, uint8_t* d) {
+        if (o + l > blob.size()) return false; std::memcpy(d, blob.data() + o, l); return true;
+    }, blob.size(), KEY, ident());
+    const size_t header_bytes = static_cast<size_t>(hr.data_offset());
+
     int rejected = 0, tried = 0;
-    for (size_t i = 0; i < kHeaderSize; ++i) {
+    for (size_t i = 0; i < header_bytes; ++i) {
         std::vector<uint8_t> t = blob;
         t[i] ^= 0x01;
         std::vector<uint8_t> out;
@@ -564,7 +584,14 @@ static void test_nonces_never_repeat() {
         std::vector<uint8_t> blob;
         CHECK_STATUS(encode(plain, KEY, ident(), blob, opts(512)), Status::Ok, "encode");
         salts.insert(std::string(reinterpret_cast<const char*>(blob.data() + 16), kSaltSize));
-        ciphertexts.insert(std::string(reinterpret_cast<const char*>(blob.data() + kHeaderSize), 32));
+        // Offset 16 is the salt in the fixed header; the first ciphertext sits
+        // after the identity block, so it is located rather than assumed.
+        Reader nr;
+        (void)nr.open([&blob](uint64_t o, size_t l, uint8_t* d) {
+            if (o + l > blob.size()) return false; std::memcpy(d, blob.data() + o, l); return true;
+        }, blob.size(), KEY, ident());
+        ciphertexts.insert(std::string(
+            reinterpret_cast<const char*>(blob.data() + nr.data_offset()), 32));
     }
     CHECK(salts.size() == 64, "64 writes produced 64 distinct salts");
     CHECK(ciphertexts.size() == 64, "…and therefore 64 distinct ciphertexts");
@@ -624,8 +651,11 @@ static void test_unknown_advisory_capability_proceeds() {
     std::vector<uint8_t> out;
     CHECK_STATUS(decode(blob, KEY, ident(), out), Status::Ok, "decode");
     CHECK(out == plain, "round-trip unaffected");
-    CHECK((kSupportedRequiredCaps & 0xFFF8) == 0,
-          "only the three defined required bits are supported today");
+    CHECK((kSupportedRequiredCaps & ~static_cast<uint16_t>(kCapCompressedBlocks |
+                                                           kCapEncrypted |
+                                                           kCapUniformStoredLength |
+                                                           kCapIdentity)) == 0,
+          "the supported mask is exactly the four defined required bits");
 }
 
 static void test_bad_magic_and_version() {
@@ -786,6 +816,154 @@ static void test_unfinished_write_is_not_readable() {
           "an unfinished write is refused, not served short");
 }
 
+// ---------------------------------------------------------------------------
+// The identity block (kCapIdentity)
+// ---------------------------------------------------------------------------
+static void test_identity_is_recorded() {
+    std::cout << "identity: the blob records which version it is..." << std::endl;
+    auto plain = текст(3000);
+    std::vector<uint8_t> blob;
+    const auto id = ident("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                          "2026-09-27T09:15:00.123456Z");
+    CHECK_STATUS(encode(plain, KEY, id, blob, opts(512, true, true)), Status::Ok, "encode");
+
+    Reader r;
+    CHECK_STATUS(r.open([&blob](uint64_t o, size_t l, uint8_t* d) {
+        if (o + l > blob.size()) return false; std::memcpy(d, blob.data() + o, l); return true;
+    }, blob.size(), KEY, id), Status::Ok, "open");
+
+    CHECK(r.header().has_identity(), "kCapIdentity is set");
+    CHECK(r.header().file_uid == id.file_uid, "file_uid round-trips");
+    CHECK(r.header().version_timestamp == id.version_timestamp, "version_timestamp round-trips");
+    CHECK(r.data_offset() > kHeaderSize, "blocks start after the identity block");
+    CHECK(r.data_offset() == kHeaderSize + 4 + id.file_uid.size() + id.version_timestamp.size(),
+          "…by exactly the identity block's length");
+
+    // The ORIGINAL FILE NAME is deliberately not here. It is mutable (a rename
+    // would make the header state something false) and a filename is
+    // content-grade PII on this platform. Asserted so that adding one later is a
+    // deliberate decision that breaks a test, not a quiet convenience.
+    const std::string hay(reinterpret_cast<const char*>(blob.data()),
+                          static_cast<size_t>(r.data_offset()));
+    CHECK(hay.find(".txt") == std::string::npos && hay.find(".ifc") == std::string::npos,
+          "the header carries no filename");
+}
+
+static void test_identity_enables_recovery() {
+    std::cout << "identity: a blob can be decoded knowing nothing but the key (SR-34)..." << std::endl;
+    // THE POINT of recording identity. Before it, decoding required already
+    // knowing which version the bytes were — which in practice meant reading it
+    // off the storage PATH, an undocumented dependency on a layout convention.
+    auto plain = текст(7000);
+    std::vector<uint8_t> blob;
+    const auto id = ident("11112222-3333-4444-5555-666677778888", "2026-09-27T10:00:00Z");
+    CHECK_STATUS(encode(plain, KEY, id, blob, opts(1024, true, true)), Status::Ok, "encode");
+
+    // An EMPTY identity: all the recoverer has is the bytes and the key.
+    Reader r;
+    CHECK_STATUS(r.open([&blob](uint64_t o, size_t l, uint8_t* d) {
+        if (o + l > blob.size()) return false; std::memcpy(d, blob.data() + o, l); return true;
+    }, blob.size(), KEY, VersionIdentity{}), Status::Ok, "open with no identity supplied");
+    CHECK(r.header().file_uid == id.file_uid, "the blob told us which file it is");
+
+    std::vector<uint8_t> out;
+    CHECK_STATUS(r.read_all([&out](const uint8_t* p, size_t n) {
+        out.insert(out.end(), p, p + n); return true;
+    }), Status::Ok, "read");
+    CHECK(out == plain, "…and the content decodes correctly from the blob alone");
+
+    // And a range, likewise — recovery is not limited to whole files.
+    Reader r2;
+    CHECK_STATUS(r2.open([&blob](uint64_t o, size_t l, uint8_t* d) {
+        if (o + l > blob.size()) return false; std::memcpy(d, blob.data() + o, l); return true;
+    }, blob.size(), KEY, VersionIdentity{}), Status::Ok, "reopen");
+    std::vector<uint8_t> win;
+    CHECK_STATUS(r2.read_range(2500, 1000, [&win](const uint8_t* p, size_t n) {
+        win.insert(win.end(), p, p + n); return true;
+    }), Status::Ok, "ranged recovery");
+    CHECK(win == std::vector<uint8_t>(plain.begin() + 2500, plain.begin() + 3500),
+          "a ranged read works from the blob alone too");
+}
+
+static void test_identity_mismatch_is_refused() {
+    std::cout << "identity: a disagreement is refused up front..." << std::endl;
+    auto plain = noise(2000);
+    std::vector<uint8_t> blob;
+    CHECK_STATUS(encode(plain, KEY, ident("file-X", "v9"), blob, opts(512)), Status::Ok, "encode");
+    std::vector<uint8_t> out;
+
+    CHECK_STATUS(decode(blob, KEY, ident("file-Y", "v9"), out), Status::IdentityMismatch,
+                 "a different uid is refused");
+    CHECK_STATUS(decode(blob, KEY, ident("file-X", "v8"), out), Status::IdentityMismatch,
+                 "a different version is refused");
+    CHECK_STATUS(decode(blob, KEY, ident("file-X", "v9"), out), Status::Ok,
+                 "the right identity is accepted");
+    CHECK(out == plain, "…and decodes");
+}
+
+static void test_identity_tampering_is_detected() {
+    std::cout << "identity: editing it invalidates every tag (SR-24)..." << std::endl;
+    auto plain = noise(1500);
+    std::vector<uint8_t> blob;
+    const auto id = ident("cafebabe-0000-1111-2222-333344445555", "2026-09-27T11:22:33Z");
+    CHECK_STATUS(encode(plain, KEY, id, blob, opts(512)), Status::Ok, "encode");
+
+    Reader r;
+    CHECK_STATUS(r.open([&blob](uint64_t o, size_t l, uint8_t* d) {
+        if (o + l > blob.size()) return false; std::memcpy(d, blob.data() + o, l); return true;
+    }, blob.size(), KEY, id), Status::Ok, "open");
+    const size_t header_bytes = static_cast<size_t>(r.data_offset());
+
+    // Every single-bit edit anywhere in the identity block must be refused. An
+    // attacker rewriting the recorded uid would otherwise be able to present one
+    // version's bytes as another's.
+    int rejected = 0, tried = 0;
+    for (size_t i = kHeaderSize; i < header_bytes; ++i) {
+        std::vector<uint8_t> t = blob;
+        t[i] ^= 0x01;
+        std::vector<uint8_t> out;
+        ++tried;
+        // Read with an EMPTY caller identity, so the cross-check cannot be what
+        // catches it — the AAD has to.
+        if (decode_range(t, KEY, VersionIdentity{}, 0, 0, out).status != Status::Ok) ++rejected;
+    }
+    CHECK(tried > 0, "there is an identity block to tamper with");
+    CHECK(rejected == tried,
+          "every single-bit edit of the identity is rejected (" +
+              std::to_string(rejected) + "/" + std::to_string(tried) + ")");
+
+    // A declared length that runs past the blob must be refused, not chased.
+    std::vector<uint8_t> huge = blob;
+    huge[kHeaderSize] = 0xFF;
+    huge[kHeaderSize + 1] = 0xFF;
+    std::vector<uint8_t> out;
+    auto e = decode(huge, KEY, id, out);
+    CHECK(e.status != Status::Ok, "an implausible identity length is refused");
+}
+
+static void test_identity_edge_lengths() {
+    std::cout << "identity: empty and long identifiers..." << std::endl;
+    auto plain = noise(700);
+
+    // An empty identity is legal (the writer records what it was given) and must
+    // round-trip rather than being mistaken for "no identity block".
+    std::vector<uint8_t> blob;
+    CHECK_STATUS(encode(plain, KEY, VersionIdentity{}, blob, opts(256)), Status::Ok, "encode empty");
+    std::vector<uint8_t> out;
+    CHECK_STATUS(decode(blob, KEY, VersionIdentity{}, out), Status::Ok, "decode empty");
+    CHECK(out == plain, "an empty identity round-trips");
+
+    // A long-but-legal pair.
+    VersionIdentity longid;
+    longid.file_uid = std::string(400, 'u');
+    longid.version_timestamp = std::string(400, 'v');
+    std::vector<uint8_t> blob2;
+    CHECK_STATUS(encode(plain, KEY, longid, blob2, opts(256)), Status::Ok, "encode long");
+    std::vector<uint8_t> out2;
+    CHECK_STATUS(decode(blob2, KEY, longid, out2), Status::Ok, "decode long");
+    CHECK(out2 == plain, "a long identity round-trips");
+}
+
 static void test_status_names_are_total() {
     std::cout << "status_name() covers every enumerator..." << std::endl;
     const Status all[] = {
@@ -851,6 +1029,11 @@ int main() {
     test_write_chunking_is_irrelevant();
     test_sink_failure_propagates();
     test_unfinished_write_is_not_readable();
+    test_identity_is_recorded();
+    test_identity_enables_recovery();
+    test_identity_mismatch_is_refused();
+    test_identity_tampering_is_detected();
+    test_identity_edge_lengths();
     test_status_names_are_total();
     test_large_payload();
     std::cout << "storage_format_v2_tests: all passed (" << g_checks << " checks)" << std::endl;

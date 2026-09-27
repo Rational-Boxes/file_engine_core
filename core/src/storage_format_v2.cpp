@@ -81,6 +81,17 @@ void serialize_header(const Header& h, std::vector<uint8_t>& out) {
     out.insert(out.end(), h.salt, h.salt + kSaltSize);
     put_u32(out, h.key_id);
     while (out.size() - start < kHeaderSize) out.push_back(0);   // reserved
+
+    // The identity block, when kCapIdentity is set. Length-prefixed rather than
+    // fixed-width: a uid is a UUID today and a version timestamp's format is
+    // the platform's to change, and neither should be able to make this header
+    // wrong by growing.
+    if (h.has_identity()) {
+        put_u16(out, static_cast<uint16_t>(h.file_uid.size()));
+        put_u16(out, static_cast<uint16_t>(h.version_timestamp.size()));
+        out.insert(out.end(), h.file_uid.begin(), h.file_uid.end());
+        out.insert(out.end(), h.version_timestamp.begin(), h.version_timestamp.end());
+    }
 }
 
 Error parse_header(const uint8_t* p, size_t n, Header& h) {
@@ -108,6 +119,27 @@ Error parse_header(const uint8_t* p, size_t n, Header& h) {
                            {static_cast<uint8_t>(unknown >> 8), static_cast<uint8_t>(unknown)}));
     }
     if (h.block_size == 0) return err(Status::BadTrailer, "block_size is zero");
+    return ok();
+}
+
+// The identity block that follows the fixed header. `p` points at it and `n` is
+// what is available. Returns the number of bytes consumed via `used`.
+//
+// Every bound is checked BEFORE anything is allocated or copied: this is the
+// one part of the header a reader must parse before any tag has verified, so it
+// is the one part that has to be hostile-input-safe on its own.
+Error parse_identity(const uint8_t* p, size_t n, Header& h, size_t& used) {
+    used = 0;
+    if (n < 4) return err(Status::ShortInput, "identity block truncated");
+    const size_t uid_len = get_u16(p);
+    const size_t ver_len = get_u16(p + 2);
+    if (uid_len > kMaxIdentityFieldBytes || ver_len > kMaxIdentityFieldBytes) {
+        return err(Status::BadMagic, "identity field implausibly long");
+    }
+    if (n < 4 + uid_len + ver_len) return err(Status::ShortInput, "identity block truncated");
+    h.file_uid.assign(reinterpret_cast<const char*>(p + 4), uid_len);
+    h.version_timestamp.assign(reinterpret_cast<const char*>(p + 4 + uid_len), ver_len);
+    used = 4 + uid_len + ver_len;
     return ok();
 }
 
@@ -270,6 +302,7 @@ const char* status_name(Status s) {
         case Status::Truncated:             return "truncated";
         case Status::RangeNotSatisfiable:   return "range-not-satisfiable";
         case Status::BadKey:                return "bad-key";
+        case Status::IdentityMismatch:      return "identity-mismatch";
         case Status::Internal:              return "internal";
     }
     return "unknown";
@@ -356,7 +389,9 @@ Writer::Writer(Sink sink, const std::string& key, const VersionIdentity& id,
     impl_->opts = opts;
     impl_->header.block_size = opts.block_size ? opts.block_size : kDefaultBlockSize;
     impl_->header.key_id = opts.key_id;
-    impl_->header.required_caps = 0;
+    impl_->header.required_caps = kCapIdentity;
+    impl_->header.file_uid = id.file_uid;
+    impl_->header.version_timestamp = id.version_timestamp;
     if (opts.compress) impl_->header.required_caps |= kCapCompressedBlocks;
     if (opts.encrypt)  impl_->header.required_caps |= kCapEncrypted;
 
@@ -499,6 +534,7 @@ struct Reader::Impl {
     uint64_t stored_size = 0;
     Header header;
     std::vector<uint8_t> header_bytes;
+    size_t header_total = kHeaderSize;   // fixed part + identity block
     Trailer trailer;
     std::vector<uint64_t> block_offset;   // stored offset of each block
     bool open = false;
@@ -563,12 +599,13 @@ Reader::~Reader() = default;
 const Header& Reader::header() const { return impl_->header; }
 const Trailer& Reader::trailer() const { return impl_->trailer; }
 uint64_t Reader::plaintext_size() const { return impl_->trailer.plaintext_size; }
+uint64_t Reader::data_offset() const { return impl_->header_total; }
 
 Error Reader::open(Source source, uint64_t stored_size, const std::string& key,
                    const VersionIdentity& id) {
     impl_->source = std::move(source);
     impl_->stored_size = stored_size;
-    impl_->id = id;
+    impl_->id = id;   // provisional; replaced below once the header is read
 
     if (stored_size < kHeaderSize + kFooterSize) {
         return err(Status::ShortInput, "blob too small to be v2");
@@ -581,7 +618,54 @@ Error Reader::open(Source source, uint64_t stored_size, const std::string& key,
     if (!impl_->fetch(0, kHeaderSize, hb)) return err(Status::ShortInput, "header unreadable");
     auto e = parse_header(hb.data(), hb.size(), impl_->header);
     if (e) return e;
+
+    // The identity block, when the header says there is one. Its LENGTH decides
+    // where the blocks start, which is why kCapIdentity is a required rather
+    // than an advisory capability: a reader that ignored the bit would compute
+    // every block offset wrongly and fail with a puzzling tag error instead of
+    // a clear one.
+    if (impl_->header.has_identity()) {
+        std::vector<uint8_t> lens;
+        if (!impl_->fetch(kHeaderSize, 4, lens)) {
+            return err(Status::ShortInput, "identity lengths unreadable");
+        }
+        const size_t uid_len = get_u16(lens.data());
+        const size_t ver_len = get_u16(lens.data() + 2);
+        if (uid_len > kMaxIdentityFieldBytes || ver_len > kMaxIdentityFieldBytes) {
+            return err(Status::BadMagic, "identity field implausibly long");
+        }
+        std::vector<uint8_t> idblock;
+        if (!impl_->fetch(kHeaderSize, 4 + uid_len + ver_len, idblock)) {
+            return err(Status::ShortInput, "identity block unreadable");
+        }
+        size_t used = 0;
+        auto ie = parse_identity(idblock.data(), idblock.size(), impl_->header, used);
+        if (ie) return ie;
+        hb.insert(hb.end(), idblock.begin(), idblock.begin() + used);
+    }
     impl_->header_bytes = hb;
+    impl_->header_total = hb.size();
+
+    // Cross-check, or adopt. An empty caller identity means "this blob is all I
+    // have" — the recovery path — and the header's own answer is used. When both
+    // are present and disagree, refuse: either the wrong blob was fetched or the
+    // database and the bytes have diverged, and both are worth stopping for
+    // rather than discovering as an authentication failure three blocks in.
+    VersionIdentity effective = id;
+    if (impl_->header.has_identity()) {
+        const bool caller_supplied = !id.file_uid.empty() || !id.version_timestamp.empty();
+        if (!caller_supplied) {
+            effective.file_uid = impl_->header.file_uid;
+            effective.version_timestamp = impl_->header.version_timestamp;
+        } else if (id.file_uid != impl_->header.file_uid ||
+                   id.version_timestamp != impl_->header.version_timestamp) {
+            return err(Status::IdentityMismatch,
+                       "blob records " + impl_->header.file_uid + "@" +
+                       impl_->header.version_timestamp + ", caller asked for " +
+                       id.file_uid + "@" + id.version_timestamp);
+        }
+    }
+    impl_->id = effective;
 
     if (impl_->header.encrypted()) {
         impl_->key = key_to_bytes(key);
@@ -598,7 +682,7 @@ Error Reader::open(Source source, uint64_t stored_size, const std::string& key,
         return err(Status::BadMagic, "bad footer magic");
     }
     const uint64_t trailer_offset = get_u64(fb.data());
-    if (trailer_offset < kHeaderSize || trailer_offset > stored_size - kFooterSize) {
+    if (trailer_offset < impl_->header_total || trailer_offset > stored_size - kFooterSize) {
         return err(Status::BadTrailer, "trailer offset out of range");
     }
     const size_t trailer_len = static_cast<size_t>(stored_size - kFooterSize - trailer_offset);
@@ -612,7 +696,7 @@ Error Reader::open(Source source, uint64_t stored_size, const std::string& key,
     if (impl_->header.encrypted()) {
         uint8_t nonce[kNonceSize];
         make_nonce(impl_->header.salt, kTrailerNonceIndex, nonce);
-        const auto aad = trailer_aad(impl_->header_bytes, id);
+        const auto aad = trailer_aad(impl_->header_bytes, impl_->id);
         if (!gcm_open(impl_->key, nonce, aad, tb.data(), tb.size(), body)) {
             // SR-26: without this an attacker rewrites the index and reorders
             // or drops blocks without touching a single block tag.
@@ -643,7 +727,7 @@ Error Reader::open(Source source, uint64_t stored_size, const std::string& key,
     // The index must describe exactly the bytes between the header and the
     // trailer — a short or long index is a structural inconsistency even if
     // every tag would verify.
-    uint64_t off = kHeaderSize;
+    uint64_t off = impl_->header_total;
     impl_->block_offset.resize(impl_->trailer.block_count);
     for (uint32_t i = 0; i < impl_->trailer.block_count; ++i) {
         impl_->block_offset[i] = off;

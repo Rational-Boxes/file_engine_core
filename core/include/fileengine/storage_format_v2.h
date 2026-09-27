@@ -74,6 +74,10 @@ constexpr size_t   kNonceSize     = 12;   // salt(8) ‖ block_index(4)
 //: §6.6 / D6.
 constexpr uint32_t kDefaultBlockSize = 1024 * 1024;
 
+//: Bound on each identity string, so a malformed header cannot make a reader
+//: allocate arbitrarily before anything has been authenticated.
+constexpr size_t kMaxIdentityFieldBytes = 512;
+
 // Capability bits (§6.2, SR-36/SR-37).
 //
 // REQUIRED bits describe something a reader must implement to read the blob at
@@ -85,10 +89,15 @@ constexpr uint32_t kDefaultBlockSize = 1024 * 1024;
 constexpr uint16_t kCapCompressedBlocks    = 1u << 0;
 constexpr uint16_t kCapEncrypted           = 1u << 1;
 constexpr uint16_t kCapUniformStoredLength = 1u << 2;
+//: An identity block follows the fixed header: the version's file_uid and
+//: version_timestamp, length-prefixed. Required rather than advisory because it
+//: changes how the header is PARSED — a reader that ignored it would compute
+//: every block offset wrongly.
+constexpr uint16_t kCapIdentity            = 1u << 3;
 //: Everything this build knows how to honour. A required bit outside this mask
 //: is refused.
 constexpr uint16_t kSupportedRequiredCaps =
-    kCapCompressedBlocks | kCapEncrypted | kCapUniformStoredLength;
+    kCapCompressedBlocks | kCapEncrypted | kCapUniformStoredLength | kCapIdentity;
 
 //: Per-block index flag, stored in the high bit of the index entry: this block
 //: is stored uncompressed even though the blob as a whole allows compression
@@ -105,9 +114,27 @@ struct Header {
     uint8_t  salt[kSaltSize] = {0};
     uint32_t key_id = 0;
 
+    // The version this blob IS, recorded in the blob (kCapIdentity).
+    //
+    // These are the two identifiers the AAD binds (SR-25), and recording them
+    // is what makes SR-34's claim complete: without them a recovered blob can
+    // be decoded only by someone who already knows which version it is, which
+    // in practice meant relying on the storage PATH to carry it — an
+    // undocumented dependency on a layout convention.
+    //
+    // The original FILE NAME is deliberately absent. It is mutable, so a rename
+    // would leave the header stating something false rather than merely
+    // incomplete; and a filename is content-grade PII on this platform (audit
+    // events reference files by uid for exactly that reason), so putting one in
+    // a cleartext header would push PII into the object store and the offsite
+    // mirror, where erasing a database row does not reach it.
+    std::string file_uid;
+    std::string version_timestamp;
+
     bool compressed() const { return (required_caps & kCapCompressedBlocks) != 0; }
     bool encrypted()  const { return (required_caps & kCapEncrypted) != 0; }
     bool uniform()    const { return (required_caps & kCapUniformStoredLength) != 0; }
+    bool has_identity() const { return (required_caps & kCapIdentity) != 0; }
 };
 
 //: Everything a read needs that is not in the header. Recovered from the
@@ -145,6 +172,7 @@ enum class Status {
     Truncated,              // SR-27: final block never reached
     RangeNotSatisfiable,
     BadKey,
+    IdentityMismatch,       // the blob says it is a different version
     Internal,
 };
 
@@ -221,12 +249,23 @@ public:
 
     //: Read and verify the footer, header and trailer. Nothing from the trailer
     //: is trusted before its tag verifies (SR-26).
+    //
+    //: `id` may be left EMPTY, in which case the identity recorded in the
+    //: header is adopted — the recovery path, where a blob is all anyone has.
+    //: When `id` is supplied and the header disagrees, the read is refused with
+    //: IdentityMismatch rather than being attempted: the two disagreeing means
+    //: either the wrong blob was fetched or the database and the bytes have
+    //: diverged, and both are worth stopping for.
     Error open(Source source, uint64_t stored_size, const std::string& key,
                const VersionIdentity& id);
 
     const Header& header() const;
     const Trailer& trailer() const;
     uint64_t plaintext_size() const;
+    //: Stored offset of the first block — the fixed header plus the identity
+    //: block. Exposed because it is not a constant any more, and a caller
+    //: (or a test) that re-derives it is one format change from being wrong.
+    uint64_t data_offset() const;
 
     //: Emit plaintext [offset, offset+length) — half-open, clamped to the end
     //: (SR-14). length 0 means "to the end". Every block touched is

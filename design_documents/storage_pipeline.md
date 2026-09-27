@@ -394,11 +394,17 @@ authentication becomes the unit of access.
 │ required_caps  uint16                    2   bit0 compressed-blocks     │
 │                                              bit1 encrypted             │
 │                                              bit2 uniform-stored-length │
+│                                              bit3 identity block follows │
 │ advisory_caps  uint16                    2   hints; safe to ignore      │
 │ block_size     uint32                    4   PLAINTEXT bytes per block  │
 │ salt           bytes                     8   per-version nonce prefix   │
 │ key_id         uint32                    4   0 = deployment key         │
 │ reserved                                 6                             │
+├ identity block (present iff required_caps bit3) ────────────────────────┤
+│ uid_len        uint16                    2                             │
+│ ver_len        uint16                    2                             │
+│ file_uid       bytes            uid_len                                │
+│ version_ts     bytes            ver_len                                │
 └─────────────────────────────────────────────────────────────────────────┘
 [ block 0 ][ block 1 ] … [ block n-1 ]        each: ciphertext ‖ tag(16)
 ┌ trailer ────────────────────────────────────────────────────────────────┐
@@ -440,8 +446,36 @@ in step.
 - **SR-34** — A v2 blob MUST be fully interpretable from **the blob and the key
   alone**. A reader given the bytes and the correct key MUST be able to
   determine the format, the block size, the nonce basis, whether blocks are
-  compressed, and the plaintext length, **with no database and no
-  configuration**.
+  compressed, the plaintext length, **and which version the blob is**, with no
+  database and no configuration.
+
+  The last of those is why the header carries an **identity block** — the
+  version's `file_uid` and `version_timestamp` (§6.2). Those two are what every
+  block's AAD binds (SR-25), so without recording them a blob could be decoded
+  only by someone who already knew which version it was. In practice that meant
+  reading it off the storage *path*, which made the recovery property depend on
+  an undocumented layout convention rather than on the bytes. An earlier draft
+  of this requirement listed everything except identity and was therefore
+  incomplete rather than wrong.
+
+- **SR-34a** — Where the caller supplies an identity and the header records a
+  different one, the read MUST be refused with a distinguishable error naming
+  both. Either the wrong blob was fetched or the database and the bytes have
+  diverged, and both are worth stopping for rather than discovering as an
+  authentication failure several structures in.
+
+- **SR-34b** — Where the caller supplies **no** identity, the header's MUST be
+  adopted. This is the recovery path, and it is what makes SR-34 operationally
+  true rather than merely arguable.
+
+- **SR-34c** — The header MUST NOT record the file's **name**. A name is
+  mutable, so a rename — which must never require rewriting or re-encrypting a
+  payload — would leave the header stating something false rather than merely
+  incomplete. A filename is also content-grade PII on this platform (audit
+  events reference files by uid for exactly that reason), and a cleartext header
+  would push it into the object store and the offsite mirror, where erasing a
+  database row does not reach it. `file_uid` is an opaque identifier and carries
+  neither problem.
 - **SR-35** — Where the header and the `versions` row disagree, **the header
   wins**. The columns added in §4 are an index for querying and for selecting a
   reader cheaply; they are not the source of truth. A reader MUST validate the
@@ -476,7 +510,11 @@ survivable, which the current format has no way to be.
 
 - **SR-36** — A reader encountering a bit set in `required_caps` that it does not
   implement MUST refuse the read with a distinguishable error naming the
-  unsupported capability. It MUST NOT attempt the read.
+  unsupported capability. It MUST NOT attempt the read. The identity block's
+  presence is a **required** capability rather than an advisory one for this
+  reason: its length decides where the blocks begin, so a reader that ignored
+  the bit would compute every block offset wrongly and fail with a puzzling tag
+  error instead of a clear refusal.
 - **SR-37** — A reader encountering an unknown bit in `advisory_caps` MUST
   proceed normally. Advisory bits carry hints — a content-class marker, a
   dedup-friendliness flag — that affect efficiency and never correctness.
@@ -863,6 +901,15 @@ sound, and most of them are adversarial rather than functional.
   the claim comes out of the document).
 - **v1 and v2 versions of the same file coexist** and both round-trip (SR-32),
   selected by the recorded `storage_format` and not by sniffing.
+- **The identity block round-trips, and recovery works without it being
+  supplied** (SR-34/SR-34b) — a blob decodes, including a ranged read, given
+  nothing but the bytes and the key.
+- **An identity disagreement is refused** and the error names both sides
+  (SR-34a); every single-bit edit of the identity block is rejected *with the
+  caller supplying no identity*, so the AAD is what catches it rather than the
+  cross-check (SR-24).
+- **The header contains no filename** (SR-34c) — asserted, so adding one later
+  breaks a test rather than passing as a convenience.
 - The writer is **single-pass**: assert it never seeks backwards, which is what
   keeps a direct-to-object-store upload possible (§6.2).
 - **Compression ratio on the SR-9 corpus** is measured against v1 whole-stream
