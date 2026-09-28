@@ -50,6 +50,19 @@ struct Config {
     // setting is turned on separately and per tenant afterwards (P6). Merging
     // those two steps is how a one-way door gets taken by accident.
     int storage_write_format = 1;
+
+    // Whether the compression DECISION is measured per payload (S2), or whether
+    // everything is compressed whenever compression is enabled (the original
+    // behaviour).
+    //
+    // DEFAULT false, DELIBERATELY, and for the same reason storage_write_format
+    // defaults to 1: with it on, an already-compressed payload is stored
+    // UNCOMPRESSED, and a rollback to a binary that decides by configuration
+    // would try to inflate those bytes and fail. So the first deploy of this
+    // work is schema + record + read-from-record with no change in what is
+    // written, which is reversible; turning this on is a separate, later
+    // decision, per tenant, once the new binary has proven itself.
+    bool storage_selective_compression = false;
     
     // S3/MinIO configuration
     std::string s3_endpoint = "http://localhost:9000";

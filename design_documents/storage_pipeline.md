@@ -662,7 +662,33 @@ This lands on a live installation with real tenants, an offsite content mirror
 and no maintenance window on offer. The stages in §8 are the engineering
 sequence; this is the deployment sequence, and they are not the same thing.
 
-### 7.1 The one-way door
+### 7.1 Two one-way doors, not one
+
+**Storage format v2 is the obvious one** (below). The subtler one is **S2**, and
+it was missed in the first draft of this section: once the measurement is on, an
+already-compressed payload is stored UNCOMPRESSED, and a binary that decides by
+configuration — every binary before S0 — will try to inflate those bytes and
+fail. The blob is not corrupt and nothing is lost, but it is unreadable until
+the newer binary is back.
+
+That is why **S2 is a setting and not a consequence of deploying the code**
+(`FILEENGINE_SELECTIVE_COMPRESSION`, default **off**). With it off the first
+deploy writes byte-for-byte what its predecessor wrote, so P1 and P2 are
+genuinely reversible; P3 turns it on, per tenant, after the binary has proven
+itself. Without the switch, the schema fix and the write-behaviour change would
+ship together and the rollback plan below would be fiction.
+
+It also revises a documented assumption elsewhere:
+`scripts/Ansible/playbooks/predeploy_capture.yml` captures databases and the
+directory but deliberately **not** file content, on the stated grounds that "a
+bad patch cannot damage the object store, because the core writes immutable
+version keys and a failed deploy never rewrites them". That premise still holds
+literally — nothing here rewrites an existing key — but from P3 onward the
+conclusion does not: new keys are written in a representation the rollback
+target cannot read. **A content snapshot is therefore a genuine precondition for
+P3 and P6, where it was not for previous deploys.**
+
+### 7.1.1 The v2 one-way door
 
 **The moment the first v2 blob is written, the core cannot be rolled back.** An
 older binary has no v2 reader, and SR-36 means it will refuse rather than
@@ -684,7 +710,7 @@ whatever code is deployed. Deploying S5 MUST NOT itself start writing v2.
 | **P0** | Answer §11-Q1: has `compression` or `encryption` ever been flipped on this deployment? If yes, there may already be versions affected by the §3 defect, and this becomes a repair before it is a migration. | n/a — a question, not a change |
 | **P1** | Deploy **S0**: the migration and the switch from configuration to the version record. No behaviour change; every version reads exactly as before. | ordinary redeploy; columns are additive and unused by the old binary |
 | **P2** | Soak. Verify via the restore rehearsal that a restored instance reads the corpus **without** matching configuration — the property S0 buys. | as P1 |
-| **P3** | Deploy **S2** (selective compression) after §9's measurement. New writes only; the corpus is now mixed by design, which P1 made safe. | ordinary redeploy; mixed corpus stays readable either way |
+| **P3** | Turn **S2** on (`FILEENGINE_SELECTIVE_COMPRESSION`, default off) after §9's measurement, per tenant. New writes only; the corpus is now mixed by design, which P1 made safe. | **not a redeploy** — revert the setting, but versions already written uncompressed stay readable only on this binary or later (see below) |
 | **P4** | Deploy **S3a** (ranges). Purely additive to the RPC. | ordinary redeploy |
 | **P5** | Deploy **S5 code** with `write_format = 1`. **The reader ships and bakes; nothing writes v2.** | ordinary redeploy — this is the last fully reversible step |
 | **P6** | Set `write_format = 2` on **one low-value tenant**. Verify by content hash, then let it run. | revert the setting; v2 blobs already written stay readable, because P5's reader is deployed everywhere |

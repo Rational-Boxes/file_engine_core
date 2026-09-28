@@ -95,7 +95,7 @@ struct Fixture {
 };
 
 static bool make_fixture(Fixture& f, bool encrypt, bool compress, const std::string& suffix,
-                         int write_format = 1) {
+                         int write_format = 1, bool selective = true) {
     TenantConfig cfg;
     cfg.db_host = env_or("FILEENGINE_PG_HOST", env_or("FE_TEST_PG_HOST", "localhost"));
     cfg.db_port = std::stoi(env_or("FILEENGINE_PG_PORT", env_or("FE_TEST_PG_PORT", "5434")));
@@ -113,6 +113,7 @@ static bool make_fixture(Fixture& f, bool encrypt, bool compress, const std::str
     cfg.encrypt_data = encrypt;
     cfg.compress_data = compress;
     cfg.storage_write_format = write_format;
+    cfg.storage_selective_compression = selective;
     cfg.encryption_key =
         "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
@@ -172,7 +173,7 @@ static void run_combination(bool encrypt, bool compress, const std::string& labe
     std::cout << "ranges end-to-end: " << label << "..." << std::endl;
 
     Fixture f;
-    if (!make_fixture(f, encrypt, compress, label, write_format)) {
+    if (!make_fixture(f, encrypt, compress, label, write_format, /*selective=*/true)) {
         check(false, "fixture " + label);
         return;
     }
@@ -405,6 +406,72 @@ static void test_mixed_corpus() {
     destroy_fixture(f);
 }
 
+// THE ROLLBACK PROPERTY. With the measurement off — the default, and what the
+// first deploy runs — an already-compressed payload must still be stored
+// compressed, exactly as the previous binary stored it. That is what keeps the
+// deploy reversible: a binary that decides by configuration can still read
+// everything the new one wrote.
+static void test_default_deploy_writes_what_the_old_binary_reads() {
+    std::cout << "rollback: with the measurement off, writes are unchanged..." << std::endl;
+
+    // A PNG: the case the measurement would store uncompressed, and therefore
+    // the case a rollback would be unable to read.
+    std::vector<uint8_t> png = {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A};
+    png.resize(20000, 0x5A);
+
+    // Default: selective compression OFF.
+    {
+        Fixture f;
+        if (!make_fixture(f, /*encrypt=*/true, /*compress=*/true, "rollback_off",
+                          /*write_format=*/1, /*selective=*/false)) {
+            check(false, "fixture"); return;
+        }
+        TenantConfig fresh;
+        check(!fresh.storage_selective_compression,
+              "TenantConfig defaults to the ORIGINAL compression behaviour");
+
+        auto c = f.fs->touch("", "image.png", USER, ROLES, f.tenant);
+        check(c.success, "touch");
+        check(f.fs->put(c.value, png, USER, ROLES, f.tenant).success, "put");
+
+        const std::string ver = f.fs->stat(c.value, USER, ROLES, f.tenant).value.version;
+        auto rec = f.db->get_version_transform(c.value, ver, f.tenant);
+        check(rec.success && rec.value.has_value(), "transform recorded");
+        check(rec.value.has_value() && rec.value->compressed.value_or(false),
+              "a PNG is still COMPRESSED with the measurement off — so a binary "
+              "that decides by configuration can still read it");
+        check(rec.value.has_value() && rec.value->storage_format == 1,
+              "and it is still format 1");
+
+        std::vector<uint8_t> back;
+        check(read_all(*f.fs, c.value, f.tenant, back), "read back");
+        check(back == png, "round-trips");
+        destroy_fixture(f);
+    }
+
+    // Switched on: the same payload is now stored uncompressed, which is the
+    // saving — and the reason the switch has to exist.
+    {
+        Fixture f;
+        if (!make_fixture(f, /*encrypt=*/true, /*compress=*/true, "rollback_on",
+                          /*write_format=*/1, /*selective=*/true)) {
+            check(false, "fixture"); return;
+        }
+        auto c = f.fs->touch("", "image.png", USER, ROLES, f.tenant);
+        check(c.success, "touch");
+        check(f.fs->put(c.value, png, USER, ROLES, f.tenant).success, "put");
+        const std::string ver = f.fs->stat(c.value, USER, ROLES, f.tenant).value.version;
+        auto rec = f.db->get_version_transform(c.value, ver, f.tenant);
+        check(rec.value.has_value() && !rec.value->compressed.value_or(true),
+              "with the measurement on, a PNG is stored uncompressed");
+
+        std::vector<uint8_t> back;
+        check(read_all(*f.fs, c.value, f.tenant, back), "read back");
+        check(back == png, "and still round-trips through the record");
+        destroy_fixture(f);
+    }
+}
+
 int main() {
     std::cout << "=== storage_range_live_tests ===\n";
 
@@ -430,6 +497,7 @@ int main() {
     run_combination(false, true,  "v2-compressed",           /*exhaustive=*/false, /*write_format=*/2);
 
     test_write_format_is_opt_in();
+    test_default_deploy_writes_what_the_old_binary_reads();
     test_mixed_corpus();
 
     std::cout << "\n=== " << (g_checks - g_failures) << "/" << g_checks

@@ -46,6 +46,8 @@ struct TenantConfig {
     // storage_pipeline.md §7.1 / SR-33. 1 = original layout, 2 = chunked v2.
     // Governs WRITES only; reads follow each version's own record (SR-32).
     int storage_write_format = 1;
+    // S2: measure per payload, or compress everything. Off = original behaviour.
+    bool storage_selective_compression = false;
 };
 
 struct TenantContext {

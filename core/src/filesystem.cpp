@@ -522,9 +522,20 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
     // anything for this payload. Video, images, Office documents (ZIP
     // containers) and the conversion pipeline's own renditions gain nothing,
     // and the cost is paid again on every read.
+    const bool compression_on = context->storage && context->storage->is_compression_enabled();
+    // The measurement is opt-in. With it off, compression behaves exactly as it
+    // always has — everything is compressed when compression is enabled — so the
+    // first deploy of this work changes nothing about what is WRITTEN and stays
+    // reversible. See Config::storage_selective_compression.
     CompressionPolicyConfig comp_cfg;
-    comp_cfg.enabled = context->storage && context->storage->is_compression_enabled();
-    const CompressionDecision comp_decision = decide_compression(data, comp_cfg);
+    comp_cfg.enabled = compression_on;
+    const CompressionDecision comp_decision =
+        context->config.storage_selective_compression
+            ? decide_compression(data, comp_cfg)
+            : CompressionDecision{compression_on,
+                                  compression_on ? CompressionDecisionReason::MeasuredGood
+                                                 : CompressionDecisionReason::Disabled,
+                                  -1.0};
 
     // §7.1 / SR-33: v2 is written only when the deployment asks for it. The
     // reader is always present; this switch is what P6 turns on, separately
@@ -927,7 +938,13 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     }
     CompressionPolicyConfig stream_cfg;
     stream_cfg.enabled = compression_allowed;
-    const CompressionDecision stream_decision = decide_compression(first_chunk, stream_cfg);
+    const CompressionDecision stream_decision =
+        context->config.storage_selective_compression
+            ? decide_compression(first_chunk, stream_cfg)
+            : CompressionDecision{compression_allowed,
+                                  compression_allowed ? CompressionDecisionReason::MeasuredGood
+                                                      : CompressionDecisionReason::Disabled,
+                                  -1.0};
     const bool do_compress = stream_decision.compress;
     if (compression_allowed && !do_compress) {
         SERVER_LOG_DEBUG("FileSystem::put_stream", std::string("Compression skipped (") +
