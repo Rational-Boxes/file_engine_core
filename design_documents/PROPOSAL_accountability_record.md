@@ -905,11 +905,49 @@ Two findings from the code, one of which contradicts the documentation:
   than against the API. `delete_file` is now a real DeleteObject (idempotent on
   NoSuchKey), and erasure treats a failure there as **fatal**, not best-effort:
   an erasure that cannot reach the durable copy has not erased anything.
+- **There is a SECOND durable copy that erasure does not reach, and by design
+  cannot.** The paragraph above is about the live object store. The deployment
+  also mirrors content to a bucket on another cloud, and that bucket is
+  deliberately delete-proof: the mirror runs with no `--remove`, versioning is
+  enabled, and the bucket policy denies `s3:DeleteObjectVersion` to every
+  principal except a break-glass role and the account root
+  (`scripts/Ansible/provisioning/aws/backup-buckets/bucket-policy-protect-history.json`).
+  That is the correct posture — a backup a compromised production host can
+  delete from is not a backup — and it means an erased payload that had already
+  been mirrored **survives there permanently**.
+
+  By this section's own standard ("an erasure that cannot reach the durable copy
+  has not erased anything") the guarantee is therefore narrower than the word
+  *erasure* implies. What the platform can honestly say is that an erased file
+  is **unreachable and unrestorable**: the version rows are gone, the live bytes
+  are gone, and the restore copies back only payloads a file record references
+  (`scripts/Ansible/docs/RESTORE.md` §4), so the offsite copy can never become
+  live again. What it cannot say is that the bytes no longer exist anywhere.
+
+  Worth noting *how* this was missed, because it is the same lesson twice: the
+  restore rehearsal verified erased files by fetching them through the API and
+  observing a 404. The 404 comes from the destroyed version rows, so that check
+  passes whether or not the payload is present — reachability tested, bytes not.
+  The correction recorded immediately above was found "by verifying an erased
+  file against the bucket rather than against the API", and this is the same
+  check not carried far enough.
+
+  Closing it needs a redaction path into the other cloud that the deployment
+  cannot itself invoke — otherwise the delete-proof property is traded away to
+  fix its consequence. A design for that is captured, unscheduled, in
+  `scripts/Ansible/docs/PROPOSAL_offsite_redaction.md`; end-to-end redaction is
+  future development, and until it exists the narrower guarantee is the one to
+  state to anyone who asks.
+
 - **Encryption is deployment-wide, not per-file.** `Storage` takes a
   `bool encrypt_data` flag; the key is not per object. So **crypto-shredding —
   destroying a per-file key to render its ciphertext unrecoverable — is not
   available today**, although the primitives support it (`EncryptStream` already
-  takes a key per stream).
+  takes a key per stream). It is also the one mechanism that would reach the
+  bucket above without any delete permission anywhere, which makes it the
+  better long-term answer to the bullet before this one rather than a separate
+  nicety. `storage_pipeline.md` §6.2 now carries a `key_id` in the v2 header and
+  on the version row, which is the seam it would need.
 
 That second point matters because of what deletion cannot reach: **backups,
 snapshots, replicas, and any storage configured to be immutable.**
