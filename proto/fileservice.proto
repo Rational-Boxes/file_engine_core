@@ -329,12 +329,41 @@ message GetFileRequest {
     string uid = 1;                     // File UUID
     string version_timestamp = 2;       // Optional version timestamp (if empty, get latest)
     AuthenticationContext auth = 3;     // Authentication information
+
+    // Byte range over the PLAINTEXT, half-open [offset, offset+length).
+    // storage_pipeline.md SR-10 - SR-14.
+    //
+    // Additive and optional: proto3 defaults make an old client's request
+    // offset=0, length=0, which is "the whole file" — exactly today's
+    // behaviour, so no consumer has to change to keep working (SR-21).
+    //
+    // The range is over plaintext, never over stored bytes: a caller must never
+    // need to know whether the deployment compresses or encrypts.
+    int64 offset = 4;                   // >= 0
+    int64 length = 5;                   // 0 = to end of file
 }
 
 message GetFileResponse {
     bool success = 1;
     string error = 2;
     bytes data = 3;                     // File content
+
+    // Range metadata, set on the FIRST frame of a stream only; zero/absent on
+    // later frames. storage_pipeline.md SR-12 / SR-13.
+    //
+    // total_size removes a round-trip the doors make today: a bridge must Stat
+    // before it can answer an HTTP Range, and a media player asks for
+    // "bytes=0-" first precisely to discover the length.
+    int64 total_size = 4;               // plaintext length of the whole version
+    int64 range_start = 5;              // first plaintext byte in this stream
+    int64 range_length = 6;             // plaintext bytes that will follow
+    bool ranged = 7;                    // true when a range was applied
+
+    // "seek" when the cost was proportional to length, "scan" when it was
+    // proportional to offset+length. Part of the contract, not diagnostics: a
+    // range API that silently costs O(offset) is worse than none, because
+    // callers design against the promise rather than the behaviour.
+    string range_method = 8;
 }
 
 // File information

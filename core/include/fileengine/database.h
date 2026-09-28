@@ -104,6 +104,18 @@ public:
                                     int64_t size, const std::string& storage_path,
                                     const std::string& revised_by, const std::string& tenant) override;
     Result<std::optional<std::string>> get_version_storage_path(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant) override;
+    // storage_pipeline.md SR-1 / SR-2 / SR-3.
+    Result<std::optional<VersionTransform>> get_version_transform(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const std::string& tenant = "") override;
+    Result<void> set_version_transform(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const VersionTransform& t, const std::string& tenant = "") override;
+    Result<std::optional<int64_t>> get_version_size(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const std::string& tenant = "") override;
+    Result<int64_t> backfill_version_transforms(
+        bool compressed, bool encrypted, const std::string& tenant = "") override;
     Result<std::vector<std::string>> list_versions(const std::string& file_uid, const std::string& tenant) override;
     Result<std::vector<VersionInfo>> list_versions_detailed(const std::string& file_uid, const std::string& tenant) override;
     Result<bool> delete_version(const std::string& file_uid, const std::string& version_timestamp, const std::string& tenant = "") override;

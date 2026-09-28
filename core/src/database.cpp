@@ -1858,6 +1858,144 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
     }
 }
 
+// ── Per-version transform record (storage_pipeline.md SR-1 / SR-2 / SR-3) ──
+
+Result<std::optional<VersionTransform>> Database::get_version_transform(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const std::string& tenant) {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::optional<VersionTransform>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string sql = "SELECT compressed, encrypted, storage_format, key_id FROM \"" +
+                      schema_name + "\".versions WHERE file_uid = $1 AND version_timestamp = $2 LIMIT 1;";
+    const char* params[2] = {file_uid.c_str(), version_timestamp.c_str()};
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::optional<VersionTransform>>::err("Failed to get version transform: " + error);
+    }
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::optional<VersionTransform>>::ok(std::nullopt);
+    }
+
+    VersionTransform t;
+    // A NULL column is "unknown", NOT false. Reading it as false is precisely
+    // the defect this record exists to fix, so the distinction is preserved all
+    // the way out to the caller.
+    if (!PQgetisnull(res, 0, 0)) t.compressed = (std::string(PQgetvalue(res, 0, 0)) == "t");
+    if (!PQgetisnull(res, 0, 1)) t.encrypted  = (std::string(PQgetvalue(res, 0, 1)) == "t");
+    if (!PQgetisnull(res, 0, 2)) t.storage_format = static_cast<int16_t>(std::stoi(PQgetvalue(res, 0, 2)));
+    if (!PQgetisnull(res, 0, 3)) t.key_id = static_cast<int32_t>(std::stol(PQgetvalue(res, 0, 3)));
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::optional<VersionTransform>>::ok(t);
+}
+
+Result<void> Database::set_version_transform(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const VersionTransform& t, const std::string& tenant) {
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema_name = get_schema_prefix(tenant);
+
+    std::string sql = "UPDATE \"" + schema_name + "\".versions SET compressed = $3, encrypted = $4, "
+                      "storage_format = $5, key_id = $6 WHERE file_uid = $1 AND version_timestamp = $2;";
+    const std::string fmt_str = std::to_string(t.storage_format);
+    const std::string key_str = std::to_string(t.key_id);
+    const char* params[6] = {
+        file_uid.c_str(),
+        version_timestamp.c_str(),
+        t.compressed.has_value() ? (*t.compressed ? "true" : "false") : nullptr,
+        t.encrypted.has_value()  ? (*t.encrypted  ? "true" : "false") : nullptr,
+        fmt_str.c_str(),
+        key_str.c_str(),
+    };
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 6, nullptr, params, nullptr, nullptr, 0);
+    const bool good = PQresultStatus(res) == PGRES_COMMAND_OK;
+    std::string error = good ? "" : PQerrorMessage(pg_conn);
+    PQclear(res);
+    connection_pool_->release(conn);
+    if (!good) return Result<void>::err("Failed to record version transform: " + error);
+    return Result<void>::ok();
+}
+
+Result<std::optional<int64_t>> Database::get_version_size(
+        const std::string& file_uid, const std::string& version_timestamp,
+        const std::string& tenant) {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::optional<int64_t>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema_name = get_schema_prefix(tenant);
+    std::string sql = "SELECT size FROM \"" + schema_name +
+                      "\".versions WHERE file_uid = $1 AND version_timestamp = $2 LIMIT 1;";
+    const char* params[2] = {file_uid.c_str(), version_timestamp.c_str()};
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<std::optional<int64_t>>::err("Failed to get version size: " + error);
+    }
+    std::optional<int64_t> out;
+    if (PQntuples(res) > 0 && !PQgetisnull(res, 0, 0)) {
+        out = std::stoll(PQgetvalue(res, 0, 0));
+    }
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::optional<int64_t>>::ok(out);
+}
+
+Result<int64_t> Database::backfill_version_transforms(
+        bool compressed, bool encrypted, const std::string& tenant) {
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<int64_t>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+    std::string schema_name = get_schema_prefix(tenant);
+
+    // SR-3: only rows that have NO record are filled, and they are filled from
+    // the flags in force right now — the assumption under which those rows are
+    // already readable. Nothing that already carries a record is touched, so
+    // this is idempotent and cannot rewrite history if the flags later change.
+    std::string sql = "UPDATE \"" + schema_name + "\".versions "
+                      "SET compressed = $1, encrypted = $2 "
+                      "WHERE compressed IS NULL OR encrypted IS NULL;";
+    const char* params[2] = {compressed ? "true" : "false", encrypted ? "true" : "false"};
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        return Result<int64_t>::err("Failed to backfill version transforms: " + error);
+    }
+    const char* affected = PQcmdTuples(res);
+    int64_t n = (affected && *affected) ? std::stoll(affected) : 0;
+    PQclear(res);
+    connection_pool_->release(conn);
+    if (n > 0) {
+        SERVER_LOG_INFO("Database::backfill_version_transforms",
+                        "recorded the storage transform for " + std::to_string(n) +
+                        " pre-existing version(s) in tenant '" + tenant + "'");
+    }
+    return Result<int64_t>::ok(n);
+}
+
 Result<std::vector<VersionInfo>> Database::list_versions_detailed(const std::string& file_uid, const std::string& tenant) {
     auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) {
@@ -4207,6 +4345,26 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
         "ALTER TABLE \"" + escaped_schema + "\".versions "
         "ADD COLUMN IF NOT EXISTS revised_by VARCHAR(255) NOT NULL DEFAULT 'unknown';";
 
+    // storage_pipeline.md SR-1: record what was applied to each stored version,
+    // rather than re-deriving it from configuration on every read (SR-2).
+    //
+    // `compressed` and `encrypted` are deliberately NULLABLE with no default. A
+    // migration cannot know what was done to a row written before the column
+    // existed, and inventing an answer here would be a guess baked in as fact;
+    // NULL means "unknown, assume the deployment flags", which is exactly the
+    // assumption those rows are already read under today. FileSystem fills them
+    // in from the live flags once, per tenant (SR-3), so the fallback stops
+    // being load-bearing.
+    //
+    // `storage_format` and `key_id` DO have safe unconditional defaults: every
+    // existing version is format 1 and was written under the deployment key.
+    std::string migrate_versions_transform =
+        "ALTER TABLE \"" + escaped_schema + "\".versions "
+        "ADD COLUMN IF NOT EXISTS compressed BOOLEAN, "
+        "ADD COLUMN IF NOT EXISTS encrypted BOOLEAN, "
+        "ADD COLUMN IF NOT EXISTS storage_format SMALLINT NOT NULL DEFAULT 1, "
+        "ADD COLUMN IF NOT EXISTS key_id INTEGER NOT NULL DEFAULT 0;";
+
     std::string create_idx_versions = "CREATE INDEX IF NOT EXISTS idx_versions_file_uid_" + escaped_schema +
         " ON \"" + escaped_schema + "\".versions(file_uid);";
 
@@ -4314,6 +4472,17 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     // Idempotent backfill migration for pre-existing tenants (non-critical).
     res = PQexec(pg_conn, migrate_versions_revised_by.c_str());
     PQclear(res);  // column may already exist; status is irrelevant
+
+    res = PQexec(pg_conn, migrate_versions_transform.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        // Unlike revised_by this one is load-bearing: without it every read
+        // falls back to configuration, which is the defect SR-1 exists to fix.
+        // Log loudly rather than swallowing it.
+        SERVER_LOG_ERROR("Database::create_tenant_schema",
+                         "Failed to add version transform columns: " +
+                         std::string(PQerrorMessage(pg_conn)));
+    }
+    PQclear(res);
 
     res = PQexec(pg_conn, create_idx_versions.c_str());
     if (PQresultStatus(res) != PGRES_COMMAND_OK) { PQclear(res); } // Index creation failure is non-critical

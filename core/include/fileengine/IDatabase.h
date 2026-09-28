@@ -28,6 +28,30 @@ namespace fileengine {
 struct FileInfo;
 enum class FileType;
 
+// ── What was actually applied to a stored version ──────────────────────────
+//
+// design_documents/storage_pipeline.md §3, SR-1 / SR-2.
+//
+// The core used to decide whether to decompress/decrypt on READ by asking the
+// deployment's CURRENT configuration — the same question the write asked, at a
+// different time. The two agree only for as long as the configuration never
+// changes, and when it does the failure is silent in one direction: turning
+// compression off makes every read hand the raw zlib stream to the client as
+// the file's content, with no error at all.
+//
+// So a version records what was done to it. `compressed` and `encrypted` are
+// OPTIONAL because rows written before this existed cannot know; an absent
+// value means "fall back to the deployment flags", which is precisely the
+// assumption those rows are already being read under (SR-3). The backfill fills
+// them in from the live flags at migration time so the fallback stops being
+// load-bearing.
+struct VersionTransform {
+    std::optional<bool> compressed;      // nullopt = unknown, assume config
+    std::optional<bool> encrypted;       // nullopt = unknown, assume config
+    int16_t storage_format = 1;          // 1 = the original layout, 2 = §6
+    int32_t key_id = 0;                  // 0 = the deployment key
+};
+
 // ── Erasure records (§5.4) ─────────────────────────────────────────────────
 
 // What begin_erasure destroyed, and what the caller must still destroy.
@@ -170,6 +194,35 @@ public:
     // no update; the concrete Database overrides it.
     virtual Result<bool> delete_version(const std::string& /*file_uid*/, const std::string& /*version_timestamp*/, const std::string& /*tenant*/ = "") {
         return Result<bool>::err("delete_version not implemented");
+    }
+
+    // ── Per-version transform record (storage_pipeline.md SR-1/SR-2) ───────
+    //
+    // Non-pure so existing mocks need no update; the concrete Database
+    // overrides all three. A mock that does not returns "unknown", which makes
+    // the caller fall back to configuration — today's behaviour exactly.
+    virtual Result<std::optional<VersionTransform>> get_version_transform(
+            const std::string& /*file_uid*/, const std::string& /*version_timestamp*/,
+            const std::string& /*tenant*/ = "") {
+        return Result<std::optional<VersionTransform>>::ok(std::nullopt);
+    }
+    virtual Result<void> set_version_transform(
+            const std::string& /*file_uid*/, const std::string& /*version_timestamp*/,
+            const VersionTransform& /*t*/, const std::string& /*tenant*/ = "") {
+        return Result<void>::ok();
+    }
+    // Plaintext size of one version. SR-12 needs it for total_size, which is
+    // what lets a door emit a valid Content-Range without a second Stat.
+    virtual Result<std::optional<int64_t>> get_version_size(
+            const std::string& /*file_uid*/, const std::string& /*version_timestamp*/,
+            const std::string& /*tenant*/ = "") {
+        return Result<std::optional<int64_t>>::ok(std::nullopt);
+    }
+    // SR-3. One-time, idempotent: fills in only the rows that have no record,
+    // from the flags in force right now. Returns how many rows were written.
+    virtual Result<int64_t> backfill_version_transforms(
+            bool /*compressed*/, bool /*encrypted*/, const std::string& /*tenant*/ = "") {
+        return Result<int64_t>::ok(0);
     }
 
     // Version restoration operations
