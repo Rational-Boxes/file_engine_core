@@ -186,6 +186,32 @@ target_include_directories(compression_policy_tests PRIVATE
     ${GRPCPP_INCLUDE_DIRS}
 )
 
+# tenant_state_tests — storage_pipeline.md
+add_executable(tenant_state_tests tenant_state_tests.cpp)
+target_link_libraries(tenant_state_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+if(AWSSDK_FOUND)
+    target_link_libraries(tenant_state_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+
+target_include_directories(tenant_state_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
 # storage_format_v2_tests — storage_pipeline.md
 add_executable(storage_format_v2_tests storage_format_v2_tests.cpp)
 target_link_libraries(storage_format_v2_tests
@@ -238,6 +264,32 @@ target_include_directories(storage_pipeline_live_tests PRIVATE
 )
 add_test(NAME storage_pipeline_live_tests COMMAND storage_pipeline_live_tests)
 set_tests_properties(storage_pipeline_live_tests PROPERTIES
+    LABELS "live" TIMEOUT 300 SKIP_RETURN_CODE 77)
+# tenant_state_live_tests — tenant lifecycle state, against a real Postgres
+add_executable(tenant_state_live_tests tenant_state_live_tests.cpp)
+target_link_libraries(tenant_state_live_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(tenant_state_live_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(tenant_state_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME tenant_state_live_tests COMMAND tenant_state_live_tests)
+set_tests_properties(tenant_state_live_tests PROPERTIES
     LABELS "live" TIMEOUT 300 SKIP_RETURN_CODE 77)
 # storage_range_live_tests — storage_pipeline.md S3a byte ranges, end to end
 add_executable(storage_range_live_tests storage_range_live_tests.cpp)
@@ -494,6 +546,7 @@ foreach(t
     file_culler_tests
     crypto_stream_tests
     compression_policy_tests
+    tenant_state_tests
     storage_format_v2_tests)
   add_test(NAME ${t} COMMAND ${t})
   set_tests_properties(${t} PROPERTIES LABELS "unit" TIMEOUT 120)

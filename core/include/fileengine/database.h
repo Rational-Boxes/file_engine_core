@@ -55,6 +55,10 @@ public:
     Result<void> create_tenant_schema(const std::string& tenant,
                                       const AccountabilityContext& ctx) override;
     Result<bool> tenant_schema_exists(const std::string& tenant) override;
+    Result<std::optional<TenantStateRecord>> get_tenant_state(const std::string& tenant) override;
+    Result<void> set_tenant_state(const std::string& tenant, TenantState state,
+                                  const std::string& actor = "",
+                                  const std::string& note = "") override;
     Result<void> drop_schema() override;
 
     // File metadata operations (using UUIDs instead of paths/ids) - now tenant-specific

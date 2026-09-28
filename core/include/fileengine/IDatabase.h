@@ -52,6 +52,41 @@ struct VersionTransform {
     int32_t key_id = 0;                  // 0 = the deployment key
 };
 
+// ── Tenant lifecycle state (global registry) ───────────────────────────────
+//
+// Only `Live` admits a user. Everything else refuses, including Provisioning —
+// a half-built tenant must not be reachable — and Decommissioned, whose row
+// outlives the data it described and must not become a way back in.
+enum class TenantState {
+    Requested,
+    AwaitingDns,
+    Provisioning,
+    Live,
+    Suspended,
+    Decommissioning,
+    Decommissioned,
+};
+
+//: The stored spelling. Kept in one place so a door, the registry and a log
+//: line cannot disagree about what "awaiting_dns" is called.
+const char* tenant_state_name(TenantState s);
+//: Parse a stored value. Returns false for anything unrecognised — which a
+//: caller MUST treat as "do not admit", not as "probably fine". A state this
+//: build does not know is a state written by a newer one, and guessing at it
+//: is how a suspension becomes advisory.
+bool tenant_state_from_string(const std::string& raw, TenantState& out);
+
+//: Does this state admit a user? The single place that answers it, so adding a
+//: state cannot quietly admit one: the switch has no default.
+bool tenant_state_admits(TenantState s);
+
+struct TenantStateRecord {
+    TenantState state = TenantState::Live;
+    std::string state_since;   // ISO-8601
+    std::string state_by;      // who moved it, empty when never moved
+    std::string note;
+};
+
 // ── Erasure records (§5.4) ─────────────────────────────────────────────────
 
 // What begin_erasure destroyed, and what the caller must still destroy.
@@ -223,6 +258,24 @@ public:
     virtual Result<int64_t> backfill_version_transforms(
             bool /*compressed*/, bool /*encrypted*/, const std::string& /*tenant*/ = "") {
         return Result<int64_t>::ok(0);
+    }
+
+    // ── Tenant lifecycle state (global registry) ───────────────────────────
+    //
+    // Non-pure so existing mocks need no update. A mock that does not override
+    // reports the tenant as ABSENT rather than live: a door that cannot
+    // determine state must refuse, and a default that invented "live" would
+    // make every unimplemented test double an open door.
+    virtual Result<std::optional<TenantStateRecord>> get_tenant_state(
+            const std::string& /*tenant*/) {
+        return Result<std::optional<TenantStateRecord>>::ok(std::nullopt);
+    }
+    //: `actor` and `note` are recorded on the row; the tamper-evident history is
+    //: the scope=Global audit event the caller emits, not this.
+    virtual Result<void> set_tenant_state(
+            const std::string& /*tenant*/, TenantState /*state*/,
+            const std::string& /*actor*/ = "", const std::string& /*note*/ = "") {
+        return Result<void>::err("set_tenant_state not implemented");
     }
 
     // Version restoration operations

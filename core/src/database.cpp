@@ -127,6 +127,28 @@ Result<void> Database::create_schema() {
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Lifecycle state, added to the registry rather than kept beside it.
+        --
+        -- The core gains a state it ALREADY emits audit events about (tenant
+        -- create/drop are scope=Global, target_type=tenant); it learns nothing
+        -- about what the state is for. Doors read it to refuse a tenant that is
+        -- not in service; the administration application drives transitions.
+        --
+        -- DEFAULT 'live' is the only safe backfill and is correct rather than
+        -- convenient: every tenant that exists when this runs IS in service, and
+        -- a migration defaulting to anything else would lock the deployment out
+        -- on the first login after it ran. A migration cannot know what it was
+        -- not told, so it asserts only what is already true.
+        --
+        -- History is NOT kept here. Transitions are scope=Global audit events
+        -- with an actor, which is a tamper-evident record; a second table would
+        -- be an unchained duplicate of it.
+        ALTER TABLE tenants
+            ADD COLUMN IF NOT EXISTS state       VARCHAR(16)  NOT NULL DEFAULT 'live',
+            ADD COLUMN IF NOT EXISTS state_since TIMESTAMPTZ  NOT NULL DEFAULT now(),
+            ADD COLUMN IF NOT EXISTS state_by    VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS state_note  TEXT;
+
         -- Global audit log (usage_logging_and_auditing.md §8): tenant
         -- create/drop and cross-tenant admin actions, readable only by
         -- system_admin. Same shape as the per-tenant audit_log plus a nullable
@@ -1859,6 +1881,134 @@ Result<std::optional<std::string>> Database::get_version_storage_path(const std:
 }
 
 // ── Per-version transform record (storage_pipeline.md SR-1 / SR-2 / SR-3) ──
+
+// ── Tenant lifecycle state (global registry) ───────────────────────────────
+
+const char* tenant_state_name(TenantState s) {
+    switch (s) {
+        case TenantState::Requested:       return "requested";
+        case TenantState::AwaitingDns:     return "awaiting_dns";
+        case TenantState::Provisioning:    return "provisioning";
+        case TenantState::Live:            return "live";
+        case TenantState::Suspended:       return "suspended";
+        case TenantState::Decommissioning: return "decommissioning";
+        case TenantState::Decommissioned:  return "decommissioned";
+    }
+    return "unknown";
+}
+
+bool tenant_state_from_string(const std::string& raw, TenantState& out) {
+    if (raw == "requested")       { out = TenantState::Requested;       return true; }
+    if (raw == "awaiting_dns")    { out = TenantState::AwaitingDns;     return true; }
+    if (raw == "provisioning")    { out = TenantState::Provisioning;    return true; }
+    if (raw == "live")            { out = TenantState::Live;            return true; }
+    if (raw == "suspended")       { out = TenantState::Suspended;       return true; }
+    if (raw == "decommissioning") { out = TenantState::Decommissioning; return true; }
+    if (raw == "decommissioned")  { out = TenantState::Decommissioned;  return true; }
+    return false;
+}
+
+bool tenant_state_admits(TenantState s) {
+    // No default. A state added to the enum without a decision here fails to
+    // compile, which is the point: the alternative is a new state silently
+    // inheriting "not admitted" or, worse, "admitted".
+    switch (s) {
+        case TenantState::Live:
+            return true;
+        case TenantState::Requested:
+        case TenantState::AwaitingDns:
+        case TenantState::Provisioning:
+        case TenantState::Suspended:
+        case TenantState::Decommissioning:
+        case TenantState::Decommissioned:
+            return false;
+    }
+    return false;
+}
+
+Result<std::optional<TenantStateRecord>> Database::get_tenant_state(const std::string& tenant) {
+    auto conn = acquire(DbOp::Read);
+    if (!conn || !conn->is_valid()) {
+        return Result<std::optional<TenantStateRecord>>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    const std::string sql =
+        "SELECT state, state_since, COALESCE(state_by, ''), COALESCE(state_note, '') "
+        "FROM tenants WHERE tenant_id = $1 LIMIT 1;";
+    const char* params[1] = {tenant.c_str()};
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::string error = PQerrorMessage(pg_conn);
+        PQclear(res);
+        connection_pool_->release(conn);
+        // An ERROR is not an absence. A caller must be able to tell "this
+        // tenant does not exist" from "I could not find out", because the
+        // second must never be treated as a verdict.
+        return Result<std::optional<TenantStateRecord>>::err("Failed to read tenant state: " + error);
+    }
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        connection_pool_->release(conn);
+        // Registration happens inside tenant creation, so an absent row means
+        // no such tenant rather than an unregistered one.
+        return Result<std::optional<TenantStateRecord>>::ok(std::nullopt);
+    }
+
+    TenantStateRecord rec;
+    const std::string raw = PQgetvalue(res, 0, 0);
+    if (!tenant_state_from_string(raw, rec.state)) {
+        PQclear(res);
+        connection_pool_->release(conn);
+        // Written by a newer build. Refused rather than guessed: an unknown
+        // state resolved to a default is how a suspension becomes advisory.
+        return Result<std::optional<TenantStateRecord>>::err(
+            "Unrecognised tenant state '" + raw + "' for tenant '" + tenant +
+            "' — written by a newer build?");
+    }
+    rec.state_since = PQgetvalue(res, 0, 1);
+    rec.state_by    = PQgetvalue(res, 0, 2);
+    rec.note        = PQgetvalue(res, 0, 3);
+
+    PQclear(res);
+    connection_pool_->release(conn);
+    return Result<std::optional<TenantStateRecord>>::ok(rec);
+}
+
+Result<void> Database::set_tenant_state(const std::string& tenant, TenantState state,
+                                        const std::string& actor, const std::string& note) {
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) {
+        return Result<void>::err("Failed to acquire database connection");
+    }
+    PGconn* pg_conn = conn->get_connection();
+
+    const std::string sql =
+        "UPDATE tenants SET state = $2, state_since = now(), state_by = $3, state_note = $4, "
+        "updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $1;";
+    const std::string state_str = tenant_state_name(state);
+    const char* params[4] = {tenant.c_str(), state_str.c_str(), actor.c_str(), note.c_str()};
+    PGresult* res = PQexecParams(pg_conn, sql.c_str(), 4, nullptr, params, nullptr, nullptr, 0);
+
+    const bool good = PQresultStatus(res) == PGRES_COMMAND_OK;
+    const std::string affected = good && PQcmdTuples(res) ? PQcmdTuples(res) : "0";
+    const std::string error = good ? "" : PQerrorMessage(pg_conn);
+    PQclear(res);
+    connection_pool_->release(conn);
+
+    if (!good) return Result<void>::err("Failed to set tenant state: " + error);
+    if (affected == "0") {
+        // Reported rather than silently succeeding. A transition against a
+        // tenant that does not exist is a caller mistake, and an UPDATE that
+        // matched nothing looks identical to one that worked.
+        return Result<void>::err("No such tenant '" + tenant + "'");
+    }
+    SERVER_LOG_INFO("Database::set_tenant_state",
+                    "tenant '" + tenant + "' -> " + state_str +
+                    (actor.empty() ? "" : " by " + actor));
+    return Result<void>::ok();
+}
 
 Result<std::optional<VersionTransform>> Database::get_version_transform(
         const std::string& file_uid, const std::string& version_timestamp,
