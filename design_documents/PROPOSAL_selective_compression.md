@@ -373,7 +373,13 @@ be seekable — but C0 is worth doing even if that proposal is rejected entirely
 
 ## 10. Open questions
 
-**Q1 — Has either flag ever been flipped on the live deployment?** (§3.2.) This
+**Q1 — Has either flag ever been flipped on the live deployment?**
+**Answered 2026-09-28: no — compression and encryption have both been on since
+launch.** C0 is therefore a prophylactic rather than a repair, and
+`storage_pipeline.md` §7.2.1 records the two cheap checks that confirm it against
+the bytes rather than against recollection. The original wording follows.
+
+*(Superseded.)* (§3.2.) This
 is a question about history, not design, and it should be answered before C0 is
 scheduled — if the answer is yes, there may be existing affected versions and C0
 becomes a repair rather than a prophylactic.

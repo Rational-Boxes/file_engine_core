@@ -707,7 +707,7 @@ whatever code is deployed. Deploying S5 MUST NOT itself start writing v2.
 
 | Phase | Action | Rollback |
 |---|---|---|
-| **P0** | Answer §11-Q1: has `compression` or `encryption` ever been flipped on this deployment? If yes, there may already be versions affected by the §3 defect, and this becomes a repair before it is a migration. | n/a — a question, not a change |
+| **P0** | **Answered 2026-09-28: both flags have been on since launch and neither has been flipped.** No version is affected by the §3 defect, so this is a migration rather than a repair. Confirm against the bytes before P1 — §7.2.1. | n/a — a question, not a change |
 | **P1** | Deploy **S0**: the migration and the switch from configuration to the version record. No behaviour change; every version reads exactly as before. | ordinary redeploy; columns are additive and unused by the old binary |
 | **P2** | Soak. Verify via the restore rehearsal that a restored instance reads the corpus **without** matching configuration — the property S0 buys. | as P1 |
 | **P3** | Turn **S2** on (`FILEENGINE_SELECTIVE_COMPRESSION`, default off) after §9's measurement, per tenant. New writes only; the corpus is now mixed by design, which P1 made safe. | **not a redeploy** — revert the setting, but versions already written uncompressed stay readable only on this binary or later (see below) |
@@ -719,6 +719,46 @@ whatever code is deployed. Deploying S5 MUST NOT itself start writing v2.
 P5 and P6 being separate deployments is the whole design of this table. Merging
 them is the mistake that turns a reversible rollout into a one-way door taken by
 accident.
+
+### 7.2.1 P0, answered — and the cheap way to confirm it
+
+The deployment has run with **compression and encryption both enabled since
+launch**, and neither flag has been changed. Three consequences:
+
+- **No version is affected by the §3 defect.** The corpus is uniformly
+  compressed and encrypted, so the configuration the read path consults has
+  always matched what the write path applied. The defect is **latent, not
+  active**: nothing is being read wrongly today, and the exposure is entirely
+  prospective — the first flip of either flag would corrupt reads silently, and
+  S0 is what removes that possibility.
+- **S0's backfill writes `true, true`** for every pre-existing row, correct by
+  the same reasoning. The implementation reads the live flags at call time, so
+  this needs no special handling.
+- **P1 proceeds as an ordinary deploy.** There is no repair to schedule first.
+
+**Confirm it against the bytes anyway, before P1.** Not because the recollection
+is doubted, but because it is a claim about every version ever written, it costs
+one query and a few reads, and this platform has been caught twice by exactly
+this shape of assumption: `S3Storage::delete_file` was believed to work and was a
+hard-coded refusal, and the offsite bucket was believed empty from a misread
+non-recursive listing. Both were found by checking the bytes rather than the
+record.
+
+Two checks, either of which falsifies the premise on its own:
+
+1. **After the S0 migration**, assert that no `versions` row is left with a NULL
+   `compressed` or `encrypted` — that the backfill reached everything, across
+   every tenant schema.
+2. **Sample stored blobs and decrypt-then-inflate them.** Every one should be a
+   valid GCM object containing a valid zlib stream. A blob that decrypts to
+   something zlib refuses is a version written under different settings, and it
+   is far better found now — while the configuration fallback still describes it
+   correctly — than after the flags become per-version and the fallback stops
+   being consulted.
+
+Weight the sample toward the **oldest** versions and toward any tenant
+provisioned separately from the main deploy, since that is where an exception
+would live if one exists.
 
 ### 7.3 Replication and mixed readers
 
