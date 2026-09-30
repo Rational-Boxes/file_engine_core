@@ -66,6 +66,22 @@ service FileService {
 
     // Administrative operations
     rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsageResponse);
+
+    // Tenant lifecycle state, from the global `tenants` registry.
+    // PROPOSAL_system_administration_application.md §3.4c.
+    //
+    // THIS IS THE DOORS' LOGIN CHECK. Only `live` admits a user; every other
+    // state refuses, including `provisioning` (a half-built tenant must not be
+    // reachable) and `decommissioned` (the row outlives the data so the name
+    // cannot be silently reused, and must not become a way back in).
+    //
+    // A read rather than a per-door database connection, deliberately: the state
+    // has ONE authoritative home and one read path. A door with its own libpq
+    // route into the core's global schema would be a second reader of
+    // core-owned state, and an LDAP copy would be a second WRITER — a tenant
+    // suspended in one place and live in the other, reachable through whichever
+    // door read the stale copy, failing silently.
+    rpc GetTenantState(TenantStateRequest) returns (TenantStateResponse);
     rpc PurgeOldVersions(PurgeOldVersionsRequest) returns (PurgeOldVersionsResponse);
 
     // Erasure ("true delete") — PROPOSAL_accountability_record.md §5.4.
@@ -765,6 +781,34 @@ message ListClaimsResponse {
 }
 
 // Administrative operations
+message TenantStateRequest {
+    string tenant = 1;
+    AuthenticationContext auth = 2;
+}
+
+message TenantStateResponse {
+    bool success = 1;
+    string error = 2;
+
+    // The state as recorded. Empty when the tenant is not in the registry.
+    string state = 3;
+    // When it entered that state, who put it there, and why. For the refusal
+    // message and for the administrative console; never for authorization.
+    string state_since = 4;
+    string state_by = 5;
+    string state_note = 6;
+
+    // The core's OWN verdict, so a door is not the only thing that knows the
+    // rule. A door still applies its own policy — shared, header-only — and the
+    // two agreeing is the point: if they ever disagree, the door refuses,
+    // because `admits` here is advisory and the door's check is the gate.
+    bool admits = 7;
+    // False when the tenant has no registry row at all. Distinct from
+    // `admits=false`, because "no such tenant" and "suspended" need different
+    // operator responses and a door that conflates them tells the wrong story.
+    bool found = 8;
+}
+
 message StorageUsageRequest {
     AuthenticationContext auth = 1;     // Authentication information
     string tenant = 2;                  // Optional tenant-specific usage

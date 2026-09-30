@@ -245,6 +245,14 @@ const std::map<std::string, Capability>& method_map() {
         {"GetStorageUsage",           Capability::Admin},
         {"TriggerSync",               Capability::Admin},
 
+        // GetTenantState is READ, not Admin, and the choice matters. EVERY door
+        // calls it on EVERY login (§3.4c), and webdav_bridge and mcp hold `read`
+        // but not `admin` — classifying it Admin would mean granting the admin
+        // capability to two doors that have deliberately never had it, to let
+        // them ask whether a tenant is live. It reads tenancy metadata; it
+        // changes nothing.
+        {"GetTenantState",            Capability::Read},
+
         // destroy — the irreversible kind.
         {"PurgeOldVersions",          Capability::Destroy},
 
