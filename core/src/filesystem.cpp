@@ -951,6 +951,19 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
                          stream_decision.reason_name() + ") for " + file_uid);
     }
 
+    // §7.1 / SR-33, exactly as in put(). This line is the fix for a defect that
+    // reached production: put_stream used to ignore storage_write_format and
+    // hard-code v1, so a deployment configured for v2 wrote v1 for every file
+    // that arrived through a door — which is all of them, since StreamFileUpload
+    // lands here. The config was read, the core was healthy, and nothing said
+    // the setting had no effect.
+    const bool write_v2 = (context->config.storage_write_format == 2);
+
+    // v2 compresses and encrypts PER BLOCK, so the stream transforms below are
+    // skipped rather than run and discarded — same division as put().
+    const bool apply_stream_compression = !write_v2 && do_compress;
+    const bool apply_stream_encryption  = !write_v2 && do_encrypt;
+
     try {
         std::filesystem::create_directories(std::filesystem::path(storage_path).parent_path());
     } catch (const std::exception& e) {
@@ -966,18 +979,47 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     try {
         std::unique_ptr<CompressStream> compressor;
         std::unique_ptr<EncryptStream> encryptor;
-        if (do_compress) compressor = std::make_unique<CompressStream>();
-        if (do_encrypt) encryptor = std::make_unique<EncryptStream>(encryption_key);
+        if (apply_stream_compression) compressor = std::make_unique<CompressStream>();
+        if (apply_stream_encryption) encryptor = std::make_unique<EncryptStream>(encryption_key);
 
         std::vector<uint8_t> chunk, cbuf, ebuf;
         auto sink = [&](const uint8_t* p, size_t n) {
             if (n > 0) ofs.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
         };
-        // Push one plaintext chunk through compress -> encrypt -> disk.
+
+        // v2::Writer takes plaintext in whatever chunking it arrives in and cuts
+        // its own blocks, which is the whole reason it is a Writer and not just
+        // encode() — so the door's chunk sizes never reach the format.
+        std::unique_ptr<v2::Writer> v2w;
+        if (write_v2) {
+            v2::Options o;
+            o.encrypt = do_encrypt;
+            // v2 decides compression per block (SR-31); the stream decision
+            // above only says whether to try at all.
+            o.compress = compression_allowed;
+            o.block_size = v2::kDefaultBlockSize;
+            v2::VersionIdentity vid;
+            vid.file_uid = file_uid;
+            vid.version_timestamp = version_timestamp;
+            v2w = std::make_unique<v2::Writer>(
+                [&](const uint8_t* p, size_t n) { sink(p, n); return true; },
+                encryption_key, vid, o);
+        }
+
+        // Push one plaintext chunk through compress -> encrypt -> disk, or hand
+        // it to the v2 writer, which does both itself.
         auto feed = [&](const uint8_t* p, size_t n) {
-            if (do_compress) { compressor->update(p, n, cbuf); p = cbuf.data(); n = cbuf.size(); }
+            if (v2w) {
+                auto e = v2w->write(p, n);
+                if (e) {
+                    throw std::runtime_error(std::string("storage format v2 write failed: ") +
+                                             v2::status_name(e.status) + " (" + e.detail + ")");
+                }
+                return;
+            }
+            if (apply_stream_compression) { compressor->update(p, n, cbuf); p = cbuf.data(); n = cbuf.size(); }
             if (n == 0) return;
-            if (do_encrypt) { encryptor->update(p, n, ebuf); sink(ebuf.data(), ebuf.size()); }
+            if (apply_stream_encryption) { encryptor->update(p, n, ebuf); sink(ebuf.data(), ebuf.size()); }
             else sink(p, n);
         };
 
@@ -993,19 +1035,32 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
             feed(chunk.data(), chunk.size());
         }
 
-        if (original_size == 0) {
+        if (v2w) {
+            // ALWAYS finish, including for an empty payload. v2 is
+            // self-describing, so a zero-byte file is still a header, an empty
+            // block index, a trailer and a footer — a truly empty blob would be
+            // unreadable rather than empty, and the reader would be right to
+            // refuse it.
+            auto e = v2w->finish();
+            if (e) {
+                throw std::runtime_error(std::string("storage format v2 finish failed: ") +
+                                         v2::status_name(e.status) + " (" + e.detail + ")");
+            }
+            ofs.flush();
+            ofs.close();
+        } else if (original_size == 0) {
             // Empty content -> empty blob (matches the one-shot convention where
             // compress/encrypt of empty data yields an empty stored blob).
             ofs.close();
         } else {
-            if (do_compress) {
+            if (apply_stream_compression) {
                 compressor->finish(cbuf);            // flush trailing compressed bytes
                 if (!cbuf.empty()) {
-                    if (do_encrypt) { encryptor->update(cbuf.data(), cbuf.size(), ebuf); sink(ebuf.data(), ebuf.size()); }
+                    if (apply_stream_encryption) { encryptor->update(cbuf.data(), cbuf.size(), ebuf); sink(ebuf.data(), ebuf.size()); }
                     else sink(cbuf.data(), cbuf.size());
                 }
             }
-            if (do_encrypt) {
+            if (apply_stream_encryption) {
                 encryptor->finish(ebuf);             // appends the 16-byte GCM tag
                 sink(ebuf.data(), ebuf.size());
             }
@@ -1032,9 +1087,11 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
     {
         // SR-1, as in put(): fatal rather than logged.
         VersionTransform vt;
-        vt.compressed = do_compress;
+        // Mirrors put(): under v2 the per-payload booleans describe what the
+        // format was ALLOWED to do, because the actual choice is per block.
+        vt.compressed = write_v2 ? compression_allowed : do_compress;
         vt.encrypted = do_encrypt;
-        vt.storage_format = 1;
+        vt.storage_format = write_v2 ? 2 : 1;
         vt.key_id = 0;
         auto rec = context->db->set_version_transform(file_uid, version_timestamp, vt, tenant);
         if (!rec.success) return Result<void>::err("Failed to record storage transform: " + rec.error);

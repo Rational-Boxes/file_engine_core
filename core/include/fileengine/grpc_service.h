@@ -218,6 +218,11 @@ public:
                                 const fileengine_rpc::StorageUsageRequest* request,
                                 fileengine_rpc::StorageUsageResponse* response) override;
 
+    // The doors' login check (§3.4c). Read-only; changes nothing.
+    grpc::Status GetTenantState(grpc::ServerContext* context,
+                                const fileengine_rpc::TenantStateRequest* request,
+                                fileengine_rpc::TenantStateResponse* response) override;
+
     grpc::Status PurgeOldVersions(grpc::ServerContext* context,
                                  const fileengine_rpc::PurgeOldVersionsRequest* request,
                                  fileengine_rpc::PurgeOldVersionsResponse* response) override;

@@ -2292,6 +2292,69 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
 }
 
 // Administrative operations
+grpc::Status GRPCFileService::GetTenantState(grpc::ServerContext* /*context*/,
+                                            const fileengine_rpc::TenantStateRequest* request,
+                                            fileengine_rpc::TenantStateResponse* response) {
+    // The doors' login check (§3.4c). Deliberately plain: a read of the global
+    // registry, no side effects, and no authorization beyond the service
+    // capability the interceptor already required.
+    //
+    // NOT gated on the END USER's roles, and that is not an oversight. A door
+    // asks this BEFORE it has decided whether to admit anybody — that is the
+    // whole point of a login check — so requiring a resolved user would make the
+    // question unanswerable at the moment it needs answering.
+    const std::string tenant = request->tenant();
+    if (tenant.empty()) {
+        response->set_success(false);
+        response->set_error("tenant is required");
+        return grpc::Status::OK;
+    }
+
+    auto db = tenant_manager_ ? tenant_manager_->shared_database() : nullptr;
+    if (!db) {
+        // FAIL CLOSED at the source too. The door refuses on any error, but
+        // saying success=false rather than inventing a state means the door
+        // reports "could not determine" instead of "suspended" — different
+        // operator responses (§3.4c property 1 and property 4).
+        response->set_success(false);
+        response->set_error("tenant registry unavailable");
+        SERVER_LOG_ERROR("GRPCService::GetTenantState",
+                         "No database available to read tenant state for '" + tenant + "'");
+        return grpc::Status::OK;
+    }
+
+    auto rec = db->get_tenant_state(tenant);
+    if (!rec.success) {
+        response->set_success(false);
+        response->set_error(rec.error);
+        SERVER_LOG_ERROR("GRPCService::GetTenantState",
+                         "Failed to read tenant state for '" + tenant + "': " + rec.error);
+        return grpc::Status::OK;
+    }
+
+    response->set_success(true);
+    if (!rec.value.has_value()) {
+        // No registry row. Distinct from suspended: "no such tenant" and
+        // "suspended" need different operator responses, and a door that
+        // conflates them tells the wrong story to the person on the phone.
+        response->set_found(false);
+        response->set_admits(false);
+        return grpc::Status::OK;
+    }
+
+    const auto& st = *rec.value;
+    response->set_found(true);
+    response->set_state(tenant_state_name(st.state));
+    response->set_state_since(st.state_since);
+    response->set_state_by(st.state_by);
+    response->set_state_note(st.note);
+    // Advisory. The door applies its own shared policy and refuses on
+    // disagreement; this is here so the core is not the only thing that knows
+    // the rule, and so a mismatch is detectable rather than invisible.
+    response->set_admits(tenant_state_admits(st.state));
+    return grpc::Status::OK;
+}
+
 grpc::Status GRPCFileService::GetStorageUsage(grpc::ServerContext* context,
                                             const fileengine_rpc::StorageUsageRequest* request,
                                             fileengine_rpc::StorageUsageResponse* response) {

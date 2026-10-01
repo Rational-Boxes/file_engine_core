@@ -317,6 +317,36 @@ target_include_directories(storage_range_live_tests PRIVATE
 add_test(NAME storage_range_live_tests COMMAND storage_range_live_tests)
 set_tests_properties(storage_range_live_tests PROPERTIES
     LABELS "live" TIMEOUT 600 SKIP_RETURN_CODE 77)
+
+# storage_write_path_parity_live_tests — put() and put_stream() must produce the
+# SAME storage format. The regression this exists for shipped to production:
+# put_stream hard-coded v1 while the deployment was configured for v2, and every
+# other suite missed it by only ever calling put().
+add_executable(storage_write_path_parity_live_tests storage_write_path_parity_live_tests.cpp)
+target_link_libraries(storage_write_path_parity_live_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(storage_write_path_parity_live_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(storage_write_path_parity_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME storage_write_path_parity_live_tests COMMAND storage_write_path_parity_live_tests)
+set_tests_properties(storage_write_path_parity_live_tests PROPERTIES
+    LABELS "live" TIMEOUT 900 SKIP_RETURN_CODE 77)
 # compression_corpus_tests — storage_pipeline.md the compression decision over the real local corpus
 add_executable(compression_corpus_tests compression_corpus_tests.cpp)
 target_link_libraries(compression_corpus_tests

@@ -81,6 +81,15 @@ public:
                                const AccountabilityContext& ctx);
     const TenantConfig& get_config() const { return config_; }
 
+    // The shared database, for GLOBAL-schema reads that belong to no tenant —
+    // the tenant registry being the one that matters (§3.4c).
+    //
+    // Exposed rather than routed through get_tenant_context(), which CREATES a
+    // context for a name it has not seen. Asking "is this tenant live" must not
+    // bring the tenant into existence, and a login check is asked about names
+    // that may well not exist.
+    std::shared_ptr<IDatabase> shared_database() const { return shared_database_; }
+
 private:
     TenantContext* create_tenant_context(const std::string& tenant_id);
 
