@@ -1309,6 +1309,17 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
                      ? get(file_uid, user, roles, tenant)
                      : get_version(file_uid, current_version, user, roles, tenant);
         if (!r.success) return Result<void>::err(r.error);
+        // Whole-buffer fallback: the total is simply the buffer, known before
+        // the (single) emit — SR-12 holds on this path too.
+        if (report) {
+            const int64_t total = static_cast<int64_t>(r.value.size());
+            const int64_t avail = std::max<int64_t>(0, total - req_offset);
+            report->ranged = windowed;
+            report->range_start = req_offset;
+            report->total_size = total;
+            report->range_length = req_length > 0 ? std::min<int64_t>(req_length, avail) : avail;
+            report->range_method = "scan";
+        }
         if (!r.value.empty()) on_chunk(r.value.data(), r.value.size());
         return Result<void>::ok();
     }
@@ -1352,6 +1363,20 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
         }
 
         const uint64_t total = reader.plaintext_size();
+        // SR-12, known NOW — before the first byte. StreamFileDownload copies the
+        // report onto its first gRPC frame from inside the sink, so filling it
+        // only after the read (as this did) sent every first frame with
+        // total_size 0 and ranged false, and no door could answer a correct 206.
+        // range_length is the planned window here; it is made exact below.
+        if (report) {
+            const int64_t avail = std::max<int64_t>(0, static_cast<int64_t>(total) - req_offset);
+            report->ranged = windowed;
+            report->range_start = req_offset;
+            report->range_length = req_length > 0 ? std::min<int64_t>(req_length, avail) : avail;
+            report->total_size = static_cast<int64_t>(total);
+            report->range_method = "seek";
+            report->authenticated = true;   // SR-28: every block touched verified
+        }
         int64_t emitted = 0;
         auto e = reader.read_range(
             static_cast<uint64_t>(req_offset),
@@ -1390,6 +1415,22 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
     if (do_encrypt) {
         encryption_key = context->config.encryption_key;
         if (encryption_key.empty()) return Result<void>::err("Encryption key not available");
+    }
+
+    // SR-12 for the v1 path, before the first byte (see the v2 branch above):
+    // the total is the version's recorded size; the method is always a scan.
+    if (report) {
+        int64_t total = 0;
+        auto sz = context->db->get_version_size(file_uid, current_version, tenant);
+        if (sz.success && sz.value.has_value()) total = *sz.value;
+        report->ranged = windowed;
+        report->range_start = req_offset;
+        report->total_size = total;
+        if (total > 0) {
+            const int64_t avail = std::max<int64_t>(0, total - req_offset);
+            report->range_length = req_length > 0 ? std::min<int64_t>(req_length, avail) : avail;
+        }
+        report->range_method = "scan";
     }
 
     std::ifstream ifs(local_storage_path, std::ios::binary);
