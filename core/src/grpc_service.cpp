@@ -2265,6 +2265,20 @@ grpc::Status GRPCFileService::StreamFileDownload(grpc::ServerContext* context,
         },
         user, roles, tenant, request->version_timestamp(), &report);
 
+    if (result.success && !first_frame_sent) {
+        // Nothing to send — an empty file, or a window that starts at or past
+        // the end. The metadata is still owed: without a total a door cannot
+        // answer 416 `bytes */total` and fell back to "200, empty body".
+        fileengine_rpc::GetFileResponse response;
+        response.set_success(true);
+        response.set_total_size(report.total_size);
+        response.set_range_start(report.range_start);
+        response.set_range_length(0);
+        response.set_ranged(report.ranged);
+        response.set_range_method(report.range_method);
+        first_frame_sent = true;
+        writer->Write(response);
+    }
     if (result.success) {
         SERVER_LOG_INFO("GRPCService", "StreamFileDownload successful for uid: " + file_uid);
     } else {
