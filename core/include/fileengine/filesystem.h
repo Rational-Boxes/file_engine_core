@@ -169,6 +169,14 @@ public:
     // Best-effort: returns false on any lookup failure. At most two DB lookups.
     bool audit_target_is_hidden_child(const std::string& uid, const std::string& tenant);
 
+    // Non-versioned sidecars (MEDIA_SHARE.md §8.4): a hidden child named
+    // audience.csv / audience-<uuid>.csv keeps exactly one version.
+    static bool is_unversioned_sidecar_name(const std::string& name);
+    Result<void> retire_superseded_sidecar_versions(const std::string& file_uid,
+                                                    const std::string& user,
+                                                    const std::vector<std::string>& roles,
+                                                    const std::string& tenant);
+
     // Path operations
     virtual Result<void> move(const std::string& src_uid, const std::string& dst_uid,
                               const std::string& user,

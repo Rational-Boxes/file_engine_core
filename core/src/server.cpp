@@ -409,6 +409,20 @@ int main(int argc, char** argv) {
     // anyone who can delete rows, turning a one-shot into a permanent back door.
     std::unique_ptr<fileengine::BootstrapListener> bootstrap;
     {
+        // A deployment issued with fileengine_cli has credentials and no marker.
+        // Close it properly first, so that emptying the map later cannot reopen
+        // enrolment. A failure here changes nothing below: the check still
+        // counts credentials, and a check that fails keeps the socket shut.
+        auto closed = database->close_service_bootstrap_if_issued(
+            fileengine::AccountabilityContext::system());
+        if (!closed.success) {
+            fileengine::ServerLogger::getInstance().security(
+                "Bootstrap", "Could not record bootstrap as closed: " + closed.error);
+        } else if (closed.value) {
+            fileengine::ServerLogger::getInstance().security(
+                "Bootstrap", "Credentials exist but bootstrap was never marked complete "
+                             "(issued directly, not by enrolment); marked it complete now");
+        }
         auto complete = database->service_bootstrap_complete();
         if (!complete.success) {
             // Fail closed. If we cannot tell whether bootstrap has been used,

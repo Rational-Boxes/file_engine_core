@@ -459,7 +459,8 @@ public:
                                        const std::string& /*cut_version_timestamp*/,
                                        int /*keep_count*/,
                                        const std::string& /*tenant*/,
-                                       const AccountabilityContext& /*ctx*/) {
+                                       const AccountabilityContext& /*ctx*/,
+                                       const std::string& /*reason*/ = "") {
         return Result<int>::err("version culling is not available from this database implementation");
     }
 

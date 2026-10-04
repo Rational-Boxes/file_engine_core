@@ -494,6 +494,30 @@ target_include_directories(test_version_selection PRIVATE
     ${GRPCPP_INCLUDE_DIRS}
 )
 
+# Non-versioned sidecar name rule (MEDIA_SHARE.md §8.4; no live DB).
+add_executable(test_unversioned_sidecar test_unversioned_sidecar.cpp)
+target_link_libraries(test_unversioned_sidecar
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(test_unversioned_sidecar ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(test_unversioned_sidecar PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
 # ACL security semantics unit test (AclManager + mock DB; no live DB).
 add_executable(test_security_acl test_security_acl.cpp)
 target_link_libraries(test_security_acl
@@ -573,6 +597,7 @@ foreach(t
     test_deleted_reachability
     test_connection_router
     test_version_selection
+    test_unversioned_sidecar
     file_culler_tests
     crypto_stream_tests
     compression_policy_tests
@@ -655,6 +680,24 @@ target_include_directories(accountability_live_tests PRIVATE
 target_link_libraries(accountability_live_tests
     fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
 add_test(NAME accountability_live_tests COMMAND accountability_live_tests)
+
+# Bootstrap closure: a direct issue writes the marker, a startup backfills it,
+# and an emptied map cannot reopen enrolment. Empties the global credential
+# tables, so it refuses the shared 'fileengine' database (exit 77 = SKIPPED).
+add_executable(service_bootstrap_live_tests service_bootstrap_live_tests.cpp)
+target_include_directories(service_bootstrap_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include ${LIBPQ_INCLUDE_DIRS})
+target_link_libraries(service_bootstrap_live_tests
+    fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
+add_test(NAME service_bootstrap_live_tests COMMAND service_bootstrap_live_tests)
+set_tests_properties(service_bootstrap_live_tests PROPERTIES SKIP_RETURN_CODE 77)
+# The same, end to end: real fileengine_server + fileengine_cli, five server
+# starts against a database it DROPS and recreates (fe_bootstrap_e2e).
+add_test(NAME service_bootstrap_e2e
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bootstrap_e2e.sh ${CMAKE_BINARY_DIR})
+set_tests_properties(service_bootstrap_e2e PROPERTIES
+    SKIP_RETURN_CODE 77 LABELS "e2e" TIMEOUT 300
+    DEPENDS "service_bootstrap_live_tests")
 
 add_executable(acl_subtree_live_tests acl_subtree_live_tests.cpp)
 target_include_directories(acl_subtree_live_tests PRIVATE

@@ -168,6 +168,29 @@ static bool read_range(FileSystem& fs, const std::string& uid, const std::string
     return r.success;
 }
 
+// The report AS SEEN BY THE FIRST CHUNK. StreamFileDownload copies the report
+// onto its first gRPC frame from inside the sink, so the metadata must be
+// complete before the first byte is delivered — not only after the read ends.
+// Found live (2026-10-03): every first frame carried total_size 0 and
+// ranged false, so the bridge could not write a correct 206.
+struct FirstSeen { bool seen = false; int64_t total = -1; bool ranged = false;
+                   int64_t start = -1; std::string method; };
+static bool read_range_first(FileSystem& fs, const std::string& uid, const std::string& tenant,
+                             int64_t off, int64_t len, FirstSeen& first) {
+    FileSystem::RangeReport rep;
+    auto r = fs.get_range(uid, off, len, [&](const uint8_t*, size_t) {
+        if (!first.seen) {
+            first.seen = true;
+            first.total = rep.total_size;
+            first.ranged = rep.ranged;
+            first.start = rep.range_start;
+            first.method = rep.range_method;
+        }
+        return true;
+    }, USER, ROLES, tenant, "", &rep);
+    return r.success;
+}
+
 static void run_combination(bool encrypt, bool compress, const std::string& label,
                             bool exhaustive, int write_format = 1) {
     std::cout << "ranges end-to-end: " << label << "..." << std::endl;
@@ -231,6 +254,22 @@ static void run_combination(bool encrypt, bool compress, const std::string& labe
         check(rep.range_method == expect_method,
               label + std::string(": range_method is ") + expect_method +
                   " (got " + rep.range_method + ")");
+    }
+
+    // SR-12, as the RPC needs it: complete at the FIRST chunk.
+    {
+        FirstSeen first;
+        check(read_range_first(*f.fs, uid, f.tenant, 12345, 5000, first),
+              label + ": first-chunk read");
+        const char* expect_method = (write_format == 2) ? "seek" : "scan";
+        check(first.seen, label + ": the sink was called");
+        check(first.total == static_cast<int64_t>(N),
+              label + ": total_size known at the first chunk (got " +
+                  std::to_string(first.total) + ")");
+        check(first.ranged, label + ": ranged known at the first chunk");
+        check(first.start == 12345, label + ": range_start known at the first chunk");
+        check(first.method == expect_method,
+              label + ": range_method known at the first chunk (got '" + first.method + "')");
     }
 
     // SR-14: overlong clamps rather than failing.

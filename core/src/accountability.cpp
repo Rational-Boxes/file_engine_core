@@ -135,8 +135,10 @@ const std::vector<ActionSchema>& action_schemas() {
          {"role"}},
         {accountability_action::kRoleRemove, AccountabilityCategory::Identity,
          {"role"}},
+        // `reason` says WHY history was cut when it was not a person's cull — a
+        // fixed token from code ("unversioned_sidecar"), never content.
         {accountability_action::kCullVersions, AccountabilityCategory::Destruction,
-         {"keep_count", "versions_removed", "cut_ts"}},
+         {"keep_count", "versions_removed", "cut_ts", "reason"}},
         // Erasure (§5.4), three actions because the record has to tell a story
         // with a beginning and an end: what was destroyed and by whom, who
         // confirmed destroying their derived copy, and the moment the obligation
@@ -174,6 +176,8 @@ const std::vector<ActionSchema>& action_schemas() {
         {accountability_action::kServiceBootstrapEnrolled, AccountabilityCategory::Identity,
          {"service_id", "pepper_version", "peer_uid"}},
         {accountability_action::kServiceBootstrapReopened, AccountabilityCategory::Identity,
+         {"service_id"}},
+        {accountability_action::kServiceBootstrapClosed, AccountabilityCategory::Identity,
          {"service_id"}},
         {accountability_action::kServiceCapGranted, AccountabilityCategory::Authorization,
          {"service_id", "capability", "high_risk"}},

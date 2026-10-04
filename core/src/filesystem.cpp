@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include <regex>
 #include "fileengine/filesystem.h"
 #include "fileengine/utils.h"
 #include "fileengine/server_logger.h"
@@ -689,6 +690,14 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
               " [CONCURRENCY CRITICAL] NOTE: Race conditions possible during async operations after this point");
 
     emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+    // Non-versioned sidecars keep exactly one version (see below). The new
+    // version is already committed, so a failure here must NOT fail the write —
+    // the caller would see an error for content that landed, and a retry would
+    // add another version. It is logged loudly instead, and the next write
+    // retires every superseded version, not just the newest, so it self-heals.
+    if (auto r = retire_superseded_sidecar_versions(file_uid, user, roles, tenant); !r.success) {
+        SERVER_LOG_ERROR("FileSystem", "sidecar " + file_uid + " keeps superseded versions: " + r.error);
+    }
     return Result<void>::ok();
 }
 
@@ -1110,6 +1119,14 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
         queue_cv_.notify_one();
     }
     emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+    // Non-versioned sidecars keep exactly one version (see below). The new
+    // version is already committed, so a failure here must NOT fail the write —
+    // the caller would see an error for content that landed, and a retry would
+    // add another version. It is logged loudly instead, and the next write
+    // retires every superseded version, not just the newest, so it self-heals.
+    if (auto r = retire_superseded_sidecar_versions(file_uid, user, roles, tenant); !r.success) {
+        SERVER_LOG_ERROR("FileSystem", "sidecar " + file_uid + " keeps superseded versions: " + r.error);
+    }
     return Result<void>::ok();
 }
 
@@ -1309,6 +1326,17 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
                      ? get(file_uid, user, roles, tenant)
                      : get_version(file_uid, current_version, user, roles, tenant);
         if (!r.success) return Result<void>::err(r.error);
+        // Whole-buffer fallback: the total is simply the buffer, known before
+        // the (single) emit — SR-12 holds on this path too.
+        if (report) {
+            const int64_t total = static_cast<int64_t>(r.value.size());
+            const int64_t avail = std::max<int64_t>(0, total - req_offset);
+            report->ranged = windowed;
+            report->range_start = req_offset;
+            report->total_size = total;
+            report->range_length = req_length > 0 ? std::min<int64_t>(req_length, avail) : avail;
+            report->range_method = "scan";
+        }
         if (!r.value.empty()) on_chunk(r.value.data(), r.value.size());
         return Result<void>::ok();
     }
@@ -1352,6 +1380,20 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
         }
 
         const uint64_t total = reader.plaintext_size();
+        // SR-12, known NOW — before the first byte. StreamFileDownload copies the
+        // report onto its first gRPC frame from inside the sink, so filling it
+        // only after the read (as this did) sent every first frame with
+        // total_size 0 and ranged false, and no door could answer a correct 206.
+        // range_length is the planned window here; it is made exact below.
+        if (report) {
+            const int64_t avail = std::max<int64_t>(0, static_cast<int64_t>(total) - req_offset);
+            report->ranged = windowed;
+            report->range_start = req_offset;
+            report->range_length = req_length > 0 ? std::min<int64_t>(req_length, avail) : avail;
+            report->total_size = static_cast<int64_t>(total);
+            report->range_method = "seek";
+            report->authenticated = true;   // SR-28: every block touched verified
+        }
         int64_t emitted = 0;
         auto e = reader.read_range(
             static_cast<uint64_t>(req_offset),
@@ -1390,6 +1432,22 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
     if (do_encrypt) {
         encryption_key = context->config.encryption_key;
         if (encryption_key.empty()) return Result<void>::err("Encryption key not available");
+    }
+
+    // SR-12 for the v1 path, before the first byte (see the v2 branch above):
+    // the total is the version's recorded size; the method is always a scan.
+    if (report) {
+        int64_t total = 0;
+        auto sz = context->db->get_version_size(file_uid, current_version, tenant);
+        if (sz.success && sz.value.has_value()) total = *sz.value;
+        report->ranged = windowed;
+        report->range_start = req_offset;
+        report->total_size = total;
+        if (total > 0) {
+            const int64_t avail = std::max<int64_t>(0, total - req_offset);
+            report->range_length = req_length > 0 ? std::min<int64_t>(req_length, avail) : avail;
+        }
+        report->range_method = "scan";
     }
 
     std::ifstream ifs(local_storage_path, std::ios::binary);
@@ -2066,6 +2124,75 @@ Result<void> FileSystem::backup_to_object_store_with_version(const std::string& 
         return Result<void>::err("Failed to store file in object store: " + obj_store_result.error);
     }
 
+    return Result<void>::ok();
+}
+
+// ── Non-versioned sidecars (MEDIA_SHARE.md §8.4, decided 2026-10-04) ────────────
+//
+// share_service's audience CSVs — `audience.csv` and `audience-<link_uid>.csv`,
+// hidden children of a shared media file — are PROJECTIONS of a Postgres table
+// holding outside viewers' email addresses. Their history has no value and is
+// a liability: after an address is erased (a legal obligation) or a link is
+// purged by retention, every earlier version would still hold it.
+//
+// So these files keep exactly ONE version: each write retires the one it
+// superseded. This is a third path that destroys data, alongside the version
+// cull and erasure, and it is deliberately as narrow and as recorded as they
+// are:
+//   * by NAME and PLACE only — a hidden child (parent is a file, not a folder)
+//     whose name is exactly `audience.csv` or `audience-<uuid>.csv`. Nothing a
+//     user creates in a folder can match, so no one can opt an ordinary file
+//     out of retention by naming it;
+//   * the superseded version only, in the same write that replaced it — the
+//     file is never left without its current content;
+//   * the same transactional accountability record a cull writes, carrying
+//     reason = "unversioned_sidecar", so the record says WHY history was cut.
+// It needs no CULL_VERSIONS grant: the writer is replacing a projection they
+// were allowed to write, not exercising a destroy-data permission on content.
+bool FileSystem::is_unversioned_sidecar_name(const std::string& name) {
+    static const std::regex kPattern(
+        "^audience(-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?\\.csv$");
+    return std::regex_match(name, kPattern);
+}
+
+Result<void> FileSystem::retire_superseded_sidecar_versions(const std::string& file_uid,
+                                                            const std::string& user,
+                                                            const std::vector<std::string>& roles,
+                                                            const std::string& tenant) {
+    auto context = get_tenant_context(tenant);
+    if (!context || !context->db) return Result<void>::ok();
+    auto file = context->db->get_file_by_uid(file_uid, tenant);
+    if (!file.success || !file.value.has_value()) return Result<void>::ok();
+    if (!is_unversioned_sidecar_name(file.value->name)) return Result<void>::ok();
+    auto parent = context->db->get_file_by_uid(file.value->parent_uid, tenant);
+    if (!parent.success || !parent.value.has_value() ||
+        parent.value->type == FileType::DIRECTORY) {
+        return Result<void>::ok();       // in a folder: an ordinary, versioned file
+    }
+    auto versions = context->db->list_versions(file_uid, tenant);
+    if (!versions.success) {
+        return Result<void>::err("Failed to list versions: " + versions.error);
+    }
+    if (versions.value.size() <= 1) return Result<void>::ok();
+    std::vector<std::string> superseded(versions.value.begin() + 1, versions.value.end());
+
+    AccountabilityContext ctx;
+    ctx.actor        = user;
+    ctx.actor_roles  = roles;
+    ctx.source_iface = CallerContext::current().service_id.empty()
+                           ? std::string("grpc")
+                           : CallerContext::current().service_id;
+    auto purged = context->db->purge_versions(file_uid, superseded, versions.value.front(), 1,
+                                              tenant, ctx, "unversioned_sidecar");
+    if (!purged.success) {
+        return Result<void>::err("Failed to retire superseded sidecar versions: " + purged.error);
+    }
+    if (context->storage) {
+        for (const auto& vts : superseded) {
+            context->storage->delete_file(
+                context->storage->get_storage_path(file_uid, vts, tenant), tenant);  // best-effort
+        }
+    }
     return Result<void>::ok();
 }
 
