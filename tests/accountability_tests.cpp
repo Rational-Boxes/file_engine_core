@@ -226,7 +226,8 @@ static void test_every_declared_action_has_a_schema() {
         A::kTenantCreate, A::kTenantDelete,
         A::kServiceTokenIssued, A::kServiceTokenRotated, A::kServiceTokenPruned,
         A::kServiceTokenRevoked, A::kServiceBootstrapEnrolled,
-        A::kServiceBootstrapReopened, A::kServiceCapGranted, A::kServiceCapRevoked,
+        A::kServiceBootstrapReopened, A::kServiceBootstrapClosed,
+        A::kServiceCapGranted, A::kServiceCapRevoked,
     };
     for (const char* action : kDeclared) {
         AccountabilityRecord rec = sample_grant();
@@ -251,6 +252,30 @@ static void test_erasure_records_carry_no_content() {
     rec.detail.set("name", std::string("Acme_Contract_J_Smith.pdf"));
     CHECK(!validate_record(rec).success,
           "a filename is not an enumerated field on an erasure record");
+}
+
+static void test_bootstrap_closure_records_only_a_service_id() {
+    std::cout << "test_bootstrap_closure_records_only_a_service_id\n";
+    // Written when a direct issue, or a core's startup backfill, closes the
+    // enrolment path. Like every credential record it must not be able to carry
+    // a secret, a hash or the pepper.
+    AccountabilityRecord rec = sample_grant();
+    rec.category = AccountabilityCategory::Identity;
+    rec.action   = accountability_action::kServiceBootstrapClosed;
+    rec.detail   = AccountabilityDetail{};
+    rec.detail.set("service_id", std::string("*pre-existing*"));
+    CHECK(validate_record(rec).success, "a closure naming what closed it is valid");
+
+    rec.detail.set("secret", std::string("fe_svc_abc"));
+    CHECK(!validate_record(rec).success, "a closure cannot carry a secret");
+
+    rec.detail   = AccountabilityDetail{};
+    rec.detail.set("service_id", std::string("http_bridge"));
+    rec.category = AccountabilityCategory::Authorization;
+    CHECK(!validate_record(rec).success, "and it is an identity record, nothing else");
+    CHECK(std::string(accountability_action::kServiceBootstrapClosed) ==
+              "service_token.bootstrap_closed",
+          "the action name is stable (the ledger is read by audit and the console)");
 }
 
 static void test_validate_rejects_category_action_mismatch() {
@@ -453,6 +478,7 @@ int main() {
     test_validate_rejects_out_of_scope_actions();
     test_every_declared_action_has_a_schema();
     test_erasure_records_carry_no_content();
+    test_bootstrap_closure_records_only_a_service_id();
     test_validate_rejects_category_action_mismatch();
     test_validate_rejects_unenumerated_detail_fields();
     test_canonical_record_is_pinned();

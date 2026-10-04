@@ -656,6 +656,24 @@ target_link_libraries(accountability_live_tests
     fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
 add_test(NAME accountability_live_tests COMMAND accountability_live_tests)
 
+# Bootstrap closure: a direct issue writes the marker, a startup backfills it,
+# and an emptied map cannot reopen enrolment. Empties the global credential
+# tables, so it refuses the shared 'fileengine' database (exit 77 = SKIPPED).
+add_executable(service_bootstrap_live_tests service_bootstrap_live_tests.cpp)
+target_include_directories(service_bootstrap_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include ${LIBPQ_INCLUDE_DIRS})
+target_link_libraries(service_bootstrap_live_tests
+    fileengine_core ${LIBPQ_LIBRARIES} Threads::Threads)
+add_test(NAME service_bootstrap_live_tests COMMAND service_bootstrap_live_tests)
+set_tests_properties(service_bootstrap_live_tests PROPERTIES SKIP_RETURN_CODE 77)
+# The same, end to end: real fileengine_server + fileengine_cli, five server
+# starts against a database it DROPS and recreates (fe_bootstrap_e2e).
+add_test(NAME service_bootstrap_e2e
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bootstrap_e2e.sh ${CMAKE_BINARY_DIR})
+set_tests_properties(service_bootstrap_e2e PROPERTIES
+    SKIP_RETURN_CODE 77 LABELS "e2e" TIMEOUT 300
+    DEPENDS "service_bootstrap_live_tests")
+
 add_executable(acl_subtree_live_tests acl_subtree_live_tests.cpp)
 target_include_directories(acl_subtree_live_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)

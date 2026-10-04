@@ -301,6 +301,11 @@ public:
     // rather than a config flag, because a restore will eventually lose the
     // credential files and the alternative is hand-written SQL under pressure.
     Result<void> reopen_service_bootstrap(const AccountabilityContext& ctx);
+    // Writes the bootstrap marker when credentials exist but the marker does
+    // not, recording kServiceBootstrapClosed. Returns true if it wrote one.
+    // Every deployment issued by fileengine_cli before this existed is in that
+    // state, and so tried to open the enrolment socket on every start.
+    Result<bool> close_service_bootstrap_if_issued(const AccountabilityContext& ctx);
 
     // The committed position of the last accountability record for a tenant.
     // The queue hint carries this so a consumer can tell "no new records" apart

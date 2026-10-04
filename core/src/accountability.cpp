@@ -175,6 +175,8 @@ const std::vector<ActionSchema>& action_schemas() {
          {"service_id", "pepper_version", "peer_uid"}},
         {accountability_action::kServiceBootstrapReopened, AccountabilityCategory::Identity,
          {"service_id"}},
+        {accountability_action::kServiceBootstrapClosed, AccountabilityCategory::Identity,
+         {"service_id"}},
         {accountability_action::kServiceCapGranted, AccountabilityCategory::Authorization,
          {"service_id", "capability", "high_risk"}},
         {accountability_action::kServiceCapRevoked, AccountabilityCategory::Authorization,
