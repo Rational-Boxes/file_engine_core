@@ -690,9 +690,13 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
               " [CONCURRENCY CRITICAL] NOTE: Race conditions possible during async operations after this point");
 
     emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
-    // Non-versioned sidecars keep exactly one version (see below).
+    // Non-versioned sidecars keep exactly one version (see below). The new
+    // version is already committed, so a failure here must NOT fail the write —
+    // the caller would see an error for content that landed, and a retry would
+    // add another version. It is logged loudly instead, and the next write
+    // retires every superseded version, not just the newest, so it self-heals.
     if (auto r = retire_superseded_sidecar_versions(file_uid, user, roles, tenant); !r.success) {
-        return r;
+        SERVER_LOG_ERROR("FileSystem", "sidecar " + file_uid + " keeps superseded versions: " + r.error);
     }
     return Result<void>::ok();
 }
@@ -1115,9 +1119,13 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
         queue_cv_.notify_one();
     }
     emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
-    // Non-versioned sidecars keep exactly one version (see below).
+    // Non-versioned sidecars keep exactly one version (see below). The new
+    // version is already committed, so a failure here must NOT fail the write —
+    // the caller would see an error for content that landed, and a retry would
+    // add another version. It is logged loudly instead, and the next write
+    // retires every superseded version, not just the newest, so it self-heals.
     if (auto r = retire_superseded_sidecar_versions(file_uid, user, roles, tenant); !r.success) {
-        return r;
+        SERVER_LOG_ERROR("FileSystem", "sidecar " + file_uid + " keeps superseded versions: " + r.error);
     }
     return Result<void>::ok();
 }
