@@ -494,6 +494,30 @@ target_include_directories(test_version_selection PRIVATE
     ${GRPCPP_INCLUDE_DIRS}
 )
 
+# Non-versioned sidecar name rule (MEDIA_SHARE.md §8.4; no live DB).
+add_executable(test_unversioned_sidecar test_unversioned_sidecar.cpp)
+target_link_libraries(test_unversioned_sidecar
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(test_unversioned_sidecar ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(test_unversioned_sidecar PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+
 # ACL security semantics unit test (AclManager + mock DB; no live DB).
 add_executable(test_security_acl test_security_acl.cpp)
 target_link_libraries(test_security_acl
@@ -573,6 +597,7 @@ foreach(t
     test_deleted_reachability
     test_connection_router
     test_version_selection
+    test_unversioned_sidecar
     file_culler_tests
     crypto_stream_tests
     compression_policy_tests

@@ -3673,7 +3673,8 @@ Result<int> Database::purge_versions(const std::string& file_uid,
                                      const std::string& cut_version_timestamp,
                                      int keep_count,
                                      const std::string& tenant,
-                                     const AccountabilityContext& ctx) {
+                                     const AccountabilityContext& ctx,
+                                     const std::string& reason) {
     if (!ctx.valid()) {
         return Result<int>::err("Refusing version cull with no actor");
     }
@@ -3731,6 +3732,9 @@ Result<int> Database::purge_versions(const std::string& file_uid,
         rec.detail.set("keep_count", keep_count);
         rec.detail.set("versions_removed", removed);
         rec.detail.set("cut_ts", cut_version_timestamp);
+        // WHY the history was cut, when it was not a person's cull: the record
+        // must distinguish "someone culled this" from "this file keeps no history".
+        if (!reason.empty()) rec.detail.set("reason", reason);
         auto recorded = append_accountability(pg_conn, tenant, rec);
         if (!recorded.success) {
             return rollback_and_fail("Version cull refused: " + recorded.error);

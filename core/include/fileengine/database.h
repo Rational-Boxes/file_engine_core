@@ -204,7 +204,8 @@ public:
                                const std::string& cut_version_timestamp,
                                int keep_count,
                                const std::string& tenant,
-                               const AccountabilityContext& ctx) override;
+                               const AccountabilityContext& ctx,
+                               const std::string& reason = "") override;
 
     // Erasure (§5.4) — see IDatabase for the semantics and why each of these is
     // shaped the way it is.
