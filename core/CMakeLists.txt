@@ -214,10 +214,15 @@ target_compile_definitions(fileengine_core PRIVATE
     _GNU_SOURCE
 )
 
-# Optional Redis-based file-activity event emission (off by default; requires
-# hiredis-devel). When unavailable the event subsystem still compiles, but the
-# factory returns no sink so nothing is published.
-option(FILEENGINE_ENABLE_EVENTS "Build with Redis event emission (requires hiredis-devel)" OFF)
+# Redis file-activity events AND the durable audit sink (both need hiredis).
+#
+# ON by default, and a missing hiredis is a configure ERROR, not a warning. A
+# core without them still starts, answers every RPC and passes its own tests —
+# while emitting no file events (so no ingest, no previews, no folder actions,
+# no diff precompute) and no audit events at all. A dev build dir configured
+# OFF ran that way for a week before a media E2E noticed the missing preview.
+# Turning it off must be a deliberate -DFILEENGINE_ENABLE_EVENTS=OFF.
+option(FILEENGINE_ENABLE_EVENTS "Build with Redis event emission + durable audit (requires hiredis-devel)" ON)
 if(FILEENGINE_ENABLE_EVENTS)
     find_library(HIREDIS_LIB hiredis)
     find_path(HIREDIS_INC hiredis/hiredis.h)
@@ -229,9 +234,14 @@ if(FILEENGINE_ENABLE_EVENTS)
         target_compile_definitions(fileengine_core PRIVATE FILEENGINE_HAS_EVENTS=1)
         message(STATUS "FileEngine event emission ENABLED (hiredis: ${HIREDIS_LIB})")
     else()
-        message(WARNING "FILEENGINE_ENABLE_EVENTS=ON but hiredis not found; "
-                        "event emission compiled out (install hiredis-devel)")
+        message(FATAL_ERROR "FILEENGINE_ENABLE_EVENTS=ON but hiredis was not found. "
+                            "Install hiredis-devel, or configure with "
+                            "-DFILEENGINE_ENABLE_EVENTS=OFF to build a core that emits "
+                            "no file events and no audit events.")
     endif()
+else()
+    message(WARNING "FILEENGINE_ENABLE_EVENTS=OFF: this core emits NO file events and "
+                    "NO audit events.")
 endif()
 
 # Add executable
