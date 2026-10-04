@@ -3108,6 +3108,38 @@ Result<std::string> Database::issue_service_credential(const std::string& servic
         if (!ok) return rollback_and_fail("Failed to store the credential: " + err);
     }
 
+    // Any credential closes the one-shot enrolment path, however it was issued.
+    // Before this only socket enrolment wrote the marker, and every deployment
+    // issues with fileengine_cli — so the marker never existed, the core tried to
+    // open the enrolment socket on every start, and emptying the credential map
+    // would have reopened it: the back door the separate marker exists to deny.
+    {
+        const std::string sql =
+            "INSERT INTO service_auth_bootstrap (id, enrolled_id) VALUES (TRUE, $1) "
+            "ON CONFLICT (id) DO NOTHING;";
+        const char* params[1] = { service_id.c_str() };
+        PGresult* res = PQexecParams(pg_conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+        const std::string err = ok ? "" : PQerrorMessage(pg_conn);
+        const bool closed_now = ok && std::string(PQcmdTuples(res)) == "1";
+        PQclear(res);
+        if (!ok) return rollback_and_fail("Failed to close the bootstrap path: " + err);
+        if (closed_now) {
+            AccountabilityRecord rec;
+            rec.ctx           = ctx;
+            rec.category      = AccountabilityCategory::Identity;
+            rec.action        = accountability_action::kServiceBootstrapClosed;
+            rec.target_type   = "service";
+            rec.principal     = service_id;
+            rec.global_tenant = service_id;
+            rec.detail.set("service_id", service_id);
+            auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+            if (!recorded.success) {
+                return rollback_and_fail("Credential change refused: " + recorded.error);
+            }
+        }
+    }
+
     {
         auto rec = credential_record(ctx,
                                      rotate ? accountability_action::kServiceTokenRotated
@@ -3469,7 +3501,14 @@ Result<bool> Database::service_bootstrap_complete() {
     auto conn = acquire(DbOp::Read);
     if (!conn || !conn->is_valid()) return Result<bool>::err("Failed to acquire database connection");
     PGconn* pg_conn = conn->get_connection();
-    PGresult* res = PQexec(pg_conn, "SELECT count(*) FROM service_auth_bootstrap;");
+    // Complete if the marker exists OR any credential does. Enrolment refuses a
+    // non-empty map anyway, so a socket opened beside credentials could never
+    // mint — it was only an unauthenticated surface that should not exist. That
+    // was every production start: credentials are issued with fileengine_cli,
+    // which (before kServiceBootstrapClosed) never wrote the marker.
+    PGresult* res = PQexec(pg_conn,
+        "SELECT (SELECT count(*) FROM service_auth_bootstrap) + "
+        "       (SELECT count(*) FROM service_auth_credential);");
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         const std::string err = PQerrorMessage(pg_conn);
         PQclear(res);
@@ -3479,7 +3518,7 @@ Result<bool> Database::service_bootstrap_complete() {
         // enrolment path on a database hiccup.
         return Result<bool>::err("Could not determine bootstrap state: " + err);
     }
-    const bool complete = std::atoi(PQgetvalue(res, 0, 0)) > 0;
+    const bool complete = std::atoll(PQgetvalue(res, 0, 0)) > 0;
     PQclear(res);
     connection_pool_->release(conn);
     return Result<bool>::ok(complete);
@@ -3604,6 +3643,64 @@ Result<std::string> Database::enrol_bootstrap_credential(const std::string& serv
     PQclear(commit_res);
     connection_pool_->release(conn);
     return Result<std::string>::ok(format_service_token(service_id, secret));
+}
+
+Result<bool> Database::close_service_bootstrap_if_issued(const AccountabilityContext& ctx) {
+    if (!ctx.valid()) return Result<bool>::err("Refusing to close enrolment with no actor");
+    auto conn = acquire(DbOp::Write);
+    if (!conn || !conn->is_valid()) return Result<bool>::err("Failed to acquire database connection");
+    PGconn* pg_conn = conn->get_connection();
+    PGresult* begin_res = PQexec(pg_conn, "BEGIN;");
+    if (PQresultStatus(begin_res) != PGRES_COMMAND_OK) {
+        PQclear(begin_res);
+        connection_pool_->release(conn);
+        return Result<bool>::err("Failed to BEGIN");
+    }
+    PQclear(begin_res);
+    auto rollback_and_fail = [&](const std::string& msg) {
+        PGresult* rb = PQexec(pg_conn, "ROLLBACK;");
+        if (rb) PQclear(rb);
+        connection_pool_->release(conn);
+        return Result<bool>::err(msg);
+    };
+
+    // Only where credentials exist: a fresh system keeps its enrolment path.
+    // ON CONFLICT so two cores starting together cannot both record a closure.
+    PGresult* res = PQexec(pg_conn,
+        "INSERT INTO service_auth_bootstrap (id, enrolled_id) "
+        "SELECT TRUE, '*pre-existing*' WHERE EXISTS (SELECT 1 FROM service_auth_credential) "
+        "ON CONFLICT (id) DO NOTHING;");
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(res);
+        return rollback_and_fail("Failed to write the bootstrap marker: " + err);
+    }
+    const bool closed_now = std::string(PQcmdTuples(res)) == "1";
+    PQclear(res);
+
+    if (closed_now) {
+        AccountabilityRecord rec;
+        rec.ctx           = ctx;
+        rec.category      = AccountabilityCategory::Identity;
+        rec.action        = accountability_action::kServiceBootstrapClosed;
+        rec.target_type   = "service";
+        rec.global_tenant = "*bootstrap*";
+        rec.detail.set("service_id", std::string("*pre-existing*"));
+        auto recorded = append_accountability(pg_conn, kGlobalChainKey, rec);
+        if (!recorded.success) {
+            return rollback_and_fail("Bootstrap closure refused: " + recorded.error);
+        }
+    }
+
+    PGresult* commit_res = PQexec(pg_conn, "COMMIT;");
+    if (PQresultStatus(commit_res) != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg_conn);
+        PQclear(commit_res);
+        return rollback_and_fail("Failed to COMMIT: " + err);
+    }
+    PQclear(commit_res);
+    connection_pool_->release(conn);
+    return Result<bool>::ok(closed_now);
 }
 
 Result<void> Database::reopen_service_bootstrap(const AccountabilityContext& ctx) {

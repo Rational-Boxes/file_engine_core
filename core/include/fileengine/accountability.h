@@ -180,6 +180,10 @@ inline constexpr const char* kServiceTokenPruned   = "service_token.pruned";
 inline constexpr const char* kServiceTokenRevoked  = "service_token.revoked";
 inline constexpr const char* kServiceBootstrapEnrolled = "service_token.bootstrap_enrolled";
 inline constexpr const char* kServiceBootstrapReopened = "service_token.bootstrap_reopened";
+// The enrolment path closed WITHOUT enrolment: a credential was issued directly
+// (fileengine_cli inside the core container — how every real deployment issues),
+// or a core found credentials and no marker at startup and wrote the marker.
+inline constexpr const char* kServiceBootstrapClosed   = "service_token.bootstrap_closed";
 inline constexpr const char* kServiceCapGranted    = "service_capability.granted";
 inline constexpr const char* kServiceCapRevoked    = "service_capability.revoked";
 }  // namespace accountability_action
