@@ -1110,9 +1110,19 @@ void test_erase_inherits_to_the_owner_of_the_new_resource() {
     auto result = acl.inherit_acls(home, file, "", "alice", "alice");
     TEST_ASSERT(result.success, "inheritance should succeed");
 
+    // The rule is copied to what she owns...
+    auto acls = acl.get_acls_for_resource(file, "");
+    bool copied = false;
+    for (const auto& r : acls.value) {
+        if (r.principal == "alice" && (r.permissions & PERM_ERASE)) copied = true;
+    }
+    TEST_ASSERT(copied, "the home's ERASE grant is inherited by the owner's new file");
+
+    // ...but every destroy-data operation is gated to erasure_admin, so the
+    // inherited bit authorizes nothing for an ordinary user, even at home.
     auto perms = acl.get_effective_permissions(file, "alice", {});
-    TEST_ASSERT(has_perm(perms.value, PERM_ERASE),
-                "alice can erase her own file in her own home");
+    TEST_ASSERT(!has_perm(perms.value, PERM_ERASE),
+                "alice cannot erase her own file without erasure_admin");
 }
 
 void test_erase_does_not_inherit_to_someone_who_does_not_own_it() {
@@ -2286,16 +2296,22 @@ void test_cull_versions_not_implied_by_write() {
                 "WRITE/DELETE must not imply CULL_VERSIONS (destroy-data is separate)");
 }
 
-void test_cull_versions_requires_explicit_grant() {
+void test_cull_versions_gated_to_erasure_admin() {
     auto db = std::make_shared<MockDatabase>();
     AclManager acl(db);
     std::string res = "doc-cullable";
 
     acl.grant_permission(res, "archivist", PrincipalType::USER, PERM_CULL_VERSIONS, "", kTestCtx);
 
+    // Destruction is gated to erasure_admin: the grant alone does nothing...
     auto check = acl.check_permission(res, "archivist", {}, PERM_CULL_VERSIONS);
-    TEST_ASSERT(check.success && check.value,
-                "explicit CULL_VERSIONS grant permits version culling");
+    TEST_ASSERT(check.success && !check.value,
+                "a CULL_VERSIONS grant without erasure_admin does not permit culling");
+
+    // ...while the role alone is sufficient, grant or no grant.
+    auto bare = acl.check_permission("doc-ungranted", "archivist", {"erasure_admin"}, PERM_CULL_VERSIONS);
+    TEST_ASSERT(bare.success && bare.value,
+                "erasure_admin without a CULL_VERSIONS grant may cull");
 }
 
 void test_cull_versions_not_in_default_creator_grants() {
@@ -2459,7 +2475,7 @@ int main() {
 
     std::cout << "\n--- 14. CULL_VERSIONS (destroy-data permission) ---\n";
     run_test("CULL_VERSIONS not implied by WRITE/DELETE", test_cull_versions_not_implied_by_write);
-    run_test("CULL_VERSIONS requires explicit grant", test_cull_versions_requires_explicit_grant);
+    run_test("CULL_VERSIONS is gated to erasure_admin", test_cull_versions_gated_to_erasure_admin);
     run_test("CULL_VERSIONS not in default creator grants", test_cull_versions_not_in_default_creator_grants);
     run_test("CULL_VERSIONS still gated by parent traversal", test_cull_versions_blocked_by_everyone_deny_and_traversal);
 

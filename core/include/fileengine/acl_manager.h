@@ -78,9 +78,11 @@ inline int operator|(Permission left, int right) {
     return static_cast<int>(left) | right;
 }
 
-// The two DESTROY-DATA bits. Both irreversibly destroy committed data, and both
-// are documented as "must be granted explicitly" — so neither may be conferred
-// by an admin bypass. See kTenantAdminPermissions.
+// The two DESTROY-DATA bits. Both irreversibly destroy committed data, so both
+// are GATED TO erasure_admin (or system_admin): for any other caller a grant of
+// either is inert — AclManager::check_permission refuses it and
+// get_effective_permissions does not report it. Within the gate the role alone
+// suffices for both (kErasureAdminPermissions). See kTenantAdminPermissions.
 inline constexpr int kDestroyDataPermissions =
       static_cast<int>(Permission::ERASE)
     | static_cast<int>(Permission::CULL_VERSIONS);
@@ -125,11 +127,13 @@ inline constexpr int kAllPermissions =
 // and would gate nothing while appearing to.
 //
 // A tenant administrator remains fully able to run their tenant. Irreversibly
-// destroying data within it becomes a deliberate, recorded grant rather than a
-// side effect of an LDAP group membership.
+// destroying data within it takes membership of the tenant's erasure_admins
+// group — a visible act in the directory — rather than riding along with
+// administration. An ACL grant alone no longer suffices for anyone.
 inline constexpr int kTenantAdminPermissions = kAllPermissions & ~kDestroyDataPermissions;
 
-// What an **erasure_admin** gets: everything a tenant_admin gets, plus ERASE.
+// What an **erasure_admin** gets: everything a tenant_admin gets, plus BOTH
+// destroy-data bits — i.e. every bit, scoped to its own tenant.
 //
 // The role exists because erasure is a legal obligation somebody has to be able
 // to discharge. Requiring a per-file ACL grant is right for an ordinary
@@ -140,13 +144,15 @@ inline constexpr int kTenantAdminPermissions = kAllPermissions & ~kDestroyDataPe
 // obligation is technically unmeetable, which §5.4 is explicit is itself the
 // violation.
 //
-// CULL_VERSIONS is deliberately NOT included, even though erasure is strictly
-// more destructive. The two bits are separate precisely so each is granted for
-// its own reason: this role answers erasure requests, not storage housekeeping,
-// and bundling a permission nobody asked for is how tenant_admin came to hold
-// CULL_VERSIONS silently in the first place.
+// CULL_VERSIONS is included too (policy, 2026-10-20): every data-destruction
+// operation is gated to this one group, and membership alone is sufficient for
+// each of them. It was previously withheld — on the grounds that erasure and
+// storage housekeeping are separate reasons — which left members needing a
+// per-file grant before the purge was usable at all. What keeps CULL_VERSIONS
+// from riding along silently, the failure tenant_admin had, is unchanged: it
+// comes from a group someone deliberately put you in, never from administration.
 inline constexpr int kErasureAdminPermissions =
-      kTenantAdminPermissions | static_cast<int>(Permission::ERASE);
+      kTenantAdminPermissions | kDestroyDataPermissions;
 
 enum class PrincipalType {
     USER,

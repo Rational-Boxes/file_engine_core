@@ -190,6 +190,16 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
     // normal case, since they administer the tenant too) must get the wider set.
     const bool is_erasure_admin_caller =
         std::find(effective_roles.begin(), effective_roles.end(), kErasureAdminRole) != effective_roles.end();
+
+    // Every destroy-data operation is gated to erasure_admin (system_admin has
+    // already passed above). The role is NECESSARY: an ACL grant of ERASE or
+    // CULL_VERSIONS to anyone else — a tenant_admin, a file's owner, the ERASE
+    // that home provisioning puts on a user's own folder — authorizes nothing.
+    // It is also SUFFICIENT: the role's bypass below covers both bits.
+    if ((required_permissions & kDestroyDataPermissions) != 0 && !is_erasure_admin_caller) {
+        return Result<bool>::ok(false);
+    }
+
     if (is_erasure_admin_caller &&
         (required_permissions & ~kErasureAdminPermissions) == 0) {
         return Result<bool>::ok(true);
@@ -201,10 +211,8 @@ Result<bool> AclManager::check_permission(const std::string& resource_uid,
         (required_permissions & kDestroyDataPermissions) == 0) {
         return Result<bool>::ok(true);
     }
-    // An admin asking for a destroy-data bit their role does not cover falls
-    // through to the normal ACL evaluation below, where an explicit grant can
-    // still satisfy it — CULL_VERSIONS for an erasure_admin, either bit for a
-    // plain tenant_admin.
+    // Nobody reaches here with a destroy-data bit: non-erasure_admins were
+    // refused above, and erasure_admin's bypass covers both bits.
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
     if (!acls_result.success) {
@@ -300,19 +308,14 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
         std::find(effective_roles.begin(), effective_roles.end(), kErasureAdminRole) != effective_roles.end();
     const bool tenant_admin =
         std::find(effective_roles.begin(), effective_roles.end(), kTenantAdminRole) != effective_roles.end();
-    if (erasure_admin || tenant_admin) {
-        // Union the bypass with anything explicitly granted, so an admin who HAS
-        // been granted a destroy-data bit sees it here. Reporting the bare bypass
-        // set would tell the caller they lack a bit that check_permission would
-        // in fact allow — and this answer drives the UI, so an under-report hides
-        // an affordance the user actually has.
-        int granted = 0;
-        auto acls_result = get_acls_for_resource(resource_uid, tenant);
-        if (acls_result.success) {
-            granted = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
-        }
-        const int bypass = erasure_admin ? kErasureAdminPermissions : kTenantAdminPermissions;
-        return Result<int>::ok(bypass | (granted & kDestroyDataPermissions));
+    if (tenant_admin && !erasure_admin) {
+        // A granted destroy-data bit is inert without erasure_admin (see
+        // check_permission), so it is not reported: this answer drives the UI,
+        // and reporting it would offer an affordance the check then refuses.
+        return Result<int>::ok(kTenantAdminPermissions);
+    }
+    if (erasure_admin) {
+        return Result<int>::ok(kErasureAdminPermissions);
     }
 
     auto acls_result = get_acls_for_resource(resource_uid, tenant);
@@ -320,7 +323,10 @@ Result<int> AclManager::get_effective_permissions(const std::string& resource_ui
         return Result<int>::err(acls_result.error);
     }
 
-    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles, claims);
+    // Not an admin of any kind, so not an erasure_admin: the destroy-data bits
+    // are inert for this caller whatever the ACL says.
+    int effective_perms = calculate_effective_permissions(acls_result.value, user, effective_roles, claims)
+                        & ~kDestroyDataPermissions;
 
     // Reflect parent-container traversal: if any ancestor container is
     // unreadable the resource is unreachable, so the effective permission set

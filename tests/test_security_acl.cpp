@@ -279,10 +279,30 @@ void test_purge_requires_cull_versions() {
     CHECK(!can(acl, "F", "owner", {}, P_CULL),
           "owner must NOT be able to purge without CULL_VERSIONS");
 
-    // The dedicated grant is necessary and sufficient to authorize purge.
+    // The dedicated grant is necessary but, on its own, NOT sufficient: every
+    // destroy-data operation is gated to erasure_admin as well.
     acl.grant_permission("F", "owner", PrincipalType::USER, P_CULL, "", kTestCtx);
-    CHECK(can(acl, "F", "owner", {}, P_CULL),
-          "explicit CULL_VERSIONS grant authorizes purge");
+    CHECK(!can(acl, "F", "owner", {}, P_CULL),
+          "a CULL_VERSIONS grant to a non-erasure_admin authorizes nothing");
+    CHECK(!(acl.get_effective_permissions("F", "owner", {}, "").value & P_CULL),
+          "and the inert grant is not reported in the effective set");
+    CHECK(can(acl, "F", "owner", {"erasure_admin"}, P_CULL),
+          "erasure_admin authorizes purge");
+}
+
+// The role gate covers ERASE the same way: a granted ERASE — including the one
+// home provisioning places on a user's own folder — does nothing without it.
+void test_erase_grant_inert_without_erasure_admin() {
+    std::cout << "test_erase_grant_inert_without_erasure_admin\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("F", "", false);
+    AclManager acl(db);
+    acl.grant_permission("F", "alice", PrincipalType::USER, P_ERASE | P_READ, "", kTestCtx);
+    CHECK(!can(acl, "F", "alice", {"users"}, P_ERASE),
+          "an ERASE grant to a non-erasure_admin authorizes nothing");
+    CHECK(!(acl.get_effective_permissions("F", "alice", {"users"}, "").value & P_ERASE),
+          "and the inert grant is not reported in the effective set");
+    CHECK(can(acl, "F", "alice", {"users"}, P_READ), "the rest of the grant still applies");
 }
 
 // Within one tier, a DENY overrides an ALLOW for the same bit ("deny wins
@@ -447,16 +467,16 @@ void test_admin_roles_bypass_within_tenant() {
     CHECK(!(eff & P_CULL) && !(eff & P_ERASE),
           "tenant_admin effective set excludes the destroy-data bits");
 
-    // An EXPLICIT grant is what a tenant_admin needs — and it works, so the
-    // split restricts the bypass without taking the capability away.
+    // An explicit grant does not open the door either: destruction is gated to
+    // erasure_admin, and a tenant_admin is not one by being an administrator.
     acl.grant_permission("F", "carol", PrincipalType::USER, P_CULL | P_ERASE, "", kTestCtx);
-    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_CULL),
-          "tenant_admin with an explicit CULL grant may cull");
-    CHECK(can(acl, "F", "carol", {"tenant_admin"}, P_ERASE),
-          "tenant_admin with an explicit ERASE grant may erase");
+    CHECK(!can(acl, "F", "carol", {"tenant_admin"}, P_CULL),
+          "tenant_admin with an explicit CULL grant still may not cull");
+    CHECK(!can(acl, "F", "carol", {"tenant_admin"}, P_ERASE),
+          "tenant_admin with an explicit ERASE grant still may not erase");
     int eff2 = acl.get_effective_permissions("F", "carol", {"tenant_admin"}, "").value;
-    CHECK((eff2 & P_CULL) && (eff2 & P_ERASE),
-          "the explicit grant shows up in the effective set, matching check_permission");
+    CHECK(!(eff2 & P_CULL) && !(eff2 & P_ERASE),
+          "the inert grant is not reported, matching check_permission");
 
     // a plain user with no grant is denied in strict mode
     CHECK(!can(acl, "F", "bob", {"users"}, P_READ), "plain user denied without a grant");
@@ -484,23 +504,18 @@ void test_erasure_admin_may_erase_anything_in_its_tenant() {
     CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_DELETE), "erasure_admin still deletes");
 }
 
-void test_erasure_admin_is_not_a_licence_to_cull() {
-    std::cout << "test_erasure_admin_is_not_a_licence_to_cull\n";
+void test_erasure_admin_may_cull_without_a_grant() {
+    std::cout << "test_erasure_admin_may_cull_without_a_grant\n";
     auto db = std::make_shared<MockDatabase>();
-    db->add_node("F", "", false);
+    db->add_node("F", "", false);   // somebody else's file, no grants for us
     AclManager acl(db);
     acl.set_default_read(false);
 
-    // Withheld even though erasure is strictly more destructive. The bits are
-    // separate so each is granted for its own reason: this role answers erasure
-    // requests, not storage housekeeping. Bundling a permission nobody asked for
-    // is how tenant_admin came to hold CULL_VERSIONS silently in the first place.
-    CHECK(!can(acl, "F", "dpo", {"erasure_admin"}, P_CULL),
-          "erasure_admin must NOT reach CULL_VERSIONS by bypass");
-
-    acl.grant_permission("F", "dpo", PrincipalType::USER, P_CULL, "", kTestCtx);
+    // Membership alone is sufficient for every destroy-data operation.
     CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_CULL),
-          "an explicit CULL grant still satisfies an erasure_admin");
+          "erasure_admin may cull without owning the file or holding a grant");
+    CHECK(can(acl, "F", "dpo", {"erasure_admin"}, P_CULL | P_ERASE),
+          "and both destroy-data bits together");
 }
 
 void test_being_an_administrator_does_not_confer_erasure_admin() {
@@ -529,7 +544,7 @@ void test_erasure_admin_effective_set_matches_the_check() {
     // over-reporting offers one the check then refuses.
     int eff = acl.get_effective_permissions("F", "dpo", {"erasure_admin"}, "acme").value;
     CHECK((eff & P_ERASE), "the effective set reports ERASE");
-    CHECK(!(eff & P_CULL), "the effective set excludes CULL_VERSIONS");
+    CHECK((eff & P_CULL), "the effective set reports CULL_VERSIONS");
     CHECK((eff & P_MANAGE) && (eff & P_DELETE), "and still carries the ordinary admin bits");
 }
 
@@ -597,8 +612,9 @@ int main() {
     test_hierarchical_precedence();
     test_tenant_admin_is_scoped_not_global();
     test_admin_roles_bypass_within_tenant();
+    test_erase_grant_inert_without_erasure_admin();
     test_erasure_admin_may_erase_anything_in_its_tenant();
-    test_erasure_admin_is_not_a_licence_to_cull();
+    test_erasure_admin_may_cull_without_a_grant();
     test_being_an_administrator_does_not_confer_erasure_admin();
     test_erasure_admin_effective_set_matches_the_check();
     test_tenant_admin_boundary_is_per_manager();
