@@ -239,7 +239,8 @@ Numerous ad-hoc `test_*.cpp` files at the project root are standalone integratio
   that require a right to erasure; it is not a convenience delete. `RemoveFile`
   is a SOFT delete that `UndeleteFile` reverses and destroys nothing. Both
   destroy-data permissions are withheld by default, are not conferred by the
-  tenant-admin bypass, and write an accountability record in the same
+  tenant-admin bypass, are GATED TO the `erasure_admin` role (an ACL grant to
+  anyone else is inert; membership alone suffices for both), and write an accountability record in the same
   transaction as the destruction. See PROPOSAL_accountability_record.md §5.4
 
 - **Never edit the .env file** — it contains database and S3 connection credentials
