@@ -409,30 +409,20 @@ Result<void> AclManager::apply_default_acls(const std::string& resource_uid,
     return Result<void>::ok();
 }
 
-Result<void> AclManager::inherit_acls(const std::string& parent_uid,
-                                     const std::string& child_uid,
-                                     const std::string& tenant,
-                                     const std::string& performed_by,
-                                     const std::string& child_owner) {
+Result<std::vector<ACLRule>> AclManager::inheritable_rules_for_child(const std::string& parent_uid,
+                                                                    const std::string& child_owner,
+                                                                    const std::string& tenant) {
     auto parent_acls_result = get_acls_for_resource(parent_uid, tenant);
     if (!parent_acls_result.success) {
-        return Result<void>::err(parent_acls_result.error);
+        return Result<std::vector<ACLRule>>::err(parent_acls_result.error);
     }
 
     const int inherit_bit = static_cast<int>(Permission::ACL_INHERIT);
-
-    // PartOfCreation for the same reason as apply_default_acls: propagating an
-    // inherited rule to a new child grants nobody anything the parent rule did
-    // not already say, and it runs on every resource creation.
-    AccountabilityContext ctx;
-    ctx.actor        = performed_by.empty() ? std::string("system") : performed_by;
-    ctx.source_iface = "grpc";
-    ctx.mode         = AccountabilityMode::PartOfCreation;
+    std::vector<ACLRule> out;
 
     // Copy only rules marked with ACL_INHERIT. The bit is preserved on the
     // child so inheritance cascades to grandchildren; callers can break the
-    // chain at any level by revoking the bit. Fail-loud: any per-rule failure
-    // aborts so the caller sees a partial-state error.
+    // chain at any level by revoking the bit.
     for (const auto& rule : parent_acls_result.value) {
         if ((rule.permissions & inherit_bit) == 0) {
             continue;
@@ -446,26 +436,50 @@ Result<void> AclManager::inherit_acls(const std::string& parent_uid,
         // there. It is not about your own.
         //
         // A user's home is a sandbox, and full control there means full control:
-        // without this, a user could not erase their own file in their own home,
-        // because the grant provisioning puts on the home folder would never
-        // reach anything inside it. Tying inheritance to ownership gives that,
-        // while keeping the blast radius exactly where §5.4.9 wants it — the
-        // grant follows what you own, not what you can reach.
-        //
-        // Still gated: this only propagates an ERASE that someone deliberately
-        // granted on the parent, which today is home provisioning and nothing
-        // else. A folder with no ERASE on it confers none.
+        // the grant provisioning puts on the home folder reaches what its owner
+        // creates inside it. Tying inheritance to ownership keeps the blast
+        // radius exactly where §5.4.9 wants it — the grant follows what you own,
+        // not what you can reach. (Holding ERASE still needs erasure_admin to
+        // mean anything; see check_permission.)
         const bool owner_rule = !child_owner.empty() &&
                                 rule.type == PrincipalType::USER &&
                                 rule.principal == child_owner;
-        const int inheritable = owner_rule
-                                    ? rule.permissions
-                                    : rule.permissions & ~static_cast<int>(Permission::ERASE);
-        if (inheritable == 0 || inheritable == inherit_bit) {
+        ACLRule copy = rule;
+        copy.permissions = owner_rule
+                               ? rule.permissions
+                               : rule.permissions & ~static_cast<int>(Permission::ERASE);
+        if (copy.permissions == 0 || copy.permissions == inherit_bit) {
             continue;   // nothing left to copy once ERASE is stripped
         }
+        out.push_back(copy);
+    }
+    return Result<std::vector<ACLRule>>::ok(out);
+}
+
+Result<void> AclManager::inherit_acls(const std::string& parent_uid,
+                                     const std::string& child_uid,
+                                     const std::string& tenant,
+                                     const std::string& performed_by,
+                                     const std::string& child_owner) {
+    auto rules = inheritable_rules_for_child(parent_uid, child_owner, tenant);
+    if (!rules.success) {
+        return Result<void>::err(rules.error);
+    }
+
+    // PartOfCreation for the same reason as apply_default_acls: propagating an
+    // inherited rule to a new child grants nobody anything the parent rule did
+    // not already say, and it runs on every resource creation.
+    AccountabilityContext ctx;
+    ctx.actor        = performed_by.empty() ? std::string("system") : performed_by;
+    ctx.source_iface = "grpc";
+    ctx.mode         = AccountabilityMode::PartOfCreation;
+
+    // Fail-loud: any per-rule failure aborts so the caller sees a
+    // partial-state error. The effect is carried over: an inherited DENY must
+    // arrive as a DENY, not as the ALLOW grant_permission defaults to.
+    for (const auto& rule : rules.value) {
         auto result = grant_permission(child_uid, rule.principal, rule.type,
-                                       inheritable, tenant, ctx);
+                                       rule.permissions, tenant, ctx, rule.effect);
         if (!result.success) {
             return Result<void>::err("inherit_acls: failed to copy rule for "
                                      + rule.principal + ": " + result.error);

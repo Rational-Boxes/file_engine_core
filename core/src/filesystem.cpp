@@ -2915,9 +2915,9 @@ void FileSystem::apply_acls_for_new_resource(const std::string& parent_uid,
                         "Failed to apply default ACLs for " + new_uid + ": " + default_result.error);
     }
 
-    // Inherit parent rules marked ACL_INHERIT on top. Empty parent_uid (the
-    // filesystem root) skips inheritance.
-    if (!parent_uid.empty() && acl_manager_->parent_has_inheritable_acls(parent_uid, tenant)) {
+    // Inherit parent rules marked ACL_INHERIT on top. An empty parent_uid is
+    // the tenant root, whose rules are inherited like any parent's.
+    if (acl_manager_->parent_has_inheritable_acls(parent_uid, tenant)) {
         // `user` twice: they performed the creation AND they own the result —
         // apply_default_acls above gives the creator full control of it. Passed
         // explicitly rather than left implicit, because the second one decides
@@ -2973,21 +2973,27 @@ std::vector<IDatabase::AclGrant> FileSystem::compute_initial_acl_grants(
         grants.push_back(other_grant);
     }
 
-    // Inheritable parent rules.
-    if (!parent_uid.empty()) {
-        auto parent_acls = acl_manager_->get_acls_for_resource(parent_uid, tenant);
-        if (parent_acls.success) {
-            const int inherit_bit = static_cast<int>(Permission::ACL_INHERIT);
-            for (const auto& rule : parent_acls.value) {
-                if ((rule.permissions & inherit_bit) == 0) continue;
-                IDatabase::AclGrant g;
-                g.principal = rule.principal;
-                g.type = static_cast<int>(rule.type);
-                g.permissions = rule.permissions;
-                g.performed_by = creator;
-                g.effect = static_cast<int>(rule.effect);
-                grants.push_back(g);
-            }
+    // Inheritable parent rules — INCLUDING the tenant root's. This used to be
+    // skipped for an empty parent_uid, so nothing created at the top level of a
+    // tenant took the root's inheritable rules: the file_services grant the
+    // background workers rely on (provisioned at the root with ACL_INHERIT)
+    // reached every node that existed when it was applied and no top-level
+    // folder made since, nor anything inside one. In production that was a
+    // folder per tenant within a month, and difference_service refused on a
+    // file in one of them every fifteen minutes.
+    //
+    // Same rules as inherit_acls, from the same helper — ERASE stays only on
+    // the creator's own rule, which this path previously did not apply.
+    auto inherited = acl_manager_->inheritable_rules_for_child(parent_uid, creator, tenant);
+    if (inherited.success) {
+        for (const auto& rule : inherited.value) {
+            IDatabase::AclGrant g;
+            g.principal = rule.principal;
+            g.type = static_cast<int>(rule.type);
+            g.permissions = rule.permissions;
+            g.performed_by = creator;
+            g.effect = static_cast<int>(rule.effect);
+            grants.push_back(g);
         }
     }
 
