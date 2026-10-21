@@ -291,6 +291,34 @@ target_include_directories(tenant_state_live_tests PRIVATE
 add_test(NAME tenant_state_live_tests COMMAND tenant_state_live_tests)
 set_tests_properties(tenant_state_live_tests PROPERTIES
     LABELS "live" TIMEOUT 300 SKIP_RETURN_CODE 77)
+# acl_root_inheritance_live_tests — creation-time inheritance from the tenant
+# root through a real FileSystem + Postgres (the file_services gap, 2026-10).
+add_executable(acl_root_inheritance_live_tests acl_root_inheritance_live_tests.cpp)
+target_link_libraries(acl_root_inheritance_live_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(acl_root_inheritance_live_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(acl_root_inheritance_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME acl_root_inheritance_live_tests COMMAND acl_root_inheritance_live_tests)
+set_tests_properties(acl_root_inheritance_live_tests PROPERTIES
+    LABELS "live" TIMEOUT 300 SKIP_RETURN_CODE 77)
+
 # storage_range_live_tests — storage_pipeline.md S3a byte ranges, end to end
 add_executable(storage_range_live_tests storage_range_live_tests.cpp)
 target_link_libraries(storage_range_live_tests

@@ -392,6 +392,20 @@ public:
                              const std::string& performed_by = "",
                              const std::string& child_owner = "");
 
+    // The rules a new child of `parent_uid` takes from it, as they should be
+    // written on the child: every rule marked ACL_INHERIT (the bit kept, so
+    // inheritance cascades), its effect preserved, and ERASE kept only on the
+    // child owner's own USER rule (§5.4.9 — see the implementation).
+    //
+    // An EMPTY parent_uid is the tenant ROOT, and it is a parent like any
+    // other: its rules are stored under resource '' (the file_services grant
+    // the workers depend on lives there). Both creation paths — inherit_acls
+    // and FileSystem::compute_initial_acl_grants — take their answer from
+    // here, so they cannot drift apart again.
+    Result<std::vector<ACLRule>> inheritable_rules_for_child(const std::string& parent_uid,
+                                                            const std::string& child_owner,
+                                                            const std::string& tenant = "");
+
     // True iff the parent has at least one rule with ACL_INHERIT set.
     // Used by callers to decide between inherit_acls and apply_default_acls.
     bool parent_has_inheritable_acls(const std::string& parent_uid,

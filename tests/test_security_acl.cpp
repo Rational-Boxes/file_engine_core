@@ -482,6 +482,51 @@ void test_admin_roles_bypass_within_tenant() {
     CHECK(!can(acl, "F", "bob", {"users"}, P_READ), "plain user denied without a grant");
 }
 
+// The tenant ROOT is a parent like any other for inheritance. Production,
+// 2026-10: the file_services grant the workers rely on is provisioned at the
+// root with ACL_INHERIT, and creation skipped inheritance for an empty
+// parent_uid — so every top-level folder made after the grant, and everything
+// in it, was closed to the workers (difference refused every 15 minutes).
+void test_root_rules_are_inherited_by_top_level_children() {
+    std::cout << "test_root_rules_are_inherited_by_top_level_children\n";
+    auto db = std::make_shared<MockDatabase>();
+    db->add_node("TOP", "", true);
+    AclManager acl(db);
+    acl.set_default_read(false);
+    const int fs_mask = 0x1730;   // inherit | read | write | delete | versions
+    acl.grant_permission("", "file_services", PrincipalType::ROLE, fs_mask, "", kTestCtx);
+
+    auto rules = acl.inheritable_rules_for_child("", "alice", "");
+    CHECK(rules.success && rules.value.size() == 1 && rules.value[0].principal == "file_services"
+          && rules.value[0].permissions == fs_mask,
+          "the root's inheritable rule is offered to a top-level child");
+
+    CHECK(acl.inherit_acls("", "TOP", "", "alice", "alice").success, "inherit from the root succeeds");
+    CHECK(can(acl, "TOP", "svc-difference", {"file_services"}, P_VIEWV),
+          "a worker holding file_services can list versions of a new top-level folder");
+}
+
+void test_inherited_rules_strip_erase_except_for_the_owner_and_keep_deny() {
+    std::cout << "test_inherited_rules_strip_erase_except_for_the_owner_and_keep_deny\n";
+    auto db = std::make_shared<MockDatabase>();
+    AclManager acl(db);
+    const int inherit = static_cast<int>(Permission::ACL_INHERIT);
+    acl.grant_permission("P", "alice", PrincipalType::USER, P_READ | P_ERASE | inherit, "", kTestCtx);
+    acl.grant_permission("P", "bob", PrincipalType::USER, P_READ | P_ERASE | inherit, "", kTestCtx);
+    acl.grant_permission("P", "mallory", PrincipalType::USER, P_READ | inherit, "", kTestCtx, AclEffect::DENY);
+    acl.grant_permission("P", "carol", PrincipalType::USER, P_READ, "", kTestCtx);  // not inheritable
+
+    auto rules = acl.inheritable_rules_for_child("P", "alice", "").value;
+    auto find = [&](const std::string& who) -> const ACLRule* {
+        for (const auto& r : rules) if (r.principal == who) return &r;
+        return nullptr;
+    };
+    CHECK(find("alice") && (find("alice")->permissions & P_ERASE), "the owner keeps an inherited ERASE");
+    CHECK(find("bob") && !(find("bob")->permissions & P_ERASE), "anyone else's ERASE is stripped");
+    CHECK(find("mallory") && find("mallory")->effect == AclEffect::DENY, "an inherited DENY stays a DENY");
+    CHECK(!find("carol"), "a rule without ACL_INHERIT is not inherited");
+}
+
 // erasure_admin — the role that exists so a legal erasure obligation is
 // dischargeable at all.
 //
@@ -613,6 +658,8 @@ int main() {
     test_tenant_admin_is_scoped_not_global();
     test_admin_roles_bypass_within_tenant();
     test_erase_grant_inert_without_erasure_admin();
+    test_root_rules_are_inherited_by_top_level_children();
+    test_inherited_rules_strip_erase_except_for_the_owner_and_keep_deny();
     test_erasure_admin_may_erase_anything_in_its_tenant();
     test_erasure_admin_may_cull_without_a_grant();
     test_being_an_administrator_does_not_confer_erasure_admin();
