@@ -157,8 +157,8 @@ CREATE TABLE "<schema>".audit_log (
 CREATE INDEX idx_audit_actor  ON "<schema>".audit_log(actor, ts);
 CREATE INDEX idx_audit_target ON "<schema>".audit_log(target_uid, ts);
 CREATE INDEX idx_audit_action ON "<schema>".audit_log(category, action, ts);
--- Daily range partitioning on ts: a 30-day rolling window in-DB; each day that
--- ages out is archived (encrypted) to object store, then its partition dropped (§7).
+-- Daily range partitioning on ts: two calendar months in-DB; a monthly job archives
+-- older rows (encrypted) to the main object store, then drops their partitions (§7).
 ```
 
 `detail` as JSONB keeps the table narrow while preserving action-specific context
@@ -300,17 +300,24 @@ Audit must be **complete**, but reads are high-volume. Design:
   edit/removal breaks the chain; a `VerifyAuditChain` op (and a periodic job)
   walks it. Optionally anchor the latest hash to the object store / an external
   notary on a schedule for external verifiability.
-- **Retention & archival (decided, §13): 30-day rolling DB window + daily
-  encrypted object-store archive.** The database keeps a **30-day rolling record**
-  (`AUDIT_RETENTION_DAYS = 30`, daily range partitions). A retention job runs
-  daily: for **each day that falls out of the window**, it seals that day's
-  partition, writes it as **one encrypted daily log file** (NDJSON) to the
-  tenant's object store, verifies the write, then drops the in-DB partition. Each
-  archived daily file carries its hash-chain linkage (its first `prev_hash` and
-  last `row_hash`) so the chain stays verifiable end-to-end across the DB→archive
-  boundary, and query/export (§9) transparently reads back archived days when a
-  request reaches past the 30-day window. External hash-anchoring to a notary
-  remains optional and is **out of scope for this version** (§13).
+- **Retention & archival (decided, §13; revised 2026-10-25): two calendar months
+  in the DB + monthly encrypted archive to the main object store.** The database
+  keeps **two complete calendar months** (`FILEENGINE_AUDIT_RETENTION_MONTHS = 2`,
+  daily range partitions). A retention job runs **monthly**: it archives every
+  older row to the **main S3 store** (the core's own bucket) under a reserved
+  per-tenant virtual folder (`<tenant>/_audit/…`, `_global/_audit/…` for the
+  deployment-wide chain), as bounded Fernet-encrypted NDJSON parts plus a
+  manifest, reads every object back, records it in a catalog, then drops the
+  partitions. Only partitions forming a **prefix of the chain in `seq` order** are
+  dropped — a late-arriving row holds its day back — and the catalog's newest
+  segment is the chain's **anchor**, from which verification, re-chaining and the
+  writer all continue, so the chain stays verifiable end-to-end across the
+  DB→archive boundary. Archived rows are read back with `audit-archive export`;
+  transparent read-back through the query API (§9) is deferred. External
+  hash-anchoring to a notary remains optional and **out of scope for this
+  version** (§13). The full contract, including the date override that drives the
+  lifecycle simulation, is
+  `audit_service/design_documents/SPEC_retention_and_archival.md`.
 
 ---
 
@@ -657,11 +664,13 @@ Forward-only: no backfill (there's no prior read history to reconstruct).
   `permission`/`user`/`auth`/`admin`, if the security event can't be durably
   captured (queue-accepted or WAL-committed), the operation is rejected — no
   degrade-to-WAL-only escape for these categories.
-- **Retention (§7): 30-day rolling DB window + daily encrypted archive.** Keep 30
-  days in Postgres (daily partitions); each day that ages out is written as one
-  encrypted daily log file (NDJSON) to the tenant's object store, then dropped,
-  with hash linkage preserved. External hash-anchoring stays optional and out of
-  scope this version.
+- **Retention (§7): two calendar months in the DB + monthly encrypted archive**
+  *(revised 2026-10-25; was a 30-day window with daily archives, which never ran
+  in production).* Keep two complete months in Postgres; a monthly job archives
+  the rest to the main S3 store under each tenant's `_audit/` virtual folder,
+  then drops it, with hash linkage preserved through a catalog anchor. See
+  `audit_service/design_documents/SPEC_retention_and_archival.md`. External
+  hash-anchoring stays optional and out of scope this version.
 - **MCP surface (§9): none this version.** No MCP query/export or rules-engine
   surface into the security system for now; the MCP bridge keeps *emitting*
   audit events as an authenticating door, but its local tool-call audit is left
