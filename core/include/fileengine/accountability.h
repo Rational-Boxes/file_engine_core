@@ -30,8 +30,9 @@
 //      bug and must fail rather than record "" — an unattributed record looks
 //      like coverage without being it (§5.1).
 //   2. `detail` is a SCHEMA-CONSTRAINED per-action structure, not an open map.
-//      The chain is immutable, hash-chained and never culled, so anything it
-//      captures the platform has committed to keeping forever. If there is no
+//      The chain is immutable, hash-chained and never culled (after two months
+//      its rows are archived, not destroyed), so anything it captures the
+//      platform has committed to keeping forever. If there is no
 //      field to put content in, content cannot arrive by accident (§5.4.7).
 //   3. The record captures IDENTIFIERS AND STRUCTURE, NEVER PAYLOAD. No
 //      filenames, no metadata values, no free text. Names are resolved from the

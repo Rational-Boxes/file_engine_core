@@ -66,7 +66,7 @@ lives in `ldap_manager` and the authenticating doors (§5).
 | Delivery | **Transactional** — commits with the operation | Complete + durable (buffered, spooled) | Best-effort, **fail-open** |
 | Scope | Authorization, identity, destruction, tenant lifecycle | Everything, incl. reads | Mutations |
 | Reads | No (volume) | **Yes** (access is the point) | No |
-| Mutability | Append-only, hash-chained, never culled | Append-only, tamper-evident | Ephemeral queue |
+| Mutability | Append-only, hash-chained; never culled with content, archived after 2 months | Append-only, tamper-evident; archived after 2 months | Ephemeral queue |
 | Disableable | **No** | Yes (configuration) | Yes (configuration) |
 | Consumer | `audit_service`, by **pull** | Tenant admin / auditor, gated | Discussion service, CSAI indexer, dashboard |
 

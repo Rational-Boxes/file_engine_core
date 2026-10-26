@@ -617,6 +617,34 @@ If retention over this table is ever needed beyond that, it must itself be an
 explicitly permissioned operation that records its own execution. **Not proposed
 here** — the right default at alpha is that it never deletes.
 
+> **Superseded 2026-10-26 — the table is now retained, not kept forever in
+> Postgres.** Decided: the tables are the source of truth (the Redis hint only
+> signals activity), and they are truncated monthly like the audit log. Rows
+> older than two complete calendar months are **archived, not destroyed**: the
+> audit service's monthly retention job copies them byte for byte into the main
+> store under `<tenant>/_accountability/` (and `_global/_accountability/`),
+> encrypted under a key derived from the deployment's at-rest key, then deletes
+> them. The contract is `audit_service/design_documents/SPEC_retention_and_archival.md`
+> §14. What still holds from this section:
+>
+> * **It still outlives culling and file erasure.** Only age moves a record, and
+>   moving it keeps it.
+> * **Only already-pulled rows move.** The job removes a seq prefix capped at the
+>   audit puller's cursor, so every removed record is already in the audit log.
+> * **The chain is checked before anything moves.** Every row's hash is
+>   recomputed from the database. A break fails that chain's run and removes
+>   nothing.
+> * **The run records its own execution.** Each run is a catalog segment
+>   (`public.audit_archive_segments`: run id, time, seq range, row count, last
+>   hash). That segment is also the chain's anchor, where verification and a
+>   rebuilt puller resume.
+> * **The core is unchanged.** Appends chain from `accountability_chain_head`,
+>   never from the table, so an emptied prefix does not affect them.
+>
+> The permission is operational, not an ACL: the job runs as the deployment's
+> scheduled task with the migration database role, on a timer that ships held
+> for a supervised first run.
+
 ### 5.3 The chain — tamper evidence *and* ordering
 
 `prev_hash` / `hash` give a per-tenant hash chain:
@@ -1002,6 +1030,11 @@ not be implemented uniformly.
 > the history is small, a restored service re-reads it **from zero** and re-purges
 > what it should not hold — no retention window to get wrong, and no dependence on
 > any instruction being redelivered.
+>
+> *As built,* the sweep reads the core's `erasure` / `erasure_ack` tables
+> (`ListPendingErasures`), not this record. Those tables are still never culled.
+> So the 2026-10-26 retention of the accountability record (§5.2) does not affect
+> it.
 
 #### 5.4.6 Reconciliation sweeps — the backstop
 
@@ -1026,7 +1059,7 @@ eventual correctness.**
 
 **Sweep against the accountability table, not against current state.** The
 erasure history in that table is the guaranteed artefact — committed with the
-operation, gap-free and commit-ordered (§5.3.2), never culled (§5.2). Everything
+operation, gap-free and commit-ordered (§5.3.2), and kept (§5.2; aged rows are archived, not destroyed). Everything
 else a sweep could consult is weaker: the queue can drop, and a state query can
 mislead.
 

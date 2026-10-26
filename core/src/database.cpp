@@ -4980,9 +4980,11 @@ Result<void> Database::create_tenant_schema(const std::string& tenant,
     // non-transactional and node-local (§3.2). This table closes all four.
     //
     // Deliberately NOT partitioned and NOT range-keyed on ts like audit_log:
-    // retention here is "never delete" (§5.2), so there is nothing for a
-    // partition boundary to do, and the consumer reads it as a cursor-ordered
-    // outbox rather than a time window.
+    // the consumer reads it as a cursor-ordered outbox rather than a time
+    // window. Retention (audit_service, SPEC_retention_and_archival.md §14)
+    // archives and DELETEs an aged seq PREFIX, which ts-monotonic seq makes
+    // exact without partitions; appends chain from accountability_chain_head,
+    // never from this table, so they are unaffected.
     //
     // seq is a plain BIGINT, NOT a BIGSERIAL. That is the load-bearing choice
     // (§5.3.1): sequence values are assigned at INSERT and become visible at
