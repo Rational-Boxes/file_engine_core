@@ -316,6 +316,24 @@ static void run_combination(bool encrypt, bool compress, const std::string& labe
         check(!bad.success, label + ": a negative offset is refused");
     }
 
+    // A window at or past the end is an EMPTY SUCCESSFUL read that reports the
+    // total, in both formats: the door answers 416 `bytes */total` from that.
+    // v2 used to return an error here instead, before any frame, so every door
+    // answered 500 to a resume of an already-complete download.
+    {
+        auto st = f.fs->stat(uid, USER, ROLES, f.tenant);
+        const int64_t total = st.success ? st.value.size : 0;
+        for (int64_t off : {total, total + 1, total + 5000}) {
+            std::vector<uint8_t> got;
+            FileSystem::RangeReport rep;
+            const bool ok = read_range(*f.fs, uid, f.tenant, off, 0, got, &rep);
+            check(ok, label + ": a window starting at " + std::to_string(off) +
+                      " (total " + std::to_string(total) + ") is a successful read, not an error");
+            check(got.empty(), label + ": ... and delivers no bytes");
+            check(rep.total_size == total, label + ": ... and reports the total, so the door can answer 416");
+        }
+    }
+
     // Every byte offset, in a smaller file, so no window is untested by luck.
     // Run for two representative combinations only: the sweep is O(n^2) reads
     // and each read re-opens and re-decodes the blob, so doing it for all four

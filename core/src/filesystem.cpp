@@ -470,6 +470,227 @@ Result<void> FileSystem::undelete(const std::string& file_uid, const std::string
     return Result<void>::ok();
 }
 
+// The one write path for a version's bytes (see filesystem.h). Lifted out of
+// put() unchanged so copy() and restore_to_version() encode exactly as a put
+// does: a v2 blob is bound to {file_uid, version_timestamp} (SR-25), so bytes
+// can never be reused under another file or version — they are re-encoded.
+Result<void> FileSystem::write_version_bytes(TenantContext* context,
+                                             const std::string& file_uid,
+                                             const std::string& version_timestamp,
+                                             const std::vector<uint8_t>& data,
+                                             const std::string& user,
+                                             const std::string& tenant) {
+    if (!context || !context->db || !context->storage) {
+        return Result<void>::err("Database or storage not available for tenant: " + tenant);
+    }
+
+    // Process data for storage (compress and encrypt if enabled)
+    std::vector<uint8_t> processed_data = data;
+
+    // SR-5 / SR-6 / SR-6a: decide from the BYTES whether compression is worth
+    // anything for this payload. Video, images, Office documents (ZIP
+    // containers) and the conversion pipeline's own renditions gain nothing,
+    // and the cost is paid again on every read.
+    const bool compression_on = context->storage && context->storage->is_compression_enabled();
+    // The measurement is opt-in. With it off, compression behaves exactly as it
+    // always has — everything is compressed when compression is enabled — so the
+    // first deploy of this work changes nothing about what is WRITTEN and stays
+    // reversible. See Config::storage_selective_compression.
+    CompressionPolicyConfig comp_cfg;
+    comp_cfg.enabled = compression_on;
+    const CompressionDecision comp_decision =
+        context->config.storage_selective_compression
+            ? decide_compression(data, comp_cfg)
+            : CompressionDecision{compression_on,
+                                  compression_on ? CompressionDecisionReason::MeasuredGood
+                                                 : CompressionDecisionReason::Disabled,
+                                  -1.0};
+
+    // §7.1 / SR-33: v2 is written only when the deployment asks for it. The
+    // reader is always present; this switch is what P6 turns on, separately
+    // from the deploy that shipped the code.
+    const bool write_v2 = (context->config.storage_write_format == 2);
+
+    // v2 compresses and encrypts per block, so the whole-payload transforms
+    // below are skipped entirely rather than run and discarded.
+    const bool applied_compression = !write_v2 && comp_decision.compress;
+
+    if (applied_compression) {
+        try {
+            processed_data = fileengine::CryptoUtils::compress_data(processed_data);
+            SERVER_LOG_DEBUG("FileSystem::write_version_bytes", "Data compressed from " + std::to_string(data.size()) +
+                             " to " + std::to_string(processed_data.size()) + " bytes");
+        } catch (const std::exception& e) {
+            SERVER_LOG_ERROR("FileSystem::write_version_bytes", "Compression failed: " + std::string(e.what()));
+            return Result<void>::err("Failed to compress data: " + std::string(e.what()));
+        }
+    } else if (comp_cfg.enabled) {
+        SERVER_LOG_DEBUG("FileSystem::write_version_bytes", std::string("Compression skipped (") +
+                         comp_decision.reason_name() + ") for " + file_uid);
+    }
+
+    // Check if encryption is enabled for this tenant/context
+    const bool encryption_on = context->storage && context->storage->is_encryption_enabled();
+    const bool applied_encryption = !write_v2 && encryption_on;
+    if (applied_encryption) {
+        try {
+            // Get the encryption key from the config
+            std::string encryption_key = context->config.encryption_key;
+            if (encryption_key.empty()) {
+                return Result<void>::err("Encryption key not available");
+            }
+
+            processed_data = fileengine::CryptoUtils::encrypt_data(processed_data, encryption_key);
+            SERVER_LOG_DEBUG("FileSystem::write_version_bytes", "Data encrypted successfully");
+        } catch (const std::exception& e) {
+            SERVER_LOG_ERROR("FileSystem::write_version_bytes", "Encryption failed: " + std::string(e.what()));
+            return Result<void>::err("Failed to encrypt data: " + std::string(e.what()));
+        }
+    }
+
+    if (write_v2) {
+        v2::Options o;
+        o.encrypt = encryption_on;
+        // v2 decides compression per BLOCK (SR-31), so the whole-payload
+        // decision above only says whether to try at all.
+        o.compress = comp_cfg.enabled;
+        o.block_size = v2::kDefaultBlockSize;
+        v2::VersionIdentity vid;
+        vid.file_uid = file_uid;
+        vid.version_timestamp = version_timestamp;
+
+        std::vector<uint8_t> encoded;
+        auto enc = v2::encode(data, context->config.encryption_key, vid, encoded, o);
+        if (enc) {
+            return Result<void>::err(std::string("Failed to encode storage format v2: ") +
+                                     v2::status_name(enc.status) + " (" + enc.detail + ")");
+        }
+        processed_data.swap(encoded);
+    }
+
+    // Store the processed file in storage
+    auto storage_result = context->storage->store_file(file_uid, version_timestamp, processed_data, tenant);
+    if (!storage_result.success) {
+        return Result<void>::err("Failed to store file in storage: " + storage_result.error);
+    }
+
+    // Record file creation in storage tracker for cache management
+    if (context->storage_tracker) {
+        context->storage_tracker->record_file_creation(storage_result.value, data.size(), tenant);
+    }
+    
+    // Record the version in the database
+    auto insert_version_result = context->db->insert_version(file_uid, version_timestamp, data.size(),
+                                                             storage_result.value, user, tenant);
+    if (!insert_version_result.success) {
+        return Result<void>::err("Failed to record version: " + insert_version_result.error);
+    }
+
+    // SR-1: record what was actually applied, in the same operation that
+    // records the version. A failure here is fatal rather than logged: a
+    // version whose transform is unrecorded reads back through the
+    // configuration fallback, and if the flags ever change that read is
+    // silently wrong. Refusing the write is the recoverable outcome.
+    {
+        VersionTransform vt;
+        // For v2 the header is authoritative (SR-35) and carries all of this;
+        // the columns are the index that selects a reader cheaply.
+        vt.compressed = write_v2 ? comp_cfg.enabled : applied_compression;
+        vt.encrypted = write_v2 ? encryption_on : applied_encryption;
+        vt.storage_format = write_v2 ? 2 : 1;
+        vt.key_id = 0;
+        auto rec = context->db->set_version_transform(file_uid, version_timestamp, vt, tenant);
+        if (!rec.success) {
+            return Result<void>::err("Failed to record storage transform: " + rec.error);
+        }
+    }
+
+    return Result<void>::ok();
+}
+
+namespace {
+
+// Undo what the WRITE did to a stored blob, read off the version row (SR-2):
+// v2 by its own header, v1 by the recorded compressed/encrypted flags.
+Result<std::vector<uint8_t>> decode_stored_version(TenantContext* context,
+                                                   std::vector<uint8_t> blob,
+                                                   const std::string& file_uid,
+                                                   const std::string& version_timestamp,
+                                                   const std::string& tenant) {
+    const AppliedTransform applied = resolve_applied_transform(
+        context->db, context->storage.get(), file_uid, version_timestamp, tenant);
+
+    if (applied.storage_format == 2) {
+        return decode_v2_buffer(blob, context->config.encryption_key, file_uid, version_timestamp);
+    }
+    if (applied.encrypt) {
+        const std::string& encryption_key = context->config.encryption_key;
+        if (encryption_key.empty()) {
+            return Result<std::vector<uint8_t>>::err("Encryption key not available");
+        }
+        try {
+            blob = fileengine::CryptoUtils::decrypt_data(blob, encryption_key);
+        } catch (const std::exception& e) {
+            return Result<std::vector<uint8_t>>::err("Failed to decrypt version data: " + std::string(e.what()));
+        }
+    }
+    if (applied.compress) {
+        try {
+            blob = fileengine::CryptoUtils::decompress_data(blob);
+        } catch (const std::exception& e) {
+            return Result<std::vector<uint8_t>>::err("Failed to decompress version data: " + std::string(e.what()));
+        }
+    }
+    return Result<std::vector<uint8_t>>::ok(std::move(blob));
+}
+
+}  // namespace
+
+Result<std::vector<uint8_t>> FileSystem::read_version_content(TenantContext* context,
+                                                              const std::string& file_uid,
+                                                              const std::string& version_timestamp,
+                                                              const std::string& tenant) {
+    if (!context || !context->db) {
+        return Result<std::vector<uint8_t>>::err("Database not available for tenant: " + tenant);
+    }
+    auto path_result = context->db->get_version_storage_path(file_uid, version_timestamp, tenant);
+    if (!path_result.success || !path_result.value.has_value()) {
+        return Result<std::vector<uint8_t>>::err("Version storage path not found for " + file_uid +
+                                                 " @ " + version_timestamp);
+    }
+
+    std::vector<uint8_t> blob;
+    bool have = false;
+    if (context->storage) {
+        auto local = context->storage->read_file(path_result.value.value(), tenant);
+        if (local.success) { blob = std::move(local.value); have = true; }
+    }
+    // The disk cull keeps only what is synced to the object store (cache-cull
+    // invariant), so a version missing locally is fetched from there — the
+    // blob is the same bytes, and the local copy is rehydrated best-effort.
+    if (!have && context->object_store) {
+        const std::string remote = context->object_store->get_storage_path(file_uid, version_timestamp, tenant);
+        auto r = context->object_store->read_file(remote, tenant);
+        if (r.success) {
+            blob = std::move(r.value);
+            have = true;
+            if (context->storage) {
+                auto back = context->storage->store_file(file_uid, version_timestamp, blob, tenant);
+                if (!back.success) {
+                    SERVER_LOG_WARN("FileSystem::read_version_content",
+                                    "Could not rehydrate " + file_uid + " @ " + version_timestamp +
+                                    " locally: " + back.error);
+                }
+            }
+        }
+    }
+    if (!have) {
+        return Result<std::vector<uint8_t>>::err("Version content not found for " + file_uid +
+                                                 " @ " + version_timestamp);
+    }
+    return decode_stored_version(context, std::move(blob), file_uid, version_timestamp, tenant);
+}
+
 Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint8_t>& data,
                              const std::string& user,
                              const std::vector<std::string>& roles,
@@ -516,131 +737,14 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
         return Result<void>::err("Cache culling requires object store configuration to prevent data loss");
     }
 
-    // Process data for storage (compress and encrypt if enabled)
-    std::vector<uint8_t> processed_data = data;
+    // Encode, store, and record the version + its transform (SR-1).
+    auto written = write_version_bytes(context, file_uid, version_timestamp, data, user, tenant);
+    if (!written.success) return written;
 
-    // SR-5 / SR-6 / SR-6a: decide from the BYTES whether compression is worth
-    // anything for this payload. Video, images, Office documents (ZIP
-    // containers) and the conversion pipeline's own renditions gain nothing,
-    // and the cost is paid again on every read.
-    const bool compression_on = context->storage && context->storage->is_compression_enabled();
-    // The measurement is opt-in. With it off, compression behaves exactly as it
-    // always has — everything is compressed when compression is enabled — so the
-    // first deploy of this work changes nothing about what is WRITTEN and stays
-    // reversible. See Config::storage_selective_compression.
-    CompressionPolicyConfig comp_cfg;
-    comp_cfg.enabled = compression_on;
-    const CompressionDecision comp_decision =
-        context->config.storage_selective_compression
-            ? decide_compression(data, comp_cfg)
-            : CompressionDecision{compression_on,
-                                  compression_on ? CompressionDecisionReason::MeasuredGood
-                                                 : CompressionDecisionReason::Disabled,
-                                  -1.0};
-
-    // §7.1 / SR-33: v2 is written only when the deployment asks for it. The
-    // reader is always present; this switch is what P6 turns on, separately
-    // from the deploy that shipped the code.
-    const bool write_v2 = (context->config.storage_write_format == 2);
-
-    // v2 compresses and encrypts per block, so the whole-payload transforms
-    // below are skipped entirely rather than run and discarded.
-    const bool applied_compression = !write_v2 && comp_decision.compress;
-
-    if (applied_compression) {
-        try {
-            processed_data = fileengine::CryptoUtils::compress_data(processed_data);
-            SERVER_LOG_DEBUG("FileSystem::put", "Data compressed from " + std::to_string(data.size()) +
-                             " to " + std::to_string(processed_data.size()) + " bytes");
-        } catch (const std::exception& e) {
-            SERVER_LOG_ERROR("FileSystem::put", "Compression failed: " + std::string(e.what()));
-            return Result<void>::err("Failed to compress data: " + std::string(e.what()));
-        }
-    } else if (comp_cfg.enabled) {
-        SERVER_LOG_DEBUG("FileSystem::put", std::string("Compression skipped (") +
-                         comp_decision.reason_name() + ") for " + file_uid);
-    }
-
-    // Check if encryption is enabled for this tenant/context
-    const bool encryption_on = context->storage && context->storage->is_encryption_enabled();
-    const bool applied_encryption = !write_v2 && encryption_on;
-    if (applied_encryption) {
-        try {
-            // Get the encryption key from the config
-            std::string encryption_key = context->config.encryption_key;
-            if (encryption_key.empty()) {
-                return Result<void>::err("Encryption key not available");
-            }
-
-            processed_data = fileengine::CryptoUtils::encrypt_data(processed_data, encryption_key);
-            SERVER_LOG_DEBUG("FileSystem::put", "Data encrypted successfully");
-        } catch (const std::exception& e) {
-            SERVER_LOG_ERROR("FileSystem::put", "Encryption failed: " + std::string(e.what()));
-            return Result<void>::err("Failed to encrypt data: " + std::string(e.what()));
-        }
-    }
-
-    if (write_v2) {
-        v2::Options o;
-        o.encrypt = encryption_on;
-        // v2 decides compression per BLOCK (SR-31), so the whole-payload
-        // decision above only says whether to try at all.
-        o.compress = comp_cfg.enabled;
-        o.block_size = v2::kDefaultBlockSize;
-        v2::VersionIdentity vid;
-        vid.file_uid = file_uid;
-        vid.version_timestamp = version_timestamp;
-
-        std::vector<uint8_t> encoded;
-        auto enc = v2::encode(data, context->config.encryption_key, vid, encoded, o);
-        if (enc) {
-            return Result<void>::err(std::string("Failed to encode storage format v2: ") +
-                                     v2::status_name(enc.status) + " (" + enc.detail + ")");
-        }
-        processed_data.swap(encoded);
-    }
-
-    // Store the processed file in storage
-    auto storage_result = context->storage->store_file(file_uid, version_timestamp, processed_data, tenant);
-    if (!storage_result.success) {
-        return Result<void>::err("Failed to store file in storage: " + storage_result.error);
-    }
-
-    // Record file creation in storage tracker for cache management
-    if (context->storage_tracker) {
-        context->storage_tracker->record_file_creation(storage_result.value, data.size(), tenant);
-    }
-    
-    // Update the file's current version in the database
+    // Point the file at the new version.
     auto update_result = context->db->update_file_current_version(file_uid, version_timestamp, tenant);
     if (!update_result.success) {
         return Result<void>::err("Failed to update current version: " + update_result.error);
-    }
-    
-    // Record the version in the database
-    auto insert_version_result = context->db->insert_version(file_uid, version_timestamp, data.size(),
-                                                             storage_result.value, user, tenant);
-    if (!insert_version_result.success) {
-        return Result<void>::err("Failed to record version: " + insert_version_result.error);
-    }
-
-    // SR-1: record what was actually applied, in the same operation that
-    // records the version. A failure here is fatal rather than logged: a
-    // version whose transform is unrecorded reads back through the
-    // configuration fallback, and if the flags ever change that read is
-    // silently wrong. Refusing the write is the recoverable outcome.
-    {
-        VersionTransform vt;
-        // For v2 the header is authoritative (SR-35) and carries all of this;
-        // the columns are the index that selects a reader cheaply.
-        vt.compressed = write_v2 ? comp_cfg.enabled : applied_compression;
-        vt.encrypted = write_v2 ? encryption_on : applied_encryption;
-        vt.storage_format = write_v2 ? 2 : 1;
-        vt.key_id = 0;
-        auto rec = context->db->set_version_transform(file_uid, version_timestamp, vt, tenant);
-        if (!rec.success) {
-            return Result<void>::err("Failed to record storage transform: " + rec.error);
-        }
     }
 
     // Keep files.size in sync with the current content so stat/listdir report
@@ -1394,6 +1498,17 @@ Result<void> FileSystem::get_range(const std::string& file_uid,
             report->range_method = "seek";
             report->authenticated = true;   // SR-28: every block touched verified
         }
+        // A window starting at or past the end is unsatisfiable (SR-14), and the
+        // DOOR says so: StreamFileDownload sends total_size with no bytes and the
+        // bridge answers 416 `bytes */total`. The v1 scan reaches exactly that by
+        // emitting nothing. v2's reader instead returns RangeNotSatisfiable, which
+        // surfaced as an error before any frame, so every door answered 500 to a
+        // resume of an already-complete download on a v2 deployment.
+        if (windowed && (static_cast<uint64_t>(req_offset) > total ||
+                         (static_cast<uint64_t>(req_offset) == total && total > 0))) {
+            if (report) report->range_length = 0;
+            return Result<void>::ok();
+        }
         int64_t emitted = 0;
         auto e = reader.read_range(
             static_cast<uint64_t>(req_offset),
@@ -1786,28 +1901,23 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
             return Result<void>::err("Failed to create file in database: " + db_result.error);
         }
 
-        // Copy every version's content (oldest -> newest) under the new UID.
+        // Copy every version (oldest -> newest) under the new UID. Each version
+        // is DECODED and RE-ENCODED, never byte-copied: a v2 blob is bound to
+        // its own {file_uid, version_timestamp} (SR-25), so a copied blob could
+        // never be read under the new uid, and the stored length is not the
+        // content size. Recording either was the defect (copy-restore-v2).
         int64_t current_size = 0;
         for (auto it = versions.rbegin(); it != versions.rend(); ++it) {
             const std::string& ver = *it;
-            std::string src_storage_path = context->storage->get_storage_path(src_uid, ver, tenant);
-            auto storage_result = context->storage->read_file(src_storage_path, tenant);
-            if (!storage_result.success) {
-                return Result<void>::err("Failed to read source version " + ver + ": " + storage_result.error);
+            auto content = read_version_content(context, src_uid, ver, tenant);
+            if (!content.success) {
+                return Result<void>::err("Failed to read source version " + ver + ": " + content.error);
             }
-            auto store_result = context->storage->store_file(new_uid, ver, storage_result.value, tenant);
-            if (!store_result.success) {
-                return Result<void>::err("Failed to store copied version " + ver + ": " + store_result.error);
+            auto written = write_version_bytes(context, new_uid, ver, content.value, user, tenant);
+            if (!written.success) {
+                return Result<void>::err("Failed to write copied version " + ver + ": " + written.error);
             }
-            if (context->storage_tracker) {
-                context->storage_tracker->record_file_creation(store_result.value, storage_result.value.size(), tenant);
-            }
-            auto insert_version_result = context->db->insert_version(new_uid, ver, storage_result.value.size(),
-                                                                     store_result.value, user, tenant);
-            if (!insert_version_result.success) {
-                return Result<void>::err("Failed to record version " + ver + ": " + insert_version_result.error);
-            }
-            if (ver == current_version) current_size = static_cast<int64_t>(storage_result.value.size());
+            if (ver == current_version) current_size = static_cast<int64_t>(content.value.size());
             // Schedule an object-store backup for this version.
             if (context->object_store) {
                 {
@@ -1850,16 +1960,16 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                               "Skipping rendition with no version: " + rend.uid);
                     continue;
                 }
-                std::string r_ver = rv.value.back();
-                auto r_read = context->storage->read_file(
-                    context->storage->get_storage_path(rend.uid, r_ver, tenant), tenant);
-                if (!r_read.success) continue;
-                std::string r_new_uid = Utils::generate_uuid();
-                auto r_store = context->storage->store_file(r_new_uid, r_ver, r_read.value, tenant);
-                if (!r_store.success) continue;
-                if (context->storage_tracker) {
-                    context->storage_tracker->record_file_creation(r_store.value, r_read.value.size(), tenant);
+                // The CURRENT rendition: list_versions is newest-first, so back()
+                // was the oldest — the same mistake the file loop above fixed.
+                std::string r_ver = newest_version(rv.value);
+                auto r_read = read_version_content(context, rend.uid, r_ver, tenant);
+                if (!r_read.success) {
+                    SERVER_LOG_ERROR("FileSystem::copy", ServerLogger::getInstance().detailed_log_prefix() +
+                              "Skipping unreadable rendition " + rend.uid + ": " + r_read.error);
+                    continue;
                 }
+                std::string r_new_uid = Utils::generate_uuid();
                 auto r_grants = compute_initial_acl_grants(new_uid, user, tenant);
                 auto r_db = context->db->create_file_with_acls(
                     r_new_uid, rend.name, new_uid + "/" + rend.name, new_uid,
@@ -1869,8 +1979,15 @@ Result<void> FileSystem::copy(const std::string& src_uid, const std::string& dst
                               "Failed to copy rendition " + rend.name + ": " + r_db.error);
                     continue;
                 }
+                // Re-encoded for the new uid (SR-25); the row comes before the bytes
+                // here because write_version_bytes records against an existing file.
+                auto r_written = write_version_bytes(context, r_new_uid, r_ver, r_read.value, user, tenant);
+                if (!r_written.success) {
+                    SERVER_LOG_ERROR("FileSystem::copy", ServerLogger::getInstance().detailed_log_prefix() +
+                              "Failed to write rendition " + rend.name + ": " + r_written.error);
+                    continue;
+                }
                 context->db->update_file_current_version(r_new_uid, r_ver, tenant);
-                context->db->insert_version(r_new_uid, r_ver, r_read.value.size(), r_store.value, user, tenant);
                 context->db->update_file_size(r_new_uid, static_cast<int64_t>(r_read.value.size()), tenant);
                 context->db->update_file_modified(r_new_uid, tenant);
             }
@@ -2050,11 +2167,37 @@ Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
         return Result<bool>::err("User does not have permission to restore to version");
     }
 
-    auto result = context->db->restore_to_version(file_uid, version_timestamp, user, tenant);
-    if (result.success && result.value) {
-        emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+    // Restoring makes a NEW version with the old content. It used to insert a
+    // row pointing at the old blob (Database::restore_to_version), which is
+    // unreadable under v2 — the blob is bound to the OLD version_timestamp
+    // (SR-25) — and recorded no transform. Decode the old version and write it
+    // through the same path as a put instead.
+    auto old_content = read_version_content(context, file_uid, version_timestamp, tenant);
+    if (!old_content.success) {
+        return Result<bool>::err("Version " + version_timestamp + " could not be read: " + old_content.error);
     }
-    return result;
+    const std::string new_ts = Utils::get_timestamp_string();
+    auto written = write_version_bytes(context, file_uid, new_ts, old_content.value, user, tenant);
+    if (!written.success) return Result<bool>::err(written.error);
+    auto cur = context->db->update_file_current_version(file_uid, new_ts, tenant);
+    if (!cur.success) {
+        return Result<bool>::err("Failed to update current version: " + cur.error);
+    }
+    auto sz = context->db->update_file_size(file_uid, static_cast<int64_t>(old_content.value.size()), tenant);
+    if (!sz.success) {
+        SERVER_LOG_ERROR("FileSystem::restore_to_version", "Failed to update file size for " + file_uid +
+                         ": " + sz.error);
+    }
+    context->db->update_file_modified(file_uid, tenant);
+    if (context->object_store) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            backup_queue_.push({file_uid, tenant, new_ts});
+        }
+        queue_cv_.notify_one();
+    }
+    emit_fs_event(tenant, FileEventType::FileUpdated, file_uid, user);
+    return Result<bool>::ok(true);
 }
 
 Result<void> FileSystem::backup_to_object_store(const std::string& file_uid,

@@ -375,6 +375,35 @@ target_include_directories(storage_write_path_parity_live_tests PRIVATE
 add_test(NAME storage_write_path_parity_live_tests COMMAND storage_write_path_parity_live_tests)
 set_tests_properties(storage_write_path_parity_live_tests PROPERTIES
     LABELS "live" TIMEOUT 900 SKIP_RETURN_CODE 77)
+# copy_restore_live_tests — copy() and restore_to_version() leave a file that
+# reads back at its real size, under v1, v2 and a v1 history read after the
+# switch to v2. Both used to reuse stored blobs, which v2 binds to their own
+# {file_uid, version_timestamp}: production answered 500 "inflate failed".
+add_executable(copy_restore_live_tests copy_restore_live_tests.cpp)
+target_link_libraries(copy_restore_live_tests
+    fileengine_core
+    ${LIBPQ_LIBRARIES}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${GRPCPP_LIBRARIES}
+    proto_lib
+    ${UUID_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(AWSSDK_FOUND)
+    target_link_libraries(copy_restore_live_tests ${AWSSDK_LINK_LIBRARIES})
+endif()
+target_include_directories(copy_restore_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/include
+    ${CMAKE_CURRENT_BINARY_DIR}/../core/generated/fileengine
+    ${LIBPQ_INCLUDE_DIRS}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${GRPCPP_INCLUDE_DIRS}
+)
+add_test(NAME copy_restore_live_tests COMMAND copy_restore_live_tests)
+set_tests_properties(copy_restore_live_tests PROPERTIES
+    LABELS "live" TIMEOUT 900 SKIP_RETURN_CODE 77)
 # compression_corpus_tests — storage_pipeline.md the compression decision over the real local corpus
 add_executable(compression_corpus_tests compression_corpus_tests.cpp)
 target_link_libraries(compression_corpus_tests

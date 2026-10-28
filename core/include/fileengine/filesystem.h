@@ -454,6 +454,30 @@ private:
                                                                 const std::string& creator,
                                                                 const std::string& tenant);
 
+    // The one write path for a version's bytes: encode `data` for exactly
+    // {file_uid, version_timestamp} as the deployment writes today (v1 or v2,
+    // per Config::storage_write_format), store it, and record the version row
+    // with the CONTENT size and its transform (SR-1). No permission check and
+    // no current-version / files.size / event bookkeeping — callers own those.
+    // put(), copy() and restore_to_version() all write through here, so a
+    // version can never be recorded with a stored length or without a transform.
+    Result<void> write_version_bytes(TenantContext* context,
+                                     const std::string& file_uid,
+                                     const std::string& version_timestamp,
+                                     const std::vector<uint8_t>& data,
+                                     const std::string& user,
+                                     const std::string& tenant);
+
+    // A version's CONTENT, decoded by the transform recorded for it (SR-2/SR-32):
+    // local storage first, else the object store (rehydrating the local copy).
+    // No permission check. Copy and restore read through here because a stored
+    // blob is bound to its own {file_uid, version_timestamp} under v2 (SR-25)
+    // and so can never be reused under another identity.
+    Result<std::vector<uint8_t>> read_version_content(TenantContext* context,
+                                                      const std::string& file_uid,
+                                                      const std::string& version_timestamp,
+                                                      const std::string& tenant);
+
 private:
     // Async object store backup functionality
     struct BackupTask {
