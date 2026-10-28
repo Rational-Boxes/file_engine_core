@@ -243,6 +243,15 @@ Numerous ad-hoc `test_*.cpp` files at the project root are standalone integratio
   anyone else is inert; membership alone suffices for both), and write an accountability record in the same
   transaction as the destruction. See PROPOSAL_accountability_record.md §5.4
 
+- **Retention MOVES records; it does not destroy them.** The audit log and the
+  accountability record keep two complete calendar months in Postgres. The
+  monthly `audit-retention` job (audit_service) archives older rows, verified
+  and encrypted under a key derived from `AT_REST_KEY`, into the main bucket
+  under `<tenant>/_audit/` and `<tenant>/_accountability/`. Only then does it
+  remove them from Postgres. The core never lists or deletes in those folders.
+  (Decided 2026-10-26; SPEC_retention_and_archival.md in audit_service; the
+  accountability record was "never culled" until then — PROPOSAL §5.2.)
+
 - **Never edit the .env file** — it contains database and S3 connection credentials
 - The `.env` must be symlinked into the build directory so binaries can find it
 - S3 objects are **write-once, not undeletable**. The core never rewrites an
