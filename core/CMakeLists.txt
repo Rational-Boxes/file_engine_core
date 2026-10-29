@@ -153,6 +153,7 @@ add_library(fileengine_core SHARED
     src/acl_manager.cpp
     src/role_manager.cpp       # Add role manager source file
     src/utils.cpp
+    src/version_id.cpp
     src/config_loader.cpp
     src/grpc_service.cpp  # Add gRPC service implementation
     src/object_store_sync.cpp  # Add missing source file

@@ -16,6 +16,7 @@
 #include <regex>
 #include "fileengine/filesystem.h"
 #include "fileengine/utils.h"
+#include "fileengine/version_id.h"
 #include "fileengine/server_logger.h"
 #include "fileengine/crypto_utils.h"
 #include "fileengine/compression_policy.h"
@@ -712,8 +713,6 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
         return Result<void>::err("File does not exist");
     }
     
-    // Generate a new version timestamp
-    std::string version_timestamp = Utils::get_timestamp_string();
     
     // Check if we need to perform cache pruning before storing
     // Only proceed with cache management if object store is available to prevent data loss
@@ -737,9 +736,18 @@ Result<void> FileSystem::put(const std::string& file_uid, const std::vector<uint
         return Result<void>::err("Cache culling requires object store configuration to prevent data loss");
     }
 
+    // Claim a version id no other write to this file holds (version_id.h).
+    auto reserved = version_id::reserve(*context->storage, file_uid, tenant);
+    if (!reserved.success) return Result<void>::err(reserved.error);
+    const std::string version_timestamp = reserved.value.version;
+
     // Encode, store, and record the version + its transform (SR-1).
     auto written = write_version_bytes(context, file_uid, version_timestamp, data, user, tenant);
-    if (!written.success) return written;
+    if (!written.success) {
+        std::error_code ec;
+        std::filesystem::remove(reserved.value.path, ec);
+        return written;
+    }
 
     // Point the file at the new version.
     auto update_result = context->db->update_file_current_version(file_uid, version_timestamp, tenant);
@@ -1027,8 +1035,18 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
         return Result<void>::err("Cache culling requires object store configuration to prevent data loss");
     }
 
-    const std::string version_timestamp = Utils::get_timestamp_string();
-    const std::string storage_path = context->storage->get_storage_path(file_uid, version_timestamp, tenant);
+    // Claim the version id BEFORE a byte is streamed: two uploads that start in
+    // the same millisecond used to share one path and interleave (version_id.h).
+    auto reserved = version_id::reserve(*context->storage, file_uid, tenant);
+    if (!reserved.success) return Result<void>::err(reserved.error);
+    const std::string version_timestamp = reserved.value.version;
+    const std::string storage_path = reserved.value.path;
+    // Give the claim back on any failure before the blob is complete, so an
+    // abandoned upload leaves no empty file behind.
+    struct Unclaim {
+        std::string path; bool keep = false;
+        ~Unclaim() { if (!keep) { std::error_code ec; std::filesystem::remove(path, ec); } }
+    } unclaim{storage_path};
 
     const bool compression_allowed = context->storage->is_compression_enabled();
     const bool do_encrypt = context->storage->is_encryption_enabled();
@@ -1181,6 +1199,7 @@ Result<void> FileSystem::put_stream(const std::string& file_uid,
             ofs.close();
         }
         if (ofs.fail()) throw std::runtime_error("write error on " + storage_path);
+        unclaim.keep = true;
     } catch (const std::exception& e) {
         if (ofs.is_open()) ofs.close();
         std::error_code ec;
@@ -2176,9 +2195,15 @@ Result<bool> FileSystem::restore_to_version(const std::string& file_uid,
     if (!old_content.success) {
         return Result<bool>::err("Version " + version_timestamp + " could not be read: " + old_content.error);
     }
-    const std::string new_ts = Utils::get_timestamp_string();
+    auto reserved = version_id::reserve(*context->storage, file_uid, tenant);
+    if (!reserved.success) return Result<bool>::err(reserved.error);
+    const std::string new_ts = reserved.value.version;
     auto written = write_version_bytes(context, file_uid, new_ts, old_content.value, user, tenant);
-    if (!written.success) return Result<bool>::err(written.error);
+    if (!written.success) {
+        std::error_code ec;
+        std::filesystem::remove(reserved.value.path, ec);
+        return Result<bool>::err(written.error);
+    }
     auto cur = context->db->update_file_current_version(file_uid, new_ts, tenant);
     if (!cur.success) {
         return Result<bool>::err("Failed to update current version: " + cur.error);

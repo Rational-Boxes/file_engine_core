@@ -1803,8 +1803,10 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
     // Keep the version_timestamp as a string to avoid conversion issues
     std::string insert_sql = "INSERT INTO \"" + schema_name + "\".versions (file_uid, version_timestamp, size, storage_path, revised_by) "
                              "VALUES ($1, $2, $3, $4, $5) "
-                             "ON CONFLICT (file_uid, version_timestamp) DO UPDATE SET "
-                             "size = EXCLUDED.size, storage_path = EXCLUDED.storage_path, revised_by = EXCLUDED.revised_by "
+                             // A version row is never re-pointed. This used to be DO UPDATE,
+                             // which let two writes that drew the same version id both
+                             // succeed onto one blob (version_id.h); now the second fails.
+                             "ON CONFLICT (file_uid, version_timestamp) DO NOTHING "
                              "RETURNING id;";
     // Own the size string so param_values doesn't point at a freed temporary.
     std::string size_str = std::to_string(size);
@@ -1833,7 +1835,8 @@ Result<int64_t> Database::insert_version(const std::string& file_uid, const std:
         } else {
             PQclear(res);
             connection_pool_->release(conn);
-            return Result<int64_t>::err("Failed to insert version record");
+            return Result<int64_t>::err("Version " + version_timestamp + " of " + file_uid +
+                                        " already exists");
         }
     } else {
         std::string error = PQerrorMessage(pg_conn);
