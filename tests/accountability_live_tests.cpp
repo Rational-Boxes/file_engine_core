@@ -555,12 +555,19 @@ static void test_detail_survives_the_read_path_byte_for_byte(Database& db) {
 // nothing else in the process having created a tenant meanwhile.
 static std::vector<StoredAccountabilityRecord> global_records_for(Database& db,
                                                          const std::string& tenant) {
-    bool has_more = false;
-    auto all = db.list_accountability_records(kGlobalChainKey, 0, 5000, has_more);
+    // Page through the WHOLE chain. A single oldest-first page of 5000 stopped
+    // seeing new records once a long-lived dev database grew past 5000 rows —
+    // the tenant's record was written, just beyond the window the test read.
     std::vector<StoredAccountabilityRecord> mine;
-    if (!all.success) return mine;
-    for (const auto& row : all.value) {
-        if (row.record.global_tenant == tenant) mine.push_back(row);
+    std::int64_t newer_than = 0;
+    bool has_more = true;
+    while (has_more) {
+        auto page = db.list_accountability_records(kGlobalChainKey, newer_than, 5000, has_more);
+        if (!page.success || page.value.empty()) break;
+        for (const auto& row : page.value) {
+            if (row.record.global_tenant == tenant) mine.push_back(row);
+        }
+        newer_than = page.value.back().ts_micros;
     }
     return mine;
 }
